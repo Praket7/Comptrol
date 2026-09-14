@@ -6,6 +6,8 @@ The fixture now includes a minimal websocket protocol route for `Runtime.evaluat
 
 `browser.cdp.open_tab` opens a visible tab through the local Chrome DevTools endpoint or creates a background tab in the existing browser profile. The background route uses `Target.createTarget` with background and focus disabled, then rediscoveries the exact target before reporting success. It does not synthesize mouse input or read or write the clipboard. Signed in account state is available because this route attaches to the existing browser profile. Comptrol does not copy cookies or credentials into a separate headless profile.
 
+`browser.cdp.close_tab` closes one exact live page target after revalidating its target id, browser context, and revision. It waits until discovery confirms that target is gone. It does not close a guessed tab, move the pointer, or use the clipboard.
+
 Enable the route only for a browser endpoint the user intentionally started with local DevTools enabled, using `COMPTROL_CDP_ENDPOINT=http://127.0.0.1:PORT` and `COMPTROL_ALLOW_BROWSER_CDP=1`. The endpoint must remain loopback only.
 
 Inactive and grouped live tabs remain addressable through exact target identity and do not need foreground focus. A closed tab or closed tab group is not a live DevTools target, so it must be reopened by the browser before Comptrol can control it. Chrome does not expose a portable closed group control surface through the route used here.

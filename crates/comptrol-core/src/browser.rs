@@ -183,6 +183,61 @@ pub fn open_tab(endpoint: &str, url: &str, background: bool) -> Result<Value, Co
     })
 }
 
+pub fn close_tab(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+) -> Result<Value, ComptrolError> {
+    let targets = discover(endpoint)?;
+    let target = crate::bind_browser_target(
+        &targets,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+    )?;
+    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Inspect the existing browser websocket endpoint".to_owned()),
+    })?;
+    let web_socket_url = version
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not provide a browser websocket".to_owned(),
+            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
+        })?;
+    let value = protocol_call(
+        web_socket_url,
+        "Target.closeTarget",
+        json!({ "targetId": target_id }),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if discover(endpoint)
+            .map(|remaining| remaining.iter().all(|item| item.id != target_id))
+            .unwrap_or(false)
+        {
+            return Ok(json!({
+                "target": target,
+                "closed": true,
+                "response": value,
+                "mouse": "untouched",
+                "clipboard": "untouched",
+                "verified": true
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(ComptrolError {
+        code: "verification_failed".to_owned(),
+        message: "The browser did not confirm that the exact target closed".to_owned(),
+        recovery: Some("Inspect browser targets before retrying".to_owned()),
+    })
+}
+
 fn protocol_call(
     web_socket_url: &str,
     method: &str,

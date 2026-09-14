@@ -45,6 +45,15 @@ const server = createServer(async (request, response) => {
     json(response, 200, target)
     return
   }
+  if (request.method === "GET" && request.url.startsWith("/json/close/")) {
+    const id = decodeURIComponent(request.url.slice("/json/close/".length))
+    if (!openedTabs.delete(id)) {
+      json(response, 404, { error: "target_not_found" })
+      return
+    }
+    json(response, 200, { result: "Target is closing" })
+    return
+  }
   if (request.method === "GET" && request.url === "/json/list") {
     json(response, 200, [{ id: targetId, type: "page", title: "Comptrol browser fixture", url: `http://127.0.0.1:${port}/`, browserContextId, revision, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${targetId}` }, ...openedTabs.values()])
     return
@@ -110,7 +119,8 @@ function websocketMessage(buffer) {
 }
 
 server.on("upgrade", (request, socket) => {
-  if (request.url !== `/devtools/page/${targetId}`) {
+  const browserSocket = request.url === `/devtools/browser/comptrol-fixture`
+  if (!browserSocket && request.url !== `/devtools/page/${targetId}`) {
     socket.destroy()
     return
   }
@@ -123,11 +133,13 @@ server.on("upgrade", (request, socket) => {
     if (!text) return
     buffer = Buffer.alloc(0)
     const message = JSON.parse(text)
-    const result = message.method === "Runtime.evaluate"
-      ? { result: { type: "string", value: message.params.expression === "document.title" ? "Comptrol browser fixture" : "fixture evaluation" } }
-      : message.method === "Page.navigate"
-        ? { frameId: "fixture-frame" }
-        : {}
+    const result = browserSocket && message.method === "Target.closeTarget"
+      ? { success: openedTabs.delete(message.params.targetId) }
+      : message.method === "Runtime.evaluate"
+        ? { result: { type: "string", value: message.params.expression === "document.title" ? "Comptrol browser fixture" : "fixture evaluation" } }
+        : message.method === "Page.navigate"
+          ? { frameId: "fixture-frame" }
+          : {}
     socket.write(websocketFrame(JSON.stringify({ id: message.id, result })))
   })
 })

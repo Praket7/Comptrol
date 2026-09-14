@@ -399,6 +399,7 @@ impl Policy {
                 "browser.cdp.fill".to_owned(),
                 "browser.cdp.click".to_owned(),
                 "browser.cdp.open_tab".to_owned(),
+                "browser.cdp.close_tab".to_owned(),
             ]);
         }
         policy
@@ -881,6 +882,7 @@ impl Runtime {
             | "browser.cdp.fill"
             | "browser.cdp.click"
             | "browser.cdp.open_tab"
+            | "browser.cdp.close_tab"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             _ => ActionResult::refused(
                 &request,
@@ -1153,7 +1155,8 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.download"
         | "browser.cdp.fill"
         | "browser.cdp.click"
-        | "browser.cdp.open_tab" => Risk::R2,
+        | "browser.cdp.open_tab"
+        | "browser.cdp.close_tab" => Risk::R2,
         "browser.cdp.wait_for" => Risk::R0,
         _ => Risk::R2,
     }
@@ -1329,6 +1332,7 @@ fn route_for(intent: &str) -> String {
         | "browser.cdp.fill"
         | "browser.cdp.click"
         | "browser.cdp.open_tab"
+        | "browser.cdp.close_tab"
         | "browser.cdp.wait_for" => "browser_protocol",
         _ => "none",
     }
@@ -1590,6 +1594,24 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    if request.intent == "browser.cdp.close_tab" {
+        return match browser::close_tab(
+            &endpoint.to_string_lossy(),
+            target_id,
+            browser_context_id,
+            revision,
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                VerificationState::Verified,
+                data,
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
     if matches!(
         request.intent.as_str(),
         "browser.cdp.fill" | "browser.cdp.click" | "browser.cdp.wait_for"
@@ -3754,6 +3776,14 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Opens a visible or background tab in the existing local browser profile without mouse or clipboard input".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.close_tab".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "browser_protocol".to_owned(),
+            note: "Closes one exact live page target after context and revision validation".to_owned(),
         },
         Capability {
             name: "browser.cdp.discovery".to_owned(),

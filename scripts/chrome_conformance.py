@@ -127,6 +127,11 @@ try:
     assert download_data["verification"] == "verified"
     downloaded = pathlib.Path(download_data["data"]["path"])
     assert downloaded.read_text(encoding="utf-8") == "Comptrol fixture download\n"
+    close = call(runtime, 14, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.close_tab", "idempotency_key": "chrome-close-background-tab", "params": opened_identity}})
+    assert close["result"]["structuredContent"]["verification"] == "verified"
+    assert close["result"]["structuredContent"]["data"]["closed"] is True
+    assert close["result"]["structuredContent"]["data"]["mouse"] == "untouched"
+    assert close["result"]["structuredContent"]["data"]["clipboard"] == "untouched"
     print("real Chrome CDP conformance passed")
 finally:
     if runtime is not None:

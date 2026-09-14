@@ -66,6 +66,12 @@ try {
     assert.equal(opened.result.structuredContent.data.visibility, "foreground")
     assert.equal(opened.result.structuredContent.data.mouse, "untouched")
     assert.equal(opened.result.structuredContent.data.clipboard, "untouched")
+    const openedTarget = opened.result.structuredContent.data.target
+    const closed = await response(6, { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.close_tab", idempotency_key: "close-visible-tab", params: { target_id: openedTarget.id, browser_context_id: openedTarget.browser_context_id, revision: openedTarget.revision } } } })
+    assert.equal(closed.result.structuredContent.verification, "verified")
+    assert.equal(closed.result.structuredContent.data.closed, true)
+    assert.equal(closed.result.structuredContent.data.mouse, "untouched")
+    assert.equal(closed.result.structuredContent.data.clipboard, "untouched")
     comptrol.kill("SIGTERM")
   }
   console.log("browser fixture conformance passed")
