@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf8">
+<title>Comptrol browser fixture</title>
+<body>
+<main>
+<h1>Comptrol browser fixture</h1>
+<form id="message-form">
+<label>Message <input id="message" name="message"></label>
+<button id="submit" type="submit">Submit once</button>
+</form>
+<output id="state" aria-live="polite"></output>
+</main>
+<script>
+const form = document.querySelector("#message-form")
+const state = document.querySelector("#state")
+form.addEventListener("submit", async event => {
+  event.preventDefault()
+  const response = await fetch("/submit", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-comptrol-idempotency-key": "fixture-form" },
+    body: JSON.stringify({ message: document.querySelector("#message").value })
+  })
+  state.textContent = await response.text()
+})
+</script>
+</body>
+</html>
+

@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "Local first computer control runtime",
+  "scripts": {
+    "test:browser": "node scripts/browser_conformance.mjs"
+  },
   "workspaces": ["packages/mcp"]
 }
-

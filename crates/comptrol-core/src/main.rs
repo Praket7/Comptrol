@@ -97,8 +97,9 @@ fn handle_message(runtime: &mut Runtime, line: &str) -> Option<Value> {
 fn tools() -> Value {
     json!([
         { "name": "operate", "description": "Execute one bounded local intent with policy, idempotency, and verification state", "inputSchema": { "type": "object", "required": ["intent"], "properties": { "intent": {"type":"string"}, "target": {"type":"object"}, "params": {"type":"object"}, "postcondition": {"type":"object"}, "risk": {"type":"string"}, "idempotency_key": {"type":"string"}, "dry_run": {"type":"boolean"} } } },
-        { "name": "inspect", "description": "Inspect doctor, status, capabilities, or current desktop observation", "inputSchema": { "type": "object", "properties": { "kind": {"type":"string", "enum":["doctor","status","capabilities","desktop"]} } } },
+        { "name": "inspect", "description": "Inspect doctor, status, capabilities, platform state, or current desktop observation", "inputSchema": { "type": "object", "properties": { "kind": {"type":"string", "enum":["doctor","status","capabilities","platform","desktop"]} } } },
         { "name": "watch", "description": "Return the known state of an operation without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
+        { "name": "reconcile", "description": "Reconcile a durable unknown operation from observed local state without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
         { "name": "capabilities", "description": "Return capabilities that are actually available in this runtime", "inputSchema": { "type": "object" } }
     ])
 }
@@ -116,6 +117,7 @@ fn call_tool(runtime: &mut Runtime, params: Value) -> Value {
         "operate" => serde_json::from_value::<OperationRequest>(arguments).map(|request| json!(runtime.operate(request))).unwrap_or_else(|error| json!({ "error": { "code": "invalid_input", "message": error.to_string() } })),
         "inspect" => json!(runtime.inspect(arguments.get("kind").and_then(Value::as_str).unwrap_or("status"))),
         "watch" => json!(runtime.watch(arguments.get("operation_id").and_then(Value::as_str).unwrap_or_default())),
+        "reconcile" => json!(runtime.reconcile(arguments.get("operation_id").and_then(Value::as_str).unwrap_or_default())),
         "capabilities" => json!(capabilities()),
         _ => json!({ "error": { "code": "tool_not_found", "message": format!("Unknown tool {name}") } }),
     };
@@ -170,6 +172,7 @@ fn run_http(port: u16) -> i32 {
             return 1;
         }
     };
+    // ponytail: one blocking loop, add bounded concurrency when multiple clients need simultaneous long operations
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -184,6 +187,7 @@ fn run_http(port: u16) -> i32 {
 }
 
 fn handle_http(stream: &mut TcpStream, runtime: &mut Runtime) -> io::Result<()> {
+    // ponytail: bounded local parser, replace with a full HTTP implementation before public network exposure
     let mut buffer = vec![0_u8; 2 * 1024 * 1024];
     let size = stream.read(&mut buffer)?;
     let request = String::from_utf8_lossy(&buffer[..size]);

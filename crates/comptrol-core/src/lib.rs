@@ -2,9 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -229,6 +230,13 @@ impl Policy {
             policy.max_risk = Risk::R1;
             policy.allowed_intents.insert("desktop.notify".to_owned());
         }
+        if std::env::var("COMPTROL_ALLOW_MACOS_AX").as_deref() == Ok("1") {
+            policy.max_risk = Risk::R2;
+            policy.allowed_intents.insert("macos.ax.press".to_owned());
+            policy
+                .allowed_intents
+                .insert("macos.ax.set_value".to_owned());
+        }
         policy
     }
 
@@ -283,6 +291,146 @@ impl AuditJournal {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableState {
+    Prepared,
+    Dispatched,
+    Complete,
+    Unknown,
+    Reconciled,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DurableOperation {
+    pub operation_id: String,
+    pub idempotency_key: Option<String>,
+    pub intent: String,
+    pub risk: Risk,
+    pub target: Option<Target>,
+    pub state: DurableState,
+    pub metadata: Value,
+    pub result: Option<ActionResult>,
+}
+
+#[derive(Debug)]
+pub struct OperationJournal {
+    path: PathBuf,
+    file: File,
+    records: HashMap<String, DurableOperation>,
+}
+
+impl OperationJournal {
+    pub fn open(state_dir: &Path) -> io::Result<Self> {
+        fs::create_dir_all(state_dir)?;
+        let path = state_dir.join("operations.jsonl");
+        let mut records = HashMap::new();
+        if path.exists() {
+            let file = File::open(&path)?;
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                if let Ok(record) = serde_json::from_str::<DurableOperation>(&line) {
+                    records.insert(record.operation_id.clone(), record);
+                }
+            }
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self {
+            path,
+            file,
+            records,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn record(&self, operation_id: &str) -> Option<&DurableOperation> {
+        self.records.get(operation_id)
+    }
+
+    pub fn completed(&self) -> impl Iterator<Item = &DurableOperation> {
+        self.records
+            .values()
+            .filter(|record| record.result.is_some())
+    }
+
+    pub fn prepare(
+        &mut self,
+        request: &OperationRequest,
+        operation_id: &str,
+        risk: Risk,
+    ) -> io::Result<()> {
+        self.write(DurableOperation {
+            operation_id: operation_id.to_owned(),
+            idempotency_key: request.idempotency_key.clone(),
+            intent: request.intent.clone(),
+            risk,
+            target: request.target.clone(),
+            state: DurableState::Prepared,
+            metadata: operation_metadata(request),
+            result: None,
+        })
+    }
+
+    pub fn dispatched(&mut self, operation_id: &str) -> io::Result<()> {
+        self.update(operation_id, |record| {
+            record.state = DurableState::Dispatched
+        })
+    }
+
+    pub fn complete(
+        &mut self,
+        request: &OperationRequest,
+        result: &ActionResult,
+    ) -> io::Result<()> {
+        self.write(DurableOperation {
+            operation_id: result.operation_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            intent: request.intent.clone(),
+            risk: request.risk.unwrap_or_else(|| classify(&request.intent)),
+            target: request.target.clone(),
+            state: DurableState::Complete,
+            metadata: operation_metadata(request),
+            result: Some(result.clone()),
+        })
+    }
+
+    pub fn reconciled(
+        &mut self,
+        operation: DurableOperation,
+        result: ActionResult,
+    ) -> io::Result<()> {
+        self.write(DurableOperation {
+            state: DurableState::Reconciled,
+            result: Some(result),
+            ..operation
+        })
+    }
+
+    fn update<F>(&mut self, operation_id: &str, mutate: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut DurableOperation),
+    {
+        let mut record = self
+            .records
+            .get(operation_id)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operation not found"))?;
+        mutate(&mut record);
+        self.write(record)
+    }
+
+    fn write(&mut self, record: DurableOperation) -> io::Result<()> {
+        serde_json::to_writer(&mut self.file, &record)?;
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        self.records.insert(record.operation_id.clone(), record);
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct StopLatch {
     path: PathBuf,
@@ -316,6 +464,7 @@ pub struct Runtime {
     pub policy: Policy,
     pub leases: LeaseManager,
     pub journal: AuditJournal,
+    pub operations: OperationJournal,
     pub stop: StopLatch,
     idempotent: HashMap<String, ActionResult>,
     sequence: u64,
@@ -323,12 +472,20 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(state_dir: PathBuf) -> io::Result<Self> {
+        let operations = OperationJournal::open(&state_dir)?;
+        let mut idempotent = HashMap::new();
+        for record in operations.completed() {
+            if let (Some(key), Some(result)) = (&record.idempotency_key, &record.result) {
+                idempotent.insert(key.clone(), result.clone());
+            }
+        }
         Ok(Self {
             policy: Policy::from_environment(),
             leases: LeaseManager::new(),
             journal: AuditJournal::open(&state_dir)?,
+            operations,
             stop: StopLatch::new(&state_dir),
-            idempotent: HashMap::new(),
+            idempotent,
             sequence: 0,
         })
     }
@@ -349,6 +506,19 @@ impl Runtime {
             return replay;
         }
         let risk = request.risk.unwrap_or_else(|| classify(&request.intent));
+        if let Some(key) = request.idempotency_key.as_ref()
+            && let Some(record) = self
+                .operations
+                .records
+                .values()
+                .find(|record| record.idempotency_key.as_ref() == Some(key))
+            && matches!(
+                record.state,
+                DurableState::Dispatched | DurableState::Unknown
+            )
+        {
+            return unknown_result(&request, record.operation_id.clone());
+        }
         if risk.mutation() && self.stop.engaged() {
             let result = ActionResult::refused(
                 &request,
@@ -385,6 +555,26 @@ impl Runtime {
             self.remember(&request, result.clone());
             return result;
         }
+        if risk.mutation()
+            && let Err(error) = self
+                .operations
+                .prepare(&request, &operation_id, risk)
+                .and_then(|_| self.operations.dispatched(&operation_id))
+        {
+            let result = ActionResult::refused(
+                &request,
+                operation_id,
+                ComptrolError {
+                    code: "recovery_unavailable".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some(
+                        "Repair the local operation journal before allowing mutations".to_owned(),
+                    ),
+                },
+            );
+            self.remember(&request, result.clone());
+            return result;
+        }
         let result = match request.intent.as_str() {
             "system.ping" => success(
                 &request,
@@ -397,6 +587,8 @@ impl Runtime {
             "desktop.observe" => desktop_observe(&request, operation_id),
             "filesystem.write" => sandbox_write(&request, operation_id),
             "desktop.notify" => desktop_notify(&request, operation_id),
+            "macos.ax.press" => macos_ax_press(&request, operation_id),
+            "macos.ax.set_value" => macos_ax_set_value(&request, operation_id),
             _ => ActionResult::refused(
                 &request,
                 operation_id,
@@ -415,6 +607,7 @@ impl Runtime {
         match kind {
             "doctor" => doctor(self),
             "capabilities" => json!(capabilities()),
+            "platform" => platform_diagnostics(),
             "desktop" | "system" => {
                 desktop_observe(
                     &OperationRequest {
@@ -446,9 +639,59 @@ impl Runtime {
             .find(|result| result.operation_id == operation_id)
         {
             json!({ "state": "complete", "result": result })
+        } else if let Some(record) = self.operations.record(operation_id) {
+            json!({ "state": format!("{:?}", record.state).to_lowercase(), "operation_id": operation_id, "reconcile_required": matches!(record.state, DurableState::Dispatched | DurableState::Unknown), "metadata": record.metadata })
         } else {
             json!({ "state": "unknown", "operation_id": operation_id, "error": "operation_unknown" })
         }
+    }
+
+    pub fn reconcile(&mut self, operation_id: &str) -> Value {
+        let Some(record) = self.operations.record(operation_id).cloned() else {
+            return json!({ "state": "unknown", "operation_id": operation_id, "error": "operation_unknown" });
+        };
+        if !matches!(
+            record.state,
+            DurableState::Dispatched | DurableState::Unknown
+        ) {
+            return self.watch(operation_id);
+        }
+        if record.intent == "filesystem.write" {
+            let path = record
+                .metadata
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            let expected_hash = record.metadata.get("content_hash").and_then(Value::as_u64);
+            if let (Some(path), Some(expected_hash)) = (path, expected_hash)
+                && let Ok(bytes) = fs::read(&path)
+                && stable_hash(&bytes) == expected_hash
+            {
+                let result = ActionResult {
+                    operation_id: record.operation_id.clone(),
+                    intent: record.intent.clone(),
+                    route: "recovery_observation".to_owned(),
+                    target: record.target.clone(),
+                    preflight: "reconciled".to_owned(),
+                    delivery: DeliveryState::Delivered,
+                    effect: EffectState::Changed,
+                    verification: VerificationState::Verified,
+                    disturbance: json!({ "foreground_changed": false }),
+                    recovery: RecoveryState::None,
+                    data: json!({ "path": path, "reconciled": true }),
+                    error: None,
+                };
+                let idempotency_key = record.idempotency_key.clone();
+                if let Err(error) = self.operations.reconciled(record, result.clone()) {
+                    return json!({ "state": "unknown", "operation_id": operation_id, "error": { "code": "recovery_write_failed", "message": error.to_string() } });
+                }
+                if let Some(key) = idempotency_key {
+                    self.idempotent.insert(key, result.clone());
+                }
+                return json!({ "state": "reconciled", "result": result });
+            }
+        }
+        json!({ "state": "unknown", "operation_id": operation_id, "error": "operation_unknown", "reconcile_required": true })
     }
 
     fn next_operation_id(&mut self) -> String {
@@ -460,6 +703,9 @@ impl Runtime {
         if let Some(key) = request.idempotency_key.as_ref() {
             self.idempotent.insert(key.clone(), result.clone());
         }
+        if let Err(error) = self.operations.complete(request, &result) {
+            eprintln!("comptrol operation journal error: {error}");
+        }
         if let Err(error) = self.journal.append(&result) {
             eprintln!("comptrol audit journal error: {error}");
         }
@@ -470,8 +716,54 @@ fn classify(intent: &str) -> Risk {
     match intent {
         "system.ping" | "desktop.observe" => Risk::R0,
         "desktop.notify" | "filesystem.write" => Risk::R1,
+        "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
         _ => Risk::R2,
     }
+}
+
+fn unknown_result(request: &OperationRequest, operation_id: String) -> ActionResult {
+    ActionResult {
+        operation_id,
+        intent: request.intent.clone(),
+        route: "recovery_observation".to_owned(),
+        target: request.target.clone(),
+        preflight: "unknown_after_restart".to_owned(),
+        delivery: DeliveryState::Unknown,
+        effect: EffectState::Unknown,
+        verification: VerificationState::Unverified,
+        disturbance: json!({ "foreground_changed": false }),
+        recovery: RecoveryState::RequiresReconciliation,
+        data: Value::Null,
+        error: Some(ComptrolError {
+            code: "operation_unknown".to_owned(),
+            message: "The operation was recorded as dispatched before the previous runtime stopped"
+                .to_owned(),
+            recovery: Some("Call reconcile after observing the target state".to_owned()),
+        }),
+    }
+}
+
+fn operation_metadata(request: &OperationRequest) -> Value {
+    let mut metadata = json!({
+        "target_kind": request.target.as_ref().map(|target| target.kind.clone()),
+    });
+    if request.intent == "filesystem.write" {
+        if let Some(path) = request.params.get("path").and_then(Value::as_str) {
+            metadata["path"] = json!(state_dir().join("sandbox").join(path));
+        }
+        if let Some(content) = request.params.get("content").and_then(Value::as_str) {
+            metadata["content_len"] = json!(content.len());
+            metadata["content_hash"] = json!(stable_hash(content.as_bytes()));
+        }
+    }
+    metadata
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    // ponytail: local reconciliation fingerprint, replace with a cryptographic digest when remote integrity is added
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn route_for(intent: &str) -> String {
@@ -480,6 +772,7 @@ fn route_for(intent: &str) -> String {
         "desktop.observe" => "platform_observe",
         "filesystem.write" => "sandbox_filesystem",
         "desktop.notify" => "platform_notification",
+        "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
         _ => "none",
     }
     .to_owned()
@@ -652,6 +945,171 @@ fn desktop_notify(request: &OperationRequest, operation_id: String) -> ActionRes
     }
 }
 
+fn macos_ax_press(request: &OperationRequest, operation_id: String) -> ActionResult {
+    if !cfg!(target_os = "macos") {
+        return unsupported_ax(request, operation_id);
+    }
+    let Some(script) = ax_script(request, "press") else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "macos.ax.press needs app, control, and optional role".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    match Command::new("osascript").args(["-e", &script]).output() {
+        Ok(output) if output.status.success() => success(
+            request,
+            operation_id,
+            "macos_ax",
+            EffectState::Changed,
+            VerificationState::Unverified,
+            json!({ "pressed": true, "postcondition": "unverified" }),
+        ),
+        Ok(output) => ax_failure(request, operation_id, &output),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "adapter_unavailable".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Check macOS Accessibility permission".to_owned()),
+            },
+        ),
+    }
+}
+
+fn macos_ax_set_value(request: &OperationRequest, operation_id: String) -> ActionResult {
+    if !cfg!(target_os = "macos") {
+        return unsupported_ax(request, operation_id);
+    }
+    let Some(value) = request.params.get("value").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "macos.ax.set_value needs a value".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let Some(script) = ax_script(request, &format!("set_value:{}", apple_quote(value))) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "macos.ax.set_value needs app, control, and optional role".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    match Command::new("osascript").args(["-e", &script]).output() {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "true" =>
+        {
+            success(
+                request,
+                operation_id,
+                "macos_ax",
+                EffectState::Changed,
+                VerificationState::Verified,
+                json!({ "value_length": value.len(), "postcondition": "value_equal" }),
+            )
+        }
+        Ok(output) => ax_failure(request, operation_id, &output),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "adapter_unavailable".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Check macOS Accessibility permission".to_owned()),
+            },
+        ),
+    }
+}
+
+fn ax_script(request: &OperationRequest, action: &str) -> Option<String> {
+    let app = apple_quote(request.params.get("app")?.as_str()?);
+    let control = apple_quote(request.params.get("control")?.as_str()?);
+    let role = request
+        .params
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("button");
+    let element = match role {
+        "button" => "button",
+        "text_field" => "text field",
+        "text_area" => "text area",
+        "checkbox" => "checkbox",
+        "static_text" => "static text",
+        _ => return None,
+    };
+    let window = request
+        .params
+        .get("window")
+        .and_then(Value::as_str)
+        .map(apple_quote)
+        .map(|name| format!("first window whose name is {name}"))
+        .unwrap_or_else(|| "window 1".to_owned());
+    let action_line = if action == "press" {
+        "perform action \"AXPress\" of targetElement\nreturn \"pressed\"".to_owned()
+    } else if let Some(value) = action.strip_prefix("set_value:") {
+        format!(
+            "set value of targetElement to {value}\nreturn ((value of targetElement as text) is {value})"
+        )
+    } else {
+        return None;
+    };
+    Some(format!(
+        "tell application \"System Events\"\ntell application process {app}\nset targetWindow to {window}\nset matches to (every {element} of targetWindow whose name is {control})\nif (count of matches) is not 1 then error \"target_ambiguous\"\nset targetElement to item 1 of matches\n{action_line}\nend tell\nend tell"
+    ))
+}
+
+fn ax_failure(
+    request: &OperationRequest,
+    operation_id: String,
+    output: &std::process::Output,
+) -> ActionResult {
+    let diagnostic = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    let code = if diagnostic.contains("target_ambiguous") {
+        "target_ambiguous"
+    } else if diagnostic.contains("not authorized") || diagnostic.contains("assistive") {
+        "permission_required"
+    } else {
+        "verification_failed"
+    };
+    ActionResult::refused(
+        request,
+        operation_id,
+        ComptrolError {
+            code: code.to_owned(),
+            message: "macOS Accessibility did not confirm the requested semantic action".to_owned(),
+            recovery: Some(
+                "Refresh the target and verify macOS Accessibility permission".to_owned(),
+            ),
+        },
+    )
+}
+
+fn unsupported_ax(request: &OperationRequest, operation_id: String) -> ActionResult {
+    ActionResult::refused(
+        request,
+        operation_id,
+        ComptrolError {
+            code: "unsupported_surface".to_owned(),
+            message: "macOS Accessibility actions are only available on macOS".to_owned(),
+            recovery: Some("Inspect platform capabilities".to_owned()),
+        },
+    )
+}
+
 fn apple_quote(value: &str) -> String {
     format!(
         "\"{}\"",
@@ -663,7 +1121,7 @@ fn apple_quote(value: &str) -> String {
 }
 
 pub fn capabilities() -> Vec<Capability> {
-    vec![
+    let mut result = vec![
         Capability {
             name: "system.ping".to_owned(),
             available: true,
@@ -707,11 +1165,77 @@ pub fn capabilities() -> Vec<Capability> {
             route: "platform_accessibility".to_owned(),
             note: "Not advertised until a platform backend and verification suite exist".to_owned(),
         },
+    ];
+    result.extend(platform_capabilities());
+    result
+}
+
+pub fn platform_capabilities() -> Vec<Capability> {
+    vec![
+        Capability {
+            name: "platform.macos.ax".to_owned(),
+            available: cfg!(target_os = "macos") && macos_accessibility_reachable(),
+            risk: Risk::R2,
+            route: "macos_ax".to_owned(),
+            note: "Public System Events route with explicit local policy".to_owned(),
+        },
+        Capability {
+            name: "platform.windows.uia".to_owned(),
+            available: cfg!(target_os = "windows")
+                && std::env::var("COMPTROL_WINDOWS_UIA").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "windows_uia".to_owned(),
+            note: "Capability broker only until UI Automation conformance passes".to_owned(),
+        },
+        Capability {
+            name: "platform.linux.atspi".to_owned(),
+            available: cfg!(target_os = "linux")
+                && std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
+            risk: Risk::R2,
+            route: "linux_atspi".to_owned(),
+            note: "Detected from the active accessibility bus".to_owned(),
+        },
+        Capability {
+            name: "platform.linux.x11".to_owned(),
+            available: cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_some(),
+            risk: Risk::R2,
+            route: "linux_x11".to_owned(),
+            note: "Detected from the active X11 display".to_owned(),
+        },
+        Capability {
+            name: "platform.linux.wayland".to_owned(),
+            available: cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            risk: Risk::R2,
+            route: "linux_wayland".to_owned(),
+            note: "Detected from the active Wayland display".to_owned(),
+        },
     ]
 }
 
+pub fn platform_diagnostics() -> Value {
+    json!({
+        "os": std::env::consts::OS,
+        "desktop": std::env::var("XDG_CURRENT_DESKTOP").ok(),
+        "session_type": std::env::var("XDG_SESSION_TYPE").ok(),
+        "display": std::env::var("DISPLAY").ok().is_some(),
+        "wayland": std::env::var("WAYLAND_DISPLAY").ok().is_some(),
+        "at_spi": std::env::var("AT_SPI_BUS_ADDRESS").ok().is_some(),
+        "capabilities": platform_capabilities(),
+    })
+}
+
+fn macos_accessibility_reachable() -> bool {
+    Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to get name of every application process",
+        ])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 fn doctor(runtime: &Runtime) -> Value {
-    json!({ "server": SERVER_VERSION, "protocol": PROTOCOL_VERSION, "platform": std::env::consts::OS, "architecture": std::env::consts::ARCH, "daemon": { "state": "in_process", "available": true }, "policy": { "max_risk": runtime.policy.max_risk, "sandbox_writes": runtime.policy.allow_sandbox_writes, "desktop_notify": runtime.policy.allow_desktop_notify }, "journal": { "available": true, "path": runtime.journal.path() }, "stop_latch": { "engaged": runtime.stop.engaged() }, "desktop_observation": { "available": true, "semantic_mutation": false }, "browser": { "available": false, "status": "not_configured" }, "remote": { "available": false, "binding": "loopback_only" }, "state_dir": state_dir() })
+    json!({ "server": SERVER_VERSION, "protocol": PROTOCOL_VERSION, "platform": std::env::consts::OS, "architecture": std::env::consts::ARCH, "daemon": { "state": "in_process", "available": true }, "policy": { "max_risk": runtime.policy.max_risk, "sandbox_writes": runtime.policy.allow_sandbox_writes, "desktop_notify": runtime.policy.allow_desktop_notify, "macos_ax": runtime.policy.allowed_intents.contains("macos.ax.press") }, "journal": { "available": true, "path": runtime.journal.path() }, "operations": { "available": true, "path": runtime.operations.path() }, "stop_latch": { "engaged": runtime.stop.engaged() }, "desktop_observation": { "available": true, "semantic_mutation": platform_capabilities().iter().any(|capability| capability.name == "platform.macos.ax" && capability.available) }, "platform": platform_diagnostics(), "browser": { "available": false, "status": "fixture_contract_only" }, "remote": { "available": false, "binding": "loopback_only" }, "state_dir": state_dir() })
 }
 
 fn state_dir() -> PathBuf {
@@ -781,10 +1305,14 @@ pub fn default_state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     fn runtime() -> Runtime {
-        Runtime::new(std::env::temp_dir().join(format!("comptrol-test-{}", now_ms())))
+        let suffix = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Runtime::new(std::env::temp_dir().join(format!("comptrol-test-{}-{}", now_ms(), suffix)))
             .expect("runtime")
     }
 
@@ -874,5 +1402,46 @@ mod tests {
         ])
         .expect("workflow");
         assert_eq!(result["verified"], true);
+    }
+
+    #[test]
+    fn restart_returns_unknown_then_reconciles_written_file() {
+        let dir = std::env::temp_dir().join(format!("comptrol-recovery-{}", now_ms()));
+        let path = dir.join("sandbox").join("recovered.txt");
+        fs::create_dir_all(path.parent().expect("parent")).expect("sandbox");
+        fs::write(&path, b"recovered").expect("fixture");
+        let request = OperationRequest {
+            intent: "filesystem.write".to_owned(),
+            target: None,
+            params: json!({ "path": "recovered.txt", "content": "recovered" }),
+            postcondition: None,
+            risk: Some(Risk::R1),
+            idempotency_key: Some("recover-key".to_owned()),
+            dry_run: false,
+        };
+        let record = DurableOperation {
+            operation_id: "op-restart".to_owned(),
+            idempotency_key: Some("recover-key".to_owned()),
+            intent: request.intent.clone(),
+            risk: Risk::R1,
+            target: None,
+            state: DurableState::Dispatched,
+            metadata: json!({ "path": path, "content_hash": stable_hash(b"recovered") }),
+            result: None,
+        };
+        fs::create_dir_all(&dir).expect("state");
+        fs::write(
+            dir.join("operations.jsonl"),
+            serde_json::to_string(&record).expect("record") + "\n",
+        )
+        .expect("journal");
+        let mut runtime = Runtime::new(dir).expect("runtime");
+        let unknown = runtime.operate(request);
+        assert_eq!(
+            unknown.error.as_ref().map(|error| error.code.as_str()),
+            Some("operation_unknown")
+        );
+        let reconciled = runtime.reconcile("op-restart");
+        assert_eq!(reconciled["state"], "reconciled");
     }
 }
