@@ -965,6 +965,55 @@ impl Runtime {
                 }
             }
         }
+        if (record.intent == "desktop.open_app"
+            || record.intent == "macos.ax.press"
+            || record.intent == "macos.ax.set_value")
+            && cfg!(target_os = "macos")
+        {
+            let confirmed = if record.intent == "desktop.open_app" {
+                record
+                    .metadata
+                    .get("app")
+                    .and_then(Value::as_str)
+                    .map(|app| {
+                        let script = format!(
+                            "tell application \"System Events\" to exists process {}",
+                            apple_quote(app)
+                        );
+                        run_osascript(&script).is_ok_and(|output| {
+                            output.status.success()
+                                && String::from_utf8_lossy(&output.stdout).trim() == "true"
+                        })
+                    })
+                    .unwrap_or(false)
+            } else {
+                ax_reconcile(&record.metadata)
+            };
+            if confirmed {
+                let result = ActionResult {
+                    operation_id: record.operation_id.clone(),
+                    intent: record.intent.clone(),
+                    route: "recovery_observation".to_owned(),
+                    target: record.target.clone(),
+                    preflight: "reconciled".to_owned(),
+                    delivery: DeliveryState::Delivered,
+                    effect: EffectState::Changed,
+                    verification: VerificationState::Verified,
+                    disturbance: json!({ "foreground_changed": false }),
+                    recovery: RecoveryState::None,
+                    data: json!({ "reconciled": true, "postcondition": "observed" }),
+                    error: None,
+                };
+                let idempotency_key = record.idempotency_key.clone();
+                if let Err(error) = self.operations.reconciled(record, result.clone()) {
+                    return json!({ "state": "unknown", "operation_id": operation_id, "error": { "code": "recovery_write_failed", "message": error.to_string() } });
+                }
+                if let Some(key) = idempotency_key {
+                    self.idempotent.insert(key, result.clone());
+                }
+                return json!({ "state": "reconciled", "result": result });
+            }
+        }
         json!({ "state": "unknown", "operation_id": operation_id, "error": "operation_unknown", "reconcile_required": true })
     }
 
@@ -1099,6 +1148,41 @@ fn operation_metadata(request: &OperationRequest) -> Value {
                 metadata[key] = json!(value);
             }
         }
+    }
+    if request.intent == "desktop.open_app" {
+        if let Some(app) = request.params.get("app").and_then(Value::as_str) {
+            metadata["app"] = json!(app);
+        }
+    }
+    if request.intent == "macos.ax.press" || request.intent == "macos.ax.set_value" {
+        for key in ["app", "control", "role", "window"] {
+            if let Some(value) = request.params.get(key).and_then(Value::as_str) {
+                metadata[key] = json!(value);
+            }
+        }
+        if metadata.get("role").is_none() {
+            metadata["role"] = json!("button");
+        }
+        if let Some(postcondition) = request.postcondition.as_ref() {
+            if let Some(attribute) = postcondition.get("attribute").and_then(Value::as_str) {
+                metadata["postcondition_attribute"] = json!(attribute);
+                if let Some(expected) = postcondition.get("equals") {
+                    if let Some(value) = expected.as_str() {
+                        metadata["postcondition_hash"] = json!(stable_hash(value.as_bytes()));
+                        metadata["postcondition_len"] = json!(value.len());
+                    } else if let Some(value) = expected.as_bool() {
+                        metadata["postcondition_bool"] = json!(value);
+                    }
+                }
+            }
+        }
+        if request.intent == "macos.ax.set_value"
+            && let Some(value) = request.params.get("value").and_then(Value::as_str)
+        {
+            metadata["value_hash"] = json!(stable_hash(value.as_bytes()));
+            metadata["value_len"] = json!(value.len());
+        }
+        metadata["action"] = json!(request.intent.strip_prefix("macos.ax.").unwrap_or_default());
     }
     metadata
 }
@@ -2502,6 +2586,77 @@ fn macos_ax_set_value(request: &OperationRequest, operation_id: String) -> Actio
     }
 }
 
+fn ax_reconcile(metadata: &Value) -> bool {
+    let Some(app) = metadata.get("app").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(control) = metadata.get("control").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(role) = metadata.get("role").and_then(Value::as_str) else {
+        return false;
+    };
+    let element = match role {
+        "button" => "button",
+        "text_field" => "text field",
+        "text_area" => "text area",
+        "checkbox" => "checkbox",
+        "static_text" => "static text",
+        _ => return false,
+    };
+    let window = metadata
+        .get("window")
+        .and_then(Value::as_str)
+        .map(apple_quote)
+        .map(|name| format!("first window whose name is {name}"))
+        .unwrap_or_else(|| "window 1".to_owned());
+    let attribute = if metadata.get("action").and_then(Value::as_str) == Some("set_value") {
+        "value"
+    } else {
+        let Some(attribute) = metadata
+            .get("postcondition_attribute")
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        attribute
+    };
+    let observation = match attribute {
+        "value" | "name" => format!("({} of targetElement as text)", attribute),
+        "enabled" | "focused" => format!("{} of targetElement", attribute),
+        "exists" => "true".to_owned(),
+        _ => return false,
+    };
+    let script = format!(
+        "tell application \"System Events\"\ntell application process {}\nset targetWindow to {}\nset matches to (every {} of targetWindow whose name is {})\nif (count of matches) is not 1 then error \"target_ambiguous\"\nset targetElement to item 1 of matches\nreturn {}\nend tell\nend tell",
+        apple_quote(app),
+        window,
+        element,
+        apple_quote(control),
+        observation
+    );
+    let Ok(output) = run_osascript(&script) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let observed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if attribute == "value" && metadata.get("action").and_then(Value::as_str) == Some("set_value") {
+        return metadata
+            .get("value_hash")
+            .and_then(Value::as_u64)
+            .is_some_and(|expected| stable_hash(observed.as_bytes()) == expected);
+    }
+    if let Some(expected) = metadata.get("postcondition_hash").and_then(Value::as_u64) {
+        return stable_hash(observed.as_bytes()) == expected;
+    }
+    metadata
+        .get("postcondition_bool")
+        .and_then(Value::as_bool)
+        .is_some_and(|expected| observed == expected.to_string())
+}
+
 fn ax_script(request: &OperationRequest, action: &str) -> Option<String> {
     let app = apple_quote(request.params.get("app")?.as_str()?);
     let control = apple_quote(request.params.get("control")?.as_str()?);
@@ -2527,7 +2682,7 @@ fn ax_script(request: &OperationRequest, action: &str) -> Option<String> {
         .unwrap_or_else(|| "window 1".to_owned());
     let action_line = if action == "press" {
         let verification = match request.postcondition.as_ref() {
-            Some(value) => Some(ax_postcondition(value)?),
+            Some(value) => Some(ax_postcondition_for_target(value)?),
             None => None,
         };
         match verification {
@@ -2546,7 +2701,7 @@ fn ax_script(request: &OperationRequest, action: &str) -> Option<String> {
     ))
 }
 
-fn ax_postcondition(value: &Value) -> Option<String> {
+fn ax_postcondition_for_target(value: &Value) -> Option<String> {
     let attribute = value.get("attribute")?.as_str()?;
     let expected = value.get("equals")?;
     match attribute {
@@ -2978,6 +3133,27 @@ mod tests {
         let script = ax_script(&request, "press").expect("semantic script");
         assert!(script.contains("perform action \"AXPress\""));
         assert!(script.contains("enabled of targetElement is true"));
+    }
+
+    #[test]
+    fn semantic_mutation_metadata_is_recoverable_without_typed_content() {
+        let request = OperationRequest {
+            intent: "macos.ax.set_value".to_owned(),
+            target: None,
+            params: json!({"app":"Fixture","control":"Name","value":"safe","role":"text_field"}),
+            postcondition: Some(json!({"attribute":"value","equals":"safe"})),
+            risk: Some(Risk::R2),
+            idempotency_key: Some("value-check".to_owned()),
+            dry_run: false,
+        };
+        let metadata = operation_metadata(&request);
+        assert_eq!(metadata["app"], "Fixture");
+        assert_eq!(metadata["control"], "Name");
+        assert_eq!(metadata["action"], "set_value");
+        assert_eq!(metadata["postcondition_attribute"], "value");
+        assert!(metadata.get("postcondition").is_none());
+        assert!(metadata.get("value").is_none());
+        assert!(metadata.get("value_hash").is_some());
     }
 
     #[test]
