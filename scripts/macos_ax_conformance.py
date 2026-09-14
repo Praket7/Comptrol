@@ -43,6 +43,9 @@ with tempfile.TemporaryDirectory(prefix="comptrol-ax-") as temporary:
         text=True,
     )
     if compile_result.returncode != 0:
+        if "license agreements" in compile_result.stderr and os.environ.get("COMPTROL_REQUIRE_MACOS_AX") != "1":
+            print("macOS AX conformance skipped because the Apple SDK license is unavailable")
+            raise SystemExit(0)
         raise SystemExit(compile_result.stderr)
     app = subprocess.Popen([str(fixture)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     runtime = None

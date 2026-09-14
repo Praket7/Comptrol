@@ -33,9 +33,11 @@ try {
     const response = (id, message) => new Promise((resolve, reject) => {
       const onData = chunk => {
         buffer += chunk
-        const line = buffer.split("\n")[0]
+        const newline = buffer.indexOf("\n")
+        if (newline < 0) return
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
         if (!line) return
-        buffer = buffer.slice(line.length + 1)
         try {
           const value = JSON.parse(line)
           if (value.id === id) {
