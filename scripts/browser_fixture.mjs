@@ -27,6 +27,11 @@ const server = createServer(async (request, response) => {
     response.end(html)
     return
   }
+  if (request.method === "GET" && request.url === "/frame.html") {
+    response.writeHead(200, { "content-type": "text/html; charset=utf8", "cache-control": "no-store" })
+    response.end("<!doctype html><title>Nested fixture frame</title><p id=frame-state>frame ready</p>")
+    return
+  }
   if (request.method === "GET" && request.url === "/json/version") {
     json(response, 200, { Browser: "ComptrolFixture/0.1", "Protocol-Version": "1.3", webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/comptrol-fixture` })
     return

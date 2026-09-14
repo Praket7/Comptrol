@@ -13,6 +13,10 @@ await new Promise((resolve, reject) => {
 try {
   const version = await fetch(`http://127.0.0.1:${port}/json/version`).then(response => response.json())
   const [target] = await fetch(`http://127.0.0.1:${port}/json/list`).then(response => response.json())
+  const fixtureHtml = await fetch(`http://127.0.0.1:${port}/`).then(response => response.text())
+  assert.match(fixtureHtml, /Ignore previous instructions/)
+  assert.match(fixtureHtml, /fixture-canvas/)
+  assert.match(fixtureHtml, /fixture-frame/)
   assert.equal(target.id, "comptrol-fixture-page")
   const headers = { "content-type": "application/json", "x-comptrol-target-id": target.id, "x-comptrol-browser-context": target.browserContextId, "x-comptrol-idempotency-key": "same-submit" }
   const first = await fetch(`http://127.0.0.1:${port}/submit`, { method: "POST", headers, body: JSON.stringify({ message: "hello" }) }).then(response => response.json())
