@@ -1,6 +1,6 @@
 # Recovery
 
-Dispatched mutations become unknown on restart. Unknown results are not loaded into the successful idempotency cache, so a retry cannot be mistaken for a completed replay. Filesystem writes, sandbox copies, browser downloads, browser fixture submissions, macOS app launches, and macOS AX mutations reconcile from observed local state when their postcondition can be checked. Reconciliation records a new durable reconciled state and never repeats the original mutation.
+The durable lifecycle records prepared, authorized, dispatched, observed, verified, committed, failed, interrupted, unknown, rollback pending, rolled back, and reconciled states. A prepared or authorized operation that never dispatched becomes interrupted on restart. A dispatched mutation becomes unknown on restart. Unknown results are not loaded into the successful idempotency cache, so a retry cannot be mistaken for a completed replay. Filesystem writes, sandbox copies, browser downloads, browser fixture submissions, macOS app launches, and macOS AX mutations reconcile from observed local state when their postcondition can be checked. Reconciliation records a new durable reconciled state and never repeats the original mutation.
 
 Every permitted mutation is written to the local operation journal before dispatch. The journal records prepared and dispatched state without storing typed content.
 

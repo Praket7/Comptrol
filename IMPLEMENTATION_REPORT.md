@@ -4,7 +4,7 @@
 
 The repository contains a Rust workspace with a native Comptrol runtime and MCP server. The runtime implements a compact MCP surface with operate, inspect, watch, reconcile, checkpoint restore, and capabilities. Deterministic closed workflows execute through one operate call.
 
-The core includes explicit risk classes, policy authorization, local stop latch, expiring leases, durable operation identity, restart reconciliation, sanitized append only audit records, bounded event sequencing, file checkpoints, privacy aware traces, revisioned multi display geometry, an isolated adapter registry contract, a closed workflow representation, and structured action results.
+The core includes explicit risk classes, policy authorization, local stop latch, expiring leases, durable operation identity, an explicit prepared through committed and recovery state lifecycle, restart reconciliation, sanitized append only audit records, bounded event sequencing, file checkpoints, privacy aware traces, revisioned multi display geometry, an isolated adapter registry contract, a closed workflow representation, and structured action results.
 
 The optional `command.run` route executes an explicitly allowlisted program with structured argv, an explicit working directory root, no shell, bounded output, a timeout, and exit code verification. It is disabled by default and is covered by a repository owned MCP conformance harness.
 
@@ -30,7 +30,7 @@ Rust format check passed.
 
 Clippy with warnings denied passed.
 
-Twenty seven unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, one call workflow execution, restart reconciliation, stale browser binding refusal, browser identity parsing, loopback enforcement, safe tab URL validation, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, adapter registry isolation, malformed adapter rejection, audit redaction, sandbox copy verification, unknown result recovery, semantic recovery metadata, and client integration round trips.
+Twenty eight unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, one call workflow execution, restart reconciliation, pre dispatch interruption recovery, stale browser binding refusal, browser identity parsing, loopback enforcement, safe tab URL validation, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, adapter registry isolation, malformed adapter rejection, audit redaction, sandbox copy verification, unknown result recovery, semantic recovery metadata, and client integration round trips.
 
 The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, real dedicated headless Chrome CDP navigation, DOM verification, sandbox upload, filename postcondition verification, allowlisted argv command execution, trace record and fixture replay, platform capability conformance, and the repository owned Codex, Claude Code, and Cursor profiles.
 

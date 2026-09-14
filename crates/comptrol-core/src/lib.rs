@@ -439,9 +439,17 @@ impl AuditJournal {
 #[serde(rename_all = "snake_case")]
 pub enum DurableState {
     Prepared,
+    Authorized,
     Dispatched,
+    Observed,
+    Verified,
+    Committed,
+    Failed,
+    Interrupted,
     Complete,
     Unknown,
+    RollbackPending,
+    RolledBack,
     Reconciled,
 }
 
@@ -481,11 +489,20 @@ impl OperationJournal {
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         let pending = records
             .values()
-            .filter(|record| matches!(record.state, DurableState::Dispatched))
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    DurableState::Prepared | DurableState::Authorized | DurableState::Dispatched
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         for mut record in pending {
-            record.state = DurableState::Unknown;
+            record.state = if record.state == DurableState::Dispatched {
+                DurableState::Unknown
+            } else {
+                DurableState::Interrupted
+            };
             serde_json::to_writer(&mut file, &record)?;
             file.write_all(b"\n")?;
             records.insert(record.operation_id.clone(), record);
@@ -511,7 +528,12 @@ impl OperationJournal {
             record.result.is_some()
                 && matches!(
                     record.state,
-                    DurableState::Complete | DurableState::Reconciled
+                    DurableState::Committed
+                        | DurableState::Observed
+                        | DurableState::Complete
+                        | DurableState::Failed
+                        | DurableState::RolledBack
+                        | DurableState::Reconciled
                 )
         })
     }
@@ -540,15 +562,26 @@ impl OperationJournal {
         })
     }
 
+    pub fn authorized(&mut self, operation_id: &str) -> io::Result<()> {
+        self.update(operation_id, |record| {
+            record.state = DurableState::Authorized
+        })
+    }
+
     pub fn complete(
         &mut self,
         request: &OperationRequest,
         result: &ActionResult,
     ) -> io::Result<()> {
-        let state = if matches!(&result.delivery, DeliveryState::Unknown) {
-            DurableState::Unknown
-        } else {
-            DurableState::Complete
+        let state = match (&result.delivery, &result.verification, &result.error) {
+            (DeliveryState::Unknown, _, _) => DurableState::Unknown,
+            (DeliveryState::Refused, _, _) => DurableState::Failed,
+            (DeliveryState::Delivered, VerificationState::Verified, None) => {
+                DurableState::Committed
+            }
+            (DeliveryState::Delivered, VerificationState::Failed, _) => DurableState::Failed,
+            (DeliveryState::Delivered, _, _) => DurableState::Observed,
+            (DeliveryState::NotDispatched, _, _) => DurableState::Failed,
         };
         self.write(DurableOperation {
             operation_id: result.operation_id.clone(),
@@ -754,6 +787,7 @@ impl Runtime {
             && let Err(error) = self
                 .operations
                 .prepare(&request, &operation_id, risk)
+                .and_then(|_| self.operations.authorized(&operation_id))
                 .and_then(|_| self.operations.dispatched(&operation_id))
         {
             let result = ActionResult::refused(
@@ -3685,6 +3719,33 @@ mod tests {
     }
 
     #[test]
+    fn restart_marks_pre_dispatch_work_interrupted() {
+        let dir = std::env::temp_dir().join(format!("comptrol-interrupted-{}", now_ms()));
+        let record = DurableOperation {
+            operation_id: "op-interrupted".to_owned(),
+            idempotency_key: Some("interrupted-key".to_owned()),
+            intent: "command.run".to_owned(),
+            risk: Risk::R3,
+            target: None,
+            state: DurableState::Authorized,
+            metadata: json!({"program":"fixture"}),
+            result: None,
+        };
+        fs::create_dir_all(&dir).expect("state");
+        fs::write(
+            dir.join("operations.jsonl"),
+            serde_json::to_string(&record).expect("record") + "\n",
+        )
+        .expect("journal");
+        let journal = OperationJournal::open(&dir).expect("reopen journal");
+        assert_eq!(
+            journal.record("op-interrupted").expect("operation").state,
+            DurableState::Interrupted
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn unknown_result_is_not_replayed_after_restart() {
         let dir = std::env::temp_dir().join(format!("comptrol-unknown-{}", now_ms()));
         let request = OperationRequest {
@@ -3717,6 +3778,49 @@ mod tests {
         let replay = runtime.operate(request);
         assert_eq!(replay.recovery, RecoveryState::RequiresReconciliation);
         assert_eq!(replay.delivery, DeliveryState::Unknown);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delivered_unverified_result_is_replayed_after_restart() {
+        let dir = std::env::temp_dir().join(format!("comptrol-observed-{}", now_ms()));
+        let request = OperationRequest {
+            intent: "desktop.notify".to_owned(),
+            target: None,
+            params: json!({"title":"fixture","body":"fixture"}),
+            postcondition: None,
+            risk: Some(Risk::R1),
+            idempotency_key: Some("observed-key".to_owned()),
+            dry_run: false,
+        };
+        let result = success(
+            &request,
+            "op-observed".to_owned(),
+            "platform_notification",
+            EffectState::Changed,
+            VerificationState::Unverified,
+            json!({"sent":true}),
+        );
+        let record = DurableOperation {
+            operation_id: "op-observed".to_owned(),
+            idempotency_key: request.idempotency_key.clone(),
+            intent: request.intent.clone(),
+            risk: Risk::R1,
+            target: None,
+            state: DurableState::Observed,
+            metadata: json!({}),
+            result: Some(result),
+        };
+        fs::create_dir_all(&dir).expect("state");
+        fs::write(
+            dir.join("operations.jsonl"),
+            serde_json::to_string(&record).expect("record") + "\n",
+        )
+        .expect("journal");
+        let mut runtime = Runtime::new(dir.clone()).expect("runtime");
+        let replay = runtime.operate(request);
+        assert_eq!(replay.recovery, RecoveryState::IdempotentReplay);
+        assert_eq!(replay.operation_id, "op-observed");
         let _ = fs::remove_dir_all(dir);
     }
 
