@@ -5,10 +5,13 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import subprocess
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--directory", required=True, type=Path)
+parser.add_argument("--public-key", type=Path)
 args = parser.parse_args()
 
 checksums = sorted(args.directory.glob("*.zip.sha256"))
@@ -28,4 +31,24 @@ for sbom in sboms:
     value = json.loads(sbom.read_text(encoding="utf-8"))
     if not isinstance(value.get("packages"), list):
         raise SystemExit(f"invalid Cargo metadata SBOM {sbom}")
+public_key = args.public_key or (args.directory / "release-public-key.pem")
+signatures = sorted(args.directory.glob("*.zip.sig"))
+if signatures or args.public_key:
+    if not public_key.is_file():
+        raise SystemExit("a public key is required to verify release signatures")
+    openssl = shutil.which("openssl")
+    if not openssl:
+        raise SystemExit("openssl is required to verify release signatures")
+    expected = {archive.with_name(f"{archive.name}.sig") for archive in (args.directory / name for name in [path.read_text(encoding="utf-8").strip().split(maxsplit=1)[1] for path in checksums])}
+    if set(signatures) != expected:
+        raise SystemExit("each release archive needs one detached signature")
+    for signature in signatures:
+        archive = signature.with_suffix("")
+        subprocess.run(
+            [openssl, "dgst", "-sha256", "-verify", str(public_key), "-signature", str(signature), str(archive)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 print(f"release verification passed for {len(checksums)} archive(s)")
