@@ -238,6 +238,102 @@ pub fn close_tab(
     })
 }
 
+pub fn history(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+    forward: bool,
+) -> Result<Value, ComptrolError> {
+    let current = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+        "Page.getNavigationHistory",
+        json!({}),
+    )?;
+    let current_index = current
+        .get("currentIndex")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not return a navigation history index".to_owned(),
+            recovery: Some("Inspect the exact browser target again".to_owned()),
+        })?;
+    let entries = current
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not return navigation history entries".to_owned(),
+            recovery: Some("Inspect the exact browser target again".to_owned()),
+        })?;
+    let destination_index = if forward {
+        current_index.saturating_add(1)
+    } else {
+        current_index.saturating_sub(1)
+    };
+    let Some(destination) = entries.get(destination_index as usize) else {
+        return Err(ComptrolError {
+            code: "history_unavailable".to_owned(),
+            message: if forward {
+                "The exact browser target has no forward history".to_owned()
+            } else {
+                "The exact browser target has no back history".to_owned()
+            },
+            recovery: Some(
+                "Inspect the current target before requesting another history step".to_owned(),
+            ),
+        });
+    };
+    let entry_id = destination
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser history entry has no numeric id".to_owned(),
+            recovery: Some("Inspect the exact browser target again".to_owned()),
+        })?;
+    cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+        "Page.navigateToHistoryEntry",
+        json!({ "entryId": entry_id }),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Ok(observed) = cdp_call(
+            endpoint,
+            target_id,
+            Some(browser_context_id),
+            Some(revision),
+            "Page.getNavigationHistory",
+            json!({}),
+        ) && observed.get("currentIndex").and_then(Value::as_i64) == Some(destination_index)
+        {
+            return Ok(json!({
+                "direction": if forward { "forward" } else { "back" },
+                "entry": destination,
+                "current_index": destination_index,
+                "verified": true,
+                "mouse": "untouched",
+                "clipboard": "untouched"
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(ComptrolError {
+        code: "verification_failed".to_owned(),
+        message: "The browser did not confirm the requested history step".to_owned(),
+        recovery: Some(
+            "Inspect the target and current navigation history before retrying".to_owned(),
+        ),
+    })
+}
+
 fn protocol_call(
     web_socket_url: &str,
     method: &str,

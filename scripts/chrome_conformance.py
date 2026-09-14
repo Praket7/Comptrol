@@ -127,7 +127,21 @@ try:
     assert download_data["verification"] == "verified"
     downloaded = pathlib.Path(download_data["data"]["path"])
     assert downloaded.read_text(encoding="utf-8") == "Comptrol fixture download\n"
-    close = call(runtime, 14, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.close_tab", "idempotency_key": "chrome-close-background-tab", "params": opened_identity}})
+    navigate_blank = call(runtime, 15, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "idempotency_key": "chrome-history-blank", "params": {**identity, "url": "about:blank"}}})
+    assert navigate_blank["result"]["structuredContent"]["delivery"] == "delivered"
+    deadline = time.time() + 5
+    current_target = None
+    while time.time() < deadline:
+        current_target = next(item for item in wait_for(f"http://127.0.0.1:{debug_port}/json/list") if item.get("id") == target["id"])
+        if current_target.get("url") == "about:blank":
+            break
+        time.sleep(0.1)
+    assert current_target and current_target.get("url") == "about:blank", current_target
+    current_identity = {"target_id": current_target["id"], "browser_context_id": current_target.get("browserContextId", "default"), "revision": current_target.get("revision", f"url:{current_target['url']}")}
+    history_back = call(runtime, 16, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.history_back", "idempotency_key": "chrome-history-back", "params": current_identity}})
+    assert history_back["result"]["structuredContent"]["verification"] == "verified", history_back
+    assert history_back["result"]["structuredContent"]["data"]["direction"] == "back"
+    close = call(runtime, 17, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.close_tab", "idempotency_key": "chrome-close-background-tab", "params": opened_identity}})
     assert close["result"]["structuredContent"]["verification"] == "verified"
     assert close["result"]["structuredContent"]["data"]["closed"] is True
     assert close["result"]["structuredContent"]["data"]["mouse"] == "untouched"

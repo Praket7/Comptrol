@@ -9,6 +9,11 @@ const browserContextId = "comptrol-fixture-context"
 const revision = "fixture-revision-1"
 const submissions = new Map()
 const openedTabs = new Map()
+let fixtureHistoryIndex = 1
+const fixtureHistory = [
+  { id: 1, url: "http://127.0.0.1:17417/previous" },
+  { id: 2, url: "http://127.0.0.1:17417/" },
+]
 const html = await readFile(join(process.cwd(), "fixtures/browser/index.html"))
 
 function json(response, status, value) {
@@ -100,7 +105,15 @@ const server = createServer(async (request, response) => {
 
 function websocketFrame(text) {
   const payload = Buffer.from(text)
-  return Buffer.concat([Buffer.from([0x81, payload.length]), payload])
+  if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload])
+  if (payload.length <= 0xffff) {
+    const header = Buffer.alloc(4)
+    header[0] = 0x81
+    header[1] = 126
+    header.writeUInt16BE(payload.length, 2)
+    return Buffer.concat([header, payload])
+  }
+  throw new Error("fixture websocket payload is too large")
 }
 
 function websocketMessage(buffer) {
@@ -137,6 +150,10 @@ server.on("upgrade", (request, socket) => {
       ? { success: openedTabs.delete(message.params.targetId) }
       : message.method === "Runtime.evaluate"
         ? { result: { type: "string", value: message.params.expression === "document.title" ? "Comptrol browser fixture" : "fixture evaluation" } }
+        : message.method === "Page.getNavigationHistory"
+          ? { currentIndex: fixtureHistoryIndex, entries: fixtureHistory }
+          : message.method === "Page.navigateToHistoryEntry"
+            ? (fixtureHistoryIndex = fixtureHistory.findIndex(entry => entry.id === message.params.entryId), {})
         : message.method === "Page.navigate"
           ? { frameId: "fixture-frame" }
           : {}

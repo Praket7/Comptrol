@@ -52,7 +52,7 @@ The runtime includes bounded event history, file checkpoints, fixture trace repl
 
 Privacy is local by default. `comptrol privacy status` reports telemetry and redaction defaults. The privacy network endpoint report lists optional routes. MCP and browser protocol messages are bounded to one mebibyte.
 
-With explicit local app launch policy, macOS, Windows, and Linux can open an exact app through their native launcher. Browser tabs can be opened and exact live tabs can be closed in the existing Chrome profile through the local DevTools endpoint. These routes do not synthesize mouse input or touch the clipboard.
+With explicit local app launch policy, macOS, Windows, and Linux can open an exact app through their native launcher. Browser tabs can be opened, moved through history, and exact live tabs can be closed in the existing Chrome profile through the local DevTools endpoint. These routes do not synthesize mouse input or touch the clipboard.
 
 Supported browser operations can request strict background posture. Routes that cannot prove that posture refuse instead of activating another application or silently taking control of the foreground.
 
