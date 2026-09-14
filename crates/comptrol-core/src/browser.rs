@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::{Message, connect};
 
 pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
@@ -291,21 +291,176 @@ pub fn cdp_upload(
     Ok(json!({ "path": path, "file_name": file_name_text, "verified": true }))
 }
 
+pub fn cdp_download(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: Option<&str>,
+    revision: Option<&str>,
+    selector: &str,
+    download_dir: &Path,
+    expected_name: &str,
+) -> Result<Value, ComptrolError> {
+    if expected_name.is_empty()
+        || Path::new(expected_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(expected_name)
+    {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Download file name must be a nonempty local file name".to_owned(),
+            recovery: None,
+        });
+    }
+    fs_create_dir(download_dir)?;
+    let targets = discover(endpoint)?;
+    let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
+    let Some(web_socket_url) = target.web_socket_url else {
+        return Err(ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The target did not provide a websocket debugger URL".to_owned(),
+            recovery: Some("Inspect browser targets again".to_owned()),
+        });
+    };
+    if !web_socket_url.starts_with("ws://") {
+        return Err(ComptrolError {
+            code: "browser_transport_unsupported".to_owned(),
+            message: "Only local unencrypted DevTools websocket endpoints are enabled".to_owned(),
+            recovery: Some(
+                "Use a local browser endpoint or configure a trusted transport".to_owned(),
+            ),
+        });
+    }
+    let (mut socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
+    let mut command_id = 0_u64;
+    let mut call = |method: &str, params: Value| -> Result<Value, ComptrolError> {
+        command_id += 1;
+        let id = command_id;
+        socket
+            .send(Message::Text(
+                json!({ "id": id, "method": method, "params": params })
+                    .to_string()
+                    .into(),
+            ))
+            .map_err(browser_dispatch_error)?;
+        loop {
+            let message = socket.read().map_err(browser_response_error)?;
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
+                code: "browser_protocol_invalid".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect the browser protocol version".to_owned()),
+            })?;
+            if value.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = value.get("error") {
+                return Err(ComptrolError {
+                    code: "browser_command_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Refresh the target and retry once".to_owned()),
+                });
+            }
+            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+        }
+    };
+    call(
+        "Page.setDownloadBehavior",
+        json!({ "behavior": "allow", "downloadPath": download_dir }),
+    )?;
+    let selector = serde_json::to_string(selector).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: None,
+    })?;
+    call(
+        "Runtime.evaluate",
+        json!({
+            "expression": format!("(() => {{ const link = document.querySelector({selector}); if (!link) throw new Error('download target missing'); link.click(); return true; }})()"),
+            "returnByValue": true,
+            "awaitPromise": true
+        }),
+    )?;
+    let expected_path = download_dir.join(expected_name);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if expected_path.is_file()
+            && !download_dir
+                .join(format!("{expected_name}.crdownload"))
+                .exists()
+        {
+            let bytes = std::fs::metadata(&expected_path)
+                .map_err(browser_file_error)?
+                .len();
+            return Ok(
+                json!({ "path": expected_path, "file_name": expected_name, "bytes": bytes, "verified": true }),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(ComptrolError {
+        code: "verification_failed".to_owned(),
+        message: "The browser did not produce the expected download".to_owned(),
+        recovery: Some("Inspect the download target and reconcile before retrying".to_owned()),
+    })
+}
+
+fn fs_create_dir(path: &Path) -> Result<(), ComptrolError> {
+    std::fs::create_dir_all(path).map_err(browser_file_error)
+}
+
+fn browser_file_error(error: io::Error) -> ComptrolError {
+    ComptrolError {
+        code: "browser_filesystem_failed".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Inspect the Comptrol sandbox and retry".to_owned()),
+    }
+}
+
+fn browser_connect_error(error: tungstenite::Error) -> ComptrolError {
+    ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Start the browser target and retry".to_owned()),
+    }
+}
+
+fn browser_dispatch_error(error: tungstenite::Error) -> ComptrolError {
+    ComptrolError {
+        code: "browser_dispatch_failed".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Reconnect to the exact browser target".to_owned()),
+    }
+}
+
+fn browser_response_error(error: tungstenite::Error) -> ComptrolError {
+    ComptrolError {
+        code: "browser_response_failed".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Inspect the browser target before retrying".to_owned()),
+    }
+}
+
 fn parse_target(value: &Value) -> Option<BrowserTarget> {
+    let url = value.get("url").and_then(Value::as_str).map(str::to_owned);
     Some(BrowserTarget {
         id: value.get("id")?.as_str()?.to_owned(),
         target_type: value.get("type").and_then(Value::as_str).map(str::to_owned),
         browser_context_id: value
             .get("browserContextId")
             .and_then(Value::as_str)
-            .map(str::to_owned),
-        url: value.get("url").and_then(Value::as_str).map(str::to_owned),
-        title: value
-            .get("title")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+            .map(str::to_owned)
+            .or_else(|| Some("default".to_owned())),
         revision: value
             .get("revision")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| url.as_ref().map(|value| format!("url:{value}"))),
+        url,
+        title: value
+            .get("title")
             .and_then(Value::as_str)
             .map(str::to_owned),
         web_socket_url: value

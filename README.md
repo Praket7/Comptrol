@@ -4,7 +4,7 @@ Comptrol is a local first control layer for computer using agents.
 
 It gives an MCP client one bounded operation surface with explicit policy, stable operation identity, audit records, recovery state, and honest verification.
 
-The first release is a small foundation. It runs on macOS, Windows, and Linux. Basic platform observation is available on the current machine. Semantic desktop mutation, browser control, remote pairing, and application adapters are not advertised until their platform tests exist.
+The first release is a small foundation. It runs on macOS, Windows, and Linux. Basic platform observation is available on the current machine. Browser CDP control is available only for an explicitly configured local endpoint. macOS semantic mutation is available only with Accessibility permission and explicit policy. Windows and Linux currently expose read only capability brokers.
 
 ## Why it exists
 
@@ -50,7 +50,7 @@ The macOS observer can use the public System Events accessibility surface when p
 
 The runtime includes bounded event history, file checkpoints, fixture trace replay, exact browser target discovery, and a loopback diagnostics dashboard.
 
-Real Chrome profile validation, Windows and Linux semantic actuation, remote pairing, signed releases, and published packages remain tracked work.
+Dedicated Chrome validation, Windows and Linux semantic actuation, remote pairing, signed releases, and published packages remain tracked work. The real Chrome harness covers navigation, DOM evaluation, sandbox upload, and sandbox download.
 
 ## Contributing
 

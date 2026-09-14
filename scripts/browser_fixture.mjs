@@ -39,6 +39,17 @@ const server = createServer(async (request, response) => {
     json(response, 200, { targetId, browserContextId, revision, submissions: [...submissions.values()] })
     return
   }
+  if (request.method === "GET" && request.url === "/download/fixture.txt") {
+    const payload = Buffer.from("Comptrol fixture download\n")
+    response.writeHead(200, {
+      "content-type": "text/plain; charset=utf8",
+      "content-disposition": 'attachment; filename="fixture.txt"',
+      "content-length": payload.length,
+      "cache-control": "no-store",
+    })
+    response.end(payload)
+    return
+  }
   if (request.method === "POST" && request.url === "/submit") {
     const target = request.headers["x-comptrol-target-id"]
     const context = request.headers["x-comptrol-browser-context"]

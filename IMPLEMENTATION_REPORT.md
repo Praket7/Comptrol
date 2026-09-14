@@ -40,7 +40,7 @@ Linux has a portable runtime build path and conservative AT SPI, X11, and Waylan
 
 ## Not built yet
 
-Real Chrome profile validation beyond the dedicated headless harness, downloads, platform accessibility fixture applications, remote pairing, application adapters, native packaging, signed releases, npm publication, Homebrew publication, and real hardware matrix testing remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, and dedicated headless Chrome validation are implemented and tested.
+Real Chrome profile validation beyond the dedicated headless harness, platform accessibility fixture applications, remote pairing, application adapters, native packaging, signed releases, npm publication, Homebrew publication, and real hardware matrix testing remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, sandbox upload and download verification, and dedicated headless Chrome validation are implemented and tested.
 
 ## Security decisions
 
@@ -58,7 +58,7 @@ Source build is verified. The npm launcher package is prepared but not published
 
 ## Remaining issues ordered by impact
 
-1. Validate the CDP websocket route against real Chrome profiles and add downloads.
+1. Validate the CDP websocket route against real user Chrome profiles and download behavior.
 2. Add platform accessibility fixture applications and live postcondition tests.
 3. Add remote pairing and application adapters.
 4. Add signed release artifacts and publish only after independent release verification.

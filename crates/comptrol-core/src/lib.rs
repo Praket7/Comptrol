@@ -273,6 +273,7 @@ impl Default for Policy {
             allowed_intents: HashSet::from([
                 "system.ping".to_owned(),
                 "desktop.observe".to_owned(),
+                "platform.broker.observe".to_owned(),
                 "workflow.execute".to_owned(),
             ]),
         }
@@ -314,6 +315,7 @@ impl Policy {
                 "browser.cdp.evaluate".to_owned(),
                 "browser.cdp.navigate".to_owned(),
                 "browser.cdp.upload".to_owned(),
+                "browser.cdp.download".to_owned(),
             ]);
         }
         policy
@@ -464,13 +466,18 @@ impl OperationJournal {
         request: &OperationRequest,
         result: &ActionResult,
     ) -> io::Result<()> {
+        let state = if matches!(&result.delivery, DeliveryState::Unknown) {
+            DurableState::Unknown
+        } else {
+            DurableState::Complete
+        };
         self.write(DurableOperation {
             operation_id: result.operation_id.clone(),
             idempotency_key: request.idempotency_key.clone(),
             intent: request.intent.clone(),
             risk: request.risk.unwrap_or_else(|| classify(&request.intent)),
             target: request.target.clone(),
-            state: DurableState::Complete,
+            state,
             metadata: operation_metadata(request),
             result: Some(result.clone()),
         })
@@ -695,6 +702,7 @@ impl Runtime {
             ),
             "workflow.execute" => execute_workflow_request(&request, operation_id),
             "desktop.observe" => desktop_observe(&request, operation_id),
+            "platform.broker.observe" => platform_broker_observe(&request, operation_id),
             "filesystem.write" => sandbox_write(&request, operation_id, &self.checkpoints),
             "filesystem.restore_checkpoint" => {
                 restore_checkpoint(&request, operation_id, &self.checkpoints)
@@ -703,9 +711,10 @@ impl Runtime {
             "macos.ax.press" => macos_ax_press(&request, operation_id),
             "macos.ax.set_value" => macos_ax_set_value(&request, operation_id),
             "browser.fixture.submit" => browser_fixture_submit(&request, operation_id),
-            "browser.cdp.evaluate" | "browser.cdp.navigate" | "browser.cdp.upload" => {
-                browser_cdp_action(&request, operation_id)
-            }
+            "browser.cdp.evaluate"
+            | "browser.cdp.navigate"
+            | "browser.cdp.upload"
+            | "browser.cdp.download" => browser_cdp_action(&request, operation_id),
             _ => ActionResult::refused(
                 &request,
                 operation_id,
@@ -785,16 +794,21 @@ impl Runtime {
         ) {
             return self.watch(operation_id);
         }
-        if record.intent == "filesystem.write" {
+        if record.intent == "filesystem.write" || record.intent == "browser.cdp.download" {
             let path = record
                 .metadata
                 .get("path")
                 .and_then(Value::as_str)
                 .map(PathBuf::from);
             let expected_hash = record.metadata.get("content_hash").and_then(Value::as_u64);
-            if let (Some(path), Some(expected_hash)) = (path, expected_hash)
-                && let Ok(bytes) = fs::read(&path)
-                && stable_hash(&bytes) == expected_hash
+            let present = path.as_ref().is_some_and(|candidate| candidate.is_file());
+            let hash_matches = match (path.as_ref(), expected_hash.as_ref()) {
+                (Some(candidate), Some(expected)) => {
+                    fs::read(candidate).is_ok_and(|bytes| stable_hash(&bytes) == *expected)
+                }
+                _ => false,
+            };
+            if let (Some(path), true) = (path, present && (expected_hash.is_none() || hash_matches))
             {
                 let result = ActionResult {
                     operation_id: record.operation_id.clone(),
@@ -807,7 +821,7 @@ impl Runtime {
                     verification: VerificationState::Verified,
                     disturbance: json!({ "foreground_changed": false }),
                     recovery: RecoveryState::None,
-                    data: json!({ "path": path, "reconciled": true }),
+                    data: json!({ "path": path, "reconciled": true, "postcondition": "file_present" }),
                     error: None,
                 };
                 let idempotency_key = record.idempotency_key.clone();
@@ -829,7 +843,9 @@ impl Runtime {
     }
 
     fn remember(&mut self, request: &OperationRequest, result: ActionResult) {
-        if let Some(key) = request.idempotency_key.as_ref() {
+        if let Some(key) = request.idempotency_key.as_ref()
+            && !matches!(&result.delivery, DeliveryState::Unknown)
+        {
             self.idempotent.insert(key.clone(), result.clone());
         }
         if let Err(error) = self.operations.complete(request, &result) {
@@ -852,11 +868,16 @@ impl Runtime {
 
 fn classify(intent: &str) -> Risk {
     match intent {
-        "system.ping" | "desktop.observe" | "workflow.execute" => Risk::R0,
+        "system.ping" | "desktop.observe" | "platform.broker.observe" | "workflow.execute" => {
+            Risk::R0
+        }
         "desktop.notify" | "filesystem.write" | "filesystem.restore_checkpoint" => Risk::R1,
         "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
         "browser.fixture.submit" => Risk::R1,
-        "browser.cdp.evaluate" | "browser.cdp.navigate" | "browser.cdp.upload" => Risk::R2,
+        "browser.cdp.evaluate"
+        | "browser.cdp.navigate"
+        | "browser.cdp.upload"
+        | "browser.cdp.download" => Risk::R2,
         _ => Risk::R2,
     }
 }
@@ -896,6 +917,28 @@ fn operation_metadata(request: &OperationRequest) -> Value {
             metadata["content_hash"] = json!(stable_hash(content.as_bytes()));
         }
     }
+    if request.intent == "browser.cdp.download" {
+        let key = request.idempotency_key.as_deref().unwrap_or("unkeyed");
+        let file_name = request
+            .params
+            .get("file_name")
+            .and_then(Value::as_str)
+            .unwrap_or("fixture.txt");
+        if Path::new(file_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(file_name)
+        {
+            metadata["path"] = json!(
+                state_dir()
+                    .join("sandbox")
+                    .join("downloads")
+                    .join(format!("{:016x}", stable_hash(key.as_bytes())))
+                    .join(file_name)
+            );
+            metadata["file_name"] = json!(file_name);
+        }
+    }
     metadata
 }
 
@@ -910,15 +953,17 @@ fn route_for(intent: &str) -> String {
     match intent {
         "system.ping" => "native",
         "desktop.observe" => "platform_observe",
+        "platform.broker.observe" => "platform_broker",
         "workflow.execute" => "workflow",
         "filesystem.write" => "sandbox_filesystem",
         "filesystem.restore_checkpoint" => "sandbox_checkpoint",
         "desktop.notify" => "platform_notification",
         "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
         "browser.fixture.submit" => "browser_fixture",
-        "browser.cdp.evaluate" | "browser.cdp.navigate" | "browser.cdp.upload" => {
-            "browser_protocol"
-        }
+        "browser.cdp.evaluate"
+        | "browser.cdp.navigate"
+        | "browser.cdp.upload"
+        | "browser.cdp.download" => "browser_protocol",
         _ => "none",
     }
     .to_owned()
@@ -1082,7 +1127,7 @@ fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> A
             VerificationState::Verified,
             data,
         ),
-        Err(error) => ActionResult::refused(request, operation_id, error),
+        Err(error) => browser_failure(request, operation_id, error),
     }
 }
 
@@ -1109,19 +1154,50 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
-    let browser_context_id = request
+    let Some(browser_context_id) = request
         .params
         .get("browser_context_id")
-        .and_then(Value::as_str);
-    let revision = request.params.get("revision").and_then(Value::as_str);
+        .and_then(Value::as_str)
+    else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser CDP actions need a browser context id".to_owned(),
+                recovery: Some("Inspect targets and include the exact browser context".to_owned()),
+            },
+        );
+    };
+    let Some(revision) = request.params.get("revision").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser CDP actions need a target revision".to_owned(),
+                recovery: Some("Inspect targets and include the exact target revision".to_owned()),
+            },
+        );
+    };
     if request.intent == "browser.cdp.upload" {
         return browser_cdp_upload(
             request,
             operation_id,
             &endpoint,
             target_id,
-            browser_context_id,
-            revision,
+            Some(browser_context_id),
+            Some(revision),
+        );
+    }
+    if request.intent == "browser.cdp.download" {
+        return browser_cdp_download(
+            request,
+            operation_id,
+            &endpoint,
+            target_id,
+            Some(browser_context_id),
+            Some(revision),
         );
     }
     let (method, params) = match request.intent.as_str() {
@@ -1165,8 +1241,8 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
     match browser::cdp_call(
         &endpoint.to_string_lossy(),
         target_id,
-        browser_context_id,
-        revision,
+        Some(browser_context_id),
+        Some(revision),
         method,
         params,
     ) {
@@ -1186,7 +1262,7 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
             data,
         ),
-        Err(error) => ActionResult::refused(request, operation_id, error),
+        Err(error) => browser_failure(request, operation_id, error),
     }
 }
 
@@ -1264,8 +1340,100 @@ fn browser_cdp_upload(
             VerificationState::Verified,
             data,
         ),
-        Err(error) => ActionResult::refused(request, operation_id, error),
+        Err(error) => browser_failure(request, operation_id, error),
     }
+}
+
+fn browser_cdp_download(
+    request: &OperationRequest,
+    operation_id: String,
+    endpoint: &std::ffi::OsStr,
+    target_id: &str,
+    browser_context_id: Option<&str>,
+    revision: Option<&str>,
+) -> ActionResult {
+    let Some(key) = request.idempotency_key.as_deref() else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "idempotency_required".to_owned(),
+                message: "Browser downloads require an idempotency key".to_owned(),
+                recovery: Some("Retry with a stable idempotency key".to_owned()),
+            },
+        );
+    };
+    let file_name = request
+        .params
+        .get("file_name")
+        .and_then(Value::as_str)
+        .unwrap_or("fixture.txt");
+    let download_dir = state_dir()
+        .join("sandbox")
+        .join("downloads")
+        .join(format!("{:016x}", stable_hash(key.as_bytes())));
+    let expected_path = download_dir.join(file_name);
+    if expected_path.is_file() {
+        return success(
+            request,
+            operation_id,
+            "browser_protocol",
+            EffectState::None,
+            VerificationState::Verified,
+            json!({ "path": expected_path, "file_name": file_name, "verified": true, "replayed": true }),
+        );
+    }
+    let selector = request
+        .params
+        .get("selector")
+        .and_then(Value::as_str)
+        .unwrap_or("#download");
+    match browser::cdp_download(
+        &endpoint.to_string_lossy(),
+        target_id,
+        browser_context_id,
+        revision,
+        selector,
+        &download_dir,
+        file_name,
+    ) {
+        Ok(data) => success(
+            request,
+            operation_id,
+            "browser_protocol",
+            EffectState::Changed,
+            VerificationState::Verified,
+            data,
+        ),
+        Err(error) => browser_failure(request, operation_id, error),
+    }
+}
+
+fn browser_failure(
+    request: &OperationRequest,
+    operation_id: String,
+    error: ComptrolError,
+) -> ActionResult {
+    if matches!(
+        error.code.as_str(),
+        "browser_dispatch_failed" | "browser_response_failed" | "browser_unavailable"
+    ) {
+        return ActionResult {
+            operation_id,
+            intent: request.intent.clone(),
+            route: "browser_protocol".to_owned(),
+            target: request.target.clone(),
+            preflight: "passed".to_owned(),
+            delivery: DeliveryState::Unknown,
+            effect: EffectState::Unknown,
+            verification: VerificationState::Unverified,
+            disturbance: json!({ "foreground_changed": false }),
+            recovery: RecoveryState::RequiresReconciliation,
+            data: Value::Null,
+            error: Some(error),
+        };
+    }
+    ActionResult::refused(request, operation_id, error)
 }
 
 fn success(
@@ -1290,6 +1458,52 @@ fn success(
         data,
         error: None,
     }
+}
+
+fn platform_broker_observe(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let requested = request
+        .params
+        .get("broker")
+        .and_then(Value::as_str)
+        .unwrap_or("current");
+    let capabilities = platform_capabilities();
+    let selected = if requested == "current" {
+        capabilities
+            .iter()
+            .find(|capability| capability.available)
+            .cloned()
+    } else {
+        capabilities
+            .iter()
+            .find(|capability| capability.name == requested || capability.route == requested)
+            .cloned()
+    };
+    let Some(selected) = selected else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "unsupported_capability".to_owned(),
+                message: format!("Unknown platform broker {requested}"),
+                recovery: Some(
+                    "Inspect platform capabilities for the available brokers".to_owned(),
+                ),
+            },
+        );
+    };
+    success(
+        request,
+        operation_id,
+        "platform_broker",
+        EffectState::None,
+        VerificationState::Verified,
+        json!({
+            "broker": selected,
+            "operations": ["observe"],
+            "semantic_mutation": false,
+            "refusal": "Actuation is not enabled until the platform fixture matrix passes"
+        }),
+    )
 }
 
 fn desktop_observe(request: &OperationRequest, operation_id: String) -> ActionResult {
@@ -1453,6 +1667,20 @@ fn macos_ax_press(request: &OperationRequest, operation_id: String) -> ActionRes
         );
     };
     match run_osascript(&script) {
+        Ok(output)
+            if output.status.success()
+                && request.postcondition.is_some()
+                && String::from_utf8_lossy(&output.stdout).trim() == "true" =>
+        {
+            success(
+                request,
+                operation_id,
+                "macos_ax",
+                EffectState::Changed,
+                VerificationState::Verified,
+                json!({ "pressed": true, "postcondition": "verified" }),
+            )
+        }
         Ok(output) if output.status.success() => success(
             request,
             operation_id,
@@ -1551,7 +1779,14 @@ fn ax_script(request: &OperationRequest, action: &str) -> Option<String> {
         .map(|name| format!("first window whose name is {name}"))
         .unwrap_or_else(|| "window 1".to_owned());
     let action_line = if action == "press" {
-        "perform action \"AXPress\" of targetElement\nreturn \"pressed\"".to_owned()
+        let verification = match request.postcondition.as_ref() {
+            Some(value) => Some(ax_postcondition(value)?),
+            None => None,
+        };
+        match verification {
+            Some(script) => format!("perform action \"AXPress\" of targetElement\nreturn {script}"),
+            None => "perform action \"AXPress\" of targetElement\nreturn \"pressed\"".to_owned(),
+        }
     } else if let Some(value) = action.strip_prefix("set_value:") {
         format!(
             "set value of targetElement to {value}\nreturn ((value of targetElement as text) is {value})"
@@ -1562,6 +1797,25 @@ fn ax_script(request: &OperationRequest, action: &str) -> Option<String> {
     Some(format!(
         "tell application \"System Events\"\ntell application process {app}\nset targetWindow to {window}\nset matches to (every {element} of targetWindow whose name is {control})\nif (count of matches) is not 1 then error \"target_ambiguous\"\nset targetElement to item 1 of matches\n{action_line}\nend tell\nend tell"
     ))
+}
+
+fn ax_postcondition(value: &Value) -> Option<String> {
+    let attribute = value.get("attribute")?.as_str()?;
+    let expected = value.get("equals")?;
+    match attribute {
+        "value" | "name" => Some(format!(
+            "(({} of targetElement as text) is {})",
+            attribute,
+            apple_quote(expected.as_str()?)
+        )),
+        "enabled" | "focused" => Some(format!(
+            "({} of targetElement is {})",
+            attribute,
+            if expected.as_bool()? { "true" } else { "false" }
+        )),
+        "exists" if expected.as_bool()? => Some("true".to_owned()),
+        _ => None,
+    }
 }
 
 fn ax_failure(
@@ -1653,6 +1907,14 @@ pub fn capabilities() -> Vec<Capability> {
                 .to_owned(),
         },
         Capability {
+            name: "platform.broker.observe".to_owned(),
+            available: true,
+            risk: Risk::R0,
+            route: "platform_broker".to_owned(),
+            note: "Reports Windows UI Automation and Linux accessibility broker state without actuation"
+                .to_owned(),
+        },
+        Capability {
             name: "filesystem.write".to_owned(),
             available: false,
             risk: Risk::R1,
@@ -1672,7 +1934,7 @@ pub fn capabilities() -> Vec<Capability> {
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
-            note: "Local CDP evaluation navigation and sandbox uploads require explicit policy"
+            note: "Local CDP evaluation navigation uploads and downloads require explicit policy"
                 .to_owned(),
         },
         Capability {
@@ -1717,7 +1979,7 @@ pub fn platform_capabilities() -> Vec<Capability> {
                 && std::env::var("COMPTROL_WINDOWS_UIA").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "windows_uia".to_owned(),
-            note: "Capability broker only until UI Automation conformance passes".to_owned(),
+            note: "Windows UI Automation broker detection and read only diagnostics".to_owned(),
         },
         Capability {
             name: "platform.linux.atspi".to_owned(),
@@ -1725,21 +1987,21 @@ pub fn platform_capabilities() -> Vec<Capability> {
                 && std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
             risk: Risk::R2,
             route: "linux_atspi".to_owned(),
-            note: "Detected from the active accessibility bus".to_owned(),
+            note: "Linux AT SPI broker detection and read only diagnostics".to_owned(),
         },
         Capability {
             name: "platform.linux.x11".to_owned(),
             available: cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_some(),
             risk: Risk::R2,
             route: "linux_x11".to_owned(),
-            note: "Detected from the active X11 display".to_owned(),
+            note: "Linux X11 broker detection and read only diagnostics".to_owned(),
         },
         Capability {
             name: "platform.linux.wayland".to_owned(),
             available: cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some(),
             risk: Risk::R2,
             route: "linux_wayland".to_owned(),
-            note: "Detected from the active Wayland display".to_owned(),
+            note: "Linux Wayland broker detection and read only diagnostics".to_owned(),
         },
     ]
 }
@@ -1752,6 +2014,28 @@ pub fn platform_diagnostics() -> Value {
         "display": std::env::var("DISPLAY").ok().is_some(),
         "wayland": std::env::var("WAYLAND_DISPLAY").ok().is_some(),
         "at_spi": std::env::var("AT_SPI_BUS_ADDRESS").ok().is_some(),
+        "brokers": {
+            "windows_uia": {
+                "configured": std::env::var("COMPTROL_WINDOWS_UIA").as_deref() == Ok("1"),
+                "actuation": false,
+                "requires": "Windows UI Automation fixture validation"
+            },
+            "linux_atspi": {
+                "configured": std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
+                "actuation": false,
+                "requires": "AT SPI fixture validation"
+            },
+            "linux_x11": {
+                "configured": std::env::var_os("DISPLAY").is_some(),
+                "actuation": false,
+                "requires": "X11 fixture validation"
+            },
+            "linux_wayland": {
+                "configured": std::env::var_os("WAYLAND_DISPLAY").is_some(),
+                "actuation": false,
+                "requires": "Wayland portal and fixture validation"
+            }
+        },
         "capabilities": platform_capabilities(),
     })
 }
@@ -1888,6 +2172,22 @@ mod tests {
             Some("policy_denied")
         );
         assert!(matches!(result.delivery, DeliveryState::Refused));
+    }
+
+    #[test]
+    fn macos_press_can_require_an_explicit_postcondition() {
+        let request = OperationRequest {
+            intent: "macos.ax.press".to_owned(),
+            target: None,
+            params: json!({"app":"Fixture","control":"Submit","role":"button"}),
+            postcondition: Some(json!({"attribute":"enabled","equals":true})),
+            risk: None,
+            idempotency_key: Some("press-check".to_owned()),
+            dry_run: false,
+        };
+        let script = ax_script(&request, "press").expect("semantic script");
+        assert!(script.contains("perform action \"AXPress\""));
+        assert!(script.contains("enabled of targetElement is true"));
     }
 
     #[test]

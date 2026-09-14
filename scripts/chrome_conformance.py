@@ -90,15 +90,21 @@ try:
     call(runtime, 1, "initialize", {})
     inspection = call(runtime, 2, "tools/call", {"name": "inspect", "arguments": {"kind": "browser"}})
     assert any(item["id"] == target["id"] for item in inspection["result"]["structuredContent"]["targets"])
-    navigation = call(runtime, 3, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "idempotency_key": "chrome-navigation", "params": {"target_id": target["id"], "url": f"http://127.0.0.1:{fixture_port}/"}}})
+    identity = {"target_id": target["id"], "browser_context_id": target.get("browserContextId", "default"), "revision": target.get("revision", f"url:{target['url']}")}
+    navigation = call(runtime, 3, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "idempotency_key": "chrome-navigation", "params": {**identity, "url": f"http://127.0.0.1:{fixture_port}/"}}})
     assert navigation["result"]["structuredContent"]["verification"] == "unverified"
-    evaluation = call(runtime, 4, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.evaluate", "idempotency_key": "chrome-evaluation", "params": {"target_id": target["id"], "expression": "(() => { const input = document.querySelector('#message'); input.value = 'real chrome'; return input.value })()"}}})
+    evaluation = call(runtime, 4, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.evaluate", "idempotency_key": "chrome-evaluation", "params": {**identity, "expression": "(() => { const input = document.querySelector('#message'); input.value = 'real chrome'; return input.value })()"}}})
     structured = evaluation["result"]["structuredContent"]
     assert structured["verification"] == "verified"
     assert structured["data"]["result"]["value"] == "real chrome"
-    upload = call(runtime, 5, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.upload", "idempotency_key": "chrome-upload", "params": {"target_id": target["id"], "selector": "#upload", "path": str(upload_path)}}})
+    upload = call(runtime, 5, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.upload", "idempotency_key": "chrome-upload", "params": {**identity, "selector": "#upload", "path": str(upload_path)}}})
     assert upload["result"]["structuredContent"]["verification"] == "verified"
     assert upload["result"]["structuredContent"]["data"]["verified"] is True
+    download = call(runtime, 6, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.download", "idempotency_key": "chrome-download", "params": {**identity, "selector": "#download", "file_name": "fixture.txt"}}})
+    download_data = download["result"]["structuredContent"]
+    assert download_data["verification"] == "verified"
+    downloaded = pathlib.Path(download_data["data"]["path"])
+    assert downloaded.read_text(encoding="utf-8") == "Comptrol fixture download\n"
     print("real Chrome CDP conformance passed")
 finally:
     if runtime is not None:
