@@ -14,8 +14,8 @@ use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use adapters::{AdapterDescriptor, AdapterRegistry};
 pub use checkpoints::{Checkpoint, CheckpointStore};
@@ -1283,13 +1283,9 @@ fn success(
 fn desktop_observe(request: &OperationRequest, operation_id: String) -> ActionResult {
     let mut data = json!({ "platform": std::env::consts::OS, "arch": std::env::consts::ARCH, "current_dir": std::env::current_dir().ok(), "route": "platform_observe", "permission": "not_required_for_basic_process_observation" });
     if cfg!(target_os = "macos") {
-        match Command::new("osascript")
-            .args([
-                "-e",
-                "tell application \"System Events\" to get name of every application process",
-            ])
-            .output()
-        {
+        match run_osascript(
+            "tell application \"System Events\" to get name of every application process",
+        ) {
             Ok(output) if output.status.success() => {
                 data["applications"] = json!(String::from_utf8_lossy(&output.stdout).trim());
                 data["accessibility"] = json!("reachable");
@@ -1394,8 +1390,8 @@ fn desktop_notify(request: &OperationRequest, operation_id: String) -> ActionRes
             apple_quote(body),
             apple_quote(title)
         );
-        match Command::new("osascript").args(["-e", &script]).status() {
-            Ok(status) if status.success() => success(
+        match run_osascript(&script) {
+            Ok(output) if output.status.success() => success(
                 request,
                 operation_id,
                 "platform_notification",
@@ -1444,7 +1440,7 @@ fn macos_ax_press(request: &OperationRequest, operation_id: String) -> ActionRes
             },
         );
     };
-    match Command::new("osascript").args(["-e", &script]).output() {
+    match run_osascript(&script) {
         Ok(output) if output.status.success() => success(
             request,
             operation_id,
@@ -1492,7 +1488,7 @@ fn macos_ax_set_value(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
-    match Command::new("osascript").args(["-e", &script]).output() {
+    match run_osascript(&script) {
         Ok(output)
             if output.status.success()
                 && String::from_utf8_lossy(&output.stdout).trim() == "true" =>
@@ -1602,6 +1598,29 @@ fn apple_quote(value: &str) -> String {
             .replace('"', "\\\"")
             .replace('\n', " ")
     )
+}
+
+fn run_osascript(script: &str) -> io::Result<Output> {
+    let mut child = Command::new("osascript")
+        .args(["-e", script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "macOS accessibility provider timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub fn capabilities() -> Vec<Capability> {
@@ -1726,12 +1745,7 @@ pub fn platform_diagnostics() -> Value {
 }
 
 fn macos_accessibility_reachable() -> bool {
-    Command::new("osascript")
-        .args([
-            "-e",
-            "tell application \"System Events\" to get name of every application process",
-        ])
-        .output()
+    run_osascript("tell application \"System Events\" to get name of every application process")
         .is_ok_and(|output| output.status.success())
 }
 

@@ -32,7 +32,7 @@ The optimized Rust build passed.
 
 macOS has real basic process observation through System Events. Semantic desktop mutation is not advertised.
 
-The macOS semantic route is implemented and policy gated. It supports exact application, window, role, and control matching. Value changes read the value back before reporting verified. Press actions report unverified because macOS does not provide a safe general postcondition for every control. This host returned the correct assistive access refusal during live probing, so no UI action was claimed as verified.
+The macOS semantic route is implemented and policy gated. It supports exact application, window, role, and control matching with bounded AppleScript provider calls. Value changes read the value back before reporting verified. Press actions report unverified because macOS does not provide a safe general postcondition for every control. This host returned the correct assistive access refusal during live probing, so no UI action was claimed as verified.
 
 Windows has a portable runtime build path and a conservative UI Automation capability broker. UI Automation actuation is not implemented.
 
