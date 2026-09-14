@@ -2,6 +2,7 @@ use crate::{BrowserTarget, ComptrolError, bind_browser_target};
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::time::Duration;
 use tungstenite::{Message, connect};
 
@@ -149,6 +150,145 @@ pub fn cdp_call(
         }
         return Ok(value.get("result").cloned().unwrap_or(Value::Null));
     }
+}
+
+pub fn cdp_upload(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: Option<&str>,
+    revision: Option<&str>,
+    selector: &str,
+    path: &Path,
+) -> Result<Value, ComptrolError> {
+    let file_name_text = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Upload path needs a valid file name".to_owned(),
+            recovery: None,
+        })?;
+    let targets = discover(endpoint)?;
+    let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
+    let Some(web_socket_url) = target.web_socket_url else {
+        return Err(ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The target did not provide a websocket debugger URL".to_owned(),
+            recovery: Some("Inspect browser targets again".to_owned()),
+        });
+    };
+    if !web_socket_url.starts_with("ws://") {
+        return Err(ComptrolError {
+            code: "browser_transport_unsupported".to_owned(),
+            message: "Only local unencrypted DevTools websocket endpoints are enabled".to_owned(),
+            recovery: Some(
+                "Use a local browser endpoint or configure a trusted transport".to_owned(),
+            ),
+        });
+    }
+    let (mut socket, _) = connect(web_socket_url).map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Start the browser target and retry".to_owned()),
+    })?;
+    let mut command_id = 0_u64;
+    let mut call = |method: &str, params: Value| -> Result<Value, ComptrolError> {
+        command_id += 1;
+        let id = command_id;
+        socket
+            .send(Message::Text(
+                json!({ "id": id, "method": method, "params": params })
+                    .to_string()
+                    .into(),
+            ))
+            .map_err(|error| ComptrolError {
+                code: "browser_dispatch_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Reconnect to the exact browser target".to_owned()),
+            })?;
+        loop {
+            let message = socket.read().map_err(|error| ComptrolError {
+                code: "browser_response_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect the browser target before retrying".to_owned()),
+            })?;
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
+                code: "browser_protocol_invalid".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect the browser protocol version".to_owned()),
+            })?;
+            if value.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = value.get("error") {
+                return Err(ComptrolError {
+                    code: "browser_command_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Refresh the target and retry once".to_owned()),
+                });
+            }
+            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+        }
+    };
+    let document = call("DOM.getDocument", json!({ "depth": -1 }))?;
+    let root_id = document
+        .get("root")
+        .and_then(|root| root.get("nodeId"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not return a document root".to_owned(),
+            recovery: Some("Refresh the browser target".to_owned()),
+        })?;
+    let node = call(
+        "DOM.querySelector",
+        json!({ "nodeId": root_id, "selector": selector }),
+    )?;
+    let node_id = node
+        .get("nodeId")
+        .and_then(Value::as_u64)
+        .filter(|id| *id != 0)
+        .ok_or_else(|| ComptrolError {
+            code: "target_gone".to_owned(),
+            message: "The browser upload control was not found".to_owned(),
+            recovery: Some("Refresh the page and inspect the exact upload selector".to_owned()),
+        })?;
+    call(
+        "DOM.setFileInputFiles",
+        json!({ "nodeId": node_id, "files": [path] }),
+    )?;
+    let selector = serde_json::to_string(selector).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: None,
+    })?;
+    let file_name = serde_json::to_string(file_name_text).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: None,
+    })?;
+    let verification = call(
+        "Runtime.evaluate",
+        json!({
+            "expression": format!("(() => {{ const files = document.querySelector({selector}).files; return files.length === 1 && files[0].name === {file_name}; }})()"),
+            "returnByValue": true
+        }),
+    )?;
+    if verification
+        .get("result")
+        .and_then(|result| result.get("value"))
+        != Some(&Value::Bool(true))
+    {
+        return Err(ComptrolError {
+            code: "verification_failed".to_owned(),
+            message: "The browser did not confirm the selected file".to_owned(),
+            recovery: Some("Inspect the upload control and retry once".to_owned()),
+        });
+    }
+    Ok(json!({ "path": path, "file_name": file_name_text, "verified": true }))
 }
 
 fn parse_target(value: &Value) -> Option<BrowserTarget> {

@@ -77,6 +77,9 @@ try:
     targets = wait_for(f"http://127.0.0.1:{debug_port}/json/list")
     target = next(item for item in targets if item.get("type") == "page" and item.get("url") == f"http://127.0.0.1:{fixture_port}/")
     state = tempfile.TemporaryDirectory(prefix="comptrol-chrome-state-")
+    upload_path = pathlib.Path(state.name) / "sandbox" / "verified.txt"
+    upload_path.parent.mkdir(parents=True)
+    upload_path.write_text("verified upload", encoding="utf-8")
     runtime = subprocess.Popen(
         [binary, "mcp"],
         stdin=subprocess.PIPE,
@@ -93,6 +96,9 @@ try:
     structured = evaluation["result"]["structuredContent"]
     assert structured["verification"] == "verified"
     assert structured["data"]["result"]["value"] == "real chrome"
+    upload = call(runtime, 5, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.upload", "idempotency_key": "chrome-upload", "params": {"target_id": target["id"], "selector": "#upload", "path": str(upload_path)}}})
+    assert upload["result"]["structuredContent"]["verification"] == "verified"
+    assert upload["result"]["structuredContent"]["data"]["verified"] is True
     print("real Chrome CDP conformance passed")
 finally:
     if runtime is not None:

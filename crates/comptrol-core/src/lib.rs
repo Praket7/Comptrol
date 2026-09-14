@@ -301,6 +301,7 @@ impl Policy {
             policy.allowed_intents.extend([
                 "browser.cdp.evaluate".to_owned(),
                 "browser.cdp.navigate".to_owned(),
+                "browser.cdp.upload".to_owned(),
             ]);
         }
         policy
@@ -690,7 +691,7 @@ impl Runtime {
             "macos.ax.press" => macos_ax_press(&request, operation_id),
             "macos.ax.set_value" => macos_ax_set_value(&request, operation_id),
             "browser.fixture.submit" => browser_fixture_submit(&request, operation_id),
-            "browser.cdp.evaluate" | "browser.cdp.navigate" => {
+            "browser.cdp.evaluate" | "browser.cdp.navigate" | "browser.cdp.upload" => {
                 browser_cdp_action(&request, operation_id)
             }
             _ => ActionResult::refused(
@@ -843,7 +844,7 @@ fn classify(intent: &str) -> Risk {
         "desktop.notify" | "filesystem.write" | "filesystem.restore_checkpoint" => Risk::R1,
         "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
         "browser.fixture.submit" => Risk::R1,
-        "browser.cdp.evaluate" | "browser.cdp.navigate" => Risk::R2,
+        "browser.cdp.evaluate" | "browser.cdp.navigate" | "browser.cdp.upload" => Risk::R2,
         _ => Risk::R2,
     }
 }
@@ -903,7 +904,9 @@ fn route_for(intent: &str) -> String {
         "desktop.notify" => "platform_notification",
         "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
         "browser.fixture.submit" => "browser_fixture",
-        "browser.cdp.evaluate" | "browser.cdp.navigate" => "browser_protocol",
+        "browser.cdp.evaluate" | "browser.cdp.navigate" | "browser.cdp.upload" => {
+            "browser_protocol"
+        }
         _ => "none",
     }
     .to_owned()
@@ -1099,6 +1102,16 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
         .get("browser_context_id")
         .and_then(Value::as_str);
     let revision = request.params.get("revision").and_then(Value::as_str);
+    if request.intent == "browser.cdp.upload" {
+        return browser_cdp_upload(
+            request,
+            operation_id,
+            &endpoint,
+            target_id,
+            browser_context_id,
+            revision,
+        );
+    }
     let (method, params) = match request.intent.as_str() {
         "browser.cdp.evaluate" => {
             let Some(expression) = request.params.get("expression").and_then(Value::as_str) else {
@@ -1159,6 +1172,84 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             } else {
                 VerificationState::Unverified
             },
+            data,
+        ),
+        Err(error) => ActionResult::refused(request, operation_id, error),
+    }
+}
+
+fn browser_cdp_upload(
+    request: &OperationRequest,
+    operation_id: String,
+    endpoint: &std::ffi::OsStr,
+    target_id: &str,
+    browser_context_id: Option<&str>,
+    revision: Option<&str>,
+) -> ActionResult {
+    let Some(path) = request.params.get("path").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser upload needs a path".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let path = PathBuf::from(path);
+    let Ok(sandbox) = fs::canonicalize(state_dir().join("sandbox")) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "The Comptrol sandbox is not available".to_owned(),
+                recovery: Some("Create an authorized sandbox file first".to_owned()),
+            },
+        );
+    };
+    let Ok(path) = fs::canonicalize(path) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "The upload file does not exist".to_owned(),
+                recovery: Some("Use an existing file inside the Comptrol sandbox".to_owned()),
+            },
+        );
+    };
+    if !path.starts_with(&sandbox) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "Browser uploads are restricted to the Comptrol sandbox".to_owned(),
+                recovery: Some("Copy the file into the authorized sandbox first".to_owned()),
+            },
+        );
+    }
+    let selector = request
+        .params
+        .get("selector")
+        .and_then(Value::as_str)
+        .unwrap_or("#upload");
+    match browser::cdp_upload(
+        &endpoint.to_string_lossy(),
+        target_id,
+        browser_context_id,
+        revision,
+        selector,
+        &path,
+    ) {
+        Ok(data) => success(
+            request,
+            operation_id,
+            "browser_protocol",
+            EffectState::Changed,
+            VerificationState::Verified,
             data,
         ),
         Err(error) => ActionResult::refused(request, operation_id, error),
@@ -1550,7 +1641,8 @@ pub fn capabilities() -> Vec<Capability> {
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
-            note: "Local CDP evaluation and navigation require explicit policy".to_owned(),
+            note: "Local CDP evaluation navigation and sandbox uploads require explicit policy"
+                .to_owned(),
         },
         Capability {
             name: "browser.cdp.discovery".to_owned(),
