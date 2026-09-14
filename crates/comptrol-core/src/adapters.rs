@@ -70,10 +70,11 @@ impl AdapterRegistry {
     }
 
     pub fn register(&mut self, descriptor: AdapterDescriptor) -> bool {
-        if self
-            .descriptors
-            .iter()
-            .any(|item| item.name == descriptor.name)
+        if !descriptor.is_valid()
+            || self
+                .descriptors
+                .iter()
+                .any(|item| item.name == descriptor.name)
         {
             return false;
         }
@@ -83,5 +84,25 @@ impl AdapterRegistry {
 
     pub fn list(&self) -> &[AdapterDescriptor] {
         &self.descriptors
+    }
+}
+
+impl AdapterDescriptor {
+    pub fn is_valid(&self) -> bool {
+        !self.name.is_empty()
+            && !self.version.is_empty()
+            && !self.route.is_empty()
+            && !self.isolation.is_empty()
+            && self
+                .name
+                .chars()
+                .all(|character| !character.is_control() && !character.is_whitespace())
+            && !self.platforms.is_empty()
+            && !self.capabilities.is_empty()
+            && self
+                .platforms
+                .iter()
+                .chain(self.capabilities.iter())
+                .all(|value| !value.is_empty() && !value.chars().any(char::is_control))
     }
 }

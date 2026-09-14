@@ -3224,6 +3224,29 @@ mod tests {
     }
 
     #[test]
+    fn adapter_registry_rejects_malformed_descriptors() {
+        let mut registry = AdapterRegistry::default();
+        assert!(!registry.register(AdapterDescriptor {
+            name: "bad adapter".to_owned(),
+            version: "0.1".to_owned(),
+            platforms: vec!["macos".to_owned()],
+            capabilities: vec!["observe".to_owned()],
+            route: "native".to_owned(),
+            risk: Risk::R0,
+            isolation: "trusted".to_owned(),
+        }));
+        assert!(!registry.register(AdapterDescriptor {
+            name: "comptrol.bad".to_owned(),
+            version: "0.1".to_owned(),
+            platforms: Vec::new(),
+            capabilities: vec!["observe".to_owned()],
+            route: "native".to_owned(),
+            risk: Risk::R0,
+            isolation: "trusted".to_owned(),
+        }));
+    }
+
+    #[test]
     fn audit_journal_redacts_typed_action_data() {
         let dir = std::env::temp_dir().join(format!("comptrol-audit-{}", now_ms()));
         let mut journal = AuditJournal::open(&dir).expect("journal");
