@@ -328,6 +328,7 @@ impl Default for Policy {
                 "desktop.observe".to_owned(),
                 "platform.broker.observe".to_owned(),
                 "browser.cdp.wait_for".to_owned(),
+                "browser.cdp.accessibility_snapshot".to_owned(),
                 "workflow.execute".to_owned(),
             ]),
         }
@@ -888,6 +889,7 @@ impl Runtime {
             | "browser.cdp.close_tab"
             | "browser.cdp.history_back"
             | "browser.cdp.history_forward"
+            | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             _ => ActionResult::refused(
                 &request,
@@ -1164,7 +1166,7 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.close_tab"
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward" => Risk::R2,
-        "browser.cdp.wait_for" => Risk::R0,
+        "browser.cdp.wait_for" | "browser.cdp.accessibility_snapshot" => Risk::R0,
         _ => Risk::R2,
     }
 }
@@ -1342,6 +1344,7 @@ fn route_for(intent: &str) -> String {
         | "browser.cdp.close_tab"
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward"
+        | "browser.cdp.accessibility_snapshot"
         | "browser.cdp.wait_for" => "browser_protocol",
         _ => "none",
     }
@@ -1639,6 +1642,32 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
                 EffectState::Changed,
                 VerificationState::Verified,
                 data,
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
+    if request.intent == "browser.cdp.accessibility_snapshot" {
+        let depth = request
+            .params
+            .get("depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(8)
+            .min(20);
+        return match browser::cdp_call(
+            &endpoint.to_string_lossy(),
+            target_id,
+            Some(browser_context_id),
+            Some(revision),
+            "Accessibility.getFullAXTree",
+            json!({ "depth": depth }),
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::None,
+                VerificationState::Verified,
+                json!({ "snapshot": data, "depth": depth, "verified": true }),
             ),
             Err(error) => browser_failure(request, operation_id, error),
         };
@@ -3835,6 +3864,14 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Moves one exact live page target through bounded browser history without foreground input".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.accessibility_snapshot".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R0,
+            route: "browser_protocol".to_owned(),
+            note: "Reads a bounded accessibility tree from one exact live page target".to_owned(),
         },
         Capability {
             name: "browser.cdp.discovery".to_owned(),

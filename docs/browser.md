@@ -10,6 +10,8 @@ The fixture now includes a minimal websocket protocol route for `Runtime.evaluat
 
 `browser.cdp.history_back` and `browser.cdp.history_forward` select the adjacent entry from the exact target navigation history, reject missing entries, and verify the resulting history index. They operate on inactive or grouped live tabs without foreground activation. A closed tab group remains outside this route because it is no longer a live DevTools target.
 
+`browser.cdp.accessibility_snapshot` reads a bounded Chrome accessibility tree from the exact target. It is observation only and returns no mouse, keyboard, or clipboard effect.
+
 Enable the route only for a browser endpoint the user intentionally started with local DevTools enabled, using `COMPTROL_CDP_ENDPOINT=http://127.0.0.1:PORT` and `COMPTROL_ALLOW_BROWSER_CDP=1`. The endpoint must remain loopback only.
 
 Inactive and grouped live tabs remain addressable through exact target identity and do not need foreground focus. A closed tab or closed tab group is not a live DevTools target, so it must be reopened by the browser before Comptrol can control it. Chrome does not expose a portable closed group control surface through the route used here.

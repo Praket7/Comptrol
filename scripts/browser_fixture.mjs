@@ -148,6 +148,8 @@ server.on("upgrade", (request, socket) => {
     const message = JSON.parse(text)
     const result = browserSocket && message.method === "Target.closeTarget"
       ? { success: openedTabs.delete(message.params.targetId) }
+      : message.method === "Accessibility.getFullAXTree"
+        ? { nodes: [{ nodeId: "fixture-root", role: { value: "RootWebArea" }, name: { value: "Comptrol browser fixture" } }] }
       : message.method === "Runtime.evaluate"
         ? { result: { type: "string", value: message.params.expression === "document.title" ? "Comptrol browser fixture" : "fixture evaluation" } }
         : message.method === "Page.getNavigationHistory"

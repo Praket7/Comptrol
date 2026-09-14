@@ -109,6 +109,10 @@ try:
     structured = evaluation["result"]["structuredContent"]
     assert structured["verification"] == "verified"
     assert structured["data"]["result"]["value"] == "real chrome"
+    snapshot = call(runtime, 18, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.accessibility_snapshot", "idempotency_key": "chrome-accessibility-snapshot", "params": {**identity, "depth": 8}}})
+    snapshot_data = snapshot["result"]["structuredContent"]
+    assert snapshot_data["verification"] == "verified"
+    assert snapshot_data["data"]["snapshot"]["nodes"]
     upload = call(runtime, 5, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.upload", "idempotency_key": "chrome-upload", "params": {**identity, "selector": "#upload", "path": str(upload_path)}}})
     assert upload["result"]["structuredContent"]["verification"] == "verified"
     assert upload["result"]["structuredContent"]["data"]["verified"] is True

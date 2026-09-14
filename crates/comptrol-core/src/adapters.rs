@@ -40,6 +40,7 @@ impl AdapterRegistry {
                     platforms: vec!["macos".to_owned(), "windows".to_owned(), "linux".to_owned()],
                     capabilities: vec![
                         "target_discovery".to_owned(),
+                        "accessibility_snapshot".to_owned(),
                         "evaluate".to_owned(),
                         "navigate".to_owned(),
                         "fill".to_owned(),
@@ -48,6 +49,8 @@ impl AdapterRegistry {
                         "upload".to_owned(),
                         "download".to_owned(),
                         "open_tab".to_owned(),
+                        "close_tab".to_owned(),
+                        "history".to_owned(),
                     ],
                     route: "browser_protocol".to_owned(),
                     risk: Risk::R2,

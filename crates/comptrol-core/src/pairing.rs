@@ -184,10 +184,18 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_path() -> std::path::PathBuf {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("comptrol-pairing-{}-{sequence}", now_ms()))
+    }
 
     #[test]
     fn pairing_scopes_accept_expire_and_revoke() {
-        let path = std::env::temp_dir().join(format!("comptrol-pairing-{}", now_ms()));
+        let path = test_path();
         let mut store = PairingStore::open(&path).expect("store");
         let (record, token) = store
             .create(
@@ -205,7 +213,7 @@ mod tests {
 
     #[test]
     fn pairing_rejects_unknown_scope() {
-        let path = std::env::temp_dir().join(format!("comptrol-pairing-{}", now_ms()));
+        let path = test_path();
         let mut store = PairingStore::open(&path).expect("store");
         assert!(store.create(vec!["terminal_all".to_owned()], None).is_err());
         let _ = fs::remove_dir_all(path);
@@ -213,7 +221,7 @@ mod tests {
 
     #[test]
     fn pairing_rejects_expired_code() {
-        let path = std::env::temp_dir().join(format!("comptrol-pairing-{}", now_ms()));
+        let path = test_path();
         let mut store = PairingStore::open(&path).expect("store");
         let (record, token) = store
             .create(vec!["observe".to_owned()], Some(60_000))
