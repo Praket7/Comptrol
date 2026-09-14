@@ -106,7 +106,11 @@ try:
     assert click["result"]["structuredContent"]["verification"] == "unverified"
     wait = call(runtime, 8, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.wait_for", "idempotency_key": "chrome-wait", "params": {**identity, "selector": "#state", "property": "textContent", "contains": "submitted"}}})
     assert wait["result"]["structuredContent"]["verification"] == "verified"
-    download = call(runtime, 9, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.download", "idempotency_key": "chrome-download", "params": {**identity, "selector": "#download", "file_name": "fixture.txt"}}})
+    dialog = call(runtime, 9, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.click", "idempotency_key": "chrome-dialog-open", "params": {**identity, "selector": "#open-dialog", "verify_expression": "document.querySelector('#fixture-dialog').open"}}})
+    assert dialog["result"]["structuredContent"]["verification"] == "verified"
+    close_dialog = call(runtime, 10, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.click", "idempotency_key": "chrome-dialog-close", "params": {**identity, "selector": "#close-dialog"}}})
+    assert close_dialog["result"]["structuredContent"]["verification"] == "unverified"
+    download = call(runtime, 11, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.download", "idempotency_key": "chrome-download", "params": {**identity, "selector": "#download", "file_name": "fixture.txt"}}})
     download_data = download["result"]["structuredContent"]
     assert download_data["verification"] == "verified"
     downloaded = pathlib.Path(download_data["data"]["path"])

@@ -1499,6 +1499,12 @@ fn browser_cdp_dom_action(
             json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
         )
     };
+    let postcondition_requested = request.intent == "browser.cdp.click"
+        && request
+            .params
+            .get("verify_expression")
+            .and_then(Value::as_str)
+            .is_some();
     let deadline = Instant::now() + Duration::from_millis(timeout);
     loop {
         let data = match evaluate() {
@@ -1546,10 +1552,12 @@ fn browser_cdp_dom_action(
                 },
                 if verified {
                     VerificationState::Verified
+                } else if postcondition_requested {
+                    VerificationState::Failed
                 } else {
                     VerificationState::Unverified
                 },
-                json!({ "result": data, "postcondition": if verified { "verified" } else { "unverified" } }),
+                json!({ "result": data, "postcondition": if verified { "verified" } else if postcondition_requested { "failed" } else { "unverified" } }),
             );
         }
         if request.intent != "browser.cdp.wait_for" || Instant::now() >= deadline {
