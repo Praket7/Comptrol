@@ -1,6 +1,6 @@
 use comptrol::{
     OperationRequest, PROTOCOL_VERSION, Runtime, SERVER_VERSION, TraceMode, capabilities,
-    default_state_dir, read_trace,
+    default_state_dir, integration, read_trace,
 };
 use serde_json::{Value, json};
 use std::env;
@@ -23,6 +23,7 @@ fn main() {
         ),
         Some("record") => run_record(env::args().skip(2).collect()),
         Some("replay") => run_replay(env::args().skip(2).collect()),
+        Some("integrate") => run_integrate(env::args().skip(2).collect()),
         Some("version") => {
             println!("{SERVER_VERSION}");
             0
@@ -30,13 +31,72 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor status capabilities stop resume serve-http record replay version"
+                "commands are mcp doctor status capabilities stop resume serve-http record replay integrate version"
             );
             2
         }
     };
     if result != 0 {
         std::process::exit(result);
+    }
+}
+
+fn run_integrate(args: Vec<String>) -> i32 {
+    if args.is_empty() || args.iter().any(|arg| arg == "--list") {
+        return print_json(integration::list());
+    }
+    let mut client = None;
+    let mut config = None;
+    let mut apply = false;
+    let mut undo = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--client" => {
+                index += 1;
+                client = args.get(index).cloned();
+            }
+            "--config" => {
+                index += 1;
+                config = args.get(index).map(std::path::PathBuf::from);
+            }
+            "--apply" => apply = true,
+            "--undo" => undo = true,
+            _ => {
+                eprintln!("integrate accepts --list, --client, --config, --apply, and --undo");
+                return 2;
+            }
+        }
+        index += 1;
+    }
+    let Some(config) = config else {
+        eprintln!("integrate requires an explicit --config path for proposal or apply");
+        return 2;
+    };
+    if undo {
+        return match integration::undo(&config) {
+            Ok(value) => print_json(value),
+            Err(error) => {
+                eprintln!("integration undo refused: {error}");
+                1
+            }
+        };
+    }
+    let Some(client) = client else {
+        eprintln!("integrate requires --client");
+        return 2;
+    };
+    let result = if apply {
+        integration::apply(&client, &config)
+    } else {
+        integration::proposal(&client, &config)
+    };
+    match result {
+        Ok(value) => print_json(value),
+        Err(error) => {
+            eprintln!("integration refused: {error}");
+            1
+        }
     }
 }
 
