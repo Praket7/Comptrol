@@ -54,7 +54,7 @@ The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.011 ms
 
 ## Distribution status
 
-Source build is verified. The npm launcher package is prepared but not published. Homebrew formula generation is prepared but no formula is published. No signed release exists. A private GitHub repository exists at `Praket7/Comptrol` with the verified main branch and seven tracked implementation issues covering the remaining platform, browser, remote, and release work.
+Source build is verified. The npm launcher package is prepared but not published. Homebrew formula generation is prepared but no formula is published. No signed release exists. A private GitHub repository exists at `Praket7/Comptrol` with the verified main branch, six open implementation issues, and one completed browser issue.
 
 ## Remaining issues ordered by impact
 
