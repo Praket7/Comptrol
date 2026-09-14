@@ -1,5 +1,6 @@
 use comptrol::{
-    OperationRequest, PROTOCOL_VERSION, Runtime, SERVER_VERSION, capabilities, default_state_dir,
+    OperationRequest, PROTOCOL_VERSION, Runtime, SERVER_VERSION, TraceMode, capabilities,
+    default_state_dir, read_trace,
 };
 use serde_json::{Value, json};
 use std::env;
@@ -20,13 +21,17 @@ fn main() {
                 .and_then(|port| port.parse().ok())
                 .unwrap_or(7317),
         ),
+        Some("record") => run_record(env::args().skip(2).collect()),
+        Some("replay") => run_replay(env::args().skip(2).collect()),
         Some("version") => {
             println!("{SERVER_VERSION}");
             0
         }
         Some(other) => {
             eprintln!("unknown command {other}");
-            eprintln!("commands are mcp doctor status capabilities stop resume serve-http version");
+            eprintln!(
+                "commands are mcp doctor status capabilities stop resume serve-http record replay version"
+            );
             2
         }
     };
@@ -97,9 +102,10 @@ fn handle_message(runtime: &mut Runtime, line: &str) -> Option<Value> {
 fn tools() -> Value {
     json!([
         { "name": "operate", "description": "Execute one bounded local intent with policy, idempotency, and verification state", "inputSchema": { "type": "object", "required": ["intent"], "properties": { "intent": {"type":"string"}, "target": {"type":"object"}, "params": {"type":"object"}, "postcondition": {"type":"object"}, "risk": {"type":"string"}, "idempotency_key": {"type":"string"}, "dry_run": {"type":"boolean"} } } },
-        { "name": "inspect", "description": "Inspect doctor, status, capabilities, platform state, or current desktop observation", "inputSchema": { "type": "object", "properties": { "kind": {"type":"string", "enum":["doctor","status","capabilities","platform","desktop"]} } } },
+        { "name": "inspect", "description": "Inspect doctor, status, capabilities, platform state, events, checkpoints, adapters, or current desktop observation", "inputSchema": { "type": "object", "properties": { "kind": {"type":"string", "enum":["doctor","status","capabilities","platform","desktop","events","checkpoints","adapters"]} } } },
         { "name": "watch", "description": "Return the known state of an operation without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
         { "name": "reconcile", "description": "Reconcile a durable unknown operation from observed local state without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
+        { "name": "restore_checkpoint", "description": "Restore a local sandbox checkpoint under explicit local write policy", "inputSchema": { "type": "object", "required":["checkpoint"], "properties": { "checkpoint": {"type":"string"}, "idempotency_key": {"type":"string"} } } },
         { "name": "capabilities", "description": "Return capabilities that are actually available in this runtime", "inputSchema": { "type": "object" } }
     ])
 }
@@ -118,6 +124,7 @@ fn call_tool(runtime: &mut Runtime, params: Value) -> Value {
         "inspect" => json!(runtime.inspect(arguments.get("kind").and_then(Value::as_str).unwrap_or("status"))),
         "watch" => json!(runtime.watch(arguments.get("operation_id").and_then(Value::as_str).unwrap_or_default())),
         "reconcile" => json!(runtime.reconcile(arguments.get("operation_id").and_then(Value::as_str).unwrap_or_default())),
+        "restore_checkpoint" => serde_json::from_value::<OperationRequest>(json!({ "intent": "filesystem.restore_checkpoint", "params": arguments.clone(), "idempotency_key": arguments.get("idempotency_key"), "risk": "R1" })).map(|request| json!(runtime.operate(request))).unwrap_or_else(|error| json!({ "error": { "code": "invalid_input", "message": error.to_string() } })),
         "capabilities" => json!(capabilities()),
         _ => json!({ "error": { "code": "tool_not_found", "message": format!("Unknown tool {name}") } }),
     };
@@ -204,24 +211,56 @@ fn handle_http(stream: &mut TcpStream, runtime: &mut Runtime) -> io::Result<()> 
         )
     });
     let method_ok = header.starts_with("POST /mcp ");
-    let response = if !origin_ok {
-        (403, json!({"error":"origin_denied"}))
+    let (status, content_type, payload) = if !origin_ok {
+        (
+            403,
+            "application/json",
+            serde_json::to_vec(&json!({"error":"origin_denied"})).unwrap_or_default(),
+        )
+    } else if header.starts_with("GET /dashboard ") {
+        (
+            200,
+            "text/html; charset=utf-8",
+            dashboard(runtime).into_bytes(),
+        )
     } else if !method_ok {
-        (405, json!({"error":"method_not_allowed"}))
+        (
+            405,
+            "application/json",
+            serde_json::to_vec(&json!({"error":"method_not_allowed"})).unwrap_or_default(),
+        )
     } else {
-        match handle_message(runtime, body) {
-            Some(value) => (200, value),
-            None => (202, json!({})),
-        }
+        let value = handle_message(runtime, body).unwrap_or_else(|| json!({}));
+        (
+            200,
+            "application/json",
+            serde_json::to_vec(&value).unwrap_or_default(),
+        )
     };
-    let payload = serde_json::to_vec(&response.1).unwrap_or_else(|_| b"{}".to_vec());
     write!(
         stream,
-        "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.0,
+        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        content_type,
         payload.len()
     )?;
     stream.write_all(&payload)
+}
+
+fn dashboard(runtime: &mut Runtime) -> String {
+    let doctor = serde_json::to_string_pretty(&runtime.inspect("doctor"))
+        .unwrap_or_else(|_| "{}".to_owned());
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Comptrol</title><style>body{{font:15px system-ui;margin:40px;max-width:900px}}pre{{background:#f4f4f4;padding:16px;overflow:auto}}</style></head><body><h1>Comptrol</h1><p>Local status and capability diagnostics</p><pre>{}</pre></body></html>",
+        html_escape(&doctor)
+    )
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn print_json(value: Value) -> i32 {
@@ -229,5 +268,111 @@ fn print_json(value: Value) -> i32 {
         "{}",
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned())
     );
+    0
+}
+
+fn run_record(args: Vec<String>) -> i32 {
+    let Some(input_path) = args.first() else {
+        eprintln!("record needs an input JSONL path and optional trace path and mode");
+        return 2;
+    };
+    let trace_path = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "comptrol.trace.jsonl".to_owned());
+    let mode = args.get(2).map(String::as_str).unwrap_or("privacy_minimal");
+    let mode = match mode {
+        "privacy_minimal" => TraceMode::PrivacyMinimal,
+        "developer" => TraceMode::Developer,
+        "fixture_full" => TraceMode::FixtureFull,
+        _ => {
+            eprintln!("unknown trace mode");
+            return 2;
+        }
+    };
+    let contents = match if input_path == "-" {
+        let mut stdin = io::stdin();
+        let mut contents = String::new();
+        stdin.read_to_string(&mut contents).map(|_| contents)
+    } else {
+        std::fs::read_to_string(input_path)
+    } {
+        Ok(contents) => contents,
+        Err(error) => {
+            eprintln!("record input failed: {error}");
+            return 1;
+        }
+    };
+    let mut runtime = match Runtime::with_trace(
+        default_state_dir(),
+        std::path::PathBuf::from(trace_path),
+        mode,
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("startup failed: {error}");
+            return 1;
+        }
+    };
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str::<OperationRequest>(line) {
+            Ok(request) => println!(
+                "{}",
+                serde_json::to_string(&runtime.operate(request))
+                    .unwrap_or_else(|_| "{}".to_owned())
+            ),
+            Err(error) => {
+                eprintln!("record input is invalid: {error}");
+                return 2;
+            }
+        }
+    }
+    0
+}
+
+fn run_replay(args: Vec<String>) -> i32 {
+    let Some(path) = args.first() else {
+        eprintln!("replay needs a trace JSONL path");
+        return 2;
+    };
+    if env::var("COMPTROL_REPLAY_FIXTURE").as_deref() != Ok("1") {
+        eprintln!("replay requires COMPTROL_REPLAY_FIXTURE=1");
+        return 2;
+    }
+    let entries = match read_trace(std::path::Path::new(path)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("trace read failed: {error}");
+            return 1;
+        }
+    };
+    let mut runtime = match Runtime::new(default_state_dir()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("startup failed: {error}");
+            return 1;
+        }
+    };
+    for entry in entries {
+        if !matches!(
+            entry.request.intent.as_str(),
+            "system.ping" | "desktop.observe" | "filesystem.write"
+        ) {
+            eprintln!("replay refuses non fixture intent {}", entry.request.intent);
+            return 2;
+        }
+        let actual = runtime.operate(entry.request);
+        let matched = actual.intent == entry.result.intent
+            && actual.route == entry.result.route
+            && actual.delivery == entry.result.delivery
+            && actual.effect == entry.result.effect
+            && actual.verification == entry.result.verification
+            && actual.error.as_ref().map(|error| &error.code)
+                == entry.result.error.as_ref().map(|error| &error.code);
+        println!("{}", serde_json::to_string(&json!({"matched": matched, "expected": entry.result, "actual": actual, "divergence": if matched { Value::Null } else { json!("result_fields_differ") }})).unwrap_or_else(|_| "{}".to_owned()));
+        if !matched {
+            return 1;
+        }
+    }
     0
 }

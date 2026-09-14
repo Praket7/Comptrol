@@ -1,0 +1,311 @@
+use crate::{BrowserTarget, ComptrolError, bind_browser_target};
+use serde_json::{Value, json};
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+use tungstenite::{Message, connect};
+
+pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
+    let value = get_json(endpoint, "/json/list").map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Start a supported browser with remote debugging enabled".to_owned()),
+    })?;
+    parse_targets(&value).ok_or_else(|| ComptrolError {
+        code: "browser_protocol_invalid".to_owned(),
+        message: "The browser returned an invalid target list".to_owned(),
+        recovery: Some("Inspect the configured DevTools endpoint".to_owned()),
+    })
+}
+
+pub fn parse_targets(value: &Value) -> Option<Vec<BrowserTarget>> {
+    value.as_array()?.iter().map(parse_target).collect()
+}
+
+pub fn fixture_submit(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+    idempotency_key: &str,
+    message: &str,
+) -> Result<Value, ComptrolError> {
+    let targets = discover(endpoint)?;
+    bind_browser_target(
+        &targets,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+    )?;
+    if [target_id, browser_context_id, revision, idempotency_key]
+        .iter()
+        .any(|value| {
+            value
+                .chars()
+                .any(|character| matches!(character, '\r' | '\n'))
+        })
+    {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Browser identity headers cannot contain line breaks".to_owned(),
+            recovery: None,
+        });
+    }
+    let (status, value) = request_json(
+        endpoint,
+        "POST",
+        "/submit",
+        &[
+            ("X-Comptrol-Target-Id", target_id),
+            ("X-Comptrol-Browser-Context", browser_context_id),
+            ("X-Comptrol-Idempotency-Key", idempotency_key),
+        ],
+        Some(&json!({ "message": message }).to_string()),
+    )
+    .map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Inspect the browser target and retry once it is healthy".to_owned()),
+    })?;
+    if status != 200 {
+        return Err(ComptrolError {
+            code: value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("browser_request_failed")
+                .to_owned(),
+            message: "The browser fixture refused the request".to_owned(),
+            recovery: Some("Refresh the target identity before retrying".to_owned()),
+        });
+    }
+    Ok(value)
+}
+
+pub fn cdp_call(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: Option<&str>,
+    revision: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<Value, ComptrolError> {
+    let targets = discover(endpoint)?;
+    let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
+    let Some(web_socket_url) = target.web_socket_url else {
+        return Err(ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The target did not provide a websocket debugger URL".to_owned(),
+            recovery: Some("Inspect browser targets again".to_owned()),
+        });
+    };
+    if !web_socket_url.starts_with("ws://") {
+        return Err(ComptrolError {
+            code: "browser_transport_unsupported".to_owned(),
+            message: "Only local unencrypted DevTools websocket endpoints are enabled".to_owned(),
+            recovery: Some(
+                "Use a local browser endpoint or configure a trusted transport".to_owned(),
+            ),
+        });
+    }
+    let (mut socket, _) = connect(web_socket_url).map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Start the browser target and retry".to_owned()),
+    })?;
+    socket
+        .send(Message::Text(
+            json!({ "id": 1, "method": method, "params": params })
+                .to_string()
+                .into(),
+        ))
+        .map_err(|error| ComptrolError {
+            code: "browser_dispatch_failed".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Reconnect to the exact browser target".to_owned()),
+        })?;
+    loop {
+        let message = socket.read().map_err(|error| ComptrolError {
+            code: "browser_response_failed".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Inspect the browser target before retrying".to_owned()),
+        })?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Inspect the browser protocol version".to_owned()),
+        })?;
+        if value.get("id").and_then(Value::as_u64) != Some(1) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(ComptrolError {
+                code: "browser_command_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Refresh the target and retry once".to_owned()),
+            });
+        }
+        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+    }
+}
+
+fn parse_target(value: &Value) -> Option<BrowserTarget> {
+    Some(BrowserTarget {
+        id: value.get("id")?.as_str()?.to_owned(),
+        browser_context_id: value
+            .get("browserContextId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        url: value.get("url").and_then(Value::as_str).map(str::to_owned),
+        title: value
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        revision: value
+            .get("revision")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        web_socket_url: value
+            .get("webSocketDebuggerUrl")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn get_json(endpoint: &str, path: &str) -> io::Result<Value> {
+    let (status, value) = request_json(endpoint, "GET", path, &[], None)?;
+    if status != 200 {
+        return Err(io::Error::other(
+            "browser endpoint returned a non success status",
+        ));
+    }
+    Ok(value)
+}
+
+fn request_json(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> io::Result<(u16, Value)> {
+    let authority = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .and_then(|value| value.split('/').next())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid browser endpoint"))?;
+    let (host, port) = authority.rsplit_once(':').ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "browser endpoint needs a port")
+    })?;
+    let host_name = host.trim_matches(|character| character == '[' || character == ']');
+    if !matches!(host_name, "localhost" | "127.0.0.1" | "::1") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "browser endpoint must be loopback",
+        ));
+    }
+    let mut stream = TcpStream::connect((
+        host_name,
+        port.parse::<u16>().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid browser endpoint port")
+        })?,
+    ))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let body = body.unwrap_or_default();
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nAccept: application/json\r\n"
+    )?;
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    if !body.is_empty() {
+        write!(
+            stream,
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )?;
+    }
+    write!(stream, "\r\n{body}")?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let response = String::from_utf8_lossy(&response);
+    let (header, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "browser response has no body")
+    })?;
+    let status = header
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid browser status"))?;
+    let body = if header.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+        })
+    }) {
+        decode_chunked(body)?
+    } else if let Some(length) = header.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (name.eq_ignore_ascii_case("content-length"))
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) {
+        body[..length.min(body.len())].to_owned()
+    } else {
+        body.to_owned()
+    };
+    let value = serde_json::from_str(&body).map_err(|error| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("{error} body={body:?}"))
+    })?;
+    Ok((status, value))
+}
+
+fn decode_chunked(mut body: &str) -> io::Result<String> {
+    let mut decoded = String::new();
+    loop {
+        let (size, rest) = body
+            .split_once("\r\n")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk header"))?;
+        let size = usize::from_str_radix(size.trim(), 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
+        if size == 0 {
+            return Ok(decoded);
+        }
+        if rest.len() < size + 2 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short chunk"));
+        }
+        decoded.push_str(&rest[..size]);
+        body = &rest[size + 2..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_endpoint_is_loopback_only() {
+        let error = discover("http://example.com:9222").expect_err("remote endpoint");
+        assert_eq!(error.code, "browser_unavailable");
+    }
+
+    #[test]
+    fn target_parser_keeps_exact_identity_fields() {
+        let targets = parse_targets(&json!([{
+            "id": "tab",
+            "browserContextId": "context",
+            "url": "http://127.0.0.1/",
+            "title": "fixture",
+            "revision": "rev",
+            "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/tab"
+        }]))
+        .expect("target list");
+        assert_eq!(targets[0].id, "tab");
+        assert_eq!(targets[0].browser_context_id.as_deref(), Some("context"));
+        assert_eq!(targets[0].revision.as_deref(), Some("rev"));
+    }
+}

@@ -1,5 +1,12 @@
 #![deny(unsafe_code)]
 
+pub mod adapters;
+pub mod browser;
+pub mod checkpoints;
+pub mod events;
+pub mod geometry;
+pub mod trace;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
@@ -9,6 +16,12 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub use adapters::{AdapterDescriptor, AdapterRegistry};
+pub use checkpoints::{Checkpoint, CheckpointStore};
+pub use events::{Event, EventBus};
+pub use geometry::{DisplayGeometry, Point, VirtualDesktop};
+pub use trace::{TraceEntry, TraceMode, TraceRecorder, read_trace};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
 pub const SERVER_VERSION: &str = "0.1.0";
@@ -53,7 +66,7 @@ pub struct OperationRequest {
     pub dry_run: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryState {
     NotDispatched,
@@ -62,7 +75,7 @@ pub enum DeliveryState {
     Unknown,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectState {
     NotAttempted,
@@ -71,7 +84,7 @@ pub enum EffectState {
     Unknown,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationState {
     NotAttempted,
@@ -147,6 +160,7 @@ pub struct BrowserTarget {
     pub url: Option<String>,
     pub title: Option<String>,
     pub revision: Option<String>,
+    pub web_socket_url: Option<String>,
 }
 
 pub fn bind_browser_target(
@@ -259,6 +273,9 @@ impl Policy {
             policy.allow_sandbox_writes = true;
             policy.max_risk = Risk::R1;
             policy.allowed_intents.insert("filesystem.write".to_owned());
+            policy
+                .allowed_intents
+                .insert("filesystem.restore_checkpoint".to_owned());
         }
         if std::env::var("COMPTROL_ALLOW_DESKTOP_NOTIFY").as_deref() == Ok("1") {
             policy.allow_desktop_notify = true;
@@ -271,6 +288,19 @@ impl Policy {
             policy
                 .allowed_intents
                 .insert("macos.ax.set_value".to_owned());
+        }
+        if std::env::var("COMPTROL_ALLOW_BROWSER_FIXTURE").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R1);
+            policy
+                .allowed_intents
+                .insert("browser.fixture.submit".to_owned());
+        }
+        if std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            policy.allowed_intents.extend([
+                "browser.cdp.evaluate".to_owned(),
+                "browser.cdp.navigate".to_owned(),
+            ]);
         }
         policy
     }
@@ -500,6 +530,10 @@ pub struct Runtime {
     pub leases: LeaseManager,
     pub journal: AuditJournal,
     pub operations: OperationJournal,
+    pub checkpoints: CheckpointStore,
+    pub adapters: AdapterRegistry,
+    pub events: EventBus,
+    pub trace: Option<TraceRecorder>,
     pub stop: StopLatch,
     idempotent: HashMap<String, ActionResult>,
     sequence: u64,
@@ -507,7 +541,29 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(state_dir: PathBuf) -> io::Result<Self> {
+        let trace = std::env::var_os("COMPTROL_TRACE_PATH")
+            .map(PathBuf::from)
+            .map(|path| {
+                TraceRecorder::open(
+                    path,
+                    match std::env::var("COMPTROL_TRACE_MODE").as_deref() {
+                        Ok("developer") => TraceMode::Developer,
+                        Ok("fixture_full") => TraceMode::FixtureFull,
+                        _ => TraceMode::PrivacyMinimal,
+                    },
+                )
+            })
+            .transpose()?;
+        Self::build(state_dir, trace)
+    }
+
+    pub fn with_trace(state_dir: PathBuf, path: PathBuf, mode: TraceMode) -> io::Result<Self> {
+        Self::build(state_dir, Some(TraceRecorder::open(path, mode)?))
+    }
+
+    fn build(state_dir: PathBuf, trace: Option<TraceRecorder>) -> io::Result<Self> {
         let operations = OperationJournal::open(&state_dir)?;
+        let checkpoints = CheckpointStore::new(&state_dir)?;
         let mut idempotent = HashMap::new();
         for record in operations.completed() {
             if let (Some(key), Some(result)) = (&record.idempotency_key, &record.result) {
@@ -519,6 +575,10 @@ impl Runtime {
             leases: LeaseManager::new(),
             journal: AuditJournal::open(&state_dir)?,
             operations,
+            checkpoints,
+            adapters: AdapterRegistry::builtin(),
+            events: EventBus::default(),
+            trace,
             stop: StopLatch::new(&state_dir),
             idempotent,
             sequence: 0,
@@ -620,10 +680,17 @@ impl Runtime {
                 json!({ "ready": true, "protocol": PROTOCOL_VERSION }),
             ),
             "desktop.observe" => desktop_observe(&request, operation_id),
-            "filesystem.write" => sandbox_write(&request, operation_id),
+            "filesystem.write" => sandbox_write(&request, operation_id, &self.checkpoints),
+            "filesystem.restore_checkpoint" => {
+                restore_checkpoint(&request, operation_id, &self.checkpoints)
+            }
             "desktop.notify" => desktop_notify(&request, operation_id),
             "macos.ax.press" => macos_ax_press(&request, operation_id),
             "macos.ax.set_value" => macos_ax_set_value(&request, operation_id),
+            "browser.fixture.submit" => browser_fixture_submit(&request, operation_id),
+            "browser.cdp.evaluate" | "browser.cdp.navigate" => {
+                browser_cdp_action(&request, operation_id)
+            }
             _ => ActionResult::refused(
                 &request,
                 operation_id,
@@ -643,6 +710,15 @@ impl Runtime {
             "doctor" => doctor(self),
             "capabilities" => json!(capabilities()),
             "platform" => platform_diagnostics(),
+            "browser" => match std::env::var("COMPTROL_CDP_ENDPOINT") {
+                Ok(endpoint) => match browser::discover(&endpoint) {
+                    Ok(targets) => json!({ "endpoint": endpoint, "targets": targets }),
+                    Err(error) => json!({ "endpoint": endpoint, "error": error }),
+                },
+                Err(_) => {
+                    json!({ "available": false, "reason": "COMPTROL_CDP_ENDPOINT is not configured" })
+                }
+            },
             "desktop" | "system" => {
                 desktop_observe(
                     &OperationRequest {
@@ -661,6 +737,9 @@ impl Runtime {
             "status" => {
                 json!({ "protocol": PROTOCOL_VERSION, "server": SERVER_VERSION, "stop_latched": self.stop.engaged(), "audit_path": self.journal.path() })
             }
+            "events" => json!(self.events.since(0, None)),
+            "checkpoints" => json!({ "path": self.checkpoints.path() }),
+            "adapters" => json!(self.adapters.list()),
             _ => {
                 json!({ "error": { "code": "unsupported_capability", "message": "Unknown inspection kind" } })
             }
@@ -744,14 +823,25 @@ impl Runtime {
         if let Err(error) = self.journal.append(&result) {
             eprintln!("comptrol audit journal error: {error}");
         }
+        self.events.emit(
+            "operation.completed",
+            json!({ "operation_id": result.operation_id, "intent": result.intent, "verification": result.verification }),
+        );
+        if let Some(trace) = &self.trace
+            && let Err(error) = trace.append(request, &result)
+        {
+            eprintln!("comptrol trace error: {error}");
+        }
     }
 }
 
 fn classify(intent: &str) -> Risk {
     match intent {
         "system.ping" | "desktop.observe" => Risk::R0,
-        "desktop.notify" | "filesystem.write" => Risk::R1,
+        "desktop.notify" | "filesystem.write" | "filesystem.restore_checkpoint" => Risk::R1,
         "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
+        "browser.fixture.submit" => Risk::R1,
+        "browser.cdp.evaluate" | "browser.cdp.navigate" => Risk::R2,
         _ => Risk::R2,
     }
 }
@@ -806,11 +896,221 @@ fn route_for(intent: &str) -> String {
         "system.ping" => "native",
         "desktop.observe" => "platform_observe",
         "filesystem.write" => "sandbox_filesystem",
+        "filesystem.restore_checkpoint" => "sandbox_checkpoint",
         "desktop.notify" => "platform_notification",
         "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
+        "browser.fixture.submit" => "browser_fixture",
+        "browser.cdp.evaluate" | "browser.cdp.navigate" => "browser_protocol",
         _ => "none",
     }
     .to_owned()
+}
+
+fn restore_checkpoint(
+    request: &OperationRequest,
+    operation_id: String,
+    checkpoints: &CheckpointStore,
+) -> ActionResult {
+    let Some(id) = request.params.get("checkpoint").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Checkpoint restore needs a checkpoint id".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    match checkpoints.restore_id(id) {
+        Ok(checkpoint) => success(
+            request,
+            operation_id,
+            "sandbox_checkpoint",
+            EffectState::Changed,
+            VerificationState::Verified,
+            json!({ "checkpoint": checkpoint.id, "path": checkpoint.source }),
+        ),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "checkpoint_restore_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect available local checkpoints".to_owned()),
+            },
+        ),
+    }
+}
+
+fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "browser_unavailable".to_owned(),
+                message: "COMPTROL_CDP_ENDPOINT is not configured".to_owned(),
+                recovery: Some("Configure a local browser fixture endpoint".to_owned()),
+            },
+        );
+    };
+    let Some(key) = request
+        .idempotency_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "idempotency_required".to_owned(),
+                message: "Browser submission requires an idempotency key".to_owned(),
+                recovery: Some("Retry with a stable idempotency key".to_owned()),
+            },
+        );
+    };
+    let target_id = request.params.get("target_id").and_then(Value::as_str);
+    let browser_context_id = request
+        .params
+        .get("browser_context_id")
+        .and_then(Value::as_str);
+    let revision = request.params.get("revision").and_then(Value::as_str);
+    let message = request
+        .params
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (Some(target_id), Some(browser_context_id), Some(revision)) =
+        (target_id, browser_context_id, revision)
+    else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser submission needs target id, browser context, and revision"
+                    .to_owned(),
+                recovery: Some("Inspect browser targets before mutation".to_owned()),
+            },
+        );
+    };
+    match browser::fixture_submit(
+        &endpoint.to_string_lossy(),
+        target_id,
+        browser_context_id,
+        revision,
+        key,
+        message,
+    ) {
+        Ok(data) => success(
+            request,
+            operation_id,
+            "browser_fixture",
+            if data.get("state").and_then(Value::as_str) == Some("replayed") {
+                EffectState::None
+            } else {
+                EffectState::Changed
+            },
+            VerificationState::Verified,
+            data,
+        ),
+        Err(error) => ActionResult::refused(request, operation_id, error),
+    }
+}
+
+fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "browser_unavailable".to_owned(),
+                message: "COMPTROL_CDP_ENDPOINT is not configured".to_owned(),
+                recovery: Some("Configure a local browser DevTools endpoint".to_owned()),
+            },
+        );
+    };
+    let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser CDP actions need a target id".to_owned(),
+                recovery: Some("Inspect browser targets before mutation".to_owned()),
+            },
+        );
+    };
+    let browser_context_id = request
+        .params
+        .get("browser_context_id")
+        .and_then(Value::as_str);
+    let revision = request.params.get("revision").and_then(Value::as_str);
+    let (method, params) = match request.intent.as_str() {
+        "browser.cdp.evaluate" => {
+            let Some(expression) = request.params.get("expression").and_then(Value::as_str) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser evaluation needs an expression".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            (
+                "Runtime.evaluate",
+                json!({
+                    "expression": expression,
+                    "returnByValue": true,
+                    "awaitPromise": request.params.get("await_promise").and_then(Value::as_bool).unwrap_or(true)
+                }),
+            )
+        }
+        "browser.cdp.navigate" => {
+            let Some(url) = request.params.get("url").and_then(Value::as_str) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser navigation needs a URL".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            ("Page.navigate", json!({ "url": url }))
+        }
+        _ => unreachable!(),
+    };
+    match browser::cdp_call(
+        &endpoint.to_string_lossy(),
+        target_id,
+        browser_context_id,
+        revision,
+        method,
+        params,
+    ) {
+        Ok(data) => success(
+            request,
+            operation_id,
+            "browser_protocol",
+            EffectState::Changed,
+            if request.intent == "browser.cdp.evaluate" {
+                if data.get("exceptionDetails").is_some() {
+                    VerificationState::Failed
+                } else {
+                    VerificationState::Verified
+                }
+            } else {
+                VerificationState::Unverified
+            },
+            data,
+        ),
+        Err(error) => ActionResult::refused(request, operation_id, error),
+    }
 }
 
 fn success(
@@ -882,7 +1182,11 @@ fn desktop_observe(request: &OperationRequest, operation_id: String) -> ActionRe
     )
 }
 
-fn sandbox_write(request: &OperationRequest, operation_id: String) -> ActionResult {
+fn sandbox_write(
+    request: &OperationRequest,
+    operation_id: String,
+    checkpoints: &CheckpointStore,
+) -> ActionResult {
     let relative = request
         .params
         .get("path")
@@ -906,7 +1210,9 @@ fn sandbox_write(request: &OperationRequest, operation_id: String) -> ActionResu
     }
     let root = state_dir().join("sandbox");
     let path = root.join(relative);
-    if let Err(error) = fs::create_dir_all(&root).and_then(|_| fs::write(&path, content.as_bytes()))
+    if let Err(error) = fs::create_dir_all(&root)
+        .and_then(|_| checkpoints.create(&operation_id, &path))
+        .and_then(|_| fs::write(&path, content.as_bytes()))
     {
         return ActionResult::refused(
             request,
@@ -920,11 +1226,11 @@ fn sandbox_write(request: &OperationRequest, operation_id: String) -> ActionResu
     }
     success(
         request,
-        operation_id,
+        operation_id.clone(),
         "sandbox_filesystem",
         EffectState::Changed,
         VerificationState::Verified,
-        json!({ "path": path, "bytes": content.len() }),
+        json!({ "path": path, "bytes": content.len(), "checkpoint": operation_id }),
     )
 }
 
@@ -1188,10 +1494,26 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp".to_owned(),
-            available: false,
-            risk: Risk::R1,
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R2,
             route: "browser_protocol".to_owned(),
-            note: "Reserved for the browser adapter milestone".to_owned(),
+            note: "Local CDP evaluation and navigation require explicit policy".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.discovery".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            risk: Risk::R0,
+            route: "browser_protocol".to_owned(),
+            note: "Discovers exact local browser targets without mutation".to_owned(),
+        },
+        Capability {
+            name: "browser.fixture.submit".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_FIXTURE").as_deref() == Ok("1"),
+            risk: Risk::R1,
+            route: "browser_fixture".to_owned(),
+            note: "Fixture only mutation with exact target identity and idempotency".to_owned(),
         },
         Capability {
             name: "desktop.semantic_input".to_owned(),
@@ -1270,7 +1592,34 @@ fn macos_accessibility_reachable() -> bool {
 }
 
 fn doctor(runtime: &Runtime) -> Value {
-    json!({ "server": SERVER_VERSION, "protocol": PROTOCOL_VERSION, "platform": std::env::consts::OS, "architecture": std::env::consts::ARCH, "daemon": { "state": "in_process", "available": true }, "policy": { "max_risk": runtime.policy.max_risk, "sandbox_writes": runtime.policy.allow_sandbox_writes, "desktop_notify": runtime.policy.allow_desktop_notify, "macos_ax": runtime.policy.allowed_intents.contains("macos.ax.press") }, "journal": { "available": true, "path": runtime.journal.path() }, "operations": { "available": true, "path": runtime.operations.path() }, "stop_latch": { "engaged": runtime.stop.engaged() }, "desktop_observation": { "available": true, "semantic_mutation": platform_capabilities().iter().any(|capability| capability.name == "platform.macos.ax" && capability.available) }, "platform": platform_diagnostics(), "browser": { "available": false, "status": "fixture_contract_only" }, "remote": { "available": false, "binding": "loopback_only" }, "state_dir": state_dir() })
+    json!({
+        "server": SERVER_VERSION,
+        "protocol": PROTOCOL_VERSION,
+        "platform": std::env::consts::OS,
+        "architecture": std::env::consts::ARCH,
+        "daemon": { "state": "in_process", "available": true },
+        "policy": {
+            "max_risk": runtime.policy.max_risk,
+            "sandbox_writes": runtime.policy.allow_sandbox_writes,
+            "desktop_notify": runtime.policy.allow_desktop_notify,
+            "macos_ax": runtime.policy.allowed_intents.contains("macos.ax.press"),
+            "browser_fixture": runtime.policy.allowed_intents.contains("browser.fixture.submit")
+        },
+        "journal": { "available": true, "path": runtime.journal.path() },
+        "operations": { "available": true, "path": runtime.operations.path() },
+        "checkpoints": { "available": true, "path": runtime.checkpoints.path() },
+        "trace": { "enabled": runtime.trace.is_some(), "path": runtime.trace.as_ref().map(|trace| trace.path()) },
+        "stop_latch": { "engaged": runtime.stop.engaged() },
+        "desktop_observation": { "available": true, "semantic_mutation": platform_capabilities().iter().any(|capability| capability.name == "platform.macos.ax" && capability.available) },
+        "platform": platform_diagnostics(),
+        "browser": {
+            "configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            "fixture_mutation": runtime.policy.allowed_intents.contains("browser.fixture.submit"),
+            "status": if std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some() { "configured" } else { "not_configured" }
+        },
+        "remote": { "available": false, "binding": "loopback_only" },
+        "state_dir": state_dir()
+    })
 }
 
 fn state_dir() -> PathBuf {
@@ -1488,6 +1837,7 @@ mod tests {
             url: Some("http://127.0.0.1/".to_owned()),
             title: Some("fixture".to_owned()),
             revision: Some("revision-1".to_owned()),
+            web_socket_url: Some("ws://127.0.0.1/devtools/page/tab-1".to_owned()),
         }];
         assert_eq!(
             bind_browser_target(&targets, "missing", None, None)
@@ -1507,5 +1857,139 @@ mod tests {
                 .id,
             "tab-1"
         );
+    }
+
+    #[test]
+    fn event_bus_deduplicates_and_bounds_history() {
+        let mut events = EventBus::new(2);
+        let first = events.emit("file.changed", json!({"path":"a"}));
+        let duplicate = events.emit("file.changed", json!({"path":"a"}));
+        assert_eq!(first.sequence, duplicate.sequence);
+        events.emit("file.changed", json!({"path":"b"}));
+        events.emit("file.changed", json!({"path":"c"}));
+        assert_eq!(events.since(0, None).len(), 2);
+        assert_eq!(
+            events
+                .wait_for(2, Some("file.changed"), Duration::ZERO)
+                .unwrap()
+                .payload["path"],
+            "c"
+        );
+    }
+
+    #[test]
+    fn checkpoint_restores_existing_file() {
+        let dir = std::env::temp_dir().join(format!("comptrol-checkpoint-{}", now_ms()));
+        let source = dir.join("note.txt");
+        fs::create_dir_all(&dir).expect("checkpoint dir");
+        fs::write(&source, b"before").expect("source");
+        let store = CheckpointStore::new(&dir).expect("store");
+        let checkpoint = store.create("operation", &source).expect("checkpoint");
+        fs::write(&source, b"after").expect("mutate");
+        store.restore_id(&checkpoint.id).expect("restore");
+        assert_eq!(fs::read(&source).expect("read"), b"before");
+    }
+
+    #[test]
+    fn privacy_trace_redacts_typed_values() {
+        let dir = std::env::temp_dir().join(format!("comptrol-trace-{}", now_ms()));
+        let path = dir.join("trace.jsonl");
+        let recorder = TraceRecorder::open(path.clone(), TraceMode::PrivacyMinimal).expect("trace");
+        let request = OperationRequest {
+            intent: "filesystem.write".to_owned(),
+            target: None,
+            params: json!({"path":"note.txt","content":"secret"}),
+            postcondition: Some(json!({"value":"secret"})),
+            risk: Some(Risk::R1),
+            idempotency_key: Some("trace-key".to_owned()),
+            dry_run: true,
+        };
+        let result = ActionResult {
+            operation_id: "trace-op".to_owned(),
+            intent: request.intent.clone(),
+            route: "sandbox_filesystem".to_owned(),
+            target: None,
+            preflight: "passed".to_owned(),
+            delivery: DeliveryState::NotDispatched,
+            effect: EffectState::NotAttempted,
+            verification: VerificationState::NotAttempted,
+            disturbance: json!({"foreground_changed":false}),
+            recovery: RecoveryState::None,
+            data: Value::Null,
+            error: None,
+        };
+        recorder.append(&request, &result).expect("append");
+        let entries = read_trace(&path).expect("read trace");
+        assert_eq!(entries[0].request.params["content"]["redacted"], true);
+        assert!(entries[0].request.postcondition.is_none());
+    }
+
+    #[test]
+    fn virtual_desktop_handles_left_above_and_mixed_scale_displays() {
+        let desktop = VirtualDesktop {
+            revision: 4,
+            displays: vec![
+                DisplayGeometry {
+                    id: "left".to_owned(),
+                    origin_logical: Point { x: -1280.0, y: 0.0 },
+                    size_logical: Point {
+                        x: 1280.0,
+                        y: 720.0,
+                    },
+                    scale: 1.0,
+                },
+                DisplayGeometry {
+                    id: "above".to_owned(),
+                    origin_logical: Point { x: 0.0, y: -900.0 },
+                    size_logical: Point {
+                        x: 1440.0,
+                        y: 900.0,
+                    },
+                    scale: 2.0,
+                },
+            ],
+        };
+        assert_eq!(
+            desktop.physical_to_virtual("left", Point { x: 20.0, y: 30.0 }),
+            Some(Point {
+                x: -1260.0,
+                y: 30.0
+            })
+        );
+        assert_eq!(
+            desktop.physical_to_virtual("above", Point { x: 200.0, y: 100.0 }),
+            Some(Point {
+                x: 100.0,
+                y: -850.0
+            })
+        );
+        assert!(desktop.contains(
+            "above",
+            Point {
+                x: 100.0,
+                y: -850.0
+            }
+        ));
+        assert_eq!(
+            desktop.virtual_to_physical(
+                "above",
+                Point {
+                    x: 100.0,
+                    y: -850.0
+                }
+            ),
+            Some(Point { x: 200.0, y: 100.0 })
+        );
+    }
+
+    #[test]
+    fn adapter_registry_rejects_duplicate_names() {
+        let mut registry = AdapterRegistry::builtin();
+        let descriptor = registry.list()[0].clone();
+        assert!(!registry.register(descriptor.clone()));
+        assert!(registry.register(AdapterDescriptor {
+            name: "fixture".to_owned(),
+            ..descriptor
+        }));
     }
 }

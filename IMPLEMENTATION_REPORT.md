@@ -2,15 +2,15 @@
 
 ## Built
 
-The repository contains a Rust workspace with a native Comptrol runtime and MCP server. The runtime implements a compact MCP surface with operate, inspect, watch, and capabilities.
+The repository contains a Rust workspace with a native Comptrol runtime and MCP server. The runtime implements a compact MCP surface with operate, inspect, watch, reconcile, checkpoint restore, and capabilities.
 
-The core includes explicit risk classes, policy authorization, local stop latch, expiring leases, durable operation identity, restart reconciliation, sanitized append only audit records, a closed workflow representation, and structured action results.
+The core includes explicit risk classes, policy authorization, local stop latch, expiring leases, durable operation identity, restart reconciliation, sanitized append only audit records, bounded event sequencing, file checkpoints, privacy aware traces, revisioned multi display geometry, an isolated adapter registry contract, a closed workflow representation, and structured action results.
 
 The current host observer is real. On macOS it calls the public System Events accessibility surface to read running application names when permission is available. On other platforms it reports best effort process observation.
 
-The loopback HTTP preview validates the origin and binds only to localhost. The standard compatibility path is MCP stdio.
+The loopback HTTP preview validates the origin and binds only to localhost. It also serves a read only diagnostics dashboard. The standard compatibility path is MCP stdio.
 
-The repository also includes an npm launcher package, CI validation, a release workflow, browser fixture with exact target binding and duplicate submission protection, platform capability brokers, client conformance harness, threat model, privacy notes, contribution guidance, and research notes.
+The repository also includes an npm launcher package, CI validation, a release workflow, browser target discovery, a narrow CDP websocket route, a fixture mutation route with exact target binding and duplicate submission protection, platform capability brokers, an adapter registry contract, client conformance harness, Homebrew formula generation, threat model, privacy notes, contribution guidance, and research notes.
 
 ## Verification
 
@@ -18,9 +18,9 @@ Rust format check passed.
 
 Clippy with warnings denied passed.
 
-Seven unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, restart reconciliation, and stale browser binding refusal.
+Fourteen unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, restart reconciliation, stale browser binding refusal, browser identity parsing, loopback enforcement, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, and adapter registry isolation.
 
-The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser fixture conformance, and the repository owned Codex, Claude Code, and Cursor profiles.
+The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, trace record and fixture replay, and the repository owned Codex, Claude Code, and Cursor profiles.
 
 The README forbidden punctuation check passed.
 
@@ -40,7 +40,7 @@ Linux has a portable runtime build path and conservative AT SPI, X11, and Waylan
 
 ## Not built yet
 
-Live Chrome DevTools websocket control, uploads, platform accessibility fixture applications, event driven waits, checkpoints, record and replay, remote pairing, dashboard, application adapters, native packaging, signed releases, npm publication, Homebrew packaging, and real hardware matrix testing remain open work. The browser fixture, exact identity contract, and duplicate submission protection are implemented without falsely claiming live CDP control.
+Real Chrome profile validation, uploads, platform accessibility fixture applications, remote pairing, application adapters, native packaging, signed releases, npm publication, Homebrew publication, and real hardware matrix testing remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, and fixture CDP mutation are implemented and tested without falsely claiming real Chrome coverage.
 
 ## Security decisions
 
@@ -50,15 +50,15 @@ The implementation preserves the difference between delivery, effect, and verifi
 
 ## Benchmark result
 
-No performance headline is claimed. The current live check is functional and does not constitute the latency benchmark required by the larger plan.
+The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.011 ms and p95 0.014 ms in this environment. This is a local transport measurement only. It is not a cross platform, browser, semantic action, or daemon latency claim.
 
 ## Distribution status
 
-Source build is verified. The npm launcher package is prepared but not published. Homebrew is not prepared. No signed release exists. A private GitHub repository exists at `Praket7/Comptrol` with the verified main branch and three open implementation issues.
+Source build is verified. The npm launcher package is prepared but not published. Homebrew formula generation is prepared but no formula is published. No signed release exists. A private GitHub repository exists at `Praket7/Comptrol` with the verified main branch and three open implementation issues.
 
 ## Remaining issues ordered by impact
 
-1. Add live Chrome DevTools websocket control.
+1. Validate the CDP websocket route against real Chrome profiles and add downloads.
 2. Add platform accessibility fixture applications and live postcondition tests.
-3. Add event driven waits, checkpoints, and record and replay.
-4. Add packaging and reproducible release artifacts.
+3. Add remote pairing and application adapters.
+4. Add signed release artifacts and publish only after independent release verification.

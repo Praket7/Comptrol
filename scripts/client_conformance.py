@@ -32,10 +32,9 @@ for client in ("codex", "claude-code", "cursor"):
             ping = call(process, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "system.ping", "idempotency_key": client}}})
             names = {tool["name"] for tool in tools["result"]["tools"]}
             assert initialize["result"]["serverInfo"]["name"] == "comptrol"
-            assert {"operate", "inspect", "watch", "reconcile", "capabilities"} <= names
+            assert {"operate", "inspect", "watch", "reconcile", "restore_checkpoint", "capabilities"} <= names
             assert ping["result"]["structuredContent"]["verification"] == "verified"
             print(f"{client} MCP contract passed")
         finally:
             process.terminate()
             process.wait(timeout=3)
-

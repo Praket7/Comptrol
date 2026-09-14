@@ -16,3 +16,36 @@ jobs:
       - run: python3 scripts/lint_readme.py
       - run: npm pack --workspace packages/mcp --dry-run
 
+  native:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: comptrol-linux
+          - os: macos-latest
+            artifact: comptrol-macos
+          - os: windows-latest
+            artifact: comptrol-windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo test --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/release/comptrol
+            target/release/comptrol.exe
+
+  packaging:
+    runs-on: ubuntu-latest
+    needs: source-check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm pack --workspace packages/mcp --dry-run
+      - run: python3 scripts/generate_homebrew_formula.py --version ${GITHUB_REF_NAME#v} --url https://example.invalid/comptrol.tar.gz --sha256 0000000000000000000000000000000000000000000000000000000000000000 --output /tmp/comptrol.rb

@@ -10,18 +10,20 @@ The first release is a small foundation. It runs on macOS, Windows, and Linux. B
 
 Computer control becomes unsafe when delivery is confused with effect. Comptrol keeps those states separate. A request may be refused. A dispatch may be accepted without a verified effect. A repeated request with the same identity must not repeat a mutation.
 
-The normal MCP surface has four tools.
+The normal MCP surface has six tools.
 
 1. Operate runs one bounded intent
 2. Inspect reads current state
 3. Watch reads an operation state
-4. Capabilities reports only usable routes
+4. Reconcile resolves durable unknown state without repeating a mutation
+5. Restore checkpoint returns a local sandbox to a saved state
+6. Capabilities reports only usable routes
 
 ## Local privacy
 
 Normal startup stays local. There is no required account, cloud service, model API, or telemetry service. The default policy allows observation and a readiness check. Mutating routes require local policy outside the agent tool channel.
 
-Audit records are local JSON lines. Typed content is not recorded by default.
+Audit records are local JSON lines. Typed content is not recorded by default. Optional traces support privacy minimal, developer, and fixture full modes.
 
 ## Install from source
 
@@ -46,7 +48,9 @@ Basic observation and the policy core are implemented and tested.
 
 The macOS observer can use the public System Events accessibility surface when permission is available. Other platforms use best effort process observation.
 
-The browser, semantic input, remote, dashboard, packaging, and signed release paths remain tracked work.
+The runtime includes bounded event history, file checkpoints, fixture trace replay, exact browser target discovery, and a loopback diagnostics dashboard.
+
+Real Chrome profile validation, Windows and Linux semantic actuation, remote pairing, signed releases, and published packages remain tracked work.
 
 ## Contributing
 

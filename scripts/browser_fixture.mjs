@@ -1,6 +1,7 @@
 import { createServer } from "node:http"
 import { readFile } from "node:fs/promises"
 import { join } from "node:path"
+import { createHash } from "node:crypto"
 
 const port = Number(process.env.COMPTROL_FIXTURE_PORT || 17417)
 const targetId = "comptrol-fixture-page"
@@ -61,6 +62,49 @@ const server = createServer(async (request, response) => {
     return
   }
   json(response, 404, { error: "not_found" })
+})
+
+function websocketFrame(text) {
+  const payload = Buffer.from(text)
+  return Buffer.concat([Buffer.from([0x81, payload.length]), payload])
+}
+
+function websocketMessage(buffer) {
+  if (buffer.length < 6 || (buffer[0] & 0x80) === 0) return null
+  let length = buffer[1] & 0x7f
+  let offset = 2
+  if (length === 126) {
+    if (buffer.length < 8) return null
+    length = buffer.readUInt16BE(2)
+    offset = 4
+  }
+  if (length > 125 || buffer.length < offset + 4 + length) return null
+  const mask = buffer.subarray(offset, offset + 4)
+  const payload = buffer.subarray(offset + 4, offset + 4 + length)
+  return Buffer.from(payload.map((value, index) => value ^ mask[index % 4])).toString()
+}
+
+server.on("upgrade", (request, socket) => {
+  if (request.url !== `/devtools/page/${targetId}`) {
+    socket.destroy()
+    return
+  }
+  const accept = createHash("sha1").update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64")
+  socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+  let buffer = Buffer.alloc(0)
+  socket.on("data", chunk => {
+    buffer = Buffer.concat([buffer, chunk])
+    const text = websocketMessage(buffer)
+    if (!text) return
+    buffer = Buffer.alloc(0)
+    const message = JSON.parse(text)
+    const result = message.method === "Runtime.evaluate"
+      ? { result: { type: "string", value: message.params.expression === "document.title" ? "Comptrol browser fixture" : "fixture evaluation" } }
+      : message.method === "Page.navigate"
+        ? { frameId: "fixture-frame" }
+        : {}
+    socket.write(websocketFrame(JSON.stringify({ id: message.id, result })))
+  })
 })
 
 server.listen(port, "127.0.0.1", () => {
