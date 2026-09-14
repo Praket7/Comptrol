@@ -230,8 +230,7 @@ fn request_json(
         )?;
     }
     write!(stream, "\r\n{body}")?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    let response = read_http_response(&mut stream)?;
     let response = String::from_utf8_lossy(&response);
     let (header, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "browser response has no body")
@@ -262,6 +261,46 @@ fn request_json(
         io::Error::new(io::ErrorKind::InvalidData, format!("{error} body={body:?}"))
     })?;
     Ok((status, value))
+}
+
+fn read_http_response(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(size) => {
+                response.extend_from_slice(&chunk[..size]);
+                let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&response[..header_end]);
+                if let Some(length) = header.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    (name.eq_ignore_ascii_case("content-length"))
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                }) {
+                    if response.len() >= header_end + 4 + length {
+                        break;
+                    }
+                } else if response.windows(5).any(|window| window == b"0\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(response)
 }
 
 fn decode_chunked(mut body: &str) -> io::Result<String> {

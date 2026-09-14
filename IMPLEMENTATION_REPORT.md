@@ -20,7 +20,7 @@ Clippy with warnings denied passed.
 
 Sixteen unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, one call workflow execution, restart reconciliation, stale browser binding refusal, browser identity parsing, loopback enforcement, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, adapter registry isolation, and audit redaction.
 
-The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, trace record and fixture replay, platform capability conformance, and the repository owned Codex, Claude Code, and Cursor profiles.
+The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, real dedicated headless Chrome CDP navigation and DOM verification, trace record and fixture replay, platform capability conformance, and the repository owned Codex, Claude Code, and Cursor profiles.
 
 The README forbidden punctuation check passed.
 
@@ -40,7 +40,7 @@ Linux has a portable runtime build path and conservative AT SPI, X11, and Waylan
 
 ## Not built yet
 
-Real Chrome profile validation, uploads, platform accessibility fixture applications, remote pairing, application adapters, native packaging, signed releases, npm publication, Homebrew publication, and real hardware matrix testing remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, and fixture CDP mutation are implemented and tested without falsely claiming real Chrome coverage.
+Real Chrome profile validation beyond the dedicated headless harness, uploads, platform accessibility fixture applications, remote pairing, application adapters, native packaging, signed releases, npm publication, Homebrew publication, and real hardware matrix testing remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, and dedicated headless Chrome validation are implemented and tested.
 
 ## Security decisions
 
