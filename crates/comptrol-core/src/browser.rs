@@ -294,6 +294,7 @@ pub fn cdp_upload(
 fn parse_target(value: &Value) -> Option<BrowserTarget> {
     Some(BrowserTarget {
         id: value.get("id")?.as_str()?.to_owned(),
+        target_type: value.get("type").and_then(Value::as_str).map(str::to_owned),
         browser_context_id: value
             .get("browserContextId")
             .and_then(Value::as_str)
@@ -476,6 +477,7 @@ mod tests {
     fn target_parser_keeps_exact_identity_fields() {
         let targets = parse_targets(&json!([{
             "id": "tab",
+            "type": "page",
             "browserContextId": "context",
             "url": "http://127.0.0.1/",
             "title": "fixture",

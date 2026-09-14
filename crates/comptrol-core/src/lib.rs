@@ -156,6 +156,7 @@ pub struct Capability {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BrowserTarget {
     pub id: String,
+    pub target_type: Option<String>,
     pub browser_context_id: Option<String>,
     pub url: Option<String>,
     pub title: Option<String>,
@@ -176,6 +177,17 @@ pub fn bind_browser_target(
             recovery: Some("Refresh browser targets before mutation".to_owned()),
         });
     };
+    if target
+        .target_type
+        .as_deref()
+        .is_some_and(|target_type| target_type != "page")
+    {
+        return Err(ComptrolError {
+            code: "wrong_target_type".to_owned(),
+            message: "The requested browser target is not a page".to_owned(),
+            recovery: Some("Select an exact page target before mutation".to_owned()),
+        });
+    }
     if browser_context_id
         .is_some_and(|expected| target.browser_context_id.as_deref() != Some(expected))
         || revision.is_some_and(|expected| target.revision.as_deref() != Some(expected))
@@ -2015,6 +2027,7 @@ mod tests {
         let targets = vec![BrowserTarget {
             id: "tab-1".to_owned(),
             browser_context_id: Some("context-1".to_owned()),
+            target_type: Some("page".to_owned()),
             url: Some("http://127.0.0.1/".to_owned()),
             title: Some("fixture".to_owned()),
             revision: Some("revision-1".to_owned()),
@@ -2037,6 +2050,15 @@ mod tests {
                 .expect("bound target")
                 .id,
             "tab-1"
+        );
+        let mut browser_ui = targets[0].clone();
+        browser_ui.id = "browser-ui".to_owned();
+        browser_ui.target_type = Some("browser_ui".to_owned());
+        assert_eq!(
+            bind_browser_target(&[browser_ui], "browser-ui", None, None)
+                .expect_err("browser UI target")
+                .code,
+            "wrong_target_type"
         );
     }
 
