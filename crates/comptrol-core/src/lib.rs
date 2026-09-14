@@ -363,6 +363,24 @@ impl Policy {
             policy.max_risk = policy.max_risk.max(Risk::R3);
             policy.allowed_intents.insert("command.run".to_owned());
         }
+        if std::env::var("COMPTROL_ALLOW_WINDOWS_UIA").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            policy
+                .allowed_intents
+                .insert("windows.uia.press".to_owned());
+            policy
+                .allowed_intents
+                .insert("windows.uia.set_value".to_owned());
+        }
+        if std::env::var("COMPTROL_ALLOW_LINUX_ATSPI").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            policy
+                .allowed_intents
+                .insert("linux.atspi.press".to_owned());
+            policy
+                .allowed_intents
+                .insert("linux.atspi.set_value".to_owned());
+        }
         if std::env::var("COMPTROL_ALLOW_BROWSER_FIXTURE").as_deref() == Ok("1") {
             policy.max_risk = policy.max_risk.max(Risk::R1);
             policy
@@ -824,6 +842,12 @@ impl Runtime {
             "desktop.notify" => desktop_notify(&request, operation_id),
             "desktop.open_app" => desktop_open_app(&request, operation_id),
             "command.run" => command_run(&request, operation_id),
+            "windows.uia.press" | "windows.uia.set_value" => {
+                windows_uia_action(&request, operation_id)
+            }
+            "linux.atspi.press" | "linux.atspi.set_value" => {
+                linux_atspi_action(&request, operation_id)
+            }
             "macos.ax.press" => macos_ax_press(&request, operation_id),
             "macos.ax.set_value" => macos_ax_set_value(&request, operation_id),
             "browser.fixture.submit" => browser_fixture_submit(&request, operation_id),
@@ -1096,6 +1120,8 @@ fn classify(intent: &str) -> Risk {
         | "filesystem.restore_checkpoint" => Risk::R1,
         "desktop.open_app" | "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
         "command.run" => Risk::R3,
+        "windows.uia.press" | "windows.uia.set_value" => Risk::R2,
+        "linux.atspi.press" | "linux.atspi.set_value" => Risk::R2,
         "browser.fixture.submit" => Risk::R1,
         "browser.cdp.evaluate"
         | "browser.cdp.navigate"
@@ -1260,6 +1286,8 @@ fn route_for(intent: &str) -> String {
         "desktop.notify" => "platform_notification",
         "desktop.open_app" => "platform_launch",
         "command.run" => "process_argv",
+        "windows.uia.press" | "windows.uia.set_value" => "windows_uia",
+        "linux.atspi.press" | "linux.atspi.set_value" => "linux_atspi",
         "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
         "browser.fixture.submit" => "browser_fixture",
         "browser.cdp.evaluate"
@@ -2868,6 +2896,394 @@ fn read_bounded(mut input: impl Read) -> Vec<u8> {
     output
 }
 
+fn run_bounded(mut command: Command, timeout: Duration) -> io::Result<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let output_thread = std::thread::spawn(move || read_bounded(stdout));
+    let error_thread = std::thread::spawn(move || read_bounded(stderr));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = output_thread.join();
+                let _ = error_thread.join();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "provider timed out",
+                ));
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: output_thread.join().unwrap_or_default(),
+        stderr: error_thread.join().unwrap_or_default(),
+    })
+}
+
+const WINDOWS_UIA_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+$matches = @()
+foreach ($candidate in $all) {
+    if ($env:COMPTROL_UIA_PROCESS_ID -and $candidate.Current.ProcessId -ne [int]$env:COMPTROL_UIA_PROCESS_ID) { continue }
+    if ($env:COMPTROL_UIA_NAME -and $candidate.Current.Name -cne $env:COMPTROL_UIA_NAME) { continue }
+    if ($env:COMPTROL_UIA_AUTOMATION_ID -and $candidate.Current.AutomationId -cne $env:COMPTROL_UIA_AUTOMATION_ID) { continue }
+    if ($env:COMPTROL_UIA_ROLE -and $candidate.Current.ControlType.ProgrammaticName -notlike ('*.' + $env:COMPTROL_UIA_ROLE)) { continue }
+    $matches += $candidate
+}
+if ($matches.Count -ne 1) { throw 'target_ambiguous' }
+$element = $matches[0]
+$verified = $false
+if ($env:COMPTROL_UIA_ACTION -eq 'press') {
+    $pattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    $pattern.Invoke()
+    if (-not $env:COMPTROL_UIA_VERIFY_ATTRIBUTE) { $verified = $false }
+} elseif ($env:COMPTROL_UIA_ACTION -eq 'set_value') {
+    $pattern = $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    $pattern.SetValue($env:COMPTROL_UIA_VALUE)
+    $verified = ($pattern.Current.Value -ceq $env:COMPTROL_UIA_VALUE)
+} else { throw 'unsupported_action' }
+if ($env:COMPTROL_UIA_VERIFY_ATTRIBUTE -eq 'name') { $verified = ($element.Current.Name -ceq $env:COMPTROL_UIA_VERIFY_VALUE) }
+if ($env:COMPTROL_UIA_VERIFY_ATTRIBUTE -eq 'enabled') { $verified = ($element.Current.IsEnabled.ToString().ToLower() -ceq $env:COMPTROL_UIA_VERIFY_VALUE.ToLower()) }
+if ($env:COMPTROL_UIA_VERIFY_ATTRIBUTE -eq 'value') {
+    $valuePattern = $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    $verified = ($valuePattern.Current.Value -ceq $env:COMPTROL_UIA_VERIFY_VALUE)
+}
+([pscustomobject]@{ verified = $verified; action = $env:COMPTROL_UIA_ACTION } | ConvertTo-Json -Compress)
+"#;
+
+const LINUX_ATSPI_SCRIPT: &str = r#"
+import json
+import os
+import gi
+gi.require_version('Atspi', '2.0')
+from gi.repository import Atspi
+
+Atspi.init()
+name = os.environ.get('COMPTROL_ATSPI_NAME', '')
+role = os.environ.get('COMPTROL_ATSPI_ROLE', '')
+process_id = int(os.environ.get('COMPTROL_ATSPI_PROCESS_ID', '0'))
+action_name = os.environ.get('COMPTROL_ATSPI_ACTION', '')
+value = os.environ.get('COMPTROL_ATSPI_VALUE', '')
+verify_attribute = os.environ.get('COMPTROL_ATSPI_VERIFY_ATTRIBUTE', '')
+verify_value = os.environ.get('COMPTROL_ATSPI_VERIFY_VALUE', '')
+
+def walk(node):
+    yield node
+    for index in range(node.get_child_count()):
+        child = node.get_child_at_index(index)
+        if child is not None:
+            yield from walk(child)
+
+matches = []
+for index in range(Atspi.get_desktop_count()):
+    desktop = Atspi.get_desktop(index)
+    if desktop is not None:
+        for item in walk(desktop):
+            if process_id and item.get_process_id() != process_id:
+                continue
+            if name and item.get_name() != name:
+                continue
+            if role and item.get_role_name() != role:
+                continue
+            matches.append(item)
+if len(matches) != 1:
+    raise RuntimeError('target_ambiguous')
+item = matches[0]
+verified = False
+if os.environ.get('COMPTROL_ATSPI_OPERATION') == 'press':
+    action = item.get_action_iface()
+    if action is None:
+        raise RuntimeError('action_unavailable')
+    selected = -1
+    for index in range(action.get_n_actions()):
+        if not action_name or action.get_action_name(index) in (action_name, 'click', 'press', 'activate'):
+            selected = index
+            break
+    if selected < 0 or not action.do_action(selected):
+        raise RuntimeError('action_failed')
+elif os.environ.get('COMPTROL_ATSPI_OPERATION') == 'set_value':
+    editable = item.get_editable_text_iface()
+    if editable is None:
+        raise RuntimeError('editable_text_unavailable')
+    editable.set_text_contents(value)
+else:
+    raise RuntimeError('unsupported_action')
+if verify_attribute == 'name':
+    verified = item.get_name() == verify_value
+elif verify_attribute == 'value':
+    text = item.get_text_iface()
+    verified = text is not None and text.get_text(0, -1) == verify_value
+elif verify_attribute == 'exists':
+    verified = True
+else:
+    verified = os.environ.get('COMPTROL_ATSPI_OPERATION') == 'set_value' and verify_value == value
+print(json.dumps({'verified': verified, 'operation': os.environ.get('COMPTROL_ATSPI_OPERATION')}))
+"#;
+
+fn semantic_provider_result(
+    request: &OperationRequest,
+    operation_id: String,
+    route: &str,
+    output: io::Result<Output>,
+) -> ActionResult {
+    let output = match output {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            return ActionResult {
+                operation_id,
+                intent: request.intent.clone(),
+                route: route.to_owned(),
+                target: request.target.clone(),
+                preflight: "passed".to_owned(),
+                delivery: DeliveryState::Unknown,
+                effect: EffectState::Unknown,
+                verification: VerificationState::Unverified,
+                disturbance: json!({ "foreground_changed": false, "mouse": "untouched", "clipboard": "untouched" }),
+                recovery: RecoveryState::RequiresReconciliation,
+                data: Value::Null,
+                error: Some(ComptrolError {
+                    code: "provider_timeout".to_owned(),
+                    message: "The semantic provider exceeded its bounded call timeout".to_owned(),
+                    recovery: Some("Observe the target before retrying".to_owned()),
+                }),
+            };
+        }
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_unavailable".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Inspect platform permissions and adapter health".to_owned()),
+                },
+            );
+        }
+    };
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        let code = if diagnostic.contains("target_ambiguous") {
+            "target_ambiguous"
+        } else if diagnostic.contains("unsupported") || diagnostic.contains("unavailable") {
+            "unsupported_surface"
+        } else {
+            "verification_failed"
+        };
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: code.to_owned(),
+                message: "The semantic provider did not confirm the requested action".to_owned(),
+                recovery: Some(
+                    "Refresh the exact target and inspect platform capability state".to_owned(),
+                ),
+            },
+        );
+    }
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| json!({}));
+    if data.get("verified").and_then(Value::as_bool) == Some(true) {
+        success(
+            request,
+            operation_id,
+            route,
+            EffectState::Changed,
+            VerificationState::Verified,
+            json!({ "verified": true, "mouse": "untouched", "clipboard": "untouched" }),
+        )
+    } else {
+        success(
+            request,
+            operation_id,
+            route,
+            EffectState::Changed,
+            VerificationState::Unverified,
+            json!({ "verified": false, "mouse": "untouched", "clipboard": "untouched" }),
+        )
+    }
+}
+
+fn windows_uia_action(request: &OperationRequest, operation_id: String) -> ActionResult {
+    if !cfg!(target_os = "windows") {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "unsupported_surface".to_owned(),
+                message: "Windows UI Automation is only available on Windows".to_owned(),
+                recovery: Some("Inspect platform capabilities".to_owned()),
+            },
+        );
+    }
+    let Some(process_id) = request.params.get("process_id").and_then(Value::as_u64) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Windows UI Automation needs an exact process_id".to_owned(),
+                recovery: Some("Observe the UIA tree and bind the process generation".to_owned()),
+            },
+        );
+    };
+    let name = request.params.get("name").and_then(Value::as_str);
+    let automation_id = request.params.get("automation_id").and_then(Value::as_str);
+    if name.is_none() && automation_id.is_none() {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Windows UI Automation needs a name or automation_id".to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_UIA_SCRIPT,
+        ])
+        .env("COMPTROL_UIA_PROCESS_ID", process_id.to_string())
+        .env(
+            "COMPTROL_UIA_ACTION",
+            if request.intent.ends_with("press") {
+                "press"
+            } else {
+                "set_value"
+            },
+        );
+    if let Some(name) = name {
+        command.env("COMPTROL_UIA_NAME", name);
+    }
+    if let Some(automation_id) = automation_id {
+        command.env("COMPTROL_UIA_AUTOMATION_ID", automation_id);
+    }
+    if let Some(role) = request.params.get("role").and_then(Value::as_str) {
+        command.env("COMPTROL_UIA_ROLE", role);
+    }
+    if let Some(value) = request.params.get("value").and_then(Value::as_str) {
+        command.env("COMPTROL_UIA_VALUE", value);
+    }
+    if let Some(postcondition) = request.postcondition.as_ref()
+        && let (Some(attribute), Some(expected)) = (
+            postcondition.get("attribute").and_then(Value::as_str),
+            postcondition.get("equals"),
+        )
+    {
+        command.env("COMPTROL_UIA_VERIFY_ATTRIBUTE", attribute);
+        command.env(
+            "COMPTROL_UIA_VERIFY_VALUE",
+            expected
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| expected.to_string()),
+        );
+    }
+    semantic_provider_result(
+        request,
+        operation_id,
+        "windows_uia",
+        run_bounded(command, Duration::from_millis(1500)),
+    )
+}
+
+fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> ActionResult {
+    if !cfg!(target_os = "linux") {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "unsupported_surface".to_owned(),
+                message: "Linux AT SPI is only available on Linux".to_owned(),
+                recovery: Some("Inspect platform capabilities".to_owned()),
+            },
+        );
+    }
+    let Some(process_id) = request.params.get("process_id").and_then(Value::as_u64) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Linux AT SPI needs an exact process_id".to_owned(),
+                recovery: Some("Observe the accessibility tree and bind the process".to_owned()),
+            },
+        );
+    };
+    let Some(name) = request.params.get("name").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Linux AT SPI needs an exact accessible name".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let mut command = Command::new("python3");
+    command
+        .args(["-c", LINUX_ATSPI_SCRIPT])
+        .env("COMPTROL_ATSPI_PROCESS_ID", process_id.to_string())
+        .env("COMPTROL_ATSPI_NAME", name)
+        .env(
+            "COMPTROL_ATSPI_OPERATION",
+            if request.intent.ends_with("press") {
+                "press"
+            } else {
+                "set_value"
+            },
+        );
+    if let Some(role) = request.params.get("role").and_then(Value::as_str) {
+        command.env("COMPTROL_ATSPI_ROLE", role);
+    }
+    if let Some(action) = request.params.get("action").and_then(Value::as_str) {
+        command.env("COMPTROL_ATSPI_ACTION", action);
+    }
+    if let Some(value) = request.params.get("value").and_then(Value::as_str) {
+        command.env("COMPTROL_ATSPI_VALUE", value);
+    }
+    if let Some(postcondition) = request.postcondition.as_ref()
+        && let (Some(attribute), Some(expected)) = (
+            postcondition.get("attribute").and_then(Value::as_str),
+            postcondition.get("equals"),
+        )
+    {
+        command.env("COMPTROL_ATSPI_VERIFY_ATTRIBUTE", attribute);
+        command.env(
+            "COMPTROL_ATSPI_VERIFY_VALUE",
+            expected
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| expected.to_string()),
+        );
+    }
+    semantic_provider_result(
+        request,
+        operation_id,
+        "linux_atspi",
+        run_bounded(command, Duration::from_millis(1500)),
+    )
+}
+
 fn macos_ax_press(request: &OperationRequest, operation_id: String) -> ActionResult {
     if !cfg!(target_os = "macos") {
         return unsupported_ax(request, operation_id);
@@ -3241,6 +3657,23 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R3,
             route: "process_argv".to_owned(),
             note: "Runs an explicitly allowlisted executable with argv inside an explicit local root and no shell".to_owned(),
+        },
+        Capability {
+            name: "windows.uia.semantic".to_owned(),
+            available: cfg!(target_os = "windows")
+                && std::env::var("COMPTROL_ALLOW_WINDOWS_UIA").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "windows_uia".to_owned(),
+            note: "Uses Windows UI Automation Invoke and Value patterns with exact process and element binding".to_owned(),
+        },
+        Capability {
+            name: "linux.atspi.semantic".to_owned(),
+            available: cfg!(target_os = "linux")
+                && std::env::var("COMPTROL_ALLOW_LINUX_ATSPI").as_deref() == Ok("1")
+                && std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
+            risk: Risk::R2,
+            route: "linux_atspi".to_owned(),
+            note: "Uses AT SPI action and editable text interfaces with exact process and element binding".to_owned(),
         },
         Capability {
             name: "browser.cdp".to_owned(),

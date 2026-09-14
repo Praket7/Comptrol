@@ -46,9 +46,9 @@ macOS has real basic process observation through System Events and a semantic AX
 
 The macOS semantic route is implemented and policy gated. It supports exact application, window, role, and control matching with bounded AppleScript provider calls. Value changes read the value back before reporting verified. Press actions report unverified when no explicit postcondition is supplied. This host returned the correct assistive access refusal during live probing, so no UI action was claimed as verified.
 
-Windows has a portable runtime build path and a conservative UI Automation capability broker. UI Automation actuation is not implemented.
+Windows has an opt in UI Automation route for exact process and element binding. Press uses InvokePattern and value changes use ValuePattern with bounded PowerShell provider calls and postcondition checks. The repository includes a WPF fixture and a Windows only conformance harness. This host cannot execute that matrix.
 
-Linux has a portable runtime build path and conservative AT SPI, X11, and Wayland capability brokers. Linux actuation is not implemented.
+Linux has an opt in AT SPI route for exact process and accessible name binding through action and editable text interfaces. X11 and Wayland capability brokers remain separate and no raw input path is claimed. The repository includes a GTK fixture and a Linux only conformance harness. This host cannot execute that matrix.
 
 ## Not built yet
 
