@@ -90,7 +90,12 @@ pub fn fixture_state(endpoint: &str) -> Result<Value, ComptrolError> {
     })
 }
 
-pub fn open_tab(endpoint: &str, url: &str, background: bool) -> Result<Value, ComptrolError> {
+pub fn open_tab(
+    endpoint: &str,
+    url: &str,
+    background: bool,
+    browser_context_id: Option<&str>,
+) -> Result<Value, ComptrolError> {
     if url.is_empty()
         || url
             .chars()
@@ -103,7 +108,7 @@ pub fn open_tab(endpoint: &str, url: &str, background: bool) -> Result<Value, Co
             recovery: Some("Provide a safe browser URL".to_owned()),
         });
     }
-    if !background {
+    if !background && browser_context_id.is_none() {
         let path = format!("/json/new?{}", encode_new_tab_url(url));
         let (status, value) =
             request_json(endpoint, "PUT", &path, &[], None).map_err(|error| ComptrolError {
@@ -146,11 +151,16 @@ pub fn open_tab(endpoint: &str, url: &str, background: bool) -> Result<Value, Co
             message: "The browser did not provide a browser websocket".to_owned(),
             recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
         })?;
-    let created = protocol_call(
-        web_socket_url,
-        "Target.createTarget",
-        json!({ "url": url, "background": true, "focus": false, "newWindow": false }),
-    )?;
+    let mut create_params = json!({
+        "url": url,
+        "background": background,
+        "focus": !background,
+        "newWindow": false
+    });
+    if let Some(browser_context_id) = browser_context_id {
+        create_params["browserContextId"] = json!(browser_context_id);
+    }
+    let created = protocol_call(web_socket_url, "Target.createTarget", create_params)?;
     let target_id = created
         .get("targetId")
         .and_then(Value::as_str)
@@ -164,6 +174,16 @@ pub fn open_tab(endpoint: &str, url: &str, background: bool) -> Result<Value, Co
         if let Ok(targets) = discover(endpoint)
             && let Some(target) = targets.into_iter().find(|target| target.id == target_id)
         {
+            if browser_context_id
+                .is_some_and(|expected| target.browser_context_id.as_deref() != Some(expected))
+            {
+                return Err(ComptrolError {
+                    code: "stale_reference".to_owned(),
+                    message: "The browser created the tab in a different browser context"
+                        .to_owned(),
+                    recovery: Some("Inspect browser contexts and open the tab again".to_owned()),
+                });
+            }
             return Ok(json!({
                 "target": target,
                 "visibility": "background",
@@ -979,7 +999,7 @@ mod tests {
 
     #[test]
     fn open_tab_rejects_unsafe_urls_before_connecting() {
-        let error = open_tab("http://127.0.0.1:9222", "javascript:alert(1)", false)
+        let error = open_tab("http://127.0.0.1:9222", "javascript:alert(1)", false, None)
             .expect_err("unsafe URL");
         assert_eq!(error.code, "invalid_input");
     }

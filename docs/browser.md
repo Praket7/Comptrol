@@ -16,6 +16,8 @@ Enable the route only for a browser endpoint the user intentionally started with
 
 Inactive and grouped live tabs remain addressable through exact target identity and do not need foreground focus. A closed tab or closed tab group is not a live DevTools target, so it must be reopened by the browser before Comptrol can control it. Chrome does not expose a portable closed group control surface through the route used here.
 
+`browser.cdp.open_tab` can receive an optional `browser_context_id` when the endpoint exposes more than the default browser context. Comptrol passes that context to `Target.createTarget` and verifies the returned tab belongs to it. Omitting the field uses the endpoint's existing default profile.
+
 The fixture page includes a nested frame, download, dialog, dynamic node, shadow root, canvas, and intentionally untrusted instruction text. The text is fixture data only and is never treated as runtime instruction.
 
 The runtime can use the same narrow routes against a local Chromium DevTools endpoint when `COMPTROL_ALLOW_BROWSER_CDP=1` is set outside the agent channel. Every CDP mutation requires the exact page target, browser context, and target revision returned by discovery.

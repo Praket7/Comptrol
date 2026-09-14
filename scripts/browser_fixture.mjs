@@ -133,7 +133,10 @@ function websocketMessage(buffer) {
 
 server.on("upgrade", (request, socket) => {
   const browserSocket = request.url === `/devtools/browser/comptrol-fixture`
-  if (!browserSocket && request.url !== `/devtools/page/${targetId}`) {
+  const pageTarget = request.url?.startsWith("/devtools/page/")
+    ? request.url.slice("/devtools/page/".length)
+    : null
+  if (!browserSocket && pageTarget !== targetId && !openedTabs.has(pageTarget)) {
     socket.destroy()
     return
   }
@@ -146,7 +149,15 @@ server.on("upgrade", (request, socket) => {
     if (!text) return
     buffer = Buffer.alloc(0)
     const message = JSON.parse(text)
-    const result = browserSocket && message.method === "Target.closeTarget"
+    const result = browserSocket && message.method === "Target.createTarget"
+      ? (() => {
+          const id = `comptrol-opened-${openedTabs.size + 1}`
+          const context = message.params.browserContextId || browserContextId
+          const target = { id, type: "page", title: "opened fixture tab", url: message.params.url, browserContextId: context, revision: `fixture-${id}`, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${id}` }
+          openedTabs.set(id, target)
+          return { targetId: id }
+        })()
+      : browserSocket && message.method === "Target.closeTarget"
       ? { success: openedTabs.delete(message.params.targetId) }
       : message.method === "Accessibility.getFullAXTree"
         ? { nodes: [{ nodeId: "fixture-root", role: { value: "RootWebArea" }, name: { value: "Comptrol browser fixture" } }] }

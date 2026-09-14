@@ -70,7 +70,7 @@ try {
     const historyForward = await response(42, { jsonrpc: "2.0", id: 42, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.history_forward", idempotency_key: "history-forward", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision } } } })
     assert.equal(historyForward.result.structuredContent.verification, "verified", JSON.stringify(historyForward))
     assert.equal(historyForward.result.structuredContent.data.direction, "forward")
-    const opened = await response(5, { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.open_tab", idempotency_key: "open-visible-tab", params: { url: `http://127.0.0.1:${port}/` } } } })
+    const opened = await response(5, { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.open_tab", idempotency_key: "open-visible-tab", params: { url: `http://127.0.0.1:${port}/`, browser_context_id: target.browserContextId } } } })
     assert.equal(opened.result.structuredContent.verification, "verified")
     assert.equal(opened.result.structuredContent.data.visibility, "foreground")
     assert.equal(opened.result.structuredContent.data.mouse, "untouched")

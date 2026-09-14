@@ -1557,7 +1557,16 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             );
         }
         let background = background || request.background.as_deref() == Some("strict_background");
-        return match browser::open_tab(&endpoint.to_string_lossy(), url, background) {
+        let browser_context_id = request
+            .params
+            .get("browser_context_id")
+            .and_then(Value::as_str);
+        return match browser::open_tab(
+            &endpoint.to_string_lossy(),
+            url,
+            background,
+            browser_context_id,
+        ) {
             Ok(data) => success(
                 request,
                 operation_id,
