@@ -10,7 +10,7 @@ The current host observer is real. On macOS it calls the public System Events ac
 
 The loopback HTTP preview validates the origin and binds only to localhost. The standard compatibility path is MCP stdio.
 
-The repository also includes an npm launcher package, CI validation, a release workflow, browser fixture, platform capability broker, client conformance harness, threat model, privacy notes, contribution guidance, and research notes.
+The repository also includes an npm launcher package, CI validation, a release workflow, browser fixture with exact target binding and duplicate submission protection, platform capability brokers, client conformance harness, threat model, privacy notes, contribution guidance, and research notes.
 
 ## Verification
 
@@ -18,7 +18,7 @@ Rust format check passed.
 
 Clippy with warnings denied passed.
 
-Six unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, and restart reconciliation.
+Seven unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, restart reconciliation, and stale browser binding refusal.
 
 The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser fixture conformance, and the repository owned Codex, Claude Code, and Cursor profiles.
 
@@ -32,15 +32,15 @@ The optimized Rust build passed.
 
 macOS has real basic process observation through System Events. Semantic desktop mutation is not advertised.
 
-The macOS semantic route is implemented and policy gated. This host returned the correct assistive access refusal during live probing, so no UI action was claimed as verified.
+The macOS semantic route is implemented and policy gated. It supports exact application, window, role, and control matching. Value changes read the value back before reporting verified. Press actions report unverified because macOS does not provide a safe general postcondition for every control. This host returned the correct assistive access refusal during live probing, so no UI action was claimed as verified.
 
-Windows has a portable runtime build path and conservative unsupported results for platform actuation. UI Automation is not implemented.
+Windows has a portable runtime build path and a conservative UI Automation capability broker. UI Automation actuation is not implemented.
 
-Linux has a portable runtime build path and conservative unsupported results for platform actuation. AT SPI, X11, and Wayland adapters are not implemented.
+Linux has a portable runtime build path and conservative AT SPI, X11, and Wayland capability brokers. Linux actuation is not implemented.
 
 ## Not built yet
 
-Live Chrome DevTools websocket control, uploads, platform accessibility fixture applications, event driven waits, checkpoints, record and replay, remote pairing, dashboard, application adapters, native packaging, signed releases, npm publication, Homebrew packaging, and real hardware matrix testing remain open work. The browser fixture and exact identity contract are implemented without falsely claiming live CDP control.
+Live Chrome DevTools websocket control, uploads, platform accessibility fixture applications, event driven waits, checkpoints, record and replay, remote pairing, dashboard, application adapters, native packaging, signed releases, npm publication, Homebrew packaging, and real hardware matrix testing remain open work. The browser fixture, exact identity contract, and duplicate submission protection are implemented without falsely claiming live CDP control.
 
 ## Security decisions
 
@@ -58,9 +58,7 @@ Source build is verified. The npm launcher package is prepared but not published
 
 ## Remaining issues ordered by impact
 
-1. Add durable operation storage and reconciliation after process restart.
-2. Build the macOS semantic adapter with exact identity and postcondition tests.
-3. Add Windows and Linux capability brokers with truthful per desktop results.
-4. Add browser protocol support and a local fixture site.
-5. Add cross client conformance tests.
-6. Add packaging and reproducible release artifacts.
+1. Add live Chrome DevTools websocket control.
+2. Add platform accessibility fixture applications and live postcondition tests.
+3. Add event driven waits, checkpoints, and record and replay.
+4. Add packaging and reproducible release artifacts.

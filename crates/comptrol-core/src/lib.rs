@@ -141,6 +141,41 @@ pub struct Capability {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BrowserTarget {
+    pub id: String,
+    pub browser_context_id: Option<String>,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub revision: Option<String>,
+}
+
+pub fn bind_browser_target(
+    targets: &[BrowserTarget],
+    target_id: &str,
+    browser_context_id: Option<&str>,
+    revision: Option<&str>,
+) -> Result<BrowserTarget, ComptrolError> {
+    let Some(target) = targets.iter().find(|target| target.id == target_id) else {
+        return Err(ComptrolError {
+            code: "target_gone".to_owned(),
+            message: "The requested browser target is not present".to_owned(),
+            recovery: Some("Refresh browser targets before mutation".to_owned()),
+        });
+    };
+    if browser_context_id
+        .is_some_and(|expected| target.browser_context_id.as_deref() != Some(expected))
+        || revision.is_some_and(|expected| target.revision.as_deref() != Some(expected))
+    {
+        return Err(ComptrolError {
+            code: "stale_reference".to_owned(),
+            message: "The browser target context or revision changed".to_owned(),
+            recovery: Some("Inspect browser targets and bind again".to_owned()),
+        });
+    }
+    Ok(target.clone())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Lease {
     pub id: String,
     pub scope: String,
@@ -1443,5 +1478,34 @@ mod tests {
         );
         let reconciled = runtime.reconcile("op-restart");
         assert_eq!(reconciled["state"], "reconciled");
+    }
+
+    #[test]
+    fn browser_binding_rejects_gone_and_stale_targets() {
+        let targets = vec![BrowserTarget {
+            id: "tab-1".to_owned(),
+            browser_context_id: Some("context-1".to_owned()),
+            url: Some("http://127.0.0.1/".to_owned()),
+            title: Some("fixture".to_owned()),
+            revision: Some("revision-1".to_owned()),
+        }];
+        assert_eq!(
+            bind_browser_target(&targets, "missing", None, None)
+                .expect_err("missing target")
+                .code,
+            "target_gone"
+        );
+        assert_eq!(
+            bind_browser_target(&targets, "tab-1", Some("context-2"), Some("revision-1"))
+                .expect_err("stale target")
+                .code,
+            "stale_reference"
+        );
+        assert_eq!(
+            bind_browser_target(&targets, "tab-1", Some("context-1"), Some("revision-1"))
+                .expect("bound target")
+                .id,
+            "tab-1"
+        );
     }
 }
