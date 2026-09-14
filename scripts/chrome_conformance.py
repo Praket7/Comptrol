@@ -103,11 +103,17 @@ try:
     opened_wait = call(runtime, 13, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.wait_for", "idempotency_key": "chrome-background-ready", "params": {**opened_identity, "selector": "#message", "property": "value", "equals": ""}}})
     assert opened_wait["result"]["structuredContent"]["verification"] == "verified"
     identity = {"target_id": target["id"], "browser_context_id": target.get("browserContextId", "default"), "revision": target.get("revision", f"url:{target['url']}")}
+    profile_marker = call(runtime, 14, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.evaluate", "idempotency_key": "chrome-profile-marker", "params": {**identity, "expression": "document.cookie = 'comptrol_profile_marker=retained; path=/'; true"}}})
+    assert profile_marker["result"]["structuredContent"]["verification"] == "verified"
+    retained_state = call(runtime, 19, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.evaluate", "idempotency_key": "chrome-profile-state", "params": {**opened_identity, "expression": "document.cookie.includes('comptrol_profile_marker=retained')"}}})
+    retained_data = retained_state["result"]["structuredContent"]
+    assert retained_data["verification"] == "verified"
+    assert retained_data["data"]["result"]["value"] is True
     navigation = call(runtime, 3, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "idempotency_key": "chrome-navigation", "params": {**identity, "url": f"http://127.0.0.1:{fixture_port}/"}}})
     assert navigation["result"]["structuredContent"]["verification"] == "unverified"
     evaluation = call(runtime, 4, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.evaluate", "idempotency_key": "chrome-evaluation", "params": {**identity, "expression": "(() => { const input = document.querySelector('#message'); input.value = 'real chrome'; return input.value })()"}}})
     structured = evaluation["result"]["structuredContent"]
-    assert structured["verification"] == "verified"
+    assert structured["verification"] == "verified", structured
     assert structured["data"]["result"]["value"] == "real chrome"
     snapshot = call(runtime, 18, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.accessibility_snapshot", "idempotency_key": "chrome-accessibility-snapshot", "params": {**identity, "depth": 8}}})
     snapshot_data = snapshot["result"]["structuredContent"]

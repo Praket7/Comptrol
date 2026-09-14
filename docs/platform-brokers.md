@@ -14,4 +14,6 @@ Doctor reports broker state explicitly. A configured but read only broker is deg
 
 The macOS fixture source is `fixtures/macos/AccessibilityFixture.swift`. `scripts/macos_ax_conformance.py` compiles it and exercises an AX press with a name postcondition. The Windows fixture is `fixtures/windows/UIAutomationFixture.ps1` and the Linux fixture is `fixtures/linux/atspi_fixture.py`. Their conformance harnesses skip on other operating systems and fail when explicitly required but unavailable.
 
+Application launch has a separate opt in harness in `scripts/macos_app_conformance.py`. It launches the exact installed application name through LaunchServices and verifies that the process is present. The normal check does not activate an application. Set `COMPTROL_RUN_LIVE_APP_CONFORMANCE=1` to run the live check.
+
 `desktop.open_app` is a separate explicit policy route. On macOS it launches an exact application name through LaunchServices and checks for the running process when Accessibility permits it. On Windows it uses `Start-Process` with an environment bound argument. On Linux it uses `gtk-launch` with an application desktop id. Non macOS launchers report accepted by the native launcher without claiming process verification. None of these routes synthesize mouse input or touch the clipboard.

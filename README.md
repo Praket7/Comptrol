@@ -46,7 +46,7 @@ The runtime refuses unsupported routes. It does not pretend that a platform back
 
 Basic observation and the policy core are implemented and tested.
 
-The macOS observer can use the public System Events accessibility surface when permission is available. Other platforms use best effort process observation.
+The macOS observer can use the public System Events accessibility surface when permission is available. Exact application launch is available through LaunchServices with process verification on macOS. Windows UI Automation and Linux AT SPI semantic routes are implemented behind explicit local policy but remain unverified on this host. Other platforms use best effort process observation.
 
 The runtime includes bounded event history, file checkpoints, fixture trace replay, exact browser target discovery, and a loopback diagnostics dashboard.
 
@@ -56,7 +56,7 @@ With explicit local app launch policy, macOS, Windows, and Linux can open an exa
 
 Supported browser operations can request strict background posture. Routes that cannot prove that posture refuse instead of activating another application or silently taking control of the foreground.
 
-Dedicated user profile Chrome validation, Windows and Linux live matrix validation, remote pairing, signed releases, and published packages remain tracked work. The real Chrome harness covers navigation, DOM evaluation, sandbox upload, and sandbox download.
+Dedicated user profile Chrome validation, Windows and Linux live matrix validation, remote transport, signed releases, and published packages remain tracked work. The real Chrome harness covers navigation, DOM evaluation, same profile background state, sandbox upload, and sandbox download.
 
 ## Contributing
 

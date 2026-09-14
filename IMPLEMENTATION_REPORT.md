@@ -12,7 +12,7 @@ The current host observer is real. On macOS it calls the public System Events ac
 
 The loopback HTTP preview validates the origin and binds only to localhost. It also serves a read only diagnostics dashboard. The standard compatibility path is MCP stdio.
 
-The repository also includes an npm launcher package, CI validation, a release workflow, browser target discovery, a narrow CDP websocket route for evaluation navigation and sandbox uploads, a fixture mutation route with exact target binding and duplicate submission protection, platform capability brokers, an adapter registry contract, client conformance harness, Homebrew formula generation, threat model, privacy notes, contribution guidance, and research notes.
+The repository also includes an npm launcher package, CI validation, a release workflow, browser target discovery, a narrow CDP websocket route for evaluation navigation and sandbox uploads, a fixture mutation route with exact target binding and duplicate submission protection, platform capability brokers, an adapter registry contract, client conformance harnesses, Homebrew formula generation, threat model, privacy notes, contribution guidance, and research notes.
 
 The browser route now opens visible tabs, reads bounded accessibility trees, moves exact live targets through history, and closes exact live targets through the configured local Chrome endpoint. It can create background tabs in the existing browser profile. The result reports the exact target identity and explicitly records that mouse and clipboard were untouched. Account state is reused by attaching to the existing profile. No credential or cookie transfer into a separate headless profile is attempted.
 
@@ -30,9 +30,9 @@ Rust format check passed.
 
 Clippy with warnings denied passed.
 
-Thirty unit tests passed. They cover policy refusal, invalid background posture refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, one call workflow execution, restart reconciliation, pre dispatch interruption recovery, delivered unverified replay, stale browser binding refusal, browser identity parsing, loopback enforcement, safe tab URL validation, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, adapter registry isolation, malformed adapter rejection, audit redaction, sandbox copy verification, unknown result recovery, semantic recovery metadata, and client integration round trips.
+Thirty three unit tests passed. They cover policy refusal, invalid background posture refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, one call workflow execution, restart reconciliation, pre dispatch interruption recovery, delivered unverified replay, stale browser binding refusal, browser identity parsing, loopback enforcement, safe tab URL validation, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, adapter registry isolation, malformed adapter rejection, audit redaction, sandbox copy verification, unknown result recovery, semantic recovery metadata, pairing expiry and revocation, and client integration round trips.
 
-The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, real dedicated headless Chrome CDP navigation, background target creation, verified history navigation, exact target close, DOM verification, sandbox upload, filename postcondition verification, allowlisted argv command execution, stdio progress notification ordering, durable MCP Tasks across restart, trace record and fixture replay, platform capability conformance, and the repository owned Codex, Claude Code, and Cursor profiles.
+The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, real dedicated headless Chrome CDP navigation, background target creation, same profile state continuity, verified history navigation, exact target close, DOM verification, sandbox upload, filename postcondition verification, allowlisted argv command execution, stdio progress notification ordering, durable MCP Tasks across restart, trace record and fixture replay, platform capability conformance, and the repository owned Codex, Claude Code, and Cursor profiles. A headed Chrome profile acceptance run also passed in an isolated visible profile. An opt in live macOS application launch acceptance run passed for Finder.
 
 The README forbidden punctuation check passed.
 
@@ -42,7 +42,7 @@ The optimized Rust build passed.
 
 ## Platform matrix
 
-macOS has real basic process observation through System Events and a semantic AX press and value route with exact application, window, role, and control matching. The controlled Cocoa fixture and conformance harness are present. The live host correctly reported missing Accessibility permission, so the fixture action was not falsely marked verified.
+macOS has real basic process observation through System Events, exact LaunchServices application launch with process verification, and a semantic AX press and value route with exact application, window, role, and control matching. The controlled Cocoa fixture and conformance harness are present. The live host correctly reported missing Accessibility permission, so the fixture action was not falsely marked verified.
 
 The macOS semantic route is implemented and policy gated. It supports exact application, window, role, and control matching with bounded AppleScript provider calls. Value changes read the value back before reporting verified. Press actions report unverified when no explicit postcondition is supplied. This host returned the correct assistive access refusal during live probing, so no UI action was claimed as verified.
 
@@ -52,7 +52,7 @@ Linux has an opt in AT SPI route for exact process and accessible name binding t
 
 ## Not built yet
 
-Real Chrome profile validation beyond the dedicated headless harness, platform accessibility fixture applications, remote pairing, application adapters, signed releases, npm publication, Homebrew publication, and real hardware matrix testing remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, target bound fill and wait operations, sandbox upload and download verification, sandbox restricted copy with checkpoint and hash verification, client integration proposals with atomic JSON apply and undo, cross platform build validation, reproducible native archive and checksum preparation, and dedicated headless Chrome validation are implemented and tested. GitHub workflow security checks now include Rust dependency audit and pull request dependency review.
+Full Streamable HTTP session and event conformance, daemon supervision, persistent hot sessions, remote mutual TLS transport, application specific adapters, closed Chrome tab group restoration, screenshots and visual recovery, full asynchronous MCP task execution and cancellation, native Windows and Linux live fixture validation on their operating systems, signed release publication, npm publication, Homebrew publication, GitHub artifact attestation, and real user profile acceptance without an explicitly supplied DevTools endpoint remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, target bound fill and wait operations, accessibility snapshots, history navigation, exact live tab close, sandbox upload and download verification, sandbox restricted copy with checkpoint and hash verification, client integration proposals with atomic JSON apply and undo, cross platform build validation, reproducible native archive and checksum preparation, and dedicated headless Chrome validation are implemented and tested. GitHub workflow security checks include Rust dependency audit and pull request dependency review.
 
 ## Security decisions
 
@@ -66,11 +66,12 @@ The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.011 ms
 
 ## Distribution status
 
-Source build is verified. The npm launcher package is prepared but not published. Homebrew formula generation is prepared but no formula is published. No signed release exists. A private GitHub repository exists at `Praket7/Comptrol` with the verified main branch, six open implementation issues, and one completed browser issue.
+Source build is verified. The npm launcher package is prepared but not published. Homebrew formula generation is prepared but no formula is published. Detached signing and verification are implemented, but no signed release exists because no operator signing identity was supplied. A private GitHub repository exists at `Praket7/Comptrol` with the verified main branch, six open implementation issues, and one completed browser issue.
 
 ## Remaining issues ordered by impact
 
-1. Validate the CDP websocket route against real user Chrome profiles and download behavior.
-2. Add platform accessibility fixture applications and live postcondition tests.
-3. Add remote pairing and application adapters.
-4. Add signed release artifacts and publish only after independent release verification.
+1. Add a real daemon with supervised reconnect and complete Streamable HTTP session conformance.
+2. Validate the CDP websocket route against an explicitly selected real user Chrome profile and add browser state delta coverage.
+3. Complete native Windows and Linux live accessibility matrices and broaden the macOS AX fixture validation when permissions allow.
+4. Add remote mutual TLS transport and application adapters.
+5. Publish signed release artifacts and packages only after independent release verification.
