@@ -2170,7 +2170,7 @@ fn success(
         effect,
         verification,
         disturbance: json!({
-            "foreground_changed": false,
+            "foreground_changed": foreground_changed(request),
             "mouse": "untouched",
             "clipboard": "untouched",
             "posture": request.background.as_deref().unwrap_or("foreground_allowed")
@@ -2178,6 +2178,18 @@ fn success(
         recovery: RecoveryState::None,
         data,
         error: None,
+    }
+}
+
+fn foreground_changed(request: &OperationRequest) -> bool {
+    match request.intent.as_str() {
+        "desktop.open_app" => true,
+        "browser.cdp.open_tab" => !request
+            .params
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
