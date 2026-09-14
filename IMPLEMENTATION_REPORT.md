@@ -2,7 +2,7 @@
 
 ## Built
 
-The repository contains a Rust workspace with a native Comptrol runtime and MCP server. The runtime implements a compact MCP surface with operate, inspect, watch, reconcile, checkpoint restore, and capabilities.
+The repository contains a Rust workspace with a native Comptrol runtime and MCP server. The runtime implements a compact MCP surface with operate, inspect, watch, reconcile, checkpoint restore, and capabilities. Deterministic closed workflows execute through one operate call.
 
 The core includes explicit risk classes, policy authorization, local stop latch, expiring leases, durable operation identity, restart reconciliation, sanitized append only audit records, bounded event sequencing, file checkpoints, privacy aware traces, revisioned multi display geometry, an isolated adapter registry contract, a closed workflow representation, and structured action results.
 
@@ -18,9 +18,9 @@ Rust format check passed.
 
 Clippy with warnings denied passed.
 
-Fourteen unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, restart reconciliation, stale browser binding refusal, browser identity parsing, loopback enforcement, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, and adapter registry isolation.
+Sixteen unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, one call workflow execution, restart reconciliation, stale browser binding refusal, browser identity parsing, loopback enforcement, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, adapter registry isolation, and audit redaction.
 
-The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, trace record and fixture replay, and the repository owned Codex, Claude Code, and Cursor profiles.
+The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, trace record and fixture replay, platform capability conformance, and the repository owned Codex, Claude Code, and Cursor profiles.
 
 The README forbidden punctuation check passed.
 

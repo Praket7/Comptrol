@@ -261,6 +261,7 @@ impl Default for Policy {
             allowed_intents: HashSet::from([
                 "system.ping".to_owned(),
                 "desktop.observe".to_owned(),
+                "workflow.execute".to_owned(),
             ]),
         }
     }
@@ -679,6 +680,7 @@ impl Runtime {
                 VerificationState::Verified,
                 json!({ "ready": true, "protocol": PROTOCOL_VERSION }),
             ),
+            "workflow.execute" => execute_workflow_request(&request, operation_id),
             "desktop.observe" => desktop_observe(&request, operation_id),
             "filesystem.write" => sandbox_write(&request, operation_id, &self.checkpoints),
             "filesystem.restore_checkpoint" => {
@@ -837,7 +839,7 @@ impl Runtime {
 
 fn classify(intent: &str) -> Risk {
     match intent {
-        "system.ping" | "desktop.observe" => Risk::R0,
+        "system.ping" | "desktop.observe" | "workflow.execute" => Risk::R0,
         "desktop.notify" | "filesystem.write" | "filesystem.restore_checkpoint" => Risk::R1,
         "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
         "browser.fixture.submit" => Risk::R1,
@@ -895,6 +897,7 @@ fn route_for(intent: &str) -> String {
     match intent {
         "system.ping" => "native",
         "desktop.observe" => "platform_observe",
+        "workflow.execute" => "workflow",
         "filesystem.write" => "sandbox_filesystem",
         "filesystem.restore_checkpoint" => "sandbox_checkpoint",
         "desktop.notify" => "platform_notification",
@@ -940,6 +943,55 @@ fn restore_checkpoint(
                 recovery: Some("Inspect available local checkpoints".to_owned()),
             },
         ),
+    }
+}
+
+fn execute_workflow_request(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(ops) = request.params.get("ops") else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Workflow execution needs an ops array".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let Ok(ops) = serde_json::from_value::<Vec<WorkflowOp>>(ops.clone()) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Workflow ops did not match the closed workflow schema".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    match execute_workflow(&ops) {
+        Ok(value) => success(
+            request,
+            operation_id,
+            "workflow",
+            EffectState::None,
+            VerificationState::Verified,
+            value,
+        ),
+        Err(error) => ActionResult {
+            operation_id,
+            intent: request.intent.clone(),
+            route: "workflow".to_owned(),
+            target: request.target.clone(),
+            preflight: "passed".to_owned(),
+            delivery: DeliveryState::Delivered,
+            effect: EffectState::None,
+            verification: VerificationState::Failed,
+            disturbance: json!({ "foreground_changed": false }),
+            recovery: RecoveryState::None,
+            data: Value::Null,
+            error: Some(error),
+        },
     }
 }
 
@@ -1649,6 +1701,7 @@ fn restrict_dir(path: &Path) -> io::Result<()> {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum WorkflowOp {
     Sense { key: String, value: Value },
     Assert { key: String, equals: Value },
@@ -1786,6 +1839,28 @@ mod tests {
         ])
         .expect("workflow");
         assert_eq!(result["verified"], true);
+    }
+
+    #[test]
+    fn workflow_executes_through_one_operation() {
+        let mut runtime = runtime();
+        let result = runtime.operate(OperationRequest {
+            intent: "workflow.execute".to_owned(),
+            target: None,
+            params: json!({
+                "ops": [
+                    {"op":"sense","key":"ready","value":true},
+                    {"op":"assert","key":"ready","equals":true},
+                    {"op":"return","value":{"done":true}}
+                ]
+            }),
+            postcondition: None,
+            risk: None,
+            idempotency_key: Some("workflow-operation".to_owned()),
+            dry_run: false,
+        });
+        assert_eq!(result.verification, VerificationState::Verified);
+        assert_eq!(result.data["done"], true);
     }
 
     #[test]
@@ -1991,5 +2066,33 @@ mod tests {
             name: "fixture".to_owned(),
             ..descriptor
         }));
+    }
+
+    #[test]
+    fn audit_journal_redacts_typed_action_data() {
+        let dir = std::env::temp_dir().join(format!("comptrol-audit-{}", now_ms()));
+        let mut journal = AuditJournal::open(&dir).expect("journal");
+        let result = ActionResult {
+            operation_id: "audit-op".to_owned(),
+            intent: "filesystem.write".to_owned(),
+            route: "sandbox_filesystem".to_owned(),
+            target: Some(Target {
+                kind: "fixture".to_owned(),
+                id: Some("secret target".to_owned()),
+                name: Some("private name".to_owned()),
+            }),
+            preflight: "passed".to_owned(),
+            delivery: DeliveryState::Delivered,
+            effect: EffectState::Changed,
+            verification: VerificationState::Verified,
+            disturbance: json!({"foreground_changed":false}),
+            recovery: RecoveryState::None,
+            data: json!({"content":"secret body"}),
+            error: None,
+        };
+        journal.append(&result).expect("append");
+        let contents = fs::read_to_string(journal.path()).expect("audit");
+        assert!(!contents.contains("secret body"));
+        assert!(contents.contains("risk_data"));
     }
 }
