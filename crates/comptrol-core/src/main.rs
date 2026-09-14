@@ -3,10 +3,107 @@ use comptrol::{
     capabilities, default_state_dir, integration, privacy_network_endpoints, privacy_status,
     read_trace,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::env;
-use std::io::{self, BufRead, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const DEFAULT_TASK_TTL_MS: u64 = 300_000;
+const TASK_POLL_INTERVAL_MS: u64 = 50;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredTask {
+    task_id: String,
+    status: String,
+    ttl_ms: u64,
+    poll_interval_ms: u64,
+    created_at_ms: u128,
+    result: Value,
+}
+
+struct TaskStore {
+    file: File,
+    records: HashMap<String, StoredTask>,
+    sequence: u64,
+}
+
+impl TaskStore {
+    fn open(state_dir: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(state_dir)?;
+        let path = state_dir.join("tasks.jsonl");
+        let mut records = HashMap::new();
+        if path.exists() {
+            for line in BufReader::new(File::open(&path)?).lines() {
+                if let Ok(task) = serde_json::from_str::<StoredTask>(&line?) {
+                    records.insert(task.task_id.clone(), task);
+                }
+            }
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            file,
+            records,
+            sequence: 0,
+        })
+    }
+
+    fn create(&mut self, result: Value, ttl_ms: u64) -> io::Result<Value> {
+        self.sequence = self.sequence.saturating_add(1);
+        let task_id = format!("task-{}-{}", now_ms(), self.sequence);
+        let task = StoredTask {
+            task_id: task_id.clone(),
+            status: "completed".to_owned(),
+            ttl_ms,
+            poll_interval_ms: TASK_POLL_INTERVAL_MS,
+            created_at_ms: now_ms(),
+            result,
+        };
+        self.write(task.clone())?;
+        Ok(task_view(&task))
+    }
+
+    fn get(&self, task_id: &str) -> Option<Value> {
+        self.records.get(task_id).map(task_view)
+    }
+
+    fn result(&self, task_id: &str) -> Option<Value> {
+        self.records.get(task_id).map(|task| task.result.clone())
+    }
+
+    fn list(&self) -> Value {
+        json!({ "tasks": self.records.values().map(task_view).collect::<Vec<_>>() })
+    }
+
+    fn write(&mut self, task: StoredTask) -> io::Result<()> {
+        serde_json::to_writer(&mut self.file, &task)?;
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        self.records.insert(task.task_id.clone(), task);
+        Ok(())
+    }
+}
+
+fn task_view(task: &StoredTask) -> Value {
+    json!({
+        "taskId": task.task_id,
+        "status": task.status,
+        "ttlMs": task.ttl_ms,
+        "pollIntervalMs": task.poll_interval_ms,
+        "result": task.result
+    })
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
 
 fn main() {
     let result = match env::args().nth(1).as_deref() {
@@ -165,6 +262,14 @@ fn run_stdio() -> i32 {
             return 1;
         }
     };
+    let mut tasks = match TaskStore::open(&default_state_dir()) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            eprintln!("task store startup failed: {error}");
+            return 1;
+        }
+    };
+    let mut tasks_enabled = false;
     let stdin = io::stdin();
     let mut input = stdin.lock();
     loop {
@@ -187,11 +292,16 @@ fn run_stdio() -> i32 {
                     }
                 };
                 if !line.trim().is_empty() {
-                    let response =
-                        handle_message_with_progress(&mut runtime, line, |notification| {
+                    let response = handle_message_with_state(
+                        &mut runtime,
+                        Some(&mut tasks),
+                        &mut tasks_enabled,
+                        line,
+                        |notification| {
                             println!("{}", notification);
                             let _ = io::stdout().flush();
-                        });
+                        },
+                    );
                     if let Some(response) = response {
                         println!("{}", response);
                         let _ = io::stdout().flush();
@@ -208,10 +318,17 @@ fn run_stdio() -> i32 {
 }
 
 fn handle_message(runtime: &mut Runtime, line: &str) -> Option<Value> {
-    handle_message_with_progress(runtime, line, |_| {})
+    let mut tasks_enabled = false;
+    handle_message_with_state(runtime, None, &mut tasks_enabled, line, |_| {})
 }
 
-fn handle_message_with_progress<F>(runtime: &mut Runtime, line: &str, mut emit: F) -> Option<Value>
+fn handle_message_with_state<F>(
+    runtime: &mut Runtime,
+    mut tasks: Option<&mut TaskStore>,
+    tasks_enabled: &mut bool,
+    line: &str,
+    mut emit: F,
+) -> Option<Value>
 where
     F: FnMut(Value),
 {
@@ -234,6 +351,7 @@ where
         .unwrap_or_default();
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     request.get("id")?;
+    let task_transport = tasks.is_some();
     let progress_token = request
         .get("params")
         .filter(|_| method == "tools/call")
@@ -254,14 +372,75 @@ where
     }
     let result = match method {
         "initialize" => {
-            json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": { "tools": { "listChanged": false } }, "serverInfo": { "name": "comptrol", "version": SERVER_VERSION }, "instructions": "Use operate for one bounded intent. Use inspect for current state. Results distinguish delivery, effect, and verification. Unsupported capabilities refuse safely." })
+            *tasks_enabled = task_transport
+                && request
+                    .get("params")
+                    .and_then(|params| params.get("capabilities"))
+                    .and_then(|capabilities| {
+                        capabilities
+                            .get("tasks")
+                            .and_then(|tasks| tasks.get("requests"))
+                            .and_then(|requests| requests.get("tools"))
+                            .and_then(|tools| tools.get("call"))
+                            .or_else(|| {
+                                capabilities.get("extensions").and_then(|extensions| {
+                                    extensions.get("io.modelcontextprotocol/tasks")
+                                })
+                            })
+                    })
+                    .is_some();
+            let task_capabilities = if task_transport {
+                json!({
+                    "list": {},
+                    "cancel": {},
+                    "requests": { "tools": { "call": {} } }
+                })
+            } else {
+                json!({})
+            };
+            let extensions = if task_transport {
+                json!({ "io.modelcontextprotocol/tasks": {} })
+            } else {
+                json!({})
+            };
+            json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": { "tools": { "listChanged": false }, "tasks": task_capabilities, "extensions": extensions }, "serverInfo": { "name": "comptrol", "version": SERVER_VERSION }, "instructions": "Use operate for one bounded intent. Use inspect for current state. Results distinguish delivery, effect, and verification. Unsupported capabilities refuse safely." })
         }
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tools() }),
-        "tools/call" => call_tool(
-            runtime,
-            request.get("params").cloned().unwrap_or(Value::Null),
-        ),
+        "tools/call" => {
+            let params = request.get("params").cloned().unwrap_or(Value::Null);
+            if *tasks_enabled && params.get("task").is_some() {
+                let ttl_ms = params
+                    .get("task")
+                    .and_then(|task| task.get("ttl"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_TASK_TTL_MS)
+                    .clamp(1_000, 86_400_000);
+                let result = call_tool(runtime, params.clone());
+                match tasks.as_deref_mut() {
+                    Some(store) => match store.create(result, ttl_ms) {
+                        Ok(task) => json!({ "resultType": "task", "task": task }),
+                        Err(error) => {
+                            json!({ "error": { "code": "task_store_failed", "message": error.to_string() } })
+                        }
+                    },
+                    None => call_tool(
+                        runtime,
+                        request.get("params").cloned().unwrap_or(Value::Null),
+                    ),
+                }
+            } else {
+                call_tool(runtime, params)
+            }
+        }
+        "tasks/get" => task_get(tasks.as_deref(), &request),
+        "tasks/result" => task_result(tasks.as_deref(), &request),
+        "tasks/list" => tasks
+            .as_deref()
+            .map(TaskStore::list)
+            .unwrap_or_else(|| task_error("Tasks are available only on the stdio transport")),
+        "tasks/cancel" => task_error("Completed Comptrol tasks cannot be cancelled"),
+        "tasks/update" => task_error("Comptrol tasks do not accept input updates"),
         _ => {
             json!({ "error": { "code": "method_not_found", "message": format!("Unknown MCP method {method}") } })
         }
@@ -279,6 +458,36 @@ where
         }));
     }
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+fn task_get(tasks: Option<&TaskStore>, request: &Value) -> Value {
+    let Some(task_id) = request
+        .get("params")
+        .and_then(|params| params.get("taskId"))
+        .and_then(Value::as_str)
+    else {
+        return task_error("tasks/get needs taskId");
+    };
+    tasks
+        .and_then(|store| store.get(task_id))
+        .unwrap_or_else(|| task_error("task not found"))
+}
+
+fn task_result(tasks: Option<&TaskStore>, request: &Value) -> Value {
+    let Some(task_id) = request
+        .get("params")
+        .and_then(|params| params.get("taskId"))
+        .and_then(Value::as_str)
+    else {
+        return task_error("tasks/result needs taskId");
+    };
+    tasks
+        .and_then(|store| store.result(task_id))
+        .unwrap_or_else(|| task_error("task not found"))
+}
+
+fn task_error(message: &str) -> Value {
+    json!({ "error": { "code": -32602, "message": message } })
 }
 
 fn tools() -> Value {

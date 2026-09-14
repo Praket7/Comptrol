@@ -8,6 +8,8 @@ The optional `background` field accepts `strict_background`, `prefer_background`
 
 The default MCP tools are operate, inspect, watch, and capabilities. Unsupported intents return a structured error and do not mutate a target.
 
-Stdio calls that provide an MCP progress token receive bounded start and completion progress notifications around the returned operation result. The operation id remains the durable recovery identity. The current runtime does not claim the MCP Tasks extension for long running work.
+Stdio calls that provide an MCP progress token receive bounded start and completion progress notifications around the returned operation result. The operation id remains the durable recovery identity.
+
+The stdio server also supports a durable completed task subset when the client advertises the Tasks extension and sends a task request. It persists the task handle and final result across restart and serves `tasks/get`, `tasks/result`, and `tasks/list`. Long running asynchronous execution and task cancellation remain unavailable and are refused rather than implied.
 
 `command.run` is an optional R3 intent. It requires `COMPTROL_ALLOW_COMMANDS=1`, an explicit `COMPTROL_COMMAND_ROOT`, and an exact executable in `COMPTROL_COMMAND_ALLOWLIST`. It accepts a structured program and argv, never invokes a shell, limits output to 64 KiB per stream, bounds execution to 60 seconds, and verifies an optional `exit_code` postcondition. A timeout is durable unknown and must be observed before retrying.
