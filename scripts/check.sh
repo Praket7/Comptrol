@@ -9,6 +9,7 @@ python3 scripts/client_conformance.py
 python3 scripts/progress_conformance.py
 python3 scripts/tasks_conformance.py
 python3 scripts/release_conformance.py
+python3 scripts/pairing_conformance.py
 python3 scripts/platform_conformance.py
 python3 scripts/privacy_conformance.py
 python3 scripts/command_conformance.py

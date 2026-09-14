@@ -6,6 +6,7 @@ pub mod checkpoints;
 pub mod events;
 pub mod geometry;
 pub mod integration;
+pub mod pairing;
 pub mod trace;
 
 use serde::{Deserialize, Serialize};

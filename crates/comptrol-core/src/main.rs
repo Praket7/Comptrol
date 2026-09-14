@@ -1,7 +1,7 @@
 use comptrol::{
     MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime, SERVER_VERSION, TraceMode,
-    capabilities, default_state_dir, integration, privacy_network_endpoints, privacy_status,
-    read_trace,
+    capabilities, default_state_dir, integration, pairing::PairingStore, privacy_network_endpoints,
+    privacy_status, read_trace,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -122,6 +122,7 @@ fn main() {
         Some("record") => run_record(env::args().skip(2).collect()),
         Some("replay") => run_replay(env::args().skip(2).collect()),
         Some("integrate") => run_integrate(env::args().skip(2).collect()),
+        Some("pair") => run_pair(env::args().skip(2).collect()),
         Some("privacy") => run_privacy(env::args().skip(2).collect()),
         Some("version") => {
             println!("{SERVER_VERSION}");
@@ -130,7 +131,7 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor status capabilities stop resume serve-http record replay integrate privacy version"
+                "commands are mcp doctor status capabilities stop resume serve-http record replay integrate pair privacy version"
             );
             2
         }
@@ -149,6 +150,111 @@ fn run_privacy(args: Vec<String>) -> i32 {
             2
         }
     }
+}
+
+fn run_pair(args: Vec<String>) -> i32 {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("pair accepts show, accept, revoke, or list");
+        return 2;
+    };
+    if let Err(error) = Runtime::new(default_state_dir()) {
+        eprintln!("startup failed: {error}");
+        return 1;
+    }
+    let mut store = match PairingStore::open(&default_state_dir()) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("pairing store failed: {error}");
+            return 1;
+        }
+    };
+    match command {
+        "show" | "create" => {
+            let mut ttl_ms = None;
+            let mut scopes = Vec::new();
+            let mut index = 1;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--ttl-ms" => {
+                        index += 1;
+                        ttl_ms = args.get(index).and_then(|value| value.parse().ok());
+                    }
+                    "--scope" => {
+                        index += 1;
+                        if let Some(scope) = args.get(index) {
+                            scopes.push(scope.clone());
+                        }
+                    }
+                    _ => {
+                        eprintln!("pair show accepts --ttl-ms and repeated --scope");
+                        return 2;
+                    }
+                }
+                index += 1;
+            }
+            if scopes.is_empty() {
+                scopes.push("observe".to_owned());
+            }
+            match store.create(scopes, ttl_ms) {
+                Ok((record, code)) => print_json(json!({
+                    "pairing_id": record.pairing_id,
+                    "code": code,
+                    "scopes": record.scopes,
+                    "expires_at_ms": record.expires_at_ms,
+                    "remote_transport": "disabled_until_mtls"
+                })),
+                Err(error) => {
+                    eprintln!("pairing creation refused: {error}");
+                    1
+                }
+            }
+        }
+        "accept" => {
+            let Some(code) = args.get(1) else {
+                eprintln!("pair accept needs a short lived code");
+                return 2;
+            };
+            match store.accept(code) {
+                Ok(record) => print_json(public_pairing(&record)),
+                Err(error) => {
+                    eprintln!("pairing acceptance refused: {error}");
+                    1
+                }
+            }
+        }
+        "revoke" => {
+            let Some(pairing_id) = args.get(1) else {
+                eprintln!("pair revoke needs a pairing id");
+                return 2;
+            };
+            match store.revoke(pairing_id) {
+                Ok(record) => print_json(public_pairing(&record)),
+                Err(error) => {
+                    eprintln!("pairing revocation failed: {error}");
+                    1
+                }
+            }
+        }
+        "list" => print_json(json!({
+            "remote_transport": "disabled_until_mtls",
+            "pairings": store.list().iter().map(public_pairing).collect::<Vec<_>>()
+        })),
+        _ => {
+            eprintln!("pair accepts show, accept, revoke, or list");
+            2
+        }
+    }
+}
+
+fn public_pairing(record: &comptrol::pairing::PairingRecord) -> Value {
+    json!({
+        "pairing_id": record.pairing_id,
+        "scopes": record.scopes,
+        "created_at_ms": record.created_at_ms,
+        "expires_at_ms": record.expires_at_ms,
+        "accepted": record.accepted,
+        "revoked": record.revoked
+    })
 }
 
 fn run_doctor(args: Vec<String>) -> i32 {
