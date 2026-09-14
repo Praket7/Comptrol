@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -358,6 +358,10 @@ impl Policy {
         if std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1") {
             policy.max_risk = Risk::R2;
             policy.allowed_intents.insert("desktop.open_app".to_owned());
+        }
+        if std::env::var("COMPTROL_ALLOW_COMMANDS").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R3);
+            policy.allowed_intents.insert("command.run".to_owned());
         }
         if std::env::var("COMPTROL_ALLOW_BROWSER_FIXTURE").as_deref() == Ok("1") {
             policy.max_risk = policy.max_risk.max(Risk::R1);
@@ -785,6 +789,7 @@ impl Runtime {
             }
             "desktop.notify" => desktop_notify(&request, operation_id),
             "desktop.open_app" => desktop_open_app(&request, operation_id),
+            "command.run" => command_run(&request, operation_id),
             "macos.ax.press" => macos_ax_press(&request, operation_id),
             "macos.ax.set_value" => macos_ax_set_value(&request, operation_id),
             "browser.fixture.submit" => browser_fixture_submit(&request, operation_id),
@@ -1056,6 +1061,7 @@ fn classify(intent: &str) -> Risk {
         | "filesystem.copy"
         | "filesystem.restore_checkpoint" => Risk::R1,
         "desktop.open_app" | "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
+        "command.run" => Risk::R3,
         "browser.fixture.submit" => Risk::R1,
         "browser.cdp.evaluate"
         | "browser.cdp.navigate"
@@ -1149,10 +1155,10 @@ fn operation_metadata(request: &OperationRequest) -> Value {
             }
         }
     }
-    if request.intent == "desktop.open_app" {
-        if let Some(app) = request.params.get("app").and_then(Value::as_str) {
-            metadata["app"] = json!(app);
-        }
+    if request.intent == "desktop.open_app"
+        && let Some(app) = request.params.get("app").and_then(Value::as_str)
+    {
+        metadata["app"] = json!(app);
     }
     if request.intent == "macos.ax.press" || request.intent == "macos.ax.set_value" {
         for key in ["app", "control", "role", "window"] {
@@ -1163,16 +1169,16 @@ fn operation_metadata(request: &OperationRequest) -> Value {
         if metadata.get("role").is_none() {
             metadata["role"] = json!("button");
         }
-        if let Some(postcondition) = request.postcondition.as_ref() {
-            if let Some(attribute) = postcondition.get("attribute").and_then(Value::as_str) {
-                metadata["postcondition_attribute"] = json!(attribute);
-                if let Some(expected) = postcondition.get("equals") {
-                    if let Some(value) = expected.as_str() {
-                        metadata["postcondition_hash"] = json!(stable_hash(value.as_bytes()));
-                        metadata["postcondition_len"] = json!(value.len());
-                    } else if let Some(value) = expected.as_bool() {
-                        metadata["postcondition_bool"] = json!(value);
-                    }
+        if let Some(postcondition) = request.postcondition.as_ref()
+            && let Some(attribute) = postcondition.get("attribute").and_then(Value::as_str)
+        {
+            metadata["postcondition_attribute"] = json!(attribute);
+            if let Some(expected) = postcondition.get("equals") {
+                if let Some(value) = expected.as_str() {
+                    metadata["postcondition_hash"] = json!(stable_hash(value.as_bytes()));
+                    metadata["postcondition_len"] = json!(value.len());
+                } else if let Some(value) = expected.as_bool() {
+                    metadata["postcondition_bool"] = json!(value);
                 }
             }
         }
@@ -1183,6 +1189,20 @@ fn operation_metadata(request: &OperationRequest) -> Value {
             metadata["value_len"] = json!(value.len());
         }
         metadata["action"] = json!(request.intent.strip_prefix("macos.ax.").unwrap_or_default());
+    }
+    if request.intent == "command.run" {
+        if let Some(program) = request.params.get("program").and_then(Value::as_str) {
+            metadata["program"] = json!(program);
+        }
+        if let Some(args) = request.params.get("args").and_then(Value::as_array) {
+            metadata["args_count"] = json!(args.len());
+            if let Ok(bytes) = serde_json::to_vec(args) {
+                metadata["args_hash"] = json!(stable_hash(&bytes));
+            }
+        }
+        if let Some(cwd) = request.params.get("cwd").and_then(Value::as_str) {
+            metadata["cwd"] = json!(cwd);
+        }
     }
     metadata
 }
@@ -1205,6 +1225,7 @@ fn route_for(intent: &str) -> String {
         "filesystem.restore_checkpoint" => "sandbox_checkpoint",
         "desktop.notify" => "platform_notification",
         "desktop.open_app" => "platform_launch",
+        "command.run" => "process_argv",
         "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
         "browser.fixture.submit" => "browser_fixture",
         "browser.cdp.evaluate"
@@ -2499,6 +2520,320 @@ fn desktop_open_app(request: &OperationRequest, operation_id: String) -> ActionR
     }
 }
 
+const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
+
+fn command_run(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(program) = request.params.get("program").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "command.run needs a program".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    if program.is_empty() || program.chars().any(char::is_control) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "command.run accepts a nonempty program without control characters"
+                    .to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    let Some(args) = request.params.get("args").and_then(Value::as_array) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "command.run needs an args array".to_owned(),
+                recovery: Some(
+                    "Pass argv as structured strings rather than a shell command".to_owned(),
+                ),
+            },
+        );
+    };
+    if args.len() > 128 {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "input_too_large".to_owned(),
+                message: "command.run accepts at most 128 arguments".to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    let mut argv = Vec::with_capacity(args.len());
+    for value in args {
+        let Some(value) = value.as_str() else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "command.run args must be strings".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        if value.chars().any(char::is_control) || value.len() > 64 * 1024 {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "command.run arguments contain invalid or oversized data".to_owned(),
+                    recovery: None,
+                },
+            );
+        }
+        argv.push(value);
+    }
+    let allowed = std::env::var("COMPTROL_COMMAND_ALLOWLIST")
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .any(|allowed| allowed == program);
+    if !allowed {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "policy_denied".to_owned(),
+                message: "The program is not in the explicit local command allowlist".to_owned(),
+                recovery: Some(
+                    "Add the exact executable to COMPTROL_COMMAND_ALLOWLIST locally".to_owned(),
+                ),
+            },
+        );
+    }
+    let Some(cwd) = request.params.get("cwd").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "command.run needs an explicit cwd".to_owned(),
+                recovery: Some("Pass a directory within COMPTROL_COMMAND_ROOT".to_owned()),
+            },
+        );
+    };
+    let Ok(cwd) = fs::canonicalize(cwd) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "command.run cwd does not resolve to a directory".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    if !cwd.is_dir() {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "command.run cwd is not a directory".to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    let Ok(root) = std::env::var("COMPTROL_COMMAND_ROOT") else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "policy_denied".to_owned(),
+                message: "COMPTROL_COMMAND_ROOT is required for command.run".to_owned(),
+                recovery: Some(
+                    "Set an explicit local command root outside the agent channel".to_owned(),
+                ),
+            },
+        );
+    };
+    let Ok(root) = fs::canonicalize(root) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "COMPTROL_COMMAND_ROOT does not resolve".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    if !cwd.starts_with(&root) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "command.run cwd is outside the command root".to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    let timeout_ms = request
+        .params
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000)
+        .clamp(1, 60_000);
+    let mut child = match Command::new(program)
+        .args(&argv)
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "launch_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some(
+                        "Check the allowlisted executable and local permissions".to_owned(),
+                    ),
+                },
+            );
+        }
+    };
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let output_thread = std::thread::spawn(move || read_bounded(stdout));
+    let error_thread = std::thread::spawn(move || read_bounded(stderr));
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let status: Result<std::process::ExitStatus, io::Error> = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = output_thread.join();
+                let _ = error_thread.join();
+                return ActionResult {
+                    operation_id,
+                    intent: request.intent.clone(),
+                    route: "process_argv".to_owned(),
+                    target: request.target.clone(),
+                    preflight: "passed".to_owned(),
+                    delivery: DeliveryState::Unknown,
+                    effect: EffectState::Unknown,
+                    verification: VerificationState::Unverified,
+                    disturbance: json!({ "foreground_changed": false }),
+                    recovery: RecoveryState::RequiresReconciliation,
+                    data: Value::Null,
+                    error: Some(ComptrolError {
+                        code: "provider_timeout".to_owned(),
+                        message: "The command exceeded its bounded timeout".to_owned(),
+                        recovery: Some("Observe the command result before retrying".to_owned()),
+                    }),
+                };
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = output_thread.join();
+                let _ = error_thread.join();
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "process_wait_failed".to_owned(),
+                        message: error.to_string(),
+                        recovery: Some("Inspect the process state before retrying".to_owned()),
+                    },
+                );
+            }
+        }
+    };
+    let stdout = output_thread.join().unwrap_or_default();
+    let stderr = error_thread.join().unwrap_or_default();
+    let exit_code = status.ok().and_then(|value| value.code());
+    let expected = request
+        .postcondition
+        .as_ref()
+        .filter(|value| value.get("kind").and_then(Value::as_str) == Some("exit_code"))
+        .and_then(|value| value.get("value").and_then(Value::as_i64))
+        .and_then(|value| i32::try_from(value).ok());
+    let verified = expected.map_or(exit_code == Some(0), |value| exit_code == Some(value));
+    let data = json!({
+        "program": program,
+        "args_count": argv.len(),
+        "cwd": cwd,
+        "exit_code": exit_code,
+        "stdout": String::from_utf8_lossy(&stdout),
+        "stderr": String::from_utf8_lossy(&stderr),
+        "output_truncated": stdout.len() == COMMAND_OUTPUT_LIMIT || stderr.len() == COMMAND_OUTPUT_LIMIT,
+    });
+    if verified {
+        success(
+            request,
+            operation_id,
+            "process_argv",
+            EffectState::Changed,
+            VerificationState::Verified,
+            data,
+        )
+    } else {
+        ActionResult {
+            operation_id,
+            intent: request.intent.clone(),
+            route: "process_argv".to_owned(),
+            target: request.target.clone(),
+            preflight: "passed".to_owned(),
+            delivery: DeliveryState::Delivered,
+            effect: EffectState::Changed,
+            verification: VerificationState::Failed,
+            disturbance: json!({ "foreground_changed": false }),
+            recovery: RecoveryState::None,
+            data,
+            error: Some(ComptrolError {
+                code: "verification_failed".to_owned(),
+                message: format!("Command exited with {:?}", exit_code),
+                recovery: Some("Inspect the bounded command output and postcondition".to_owned()),
+            }),
+        }
+    }
+}
+
+fn read_bounded(mut input: impl Read) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    while output.len() < COMMAND_OUTPUT_LIMIT {
+        let remaining = COMMAND_OUTPUT_LIMIT - output.len();
+        let chunk_len = remaining.min(buffer.len());
+        let size = input.read(&mut buffer[..chunk_len]).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..size]);
+    }
+    output
+}
+
 fn macos_ax_press(request: &OperationRequest, operation_id: String) -> ActionResult {
     if !cfg!(target_os = "macos") {
         return unsupported_ax(request, operation_id);
@@ -2866,6 +3201,14 @@ pub fn capabilities() -> Vec<Capability> {
             note: "Opens an exact app through the native desktop launcher without mouse or clipboard input".to_owned(),
         },
         Capability {
+            name: "command.run".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_COMMANDS").as_deref() == Ok("1")
+                && std::env::var_os("COMPTROL_COMMAND_ROOT").is_some(),
+            risk: Risk::R3,
+            route: "process_argv".to_owned(),
+            note: "Runs an explicitly allowlisted executable with argv inside an explicit local root and no shell".to_owned(),
+        },
+        Capability {
             name: "browser.cdp".to_owned(),
             available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
@@ -3020,7 +3363,8 @@ fn doctor(runtime: &Runtime) -> Value {
             "sandbox_writes": runtime.policy.allow_sandbox_writes,
             "desktop_notify": runtime.policy.allow_desktop_notify,
             "macos_ax": runtime.policy.allowed_intents.contains("macos.ax.press"),
-            "browser_fixture": runtime.policy.allowed_intents.contains("browser.fixture.submit")
+            "browser_fixture": runtime.policy.allowed_intents.contains("browser.fixture.submit"),
+            "commands": runtime.policy.allowed_intents.contains("command.run")
         },
         "journal": { "available": true, "path": runtime.journal.path() },
         "operations": { "available": true, "path": runtime.operations.path() },

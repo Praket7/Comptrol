@@ -8,6 +8,7 @@ npm run test:browser
 python3 scripts/client_conformance.py
 python3 scripts/platform_conformance.py
 python3 scripts/privacy_conformance.py
+python3 scripts/command_conformance.py
 python3 scripts/chrome_conformance.py
 python3 scripts/visible_chrome_conformance.py
 python3 scripts/macos_ax_conformance.py
