@@ -40,7 +40,7 @@ Linux has a portable runtime build path and conservative AT SPI, X11, and Waylan
 
 ## Not built yet
 
-Real Chrome profile validation beyond the dedicated headless harness, platform accessibility fixture applications, remote pairing, application adapters, native packaging, signed releases, npm publication, Homebrew publication, and real hardware matrix testing remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, target bound fill and wait operations, sandbox upload and download verification, client integration proposals with atomic JSON apply and undo, cross platform build validation, and dedicated headless Chrome validation are implemented and tested. GitHub workflow security checks now include Rust dependency audit and pull request dependency review.
+Real Chrome profile validation beyond the dedicated headless harness, platform accessibility fixture applications, remote pairing, application adapters, signed releases, npm publication, Homebrew publication, and real hardware matrix testing remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, target bound fill and wait operations, sandbox upload and download verification, client integration proposals with atomic JSON apply and undo, cross platform build validation, reproducible native archive and checksum preparation, and dedicated headless Chrome validation are implemented and tested. GitHub workflow security checks now include Rust dependency audit and pull request dependency review.
 
 ## Security decisions
 
