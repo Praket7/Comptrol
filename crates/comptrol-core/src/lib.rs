@@ -1390,18 +1390,90 @@ fn browser_cdp_dom_action(
             )
         }
         "browser.cdp.wait_for" => {
-            let Some(expression) = request.params.get("expression").and_then(Value::as_str) else {
+            let Some(selector) = request.params.get("selector").and_then(Value::as_str) else {
                 return ActionResult::refused(
                     request,
                     operation_id,
                     ComptrolError {
                         code: "invalid_input".to_owned(),
-                        message: "Browser wait needs an expression".to_owned(),
+                        message: "Browser wait needs a selector".to_owned(),
                         recovery: None,
                     },
                 );
             };
-            (expression.to_owned(), true)
+            let property = request
+                .params
+                .get("property")
+                .and_then(Value::as_str)
+                .unwrap_or("textContent");
+            if !matches!(
+                property,
+                "textContent" | "value" | "title" | "href" | "checked" | "disabled"
+            ) {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser wait property is not allowlisted".to_owned(),
+                        recovery: None,
+                    },
+                );
+            }
+            let condition = if let Some(expected) = request.params.get("equals") {
+                let Ok(expected) = serde_json::to_string(expected) else {
+                    return ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "invalid_input".to_owned(),
+                            message: "Browser wait value is not serializable".to_owned(),
+                            recovery: None,
+                        },
+                    );
+                };
+                format!("JSON.stringify(element[{property:?}]) === JSON.stringify({expected})")
+            } else if let Some(expected) = request.params.get("contains").and_then(Value::as_str) {
+                let Ok(expected) = serde_json::to_string(expected) else {
+                    return ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "invalid_input".to_owned(),
+                            message: "Browser wait value is not serializable".to_owned(),
+                            recovery: None,
+                        },
+                    );
+                };
+                format!("String(element[{property:?}] ?? '').includes({expected})")
+            } else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser wait needs equals or contains".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            let Ok(selector) = serde_json::to_string(selector) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser selector is not serializable".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            (
+                format!(
+                    "(() => {{ const element = document.querySelector({selector}); return Boolean(element) && {condition}; }})()"
+                ),
+                true,
+            )
         }
         _ => unreachable!(),
     };
@@ -2282,6 +2354,7 @@ fn doctor(runtime: &Runtime) -> Value {
         "platform": std::env::consts::OS,
         "architecture": std::env::consts::ARCH,
         "daemon": { "state": "in_process", "available": true },
+        "mcp_adapter": { "available": true, "transport": "stdio", "command": "comptrol mcp" },
         "policy": {
             "max_risk": runtime.policy.max_risk,
             "sandbox_writes": runtime.policy.allow_sandbox_writes,
@@ -2301,6 +2374,7 @@ fn doctor(runtime: &Runtime) -> Value {
             "fixture_mutation": runtime.policy.allowed_intents.contains("browser.fixture.submit"),
             "status": if std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some() { "configured" } else { "not_configured" }
         },
+        "client_configuration": integration::list(),
         "remote": { "available": false, "binding": "loopback_only" },
         "state_dir": state_dir()
     })

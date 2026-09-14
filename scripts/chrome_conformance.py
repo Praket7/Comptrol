@@ -104,7 +104,7 @@ try:
     assert fill["result"]["structuredContent"]["verification"] == "verified"
     click = call(runtime, 7, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.click", "idempotency_key": "chrome-click", "params": {**identity, "selector": "#submit"}}})
     assert click["result"]["structuredContent"]["verification"] == "unverified"
-    wait = call(runtime, 8, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.wait_for", "idempotency_key": "chrome-wait", "params": {**identity, "expression": "document.querySelector('#state').textContent.includes('submitted')"}}})
+    wait = call(runtime, 8, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.wait_for", "idempotency_key": "chrome-wait", "params": {**identity, "selector": "#state", "property": "textContent", "contains": "submitted"}}})
     assert wait["result"]["structuredContent"]["verification"] == "verified"
     download = call(runtime, 9, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.download", "idempotency_key": "chrome-download", "params": {**identity, "selector": "#download", "file_name": "fixture.txt"}}})
     download_data = download["result"]["structuredContent"]

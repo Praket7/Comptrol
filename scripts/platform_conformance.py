@@ -14,6 +14,8 @@ with tempfile.TemporaryDirectory(prefix="comptrol-platform-") as state:
     assert names["platform.broker.observe"]["available"] is True
     diagnostics = json.loads(subprocess.check_output(["target/debug/comptrol", "doctor"], env=environment))
     assert set((diagnostics["platform"]["brokers"] or {})) >= {"windows_uia", "linux_atspi", "linux_x11", "linux_wayland"}
+    assert diagnostics["mcp_adapter"]["transport"] == "stdio"
+    assert {item["client"] for item in diagnostics["client_configuration"]} >= {"codex", "claude-code", "cursor"}
     platform = os.uname().sysname.lower()
     if platform == "darwin":
         assert names["platform.windows.uia"]["available"] is False
