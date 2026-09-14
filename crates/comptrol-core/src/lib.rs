@@ -407,6 +407,12 @@ impl Policy {
                 "browser.cdp.history_forward".to_owned(),
             ]);
         }
+        if std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            policy
+                .allowed_intents
+                .insert("browser.chrome.open_tab".to_owned());
+        }
         policy
     }
 
@@ -870,6 +876,7 @@ impl Runtime {
             }
             "desktop.notify" => desktop_notify(&request, operation_id),
             "desktop.open_app" => desktop_open_app(&request, operation_id),
+            "browser.chrome.open_tab" => browser_chrome_open_tab(&request, operation_id),
             "command.run" => command_run(&request, operation_id),
             "windows.uia.press" | "windows.uia.set_value" => {
                 windows_uia_action(&request, operation_id)
@@ -1156,6 +1163,7 @@ fn classify(intent: &str) -> Risk {
         | "filesystem.copy"
         | "filesystem.restore_checkpoint" => Risk::R1,
         "desktop.open_app" | "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
+        "browser.chrome.open_tab" => Risk::R2,
         "command.run" => Risk::R3,
         "windows.uia.press" | "windows.uia.set_value" => Risk::R2,
         "linux.atspi.press" | "linux.atspi.set_value" => Risk::R2,
@@ -1335,6 +1343,7 @@ fn route_for(intent: &str) -> String {
         "filesystem.restore_checkpoint" => "sandbox_checkpoint",
         "desktop.notify" => "platform_notification",
         "desktop.open_app" => "platform_launch",
+        "browser.chrome.open_tab" => "browser_launcher",
         "command.run" => "process_argv",
         "windows.uia.press" | "windows.uia.set_value" => "windows_uia",
         "linux.atspi.press" | "linux.atspi.set_value" => "linux_atspi",
@@ -2282,6 +2291,7 @@ fn foreground_changed(request: &OperationRequest) -> bool {
             .get("background")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        "browser.chrome.open_tab" => true,
         _ => false,
     }
 }
@@ -2769,6 +2779,44 @@ fn desktop_open_app(request: &OperationRequest, operation_id: String) -> ActionR
                 recovery: Some("Check that macOS LaunchServices is available".to_owned()),
             },
         ),
+    }
+}
+
+fn browser_chrome_open_tab(request: &OperationRequest, operation_id: String) -> ActionResult {
+    if request.background.as_deref() == Some("strict_background") {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "background_unavailable".to_owned(),
+                message: "The native Chrome launcher may activate the desktop".to_owned(),
+                recovery: Some(
+                    "Use browser.cdp.open_tab with an explicit background tab".to_owned(),
+                ),
+            },
+        );
+    }
+    let Some(url) = request.params.get("url").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Opening a Chrome tab needs a URL".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    match browser::launch_chrome_tab(url) {
+        Ok(data) => success(
+            request,
+            operation_id,
+            "browser_launcher",
+            EffectState::Changed,
+            VerificationState::Unverified,
+            data,
+        ),
+        Err(error) => ActionResult::refused(request, operation_id, error),
     }
 }
 
@@ -3839,6 +3887,16 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R2,
             route: "platform_launch".to_owned(),
             note: "Opens an exact app through the native desktop launcher without mouse or clipboard input".to_owned(),
+        },
+        Capability {
+            name: "browser.chrome.open_tab".to_owned(),
+            available: (cfg!(target_os = "macos")
+                || cfg!(target_os = "windows")
+                || cfg!(target_os = "linux"))
+                && std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "browser_launcher".to_owned(),
+            note: "Opens a foreground Chrome tab in the existing default browser profile and reports launcher acceptance only".to_owned(),
         },
         Capability {
             name: "command.run".to_owned(),

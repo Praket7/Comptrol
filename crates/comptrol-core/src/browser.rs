@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tungstenite::{Message, connect};
 
@@ -96,18 +97,7 @@ pub fn open_tab(
     background: bool,
     browser_context_id: Option<&str>,
 ) -> Result<Value, ComptrolError> {
-    if url.is_empty()
-        || url
-            .chars()
-            .any(|character| character == '\r' || character == '\n')
-        || !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("about:"))
-    {
-        return Err(ComptrolError {
-            code: "invalid_input".to_owned(),
-            message: "Browser tabs accept only http, https, or about URLs".to_owned(),
-            recovery: Some("Provide a safe browser URL".to_owned()),
-        });
-    }
+    validate_url(url)?;
     if !background && browser_context_id.is_none() {
         let path = format!("/json/new?{}", encode_new_tab_url(url));
         let (status, value) =
@@ -201,6 +191,71 @@ pub fn open_tab(
         message: "The browser did not expose the new background tab".to_owned(),
         recovery: Some("Inspect browser targets before retrying".to_owned()),
     })
+}
+
+pub fn launch_chrome_tab(url: &str) -> Result<Value, ComptrolError> {
+    validate_url(url)?;
+    let status = if cfg!(target_os = "macos") {
+        Command::new("open")
+            .args(["-a", "Google Chrome", url])
+            .status()
+    } else if cfg!(target_os = "windows") {
+        Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Process -FilePath $env:COMPTROL_CHROME_URL",
+            ])
+            .env("COMPTROL_CHROME_URL", url)
+            .status()
+    } else if cfg!(target_os = "linux") {
+        Command::new("xdg-open").arg(url).status()
+    } else {
+        return Err(ComptrolError {
+            code: "unsupported_surface".to_owned(),
+            message: "Chrome launcher control is unsupported on this operating system".to_owned(),
+            recovery: Some("Use the configured browser DevTools route".to_owned()),
+        });
+    };
+    match status {
+        Ok(status) if status.success() => Ok(json!({
+            "browser": "Google Chrome",
+            "url": url,
+            "visibility": "foreground",
+            "profile": "existing_default_browser_profile",
+            "account_state": "preserved_by_browser",
+            "postcondition": "launcher_accepted",
+            "mouse": "untouched",
+            "clipboard": "untouched"
+        })),
+        Ok(status) => Err(ComptrolError {
+            code: "launch_failed".to_owned(),
+            message: format!("Chrome launcher returned {status}"),
+            recovery: Some("Check that Google Chrome is installed".to_owned()),
+        }),
+        Err(error) => Err(ComptrolError {
+            code: "launch_unavailable".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Check that the native browser launcher is available".to_owned()),
+        }),
+    }
+}
+
+fn validate_url(url: &str) -> Result<(), ComptrolError> {
+    if url.is_empty()
+        || url
+            .chars()
+            .any(|character| character == '\r' || character == '\n')
+        || !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("about:"))
+    {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Browser tabs accept only http, https, or about URLs".to_owned(),
+            recovery: Some("Provide a safe browser URL".to_owned()),
+        });
+    }
+    Ok(())
 }
 
 pub fn close_tab(

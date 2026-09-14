@@ -8,6 +8,8 @@ The temporary headless profile is intentionally unauthenticated. Signed in accou
 
 The real Chrome harness also writes a disposable fixture cookie in the initial page and verifies that a background page created in the same browser profile can observe it. This proves profile continuity without reading credentials or transferring browser secrets.
 
+`browser.chrome.open_tab` is a separate opt in foreground launcher route for machines without a DevTools endpoint. It asks the installed Chrome launcher to open the URL in the existing default browser profile, so signed in state stays with Chrome. It reports unverified launcher acceptance because no exact target identity is available. Strict background posture refuses this route and directs callers to CDP.
+
 The normal repository check uses the deterministic fixture websocket. Real Chrome validation is a host acceptance test because Chrome is not guaranteed on CI.
 
 For a user visible validation, start Chrome with a loopback DevTools endpoint and set `COMPTROL_CDP_ENDPOINT` plus `COMPTROL_ALLOW_BROWSER_CDP`. The validation must use the user chosen profile intentionally. Comptrol will reuse that profile but will not copy cookies or credentials into another profile.

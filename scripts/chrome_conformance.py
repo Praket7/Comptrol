@@ -111,6 +111,16 @@ try:
     assert retained_data["data"]["result"]["value"] is True
     navigation = call(runtime, 3, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "idempotency_key": "chrome-navigation", "params": {**identity, "url": f"http://127.0.0.1:{fixture_port}/"}}})
     assert navigation["result"]["structuredContent"]["verification"] == "unverified"
+    deadline = time.time() + 5
+    rebound = None
+    while time.time() < deadline:
+        candidate = next(item for item in wait_for(f"http://127.0.0.1:{debug_port}/json/list") if item.get("id") == target["id"])
+        if candidate.get("url") == f"http://127.0.0.1:{fixture_port}/":
+            rebound = candidate
+            break
+        time.sleep(0.05)
+    assert rebound is not None, rebound
+    identity = {"target_id": rebound["id"], "browser_context_id": rebound.get("browserContextId", "default"), "revision": rebound.get("revision", f"url:{rebound['url']}")}
     evaluation = call(runtime, 4, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.evaluate", "idempotency_key": "chrome-evaluation", "params": {**identity, "expression": "(() => { const input = document.querySelector('#message'); input.value = 'real chrome'; return input.value })()"}}})
     structured = evaluation["result"]["structuredContent"]
     assert structured["verification"] == "verified", structured
