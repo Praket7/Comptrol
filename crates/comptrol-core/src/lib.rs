@@ -3047,6 +3047,12 @@ mod tests {
     #[test]
     fn adapter_registry_rejects_duplicate_names() {
         let mut registry = AdapterRegistry::builtin();
+        assert!(
+            registry
+                .list()
+                .iter()
+                .any(|adapter| adapter.name == "comptrol.browser.cdp")
+        );
         let descriptor = registry.list()[0].clone();
         assert!(!registry.register(descriptor.clone()));
         assert!(registry.register(AdapterDescriptor {

@@ -20,19 +20,52 @@ pub struct AdapterRegistry {
 impl AdapterRegistry {
     pub fn builtin() -> Self {
         Self {
-            descriptors: vec![AdapterDescriptor {
-                name: "comptrol.core".to_owned(),
-                version: "0.1".to_owned(),
-                platforms: vec!["macos".to_owned(), "windows".to_owned(), "linux".to_owned()],
-                capabilities: vec![
-                    "observe".to_owned(),
-                    "policy".to_owned(),
-                    "recovery".to_owned(),
-                ],
-                route: "native".to_owned(),
-                risk: Risk::R0,
-                isolation: "in_process_trusted".to_owned(),
-            }],
+            descriptors: vec![
+                AdapterDescriptor {
+                    name: "comptrol.core".to_owned(),
+                    version: "0.1".to_owned(),
+                    platforms: vec!["macos".to_owned(), "windows".to_owned(), "linux".to_owned()],
+                    capabilities: vec![
+                        "observe".to_owned(),
+                        "policy".to_owned(),
+                        "recovery".to_owned(),
+                    ],
+                    route: "native".to_owned(),
+                    risk: Risk::R0,
+                    isolation: "in_process_trusted".to_owned(),
+                },
+                AdapterDescriptor {
+                    name: "comptrol.browser.cdp".to_owned(),
+                    version: "0.1".to_owned(),
+                    platforms: vec!["macos".to_owned(), "windows".to_owned(), "linux".to_owned()],
+                    capabilities: vec![
+                        "target_discovery".to_owned(),
+                        "evaluate".to_owned(),
+                        "navigate".to_owned(),
+                        "fill".to_owned(),
+                        "click".to_owned(),
+                        "wait_for".to_owned(),
+                        "upload".to_owned(),
+                        "download".to_owned(),
+                    ],
+                    route: "browser_protocol".to_owned(),
+                    risk: Risk::R2,
+                    isolation: "loopback_policy_bound".to_owned(),
+                },
+                AdapterDescriptor {
+                    name: "comptrol.macos.ax".to_owned(),
+                    version: "0.1".to_owned(),
+                    platforms: vec!["macos".to_owned()],
+                    capabilities: vec![
+                        "press".to_owned(),
+                        "set_value".to_owned(),
+                        "postcondition".to_owned(),
+                    ],
+                    route: "macos_ax".to_owned(),
+                    risk: Risk::R2,
+                    isolation: "osascript_bounded".to_owned(),
+                },
+            ],
         }
     }
 
