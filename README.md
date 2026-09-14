@@ -54,6 +54,8 @@ Privacy is local by default. `comptrol privacy status` reports telemetry and red
 
 With explicit local app launch policy, macOS, Windows, and Linux can open an exact app through their native launcher. Browser tabs can be opened in the existing Chrome profile through the local DevTools endpoint. These routes do not synthesize mouse input or touch the clipboard.
 
+Supported browser operations can request strict background posture. Routes that cannot prove that posture refuse instead of activating another application or silently taking control of the foreground.
+
 Dedicated user profile Chrome validation, Windows and Linux live matrix validation, remote pairing, signed releases, and published packages remain tracked work. The real Chrome harness covers navigation, DOM evaluation, sandbox upload, and sandbox download.
 
 ## Contributing

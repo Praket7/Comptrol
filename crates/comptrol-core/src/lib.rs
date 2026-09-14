@@ -114,6 +114,8 @@ pub struct OperationRequest {
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
+    #[serde(default)]
+    pub background: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -752,6 +754,27 @@ impl Runtime {
             return replay;
         }
         let risk = request.risk.unwrap_or_else(|| classify(&request.intent));
+        if let Some(background) = request.background.as_deref()
+            && !matches!(
+                background,
+                "strict_background"
+                    | "prefer_background"
+                    | "foreground_allowed"
+                    | "foreground_required"
+            )
+        {
+            let result = ActionResult::refused(
+                &request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Unknown background posture".to_owned(),
+                    recovery: Some("Use strict_background, prefer_background, foreground_allowed, or foreground_required".to_owned()),
+                },
+            );
+            self.remember(&request, result.clone());
+            return result;
+        }
         if let Some(key) = request.idempotency_key.as_ref()
             && let Some(record) = self
                 .operations
@@ -897,6 +920,7 @@ impl Runtime {
                         risk: Some(Risk::R0),
                         idempotency_key: None,
                         dry_run: false,
+                        background: None,
                     },
                     self.next_operation_id(),
                 )
@@ -1145,7 +1169,12 @@ fn unknown_result(request: &OperationRequest, operation_id: String) -> ActionRes
         delivery: DeliveryState::Unknown,
         effect: EffectState::Unknown,
         verification: VerificationState::Unverified,
-        disturbance: json!({ "foreground_changed": false }),
+        disturbance: json!({
+            "foreground_changed": false,
+            "mouse": "untouched",
+            "clipboard": "untouched",
+            "posture": request.background.as_deref().unwrap_or("foreground_allowed")
+        }),
         recovery: RecoveryState::RequiresReconciliation,
         data: Value::Null,
         error: Some(ComptrolError {
@@ -1161,6 +1190,9 @@ fn operation_metadata(request: &OperationRequest) -> Value {
     let mut metadata = json!({
         "target_kind": request.target.as_ref().map(|target| target.kind.clone()),
     });
+    if let Some(background) = request.background.as_deref() {
+        metadata["background"] = json!(background);
+    }
     if request.intent == "filesystem.write" {
         if let Some(path) = request.params.get("path").and_then(Value::as_str) {
             metadata["path"] = json!(state_dir().join("sandbox").join(path));
@@ -1494,6 +1526,21 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             .get("background")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if request.background.as_deref() == Some("strict_background") && !background {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "background_unavailable".to_owned(),
+                    message: "Strict background browser opening requires background true"
+                        .to_owned(),
+                    recovery: Some(
+                        "Request a background tab through the existing browser profile".to_owned(),
+                    ),
+                },
+            );
+        }
+        let background = background || request.background.as_deref() == Some("strict_background");
         return match browser::open_tab(&endpoint.to_string_lossy(), url, background) {
             Ok(data) => success(
                 request,
@@ -2100,7 +2147,12 @@ fn success(
         delivery: DeliveryState::Delivered,
         effect,
         verification,
-        disturbance: json!({ "foreground_changed": false }),
+        disturbance: json!({
+            "foreground_changed": false,
+            "mouse": "untouched",
+            "clipboard": "untouched",
+            "posture": request.background.as_deref().unwrap_or("foreground_allowed")
+        }),
         recovery: RecoveryState::None,
         data,
         error: None,
@@ -2483,6 +2535,17 @@ fn desktop_notify(request: &OperationRequest, operation_id: String) -> ActionRes
 }
 
 fn desktop_open_app(request: &OperationRequest, operation_id: String) -> ActionResult {
+    if request.background.as_deref() == Some("strict_background") {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "background_unavailable".to_owned(),
+                message: "Opening an application may activate the desktop and cannot satisfy strict background posture".to_owned(),
+                recovery: Some("Use foreground_allowed or open a browser target through CDP".to_owned()),
+            },
+        );
+    }
     let Some(app) = request.params.get("app").and_then(Value::as_str) else {
         return ActionResult::refused(
             request,
@@ -3941,6 +4004,7 @@ mod tests {
             risk: None,
             idempotency_key: Some("deny".to_owned()),
             dry_run: false,
+            background: None,
         });
         assert_eq!(
             result.error.as_ref().map(|e| e.code.as_str()),
@@ -3959,6 +4023,7 @@ mod tests {
             risk: None,
             idempotency_key: Some("press-check".to_owned()),
             dry_run: false,
+            background: None,
         };
         let script = ax_script(&request, "press").expect("semantic script");
         assert!(script.contains("perform action \"AXPress\""));
@@ -3975,6 +4040,7 @@ mod tests {
             risk: Some(Risk::R2),
             idempotency_key: Some("value-check".to_owned()),
             dry_run: false,
+            background: None,
         };
         let metadata = operation_metadata(&request);
         assert_eq!(metadata["app"], "Fixture");
@@ -3997,6 +4063,7 @@ mod tests {
             risk: None,
             idempotency_key: Some("same".to_owned()),
             dry_run: false,
+            background: None,
         };
         let first = runtime.operate(request.clone());
         let second = runtime.operate(request);
@@ -4021,6 +4088,7 @@ mod tests {
             risk: None,
             idempotency_key: Some("stopped".to_owned()),
             dry_run: false,
+            background: None,
         });
         assert_eq!(
             result.error.as_ref().map(|e| e.code.as_str()),
@@ -4043,6 +4111,7 @@ mod tests {
             risk: Some(Risk::R1),
             idempotency_key: Some("copy-test".to_owned()),
             dry_run: false,
+            background: None,
         };
         let result = sandbox_copy_at(&request, "copy-op".to_owned(), &checkpoints, &sandbox);
         assert_eq!(result.verification, VerificationState::Verified);
@@ -4104,6 +4173,7 @@ mod tests {
             risk: None,
             idempotency_key: Some("workflow-operation".to_owned()),
             dry_run: false,
+            background: None,
         });
         assert_eq!(result.verification, VerificationState::Verified);
         assert_eq!(result.data["done"], true);
@@ -4123,6 +4193,7 @@ mod tests {
             risk: Some(Risk::R1),
             idempotency_key: Some("recover-key".to_owned()),
             dry_run: false,
+            background: None,
         };
         let record = DurableOperation {
             operation_id: "op-restart".to_owned(),
@@ -4189,6 +4260,7 @@ mod tests {
             risk: Some(Risk::R1),
             idempotency_key: Some("unknown-key".to_owned()),
             dry_run: false,
+            background: None,
         };
         let result = unknown_result(&request, "op-unknown".to_owned());
         let record = DurableOperation {
@@ -4225,6 +4297,7 @@ mod tests {
             risk: Some(Risk::R1),
             idempotency_key: Some("observed-key".to_owned()),
             dry_run: false,
+            background: None,
         };
         let result = success(
             &request,
@@ -4341,6 +4414,7 @@ mod tests {
             risk: Some(Risk::R1),
             idempotency_key: Some("trace-key".to_owned()),
             dry_run: true,
+            background: None,
         };
         let result = ActionResult {
             operation_id: "trace-op".to_owned(),
