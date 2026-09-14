@@ -166,7 +166,7 @@ pub fn open_tab(
         .and_then(Value::as_str)
         .ok_or_else(|| ComptrolError {
             code: "browser_protocol_invalid".to_owned(),
-            message: "The browser did not return the background tab identity".to_owned(),
+            message: "The browser did not return the opened tab identity".to_owned(),
             recovery: Some("Inspect the browser target list".to_owned()),
         })?;
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -186,7 +186,7 @@ pub fn open_tab(
             }
             return Ok(json!({
                 "target": target,
-                "visibility": "background",
+                "visibility": if background { "background" } else { "foreground" },
                 "profile": "attached_existing_browser",
                 "account_state": "same_browser_profile",
                 "mouse": "untouched",

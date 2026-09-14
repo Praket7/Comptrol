@@ -125,7 +125,7 @@ function websocketMessage(buffer) {
     length = buffer.readUInt16BE(2)
     offset = 4
   }
-  if (length > 125 || buffer.length < offset + 4 + length) return null
+  if (length > 1024 * 1024 || buffer.length < offset + 4 + length) return null
   const mask = buffer.subarray(offset, offset + 4)
   const payload = buffer.subarray(offset + 4, offset + 4 + length)
   return Buffer.from(payload.map((value, index) => value ^ mask[index % 4])).toString()

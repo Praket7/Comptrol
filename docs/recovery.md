@@ -4,6 +4,8 @@ The durable lifecycle records prepared, authorized, dispatched, observed, verifi
 
 Every permitted mutation is written to the local operation journal before dispatch. The journal records prepared and dispatched state without storing typed content.
 
+The process level acceptance path in `scripts/recovery_conformance.py` seeds one fixture mutation, restarts the MCP server from a dispatched journal record, confirms `operation_unknown`, reconciles by observing the fixture, and confirms that the stable retry is an idempotent replay with one fixture submission.
+
 If the process restarts after dispatch and before completion, a repeated idempotency key returns operation unknown. The runtime will not repeat the mutation. Call reconcile after observing the target state.
 
 Sandbox file writes can reconcile by comparing a local path and content fingerprint. macOS app launches reconcile by checking the exact process. AX value changes and presses reconcile only when their exact semantic target and postcondition were journaled. Raw values are stored as fingerprints rather than typed content. Notifications and browser tab creation remain unknown after a crash because the operating system or browser cannot prove the exact mutation safely.
