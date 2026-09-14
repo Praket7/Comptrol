@@ -14,7 +14,7 @@ The repository also includes an npm launcher package, CI validation, a release w
 
 The browser route now opens visible tabs through the configured local Chrome endpoint and can create background tabs in the existing browser profile. The result reports the exact target identity and explicitly records that mouse and clipboard were untouched. Account state is reused by attaching to the existing profile. No credential or cookie transfer into a separate headless profile is attempted.
 
-macOS app launch is available as a separate explicit policy route through LaunchServices. It accepts an exact application name and reports process verification when Accessibility permits it. Windows and Linux app launch remain unsupported until native launch adapters are validated.
+App launch is available as a separate explicit policy route through native launchers. macOS accepts an exact application name and reports process verification when Accessibility permits it. Windows uses `Start-Process` and Linux uses `gtk-launch`; both report launcher acceptance without claiming process verification.
 
 The protocol boundary now rejects MCP and browser messages larger than one mebibyte before parsing. The privacy commands report disabled telemetry, disabled automatic update checks, redacted data classes, and the optional network routes known to this build.
 

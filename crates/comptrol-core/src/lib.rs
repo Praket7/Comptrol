@@ -2426,28 +2426,45 @@ fn desktop_open_app(request: &OperationRequest, operation_id: String) -> ActionR
             },
         );
     }
-    if !cfg!(target_os = "macos") {
+    let status = if cfg!(target_os = "macos") {
+        Command::new("open").args(["-a", app]).status()
+    } else if cfg!(target_os = "windows") {
+        Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Process -FilePath $env:COMPTROL_APP_NAME",
+            ])
+            .env("COMPTROL_APP_NAME", app)
+            .status()
+    } else if cfg!(target_os = "linux") {
+        Command::new("gtk-launch").arg(app).status()
+    } else {
         return ActionResult::refused(
             request,
             operation_id,
             ComptrolError {
                 code: "unsupported_surface".to_owned(),
-                message: "Application launch is only implemented through macOS LaunchServices"
-                    .to_owned(),
-                recovery: Some("Use a platform launch adapter on this operating system".to_owned()),
+                message: "Application launch is unsupported on this operating system".to_owned(),
+                recovery: Some("Inspect platform capabilities".to_owned()),
             },
         );
-    }
-    let status = Command::new("open").args(["-a", app]).status();
+    };
     match status {
         Ok(status) if status.success() => {
-            let verify_script = format!(
-                "tell application \"System Events\" to exists process {}",
-                apple_quote(app)
-            );
-            let verified = run_osascript(&verify_script).is_ok_and(|output| {
-                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
-            });
+            let verified = if cfg!(target_os = "macos") {
+                let verify_script = format!(
+                    "tell application \"System Events\" to exists process {}",
+                    apple_quote(app)
+                );
+                run_osascript(&verify_script).is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "true"
+                })
+            } else {
+                false
+            };
             success(
                 request,
                 operation_id,
@@ -2458,7 +2475,7 @@ fn desktop_open_app(request: &OperationRequest, operation_id: String) -> ActionR
                 } else {
                     VerificationState::Unverified
                 },
-                json!({ "app": app, "opened": true, "mouse": "untouched", "clipboard": "untouched", "postcondition": if verified { "process_present" } else { "unverified" } }),
+                json!({ "app": app, "opened": true, "mouse": "untouched", "clipboard": "untouched", "postcondition": if verified { "process_present" } else { "launcher_accepted" } }),
             )
         }
         Ok(output) => ActionResult::refused(
@@ -2840,11 +2857,13 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "desktop.open_app".to_owned(),
-            available: cfg!(target_os = "macos")
+            available: (cfg!(target_os = "macos")
+                || cfg!(target_os = "windows")
+                || cfg!(target_os = "linux"))
                 && std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "platform_launch".to_owned(),
-            note: "Opens an exact macOS application name through LaunchServices without mouse or clipboard input".to_owned(),
+            note: "Opens an exact app through the native desktop launcher without mouse or clipboard input".to_owned(),
         },
         Capability {
             name: "browser.cdp".to_owned(),

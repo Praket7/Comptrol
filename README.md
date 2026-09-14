@@ -52,9 +52,9 @@ The runtime includes bounded event history, file checkpoints, fixture trace repl
 
 Privacy is local by default. `comptrol privacy status` reports telemetry and redaction defaults. The privacy network endpoint report lists optional routes. MCP and browser protocol messages are bounded to one mebibyte.
 
-With explicit local app launch policy, macOS can open an exact application name through LaunchServices. Browser tabs can be opened in the existing Chrome profile through the local DevTools endpoint. These routes do not synthesize mouse input or touch the clipboard.
+With explicit local app launch policy, macOS, Windows, and Linux can open an exact app through their native launcher. Browser tabs can be opened in the existing Chrome profile through the local DevTools endpoint. These routes do not synthesize mouse input or touch the clipboard.
 
-Dedicated Chrome validation, Windows and Linux semantic actuation, remote pairing, signed releases, and published packages remain tracked work. The real Chrome harness covers navigation, DOM evaluation, sandbox upload, and sandbox download.
+Dedicated user profile Chrome validation, Windows and Linux semantic actuation, remote pairing, signed releases, and published packages remain tracked work. The real Chrome harness covers navigation, DOM evaluation, sandbox upload, and sandbox download.
 
 ## Contributing
 
