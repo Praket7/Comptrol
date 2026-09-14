@@ -1467,17 +1467,30 @@ fn platform_broker_observe(request: &OperationRequest, operation_id: String) -> 
         .and_then(Value::as_str)
         .unwrap_or("current");
     let capabilities = platform_capabilities();
-    let selected = if requested == "current" {
-        capabilities
-            .iter()
-            .find(|capability| capability.available)
-            .cloned()
-    } else {
-        capabilities
-            .iter()
-            .find(|capability| capability.name == requested || capability.route == requested)
-            .cloned()
+    let current_name = match std::env::consts::OS {
+        "macos" => "platform.macos.ax",
+        "windows" => "platform.windows.uia",
+        "linux" => {
+            if std::env::var_os("AT_SPI_BUS_ADDRESS").is_some() {
+                "platform.linux.atspi"
+            } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                "platform.linux.wayland"
+            } else {
+                "platform.linux.x11"
+            }
+        }
+        _ => "platform.macos.ax",
     };
+    let selected = capabilities
+        .iter()
+        .find(|capability| {
+            if requested == "current" {
+                capability.name == current_name
+            } else {
+                capability.name == requested || capability.route == requested
+            }
+        })
+        .cloned();
     let Some(selected) = selected else {
         return ActionResult::refused(
             request,
