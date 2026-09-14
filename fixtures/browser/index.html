@@ -16,11 +16,15 @@
 <script>
 const form = document.querySelector("#message-form")
 const state = document.querySelector("#state")
+const identity = {
+  "x-comptrol-target-id": "comptrol-fixture-page",
+  "x-comptrol-browser-context": "comptrol-fixture-context",
+}
 form.addEventListener("submit", async event => {
   event.preventDefault()
   const response = await fetch("/submit", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-comptrol-idempotency-key": "fixture-form" },
+    headers: { "content-type": "application/json", "x-comptrol-idempotency-key": "fixture-form", ...identity },
     body: JSON.stringify({ message: document.querySelector("#message").value })
   })
   state.textContent = await response.text()

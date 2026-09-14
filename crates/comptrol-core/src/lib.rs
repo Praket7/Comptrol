@@ -274,6 +274,7 @@ impl Default for Policy {
                 "system.ping".to_owned(),
                 "desktop.observe".to_owned(),
                 "platform.broker.observe".to_owned(),
+                "browser.cdp.wait_for".to_owned(),
                 "workflow.execute".to_owned(),
             ]),
         }
@@ -316,6 +317,8 @@ impl Policy {
                 "browser.cdp.navigate".to_owned(),
                 "browser.cdp.upload".to_owned(),
                 "browser.cdp.download".to_owned(),
+                "browser.cdp.fill".to_owned(),
+                "browser.cdp.click".to_owned(),
             ]);
         }
         policy
@@ -714,7 +717,10 @@ impl Runtime {
             "browser.cdp.evaluate"
             | "browser.cdp.navigate"
             | "browser.cdp.upload"
-            | "browser.cdp.download" => browser_cdp_action(&request, operation_id),
+            | "browser.cdp.download"
+            | "browser.cdp.fill"
+            | "browser.cdp.click"
+            | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             _ => ActionResult::refused(
                 &request,
                 operation_id,
@@ -877,7 +883,10 @@ fn classify(intent: &str) -> Risk {
         "browser.cdp.evaluate"
         | "browser.cdp.navigate"
         | "browser.cdp.upload"
-        | "browser.cdp.download" => Risk::R2,
+        | "browser.cdp.download"
+        | "browser.cdp.fill"
+        | "browser.cdp.click" => Risk::R2,
+        "browser.cdp.wait_for" => Risk::R0,
         _ => Risk::R2,
     }
 }
@@ -963,7 +972,10 @@ fn route_for(intent: &str) -> String {
         "browser.cdp.evaluate"
         | "browser.cdp.navigate"
         | "browser.cdp.upload"
-        | "browser.cdp.download" => "browser_protocol",
+        | "browser.cdp.download"
+        | "browser.cdp.fill"
+        | "browser.cdp.click"
+        | "browser.cdp.wait_for" => "browser_protocol",
         _ => "none",
     }
     .to_owned()
@@ -1180,6 +1192,19 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    if matches!(
+        request.intent.as_str(),
+        "browser.cdp.fill" | "browser.cdp.click" | "browser.cdp.wait_for"
+    ) {
+        return browser_cdp_dom_action(
+            request,
+            operation_id,
+            &endpoint,
+            target_id,
+            browser_context_id,
+            revision,
+        );
+    }
     if request.intent == "browser.cdp.upload" {
         return browser_cdp_upload(
             request,
@@ -1263,6 +1288,197 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             data,
         ),
         Err(error) => browser_failure(request, operation_id, error),
+    }
+}
+
+fn browser_cdp_dom_action(
+    request: &OperationRequest,
+    operation_id: String,
+    endpoint: &std::ffi::OsStr,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+) -> ActionResult {
+    let timeout = request
+        .params
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(5_000)
+        .min(30_000);
+    let (expression, verified_by_default) = match request.intent.as_str() {
+        "browser.cdp.fill" => {
+            let Some(selector) = request.params.get("selector").and_then(Value::as_str) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser fill needs a selector".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            let Some(value) = request.params.get("value").and_then(Value::as_str) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser fill needs a value".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            let Ok(selector) = serde_json::to_string(selector) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser selector is not serializable".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            let Ok(value) = serde_json::to_string(value) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser value is not serializable".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            (
+                format!(
+                    "(() => {{ const element = document.querySelector({selector}); if (!element) throw new Error('target missing'); element.focus(); element.value = {value}; element.dispatchEvent(new Event('input', {{ bubbles: true }})); element.dispatchEvent(new Event('change', {{ bubbles: true }})); return element.value === {value}; }})()"
+                ),
+                true,
+            )
+        }
+        "browser.cdp.click" => {
+            let Some(selector) = request.params.get("selector").and_then(Value::as_str) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser click needs a selector".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            let Ok(selector) = serde_json::to_string(selector) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser selector is not serializable".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            (
+                format!(
+                    "(() => {{ const element = document.querySelector({selector}); if (!element) throw new Error('target missing'); element.click(); return true; }})()"
+                ),
+                false,
+            )
+        }
+        "browser.cdp.wait_for" => {
+            let Some(expression) = request.params.get("expression").and_then(Value::as_str) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser wait needs an expression".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            (expression.to_owned(), true)
+        }
+        _ => unreachable!(),
+    };
+    let evaluate = || {
+        browser::cdp_call(
+            &endpoint.to_string_lossy(),
+            target_id,
+            Some(browser_context_id),
+            Some(revision),
+            "Runtime.evaluate",
+            json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
+        )
+    };
+    let deadline = Instant::now() + Duration::from_millis(timeout);
+    loop {
+        let data = match evaluate() {
+            Ok(data) => data,
+            Err(error) => return browser_failure(request, operation_id, error),
+        };
+        let value = data.get("result").and_then(|result| result.get("value"));
+        if value == Some(&Value::Bool(true)) {
+            let verified = if request.intent == "browser.cdp.click" {
+                if let Some(expression) = request
+                    .params
+                    .get("verify_expression")
+                    .and_then(Value::as_str)
+                {
+                    match browser::cdp_call(
+                        &endpoint.to_string_lossy(),
+                        target_id,
+                        Some(browser_context_id),
+                        Some(revision),
+                        "Runtime.evaluate",
+                        json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
+                    ) {
+                        Ok(postcondition) => {
+                            postcondition
+                                .get("result")
+                                .and_then(|result| result.get("value"))
+                                == Some(&Value::Bool(true))
+                        }
+                        Err(error) => return browser_failure(request, operation_id, error),
+                    }
+                } else {
+                    false
+                }
+            } else {
+                verified_by_default
+            };
+            return success(
+                request,
+                operation_id,
+                "browser_protocol",
+                if request.intent == "browser.cdp.wait_for" {
+                    EffectState::None
+                } else {
+                    EffectState::Changed
+                },
+                if verified {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                json!({ "result": data, "postcondition": if verified { "verified" } else { "unverified" } }),
+            );
+        }
+        if request.intent != "browser.cdp.wait_for" || Instant::now() >= deadline {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "verification_failed".to_owned(),
+                    message: "The browser did not confirm the requested DOM condition".to_owned(),
+                    recovery: Some("Inspect the exact page state and retry once".to_owned()),
+                },
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 

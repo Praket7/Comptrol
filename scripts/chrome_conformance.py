@@ -100,7 +100,13 @@ try:
     upload = call(runtime, 5, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.upload", "idempotency_key": "chrome-upload", "params": {**identity, "selector": "#upload", "path": str(upload_path)}}})
     assert upload["result"]["structuredContent"]["verification"] == "verified"
     assert upload["result"]["structuredContent"]["data"]["verified"] is True
-    download = call(runtime, 6, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.download", "idempotency_key": "chrome-download", "params": {**identity, "selector": "#download", "file_name": "fixture.txt"}}})
+    fill = call(runtime, 6, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.fill", "idempotency_key": "chrome-fill", "params": {**identity, "selector": "#message", "value": "verified form"}}})
+    assert fill["result"]["structuredContent"]["verification"] == "verified"
+    click = call(runtime, 7, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.click", "idempotency_key": "chrome-click", "params": {**identity, "selector": "#submit"}}})
+    assert click["result"]["structuredContent"]["verification"] == "unverified"
+    wait = call(runtime, 8, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.wait_for", "idempotency_key": "chrome-wait", "params": {**identity, "expression": "document.querySelector('#state').textContent.includes('submitted')"}}})
+    assert wait["result"]["structuredContent"]["verification"] == "verified"
+    download = call(runtime, 9, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.download", "idempotency_key": "chrome-download", "params": {**identity, "selector": "#download", "file_name": "fixture.txt"}}})
     download_data = download["result"]["structuredContent"]
     assert download_data["verification"] == "verified"
     downloaded = pathlib.Path(download_data["data"]["path"])

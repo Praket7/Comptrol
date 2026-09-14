@@ -8,4 +8,6 @@ The runtime can use the same narrow routes against a local Chromium DevTools end
 
 Uploads are restricted to the Comptrol sandbox and verify the selected filename. Downloads require a stable idempotency key, use a key scoped sandbox directory, wait for the expected file, and verify the resulting file. A repeated key returns an existing verified download without clicking the page again.
 
+The CDP operation surface also provides target bound fill, click, and wait for condition routes. Fill verifies the resulting value. Click reports unverified unless a caller supplies a postcondition expression. Wait evaluates the condition inside Comptrol with a bounded timeout and never polls through the model.
+
 Run `node scripts/browser_conformance.mjs` from the repository root.
