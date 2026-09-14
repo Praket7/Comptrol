@@ -64,6 +64,8 @@ try {
     const snapshot = await response(43, { jsonrpc: "2.0", id: 43, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.accessibility_snapshot", idempotency_key: "accessibility-snapshot", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, depth: 4 } } } })
     assert.equal(snapshot.result.structuredContent.verification, "verified")
     assert.equal(snapshot.result.structuredContent.data.snapshot.nodes[0].name.value, "Comptrol browser fixture")
+    const closedGroup = await response(44, { jsonrpc: "2.0", id: 44, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.reopen_closed_group", idempotency_key: "closed-group-refusal" } } })
+    assert.equal(closedGroup.result.structuredContent.error.code, "closed_group_unsupported")
     const historyBack = await response(41, { jsonrpc: "2.0", id: 41, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.history_back", idempotency_key: "history-back", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision } } } })
     assert.equal(historyBack.result.structuredContent.verification, "verified", JSON.stringify(historyBack))
     assert.equal(historyBack.result.structuredContent.data.direction, "back")

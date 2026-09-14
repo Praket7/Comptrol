@@ -329,6 +329,7 @@ impl Default for Policy {
                 "platform.broker.observe".to_owned(),
                 "browser.cdp.wait_for".to_owned(),
                 "browser.cdp.accessibility_snapshot".to_owned(),
+                "browser.cdp.reopen_closed_group".to_owned(),
                 "workflow.execute".to_owned(),
             ]),
         }
@@ -879,6 +880,9 @@ impl Runtime {
             "macos.ax.press" => macos_ax_press(&request, operation_id),
             "macos.ax.set_value" => macos_ax_set_value(&request, operation_id),
             "browser.fixture.submit" => browser_fixture_submit(&request, operation_id),
+            "browser.cdp.reopen_closed_group" => {
+                browser_closed_group_unsupported(&request, operation_id)
+            }
             "browser.cdp.evaluate"
             | "browser.cdp.navigate"
             | "browser.cdp.upload"
@@ -1166,7 +1170,9 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.close_tab"
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward" => Risk::R2,
-        "browser.cdp.wait_for" | "browser.cdp.accessibility_snapshot" => Risk::R0,
+        "browser.cdp.wait_for"
+        | "browser.cdp.accessibility_snapshot"
+        | "browser.cdp.reopen_closed_group" => Risk::R0,
         _ => Risk::R2,
     }
 }
@@ -1345,6 +1351,7 @@ fn route_for(intent: &str) -> String {
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward"
         | "browser.cdp.accessibility_snapshot"
+        | "browser.cdp.reopen_closed_group"
         | "browser.cdp.wait_for" => "browser_protocol",
         _ => "none",
     }
@@ -2219,6 +2226,23 @@ fn browser_failure(
         };
     }
     ActionResult::refused(request, operation_id, error)
+}
+
+fn browser_closed_group_unsupported(
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    ActionResult::refused(
+        request,
+        operation_id,
+        ComptrolError {
+            code: "closed_group_unsupported".to_owned(),
+            message: "Chrome does not expose closed tab groups as live DevTools targets".to_owned(),
+            recovery: Some(
+                "Reopen the group in Chrome, then inspect and bind its new live targets".to_owned(),
+            ),
+        },
+    )
 }
 
 fn success(
@@ -3881,6 +3905,13 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
             note: "Reads a bounded accessibility tree from one exact live page target".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.reopen_closed_group".to_owned(),
+            available: false,
+            risk: Risk::R0,
+            route: "browser_protocol".to_owned(),
+            note: "Closed tab groups are not exposed as portable live DevTools targets".to_owned(),
         },
         Capability {
             name: "browser.cdp.discovery".to_owned(),
