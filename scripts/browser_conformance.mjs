@@ -59,6 +59,11 @@ try {
     const cdp = await response(4, { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.evaluate", idempotency_key: "cdp-evaluate", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, expression: "document.title" } } } })
     assert.equal(cdp.result.structuredContent.verification, "verified")
     assert.equal(cdp.result.structuredContent.data.result.value, "Comptrol browser fixture")
+    const opened = await response(5, { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.open_tab", idempotency_key: "open-visible-tab", params: { url: `http://127.0.0.1:${port}/` } } } })
+    assert.equal(opened.result.structuredContent.verification, "verified")
+    assert.equal(opened.result.structuredContent.data.visibility, "foreground")
+    assert.equal(opened.result.structuredContent.data.mouse, "untouched")
+    assert.equal(opened.result.structuredContent.data.clipboard, "untouched")
     comptrol.kill("SIGTERM")
   }
   console.log("browser fixture conformance passed")

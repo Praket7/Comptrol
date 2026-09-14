@@ -90,6 +90,164 @@ pub fn fixture_state(endpoint: &str) -> Result<Value, ComptrolError> {
     })
 }
 
+pub fn open_tab(endpoint: &str, url: &str, background: bool) -> Result<Value, ComptrolError> {
+    if url.is_empty()
+        || url
+            .chars()
+            .any(|character| character == '\r' || character == '\n')
+        || !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("about:"))
+    {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Browser tabs accept only http, https, or about URLs".to_owned(),
+            recovery: Some("Provide a safe browser URL".to_owned()),
+        });
+    }
+    if !background {
+        let path = format!("/json/new?{}", encode_new_tab_url(url));
+        let (status, value) =
+            request_json(endpoint, "PUT", &path, &[], None).map_err(|error| ComptrolError {
+                code: "browser_unavailable".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Start the visible browser with local DevTools enabled".to_owned()),
+            })?;
+        if status != 200 {
+            return Err(ComptrolError {
+                code: "browser_request_failed".to_owned(),
+                message: "The browser refused to open a visible tab".to_owned(),
+                recovery: Some("Inspect the local browser endpoint".to_owned()),
+            });
+        }
+        let target = parse_target(&value).ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not return the opened tab identity".to_owned(),
+            recovery: Some("Inspect the browser target list".to_owned()),
+        })?;
+        return Ok(json!({
+            "target": target,
+            "visibility": "foreground",
+            "profile": "attached_existing_browser",
+            "account_state": "same_browser_profile",
+            "mouse": "untouched",
+            "clipboard": "untouched",
+            "verified": true
+        }));
+    }
+    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Start the existing browser with local DevTools enabled".to_owned()),
+    })?;
+    let web_socket_url = version
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not provide a browser websocket".to_owned(),
+            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
+        })?;
+    let created = protocol_call(
+        web_socket_url,
+        "Target.createTarget",
+        json!({ "url": url, "background": true, "focus": false, "newWindow": false }),
+    )?;
+    let target_id = created
+        .get("targetId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not return the background tab identity".to_owned(),
+            recovery: Some("Inspect the browser target list".to_owned()),
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Ok(targets) = discover(endpoint)
+            && let Some(target) = targets.into_iter().find(|target| target.id == target_id)
+        {
+            return Ok(json!({
+                "target": target,
+                "visibility": "background",
+                "profile": "attached_existing_browser",
+                "account_state": "same_browser_profile",
+                "mouse": "untouched",
+                "clipboard": "untouched",
+                "verified": true
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(ComptrolError {
+        code: "verification_failed".to_owned(),
+        message: "The browser did not expose the new background tab".to_owned(),
+        recovery: Some("Inspect browser targets before retrying".to_owned()),
+    })
+}
+
+fn protocol_call(
+    web_socket_url: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, ComptrolError> {
+    if !web_socket_url.starts_with("ws://") {
+        return Err(ComptrolError {
+            code: "browser_transport_unsupported".to_owned(),
+            message: "Only local unencrypted DevTools websocket endpoints are enabled".to_owned(),
+            recovery: Some("Use a local browser endpoint".to_owned()),
+        });
+    }
+    let (mut socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
+    socket
+        .send(Message::Text(
+            json!({ "id": 1, "method": method, "params": params })
+                .to_string()
+                .into(),
+        ))
+        .map_err(browser_dispatch_error)?;
+    loop {
+        let message = socket.read().map_err(browser_response_error)?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        if text.len() > MAX_PROTOCOL_BYTES {
+            return Err(ComptrolError {
+                code: "browser_message_too_large".to_owned(),
+                message: format!(
+                    "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
+                ),
+                recovery: Some("Inspect the browser target".to_owned()),
+            });
+        }
+        let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Inspect the browser protocol version".to_owned()),
+        })?;
+        if value.get("id").and_then(Value::as_u64) != Some(1) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(ComptrolError {
+                code: "browser_command_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect the browser target and retry once".to_owned()),
+            });
+        }
+        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+    }
+}
+
+fn encode_new_tab_url(url: &str) -> String {
+    url.bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~:/?&=%".contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
 pub fn cdp_call(
     endpoint: &str,
     target_id: &str,
@@ -666,6 +824,13 @@ mod tests {
     fn browser_endpoint_is_loopback_only() {
         let error = discover("http://example.com:9222").expect_err("remote endpoint");
         assert_eq!(error.code, "browser_unavailable");
+    }
+
+    #[test]
+    fn open_tab_rejects_unsafe_urls_before_connecting() {
+        let error = open_tab("http://127.0.0.1:9222", "javascript:alert(1)", false)
+            .expect_err("unsafe URL");
+        assert_eq!(error.code, "invalid_input");
     }
 
     #[test]

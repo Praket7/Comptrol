@@ -1,6 +1,6 @@
 # Adapter boundary
 
-The runtime exposes an adapter descriptor contract for detectors, capabilities, routes, risk, and isolation. The built in registry describes the core runtime, the loopback policy bound CDP browser adapter, and the bounded macOS Accessibility adapter.
+The runtime exposes an adapter descriptor contract for detectors, capabilities, routes, risk, and isolation. The built in registry describes the core runtime, the loopback policy bound CDP browser adapter, the bounded macOS Accessibility adapter, and the explicit macOS LaunchServices adapter.
 
 The trusted core registry rejects duplicate names. Community adapters are not dynamically loaded into the privileged process. A future adapter host must use bounded out of process RPC and receive explicit capabilities.
 

@@ -8,6 +8,7 @@ const targetId = "comptrol-fixture-page"
 const browserContextId = "comptrol-fixture-context"
 const revision = "fixture-revision-1"
 const submissions = new Map()
+const openedTabs = new Map()
 const html = await readFile(join(process.cwd(), "fixtures/browser/index.html"))
 
 function json(response, status, value) {
@@ -36,8 +37,16 @@ const server = createServer(async (request, response) => {
     json(response, 200, { Browser: "ComptrolFixture/0.1", "Protocol-Version": "1.3", webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/comptrol-fixture` })
     return
   }
+  if (request.method === "PUT" && request.url.startsWith("/json/new?")) {
+    const id = `comptrol-opened-${openedTabs.size + 1}`
+    const url = decodeURIComponent(request.url.slice("/json/new?".length))
+    const target = { id, type: "page", title: "opened fixture tab", url, browserContextId, revision: `fixture-${id}`, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${id}` }
+    openedTabs.set(id, target)
+    json(response, 200, target)
+    return
+  }
   if (request.method === "GET" && request.url === "/json/list") {
-    json(response, 200, [{ id: targetId, type: "page", title: "Comptrol browser fixture", url: `http://127.0.0.1:${port}/`, browserContextId, revision, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${targetId}` }])
+    json(response, 200, [{ id: targetId, type: "page", title: "Comptrol browser fixture", url: `http://127.0.0.1:${port}/`, browserContextId, revision, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${targetId}` }, ...openedTabs.values()])
     return
   }
   if (request.method === "GET" && request.url === "/state") {

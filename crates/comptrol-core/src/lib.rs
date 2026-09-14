@@ -355,6 +355,10 @@ impl Policy {
                 .allowed_intents
                 .insert("macos.ax.set_value".to_owned());
         }
+        if std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1") {
+            policy.max_risk = Risk::R2;
+            policy.allowed_intents.insert("desktop.open_app".to_owned());
+        }
         if std::env::var("COMPTROL_ALLOW_BROWSER_FIXTURE").as_deref() == Ok("1") {
             policy.max_risk = policy.max_risk.max(Risk::R1);
             policy
@@ -370,6 +374,7 @@ impl Policy {
                 "browser.cdp.download".to_owned(),
                 "browser.cdp.fill".to_owned(),
                 "browser.cdp.click".to_owned(),
+                "browser.cdp.open_tab".to_owned(),
             ]);
         }
         policy
@@ -779,6 +784,7 @@ impl Runtime {
                 restore_checkpoint(&request, operation_id, &self.checkpoints)
             }
             "desktop.notify" => desktop_notify(&request, operation_id),
+            "desktop.open_app" => desktop_open_app(&request, operation_id),
             "macos.ax.press" => macos_ax_press(&request, operation_id),
             "macos.ax.set_value" => macos_ax_set_value(&request, operation_id),
             "browser.fixture.submit" => browser_fixture_submit(&request, operation_id),
@@ -788,6 +794,7 @@ impl Runtime {
             | "browser.cdp.download"
             | "browser.cdp.fill"
             | "browser.cdp.click"
+            | "browser.cdp.open_tab"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             _ => ActionResult::refused(
                 &request,
@@ -999,14 +1006,15 @@ fn classify(intent: &str) -> Risk {
         | "filesystem.write"
         | "filesystem.copy"
         | "filesystem.restore_checkpoint" => Risk::R1,
-        "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
+        "desktop.open_app" | "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
         "browser.fixture.submit" => Risk::R1,
         "browser.cdp.evaluate"
         | "browser.cdp.navigate"
         | "browser.cdp.upload"
         | "browser.cdp.download"
         | "browser.cdp.fill"
-        | "browser.cdp.click" => Risk::R2,
+        | "browser.cdp.click"
+        | "browser.cdp.open_tab" => Risk::R2,
         "browser.cdp.wait_for" => Risk::R0,
         _ => Risk::R2,
     }
@@ -1112,6 +1120,7 @@ fn route_for(intent: &str) -> String {
         "filesystem.copy" => "sandbox_filesystem",
         "filesystem.restore_checkpoint" => "sandbox_checkpoint",
         "desktop.notify" => "platform_notification",
+        "desktop.open_app" => "platform_launch",
         "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
         "browser.fixture.submit" => "browser_fixture",
         "browser.cdp.evaluate"
@@ -1120,6 +1129,7 @@ fn route_for(intent: &str) -> String {
         | "browser.cdp.download"
         | "browser.cdp.fill"
         | "browser.cdp.click"
+        | "browser.cdp.open_tab"
         | "browser.cdp.wait_for" => "browser_protocol",
         _ => "none",
     }
@@ -1300,6 +1310,35 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    if request.intent == "browser.cdp.open_tab" {
+        let Some(url) = request.params.get("url").and_then(Value::as_str) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Opening a browser tab needs a URL".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        let background = request
+            .params
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return match browser::open_tab(&endpoint.to_string_lossy(), url, background) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                VerificationState::Verified,
+                data,
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
     let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) else {
         return ActionResult::refused(
             request,
@@ -2276,6 +2315,89 @@ fn desktop_notify(request: &OperationRequest, operation_id: String) -> ActionRes
     }
 }
 
+fn desktop_open_app(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(app) = request.params.get("app").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Opening an app needs an exact application name".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    if app.is_empty()
+        || app.chars().any(char::is_control)
+        || app.contains('/')
+        || app.contains('\\')
+    {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "App launch accepts a local application name without a path".to_owned(),
+                recovery: Some("Use the exact installed application name".to_owned()),
+            },
+        );
+    }
+    if !cfg!(target_os = "macos") {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "unsupported_surface".to_owned(),
+                message: "Application launch is only implemented through macOS LaunchServices"
+                    .to_owned(),
+                recovery: Some("Use a platform launch adapter on this operating system".to_owned()),
+            },
+        );
+    }
+    let status = Command::new("open").args(["-a", app]).status();
+    match status {
+        Ok(status) if status.success() => {
+            let verify_script = format!(
+                "tell application \"System Events\" to exists process {}",
+                apple_quote(app)
+            );
+            let verified = run_osascript(&verify_script).is_ok_and(|output| {
+                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+            });
+            success(
+                request,
+                operation_id,
+                "platform_launch",
+                EffectState::Changed,
+                if verified {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                json!({ "app": app, "opened": true, "mouse": "untouched", "clipboard": "untouched", "postcondition": if verified { "process_present" } else { "unverified" } }),
+            )
+        }
+        Ok(output) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "launch_failed".to_owned(),
+                message: format!("macOS LaunchServices returned {}", output),
+                recovery: Some("Check the installed application name".to_owned()),
+            },
+        ),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "launch_unavailable".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Check that macOS LaunchServices is available".to_owned()),
+            },
+        ),
+    }
+}
+
 fn macos_ax_press(request: &OperationRequest, operation_id: String) -> ActionResult {
     if !cfg!(target_os = "macos") {
         return unsupported_ax(request, operation_id);
@@ -2562,6 +2684,14 @@ pub fn capabilities() -> Vec<Capability> {
             note: "Available only after local notification policy is enabled".to_owned(),
         },
         Capability {
+            name: "desktop.open_app".to_owned(),
+            available: cfg!(target_os = "macos")
+                && std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "platform_launch".to_owned(),
+            note: "Opens an exact macOS application name through LaunchServices without mouse or clipboard input".to_owned(),
+        },
+        Capability {
             name: "browser.cdp".to_owned(),
             available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
@@ -2569,6 +2699,14 @@ pub fn capabilities() -> Vec<Capability> {
             route: "browser_protocol".to_owned(),
             note: "Local CDP evaluation navigation uploads and downloads require explicit policy"
                 .to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.open_tab".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "browser_protocol".to_owned(),
+            note: "Opens a visible or background tab in the existing local browser profile without mouse or clipboard input".to_owned(),
         },
         Capability {
             name: "browser.cdp.discovery".to_owned(),

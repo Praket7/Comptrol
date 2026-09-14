@@ -47,6 +47,7 @@ impl AdapterRegistry {
                         "wait_for".to_owned(),
                         "upload".to_owned(),
                         "download".to_owned(),
+                        "open_tab".to_owned(),
                     ],
                     route: "browser_protocol".to_owned(),
                     risk: Risk::R2,
@@ -64,6 +65,15 @@ impl AdapterRegistry {
                     route: "macos_ax".to_owned(),
                     risk: Risk::R2,
                     isolation: "osascript_bounded".to_owned(),
+                },
+                AdapterDescriptor {
+                    name: "comptrol.macos.launch".to_owned(),
+                    version: "0.1".to_owned(),
+                    platforms: vec!["macos".to_owned()],
+                    capabilities: vec!["open_app".to_owned()],
+                    route: "launchservices".to_owned(),
+                    risk: Risk::R2,
+                    isolation: "argument_vector_bounded".to_owned(),
                 },
             ],
         }

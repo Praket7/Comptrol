@@ -90,6 +90,18 @@ try:
     call(runtime, 1, "initialize", {})
     inspection = call(runtime, 2, "tools/call", {"name": "inspect", "arguments": {"kind": "browser"}})
     assert any(item["id"] == target["id"] for item in inspection["result"]["structuredContent"]["targets"])
+    opened = call(runtime, 12, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.open_tab", "idempotency_key": "chrome-background-tab", "params": {"url": f"http://127.0.0.1:{fixture_port}/", "background": True}}})
+    opened_data = opened["result"]["structuredContent"]
+    assert opened_data["verification"] == "verified"
+    assert opened_data["data"]["visibility"] == "background"
+    assert opened_data["data"]["profile"] == "attached_existing_browser"
+    assert opened_data["data"]["account_state"] == "same_browser_profile"
+    assert opened_data["data"]["mouse"] == "untouched"
+    assert opened_data["data"]["clipboard"] == "untouched"
+    opened_target = opened_data["data"]["target"]
+    opened_identity = {"target_id": opened_target["id"], "browser_context_id": opened_target.get("browser_context_id", "default"), "revision": opened_target.get("revision", f"url:{opened_target['url']}")}
+    opened_wait = call(runtime, 13, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.wait_for", "idempotency_key": "chrome-background-ready", "params": {**opened_identity, "selector": "#message", "property": "value", "equals": ""}}})
+    assert opened_wait["result"]["structuredContent"]["verification"] == "verified"
     identity = {"target_id": target["id"], "browser_context_id": target.get("browserContextId", "default"), "revision": target.get("revision", f"url:{target['url']}")}
     navigation = call(runtime, 3, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "idempotency_key": "chrome-navigation", "params": {**identity, "url": f"http://127.0.0.1:{fixture_port}/"}}})
     assert navigation["result"]["structuredContent"]["verification"] == "unverified"

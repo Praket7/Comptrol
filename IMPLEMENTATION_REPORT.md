@@ -12,6 +12,10 @@ The loopback HTTP preview validates the origin and binds only to localhost. It a
 
 The repository also includes an npm launcher package, CI validation, a release workflow, browser target discovery, a narrow CDP websocket route for evaluation navigation and sandbox uploads, a fixture mutation route with exact target binding and duplicate submission protection, platform capability brokers, an adapter registry contract, client conformance harness, Homebrew formula generation, threat model, privacy notes, contribution guidance, and research notes.
 
+The browser route now opens visible tabs through the configured local Chrome endpoint and can create background tabs in the existing browser profile. The result reports the exact target identity and explicitly records that mouse and clipboard were untouched. Account state is reused by attaching to the existing profile. No credential or cookie transfer into a separate headless profile is attempted.
+
+macOS app launch is available as a separate explicit policy route through LaunchServices. It accepts an exact application name and reports process verification when Accessibility permits it. Windows and Linux app launch remain unsupported until native launch adapters are validated.
+
 The protocol boundary now rejects MCP and browser messages larger than one mebibyte before parsing. The privacy commands report disabled telemetry, disabled automatic update checks, redacted data classes, and the optional network routes known to this build.
 
 Restart recovery also excludes durable unknown results from the successful idempotency cache. Browser fixture submissions can be reconciled from the fixture state endpoint by idempotency key without resubmitting them.
@@ -24,7 +28,7 @@ Rust format check passed.
 
 Clippy with warnings denied passed.
 
-Twenty five unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, one call workflow execution, restart reconciliation, stale browser binding refusal, browser identity parsing, loopback enforcement, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, adapter registry isolation, malformed adapter rejection, audit redaction, sandbox copy verification, unknown result recovery, and client integration round trips.
+Twenty six unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, workflow verification, one call workflow execution, restart reconciliation, stale browser binding refusal, browser identity parsing, loopback enforcement, safe tab URL validation, event deduplication, checkpoint restore, trace redaction, mixed scale display geometry, adapter registry isolation, malformed adapter rejection, audit redaction, sandbox copy verification, unknown result recovery, and client integration round trips.
 
 The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, real dedicated headless Chrome CDP navigation, DOM verification, sandbox upload, and filename postcondition verification, trace record and fixture replay, platform capability conformance, and the repository owned Codex, Claude Code, and Cursor profiles.
 
