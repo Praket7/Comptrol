@@ -3829,7 +3829,12 @@ pub fn platform_capabilities() -> Vec<Capability> {
 pub fn platform_diagnostics() -> Value {
     let mac_accessible = cfg!(target_os = "macos") && macos_accessibility_reachable();
     let windows_uia_configured = std::env::var("COMPTROL_WINDOWS_UIA").as_deref() == Ok("1");
+    let windows_uia_actuation = cfg!(target_os = "windows")
+        && std::env::var("COMPTROL_ALLOW_WINDOWS_UIA").as_deref() == Ok("1");
     let at_spi_configured = std::env::var_os("AT_SPI_BUS_ADDRESS").is_some();
+    let at_spi_actuation = cfg!(target_os = "linux")
+        && at_spi_configured
+        && std::env::var("COMPTROL_ALLOW_LINUX_ATSPI").as_deref() == Ok("1");
     let x11_configured = std::env::var_os("DISPLAY").is_some();
     let wayland_configured = std::env::var_os("WAYLAND_DISPLAY").is_some();
     json!({
@@ -3842,15 +3847,15 @@ pub fn platform_diagnostics() -> Value {
         "brokers": {
             "windows_uia": {
                 "configured": std::env::var("COMPTROL_WINDOWS_UIA").as_deref() == Ok("1"),
-                "actuation": false,
-                "status": if !cfg!(target_os = "windows") { "unsupported" } else if windows_uia_configured { "degraded" } else { "unavailable" },
-                "requires": "Windows UI Automation fixture validation"
+                "actuation": windows_uia_actuation,
+                "status": if !cfg!(target_os = "windows") { "unsupported" } else if windows_uia_actuation { "available" } else if windows_uia_configured { "degraded" } else { "unavailable" },
+                "requires": if windows_uia_actuation { "Windows UI Automation fixture validation" } else { "COMPTROL_ALLOW_WINDOWS_UIA and UI Automation permission" }
             },
             "linux_atspi": {
                 "configured": std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
-                "actuation": false,
-                "status": if !cfg!(target_os = "linux") { "unsupported" } else if at_spi_configured { "degraded" } else { "unavailable" },
-                "requires": "AT SPI fixture validation"
+                "actuation": at_spi_actuation,
+                "status": if !cfg!(target_os = "linux") { "unsupported" } else if at_spi_actuation { "available" } else if at_spi_configured { "degraded" } else { "unavailable" },
+                "requires": if at_spi_actuation { "AT SPI fixture validation" } else { "AT SPI bus and COMPTROL_ALLOW_LINUX_ATSPI" }
             },
             "linux_x11": {
                 "configured": std::env::var_os("DISPLAY").is_some(),
