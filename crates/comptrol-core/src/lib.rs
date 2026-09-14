@@ -419,7 +419,19 @@ impl OperationJournal {
                 }
             }
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let pending = records
+            .values()
+            .filter(|record| matches!(record.state, DurableState::Dispatched))
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut record in pending {
+            record.state = DurableState::Unknown;
+            serde_json::to_writer(&mut file, &record)?;
+            file.write_all(b"\n")?;
+            records.insert(record.operation_id.clone(), record);
+        }
+        file.flush()?;
         Ok(Self {
             path,
             file,
@@ -2622,6 +2634,7 @@ mod tests {
             unknown.error.as_ref().map(|error| error.code.as_str()),
             Some("operation_unknown")
         );
+        assert_eq!(runtime.watch("op-restart")["state"], "unknown");
         let reconciled = runtime.reconcile("op-restart");
         assert_eq!(reconciled["state"], "reconciled");
     }
