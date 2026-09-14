@@ -6,6 +6,7 @@ cargo build
 python3 scripts/lint_readme.py
 npm run test:browser
 python3 scripts/client_conformance.py
+python3 scripts/progress_conformance.py
 python3 scripts/platform_conformance.py
 python3 scripts/privacy_conformance.py
 python3 scripts/command_conformance.py

@@ -186,11 +186,16 @@ fn run_stdio() -> i32 {
                         return 1;
                     }
                 };
-                if !line.trim().is_empty()
-                    && let Some(response) = handle_message(&mut runtime, line)
-                {
-                    println!("{}", response);
-                    let _ = io::stdout().flush();
+                if !line.trim().is_empty() {
+                    let response =
+                        handle_message_with_progress(&mut runtime, line, |notification| {
+                            println!("{}", notification);
+                            let _ = io::stdout().flush();
+                        });
+                    if let Some(response) = response {
+                        println!("{}", response);
+                        let _ = io::stdout().flush();
+                    }
                 }
             }
             Err(error) => {
@@ -203,6 +208,13 @@ fn run_stdio() -> i32 {
 }
 
 fn handle_message(runtime: &mut Runtime, line: &str) -> Option<Value> {
+    handle_message_with_progress(runtime, line, |_| {})
+}
+
+fn handle_message_with_progress<F>(runtime: &mut Runtime, line: &str, mut emit: F) -> Option<Value>
+where
+    F: FnMut(Value),
+{
     if line.len() > MAX_PROTOCOL_BYTES {
         return Some(
             json!({ "jsonrpc": "2.0", "id": Value::Null, "error": { "code": "message_too_large", "message": format!("MCP messages are limited to {MAX_PROTOCOL_BYTES} bytes") } }),
@@ -222,6 +234,24 @@ fn handle_message(runtime: &mut Runtime, line: &str) -> Option<Value> {
         .unwrap_or_default();
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     request.get("id")?;
+    let progress_token = request
+        .get("params")
+        .filter(|_| method == "tools/call")
+        .and_then(|params| params.get("_meta"))
+        .and_then(|meta| meta.get("progressToken"))
+        .cloned();
+    if let Some(token) = progress_token.as_ref() {
+        emit(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {
+                "progressToken": token,
+                "progress": 0,
+                "total": 1,
+                "message": "operation_started"
+            }
+        }));
+    }
     let result = match method {
         "initialize" => {
             json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": { "tools": { "listChanged": false } }, "serverInfo": { "name": "comptrol", "version": SERVER_VERSION }, "instructions": "Use operate for one bounded intent. Use inspect for current state. Results distinguish delivery, effect, and verification. Unsupported capabilities refuse safely." })
@@ -236,6 +266,18 @@ fn handle_message(runtime: &mut Runtime, line: &str) -> Option<Value> {
             json!({ "error": { "code": "method_not_found", "message": format!("Unknown MCP method {method}") } })
         }
     };
+    if let Some(token) = progress_token {
+        emit(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {
+                "progressToken": token,
+                "progress": 1,
+                "total": 1,
+                "message": "operation_completed"
+            }
+        }));
+    }
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
