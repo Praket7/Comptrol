@@ -20,7 +20,7 @@ Clippy with warnings denied passed.
 
 Five unit tests passed. They cover policy refusal, idempotent replay, stop latch behavior, lease expiry, and workflow verification.
 
-The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, and idempotent replay.
+The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, and loopback HTTP origin rejection plus acceptance.
 
 The README forbidden punctuation check passed.
 

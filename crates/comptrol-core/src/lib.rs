@@ -390,6 +390,8 @@ impl Runtime {
                 &request,
                 operation_id,
                 "native",
+                EffectState::None,
+                VerificationState::Verified,
                 json!({ "ready": true, "protocol": PROTOCOL_VERSION }),
             ),
             "desktop.observe" => desktop_observe(&request, operation_id),
@@ -487,6 +489,8 @@ fn success(
     request: &OperationRequest,
     operation_id: String,
     route: &str,
+    effect: EffectState,
+    verification: VerificationState,
     data: Value,
 ) -> ActionResult {
     ActionResult {
@@ -496,8 +500,8 @@ fn success(
         target: request.target.clone(),
         preflight: "passed".to_owned(),
         delivery: DeliveryState::Delivered,
-        effect: EffectState::None,
-        verification: VerificationState::Verified,
+        effect,
+        verification,
         disturbance: json!({ "foreground_changed": false }),
         recovery: RecoveryState::None,
         data,
@@ -540,7 +544,14 @@ fn desktop_observe(request: &OperationRequest, operation_id: String) -> ActionRe
                 .collect::<Vec<_>>()
         );
     }
-    success(request, operation_id, "platform_observe", data)
+    success(
+        request,
+        operation_id,
+        "platform_observe",
+        EffectState::None,
+        VerificationState::Verified,
+        data,
+    )
 }
 
 fn sandbox_write(request: &OperationRequest, operation_id: String) -> ActionResult {
@@ -583,6 +594,8 @@ fn sandbox_write(request: &OperationRequest, operation_id: String) -> ActionResu
         request,
         operation_id,
         "sandbox_filesystem",
+        EffectState::Changed,
+        VerificationState::Verified,
         json!({ "path": path, "bytes": content.len() }),
     )
 }
@@ -609,6 +622,8 @@ fn desktop_notify(request: &OperationRequest, operation_id: String) -> ActionRes
                 request,
                 operation_id,
                 "platform_notification",
+                EffectState::Changed,
+                VerificationState::Unverified,
                 json!({ "sent": true }),
             ),
             Ok(_) | Err(_) => ActionResult::refused(
