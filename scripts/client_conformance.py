@@ -33,6 +33,13 @@ for client in ("codex", "claude-code", "cursor"):
             names = {tool["name"] for tool in tools["result"]["tools"]}
             assert initialize["result"]["serverInfo"]["name"] == "comptrol"
             assert {"operate", "inspect", "watch", "reconcile", "restore_checkpoint", "capabilities"} <= names
+            operate_schema = next(tool["inputSchema"] for tool in tools["result"]["tools"] if tool["name"] == "operate")
+            assert set(operate_schema["properties"]["background"]["enum"]) == {
+                "strict_background",
+                "prefer_background",
+                "foreground_allowed",
+                "foreground_required",
+            }
             assert ping["result"]["structuredContent"]["verification"] == "verified"
             print(f"{client} MCP contract passed")
         finally:

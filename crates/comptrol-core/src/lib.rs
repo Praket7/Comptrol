@@ -4014,6 +4014,25 @@ mod tests {
     }
 
     #[test]
+    fn invalid_background_posture_is_refused() {
+        let mut runtime = runtime();
+        let result = runtime.operate(OperationRequest {
+            intent: "system.ping".to_owned(),
+            target: None,
+            params: Value::Null,
+            postcondition: None,
+            risk: None,
+            idempotency_key: Some("bad-background".to_owned()),
+            dry_run: false,
+            background: Some("silent_downgrade".to_owned()),
+        });
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid_input")
+        );
+    }
+
+    #[test]
     fn macos_press_can_require_an_explicit_postcondition() {
         let request = OperationRequest {
             intent: "macos.ax.press".to_owned(),
