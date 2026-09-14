@@ -52,7 +52,7 @@ No performance headline is claimed. The current live check is functional and doe
 
 ## Distribution status
 
-Source build is verified. The npm launcher package is prepared but not published. Homebrew is not prepared. No signed release exists. No GitHub repository has been created yet at the time this report is written.
+Source build is verified. The npm launcher package is prepared but not published. Homebrew is not prepared. No signed release exists. A private GitHub repository exists at `Praket7/Comptrol` with the verified main branch and three open implementation issues.
 
 ## Remaining issues ordered by impact
 
@@ -62,4 +62,3 @@ Source build is verified. The npm launcher package is prepared but not published
 4. Add browser protocol support and a local fixture site.
 5. Add cross client conformance tests.
 6. Add packaging and reproducible release artifacts.
-
