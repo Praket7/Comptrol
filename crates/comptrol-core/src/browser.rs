@@ -1,4 +1,4 @@
-use crate::{BrowserTarget, ComptrolError, bind_browser_target};
+use crate::{BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_target};
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -82,6 +82,14 @@ pub fn fixture_submit(
     Ok(value)
 }
 
+pub fn fixture_state(endpoint: &str) -> Result<Value, ComptrolError> {
+    get_json(endpoint, "/state").map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Inspect the browser fixture before reconciling".to_owned()),
+    })
+}
+
 pub fn cdp_call(
     endpoint: &str,
     target_id: &str,
@@ -133,6 +141,15 @@ pub fn cdp_call(
         let Message::Text(text) = message else {
             continue;
         };
+        if text.len() > MAX_PROTOCOL_BYTES {
+            return Err(ComptrolError {
+                code: "browser_message_too_large".to_owned(),
+                message: format!(
+                    "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
+                ),
+                recovery: Some("Inspect the target and retry with a bounded response".to_owned()),
+            });
+        }
         let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
             code: "browser_protocol_invalid".to_owned(),
             message: error.to_string(),
@@ -215,6 +232,17 @@ pub fn cdp_upload(
             let Message::Text(text) = message else {
                 continue;
             };
+            if text.len() > MAX_PROTOCOL_BYTES {
+                return Err(ComptrolError {
+                    code: "browser_message_too_large".to_owned(),
+                    message: format!(
+                        "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
+                    ),
+                    recovery: Some(
+                        "Inspect the target and retry with a bounded response".to_owned(),
+                    ),
+                });
+            }
             let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
                 code: "browser_protocol_invalid".to_owned(),
                 message: error.to_string(),
@@ -567,6 +595,12 @@ fn read_http_response(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
             Ok(0) => break,
             Ok(size) => {
                 response.extend_from_slice(&chunk[..size]);
+                if response.len() > MAX_PROTOCOL_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "browser response exceeds protocol size limit",
+                    ));
+                }
                 let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n")
                 else {
                     continue;
@@ -609,6 +643,12 @@ fn decode_chunked(mut body: &str) -> io::Result<String> {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
         if size == 0 {
             return Ok(decoded);
+        }
+        if size > MAX_PROTOCOL_BYTES || decoded.len().saturating_add(size) > MAX_PROTOCOL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked browser response exceeds protocol size limit",
+            ));
         }
         if rest.len() < size + 2 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short chunk"));

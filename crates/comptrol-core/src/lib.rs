@@ -26,6 +26,55 @@ pub use trace::{TraceEntry, TraceMode, TraceRecorder, read_trace};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
 pub const SERVER_VERSION: &str = "0.1.0";
+pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
+
+pub fn privacy_status() -> Value {
+    json!({
+        "telemetry": { "enabled": false, "default": false },
+        "automatic_updates": { "enabled": false, "network_on_startup": false },
+        "network": {
+            "core_after_install": "none",
+            "explicit_features": ["browser_cdp", "remote_host", "update", "package_operation"]
+        },
+        "redacted_by_default": [
+            "screenshots", "ocr_text", "accessibility_tree_text", "typed_content",
+            "clipboard", "credentials", "window_titles", "urls", "file_paths",
+            "commands", "document_contents"
+        ]
+    })
+}
+
+pub fn privacy_network_endpoints() -> Value {
+    json!({
+        "endpoints": [
+            {
+                "name": "browser_cdp",
+                "configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+                "address": std::env::var("COMPTROL_CDP_ENDPOINT").ok(),
+                "reason": "Only used when an explicit browser action is requested"
+            },
+            {
+                "name": "remote_host",
+                "configured": false,
+                "address": Value::Null,
+                "reason": "Remote pairing is not implemented"
+            },
+            {
+                "name": "update_service",
+                "configured": false,
+                "address": Value::Null,
+                "reason": "Automatic update checks are disabled and no update endpoint is configured"
+            },
+            {
+                "name": "telemetry",
+                "configured": false,
+                "address": Value::Null,
+                "reason": "Opt in telemetry is not implemented"
+            }
+        ],
+        "local_only": ["mcp_stdio", "loopback_dashboard", "local_state", "local_audit"]
+    })
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -94,7 +143,7 @@ pub enum VerificationState {
     Failed,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryState {
     None,
@@ -449,9 +498,13 @@ impl OperationJournal {
     }
 
     pub fn completed(&self) -> impl Iterator<Item = &DurableOperation> {
-        self.records
-            .values()
-            .filter(|record| record.result.is_some())
+        self.records.values().filter(|record| {
+            record.result.is_some()
+                && matches!(
+                    record.state,
+                    DurableState::Complete | DurableState::Reconciled
+                )
+        })
     }
 
     pub fn prepare(
@@ -858,6 +911,53 @@ impl Runtime {
                 return json!({ "state": "reconciled", "result": result });
             }
         }
+        if record.intent == "browser.fixture.submit"
+            && let (Some(endpoint), Some(key)) = (
+                std::env::var_os("COMPTROL_CDP_ENDPOINT"),
+                record.idempotency_key.as_deref(),
+            )
+        {
+            match browser::fixture_state(&endpoint.to_string_lossy()) {
+                Ok(state)
+                    if state
+                        .get("submissions")
+                        .and_then(Value::as_array)
+                        .is_some_and(|submissions| {
+                            submissions.iter().any(|submission| {
+                                submission.get("idempotency_key").and_then(Value::as_str)
+                                    == Some(key)
+                            })
+                        }) =>
+                {
+                    let result = ActionResult {
+                        operation_id: record.operation_id.clone(),
+                        intent: record.intent.clone(),
+                        route: "recovery_observation".to_owned(),
+                        target: record.target.clone(),
+                        preflight: "reconciled".to_owned(),
+                        delivery: DeliveryState::Delivered,
+                        effect: EffectState::Changed,
+                        verification: VerificationState::Verified,
+                        disturbance: json!({ "foreground_changed": false }),
+                        recovery: RecoveryState::None,
+                        data: json!({ "reconciled": true, "idempotency_key": key }),
+                        error: None,
+                    };
+                    let idempotency_key = record.idempotency_key.clone();
+                    if let Err(error) = self.operations.reconciled(record, result.clone()) {
+                        return json!({ "state": "unknown", "operation_id": operation_id, "error": { "code": "recovery_write_failed", "message": error.to_string() } });
+                    }
+                    if let Some(key) = idempotency_key {
+                        self.idempotent.insert(key, result.clone());
+                    }
+                    return json!({ "state": "reconciled", "result": result });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return json!({ "state": "unknown", "operation_id": operation_id, "error": error });
+                }
+            }
+        }
         json!({ "state": "unknown", "operation_id": operation_id, "error": "operation_unknown", "reconcile_required": true })
     }
 
@@ -979,6 +1079,17 @@ fn operation_metadata(request: &OperationRequest) -> Value {
                     .join(file_name)
             );
             metadata["file_name"] = json!(file_name);
+        }
+    }
+    if request.intent == "browser.fixture.submit" {
+        for (key, parameter) in [
+            ("target_id", "target_id"),
+            ("browser_context_id", "browser_context_id"),
+            ("revision", "revision"),
+        ] {
+            if let Some(value) = request.params.get(parameter).and_then(Value::as_str) {
+                metadata[key] = json!(value);
+            }
         }
     }
     metadata
@@ -2879,6 +2990,42 @@ mod tests {
         assert_eq!(runtime.watch("op-restart")["state"], "unknown");
         let reconciled = runtime.reconcile("op-restart");
         assert_eq!(reconciled["state"], "reconciled");
+    }
+
+    #[test]
+    fn unknown_result_is_not_replayed_after_restart() {
+        let dir = std::env::temp_dir().join(format!("comptrol-unknown-{}", now_ms()));
+        let request = OperationRequest {
+            intent: "filesystem.write".to_owned(),
+            target: None,
+            params: json!({ "path": "unknown.txt", "content": "unknown" }),
+            postcondition: None,
+            risk: Some(Risk::R1),
+            idempotency_key: Some("unknown-key".to_owned()),
+            dry_run: false,
+        };
+        let result = unknown_result(&request, "op-unknown".to_owned());
+        let record = DurableOperation {
+            operation_id: "op-unknown".to_owned(),
+            idempotency_key: request.idempotency_key.clone(),
+            intent: request.intent.clone(),
+            risk: Risk::R1,
+            target: None,
+            state: DurableState::Unknown,
+            metadata: json!({}),
+            result: Some(result),
+        };
+        fs::create_dir_all(&dir).expect("state");
+        fs::write(
+            dir.join("operations.jsonl"),
+            serde_json::to_string(&record).expect("record") + "\n",
+        )
+        .expect("journal");
+        let mut runtime = Runtime::new(dir.clone()).expect("runtime");
+        let replay = runtime.operate(request);
+        assert_eq!(replay.recovery, RecoveryState::RequiresReconciliation);
+        assert_eq!(replay.delivery, DeliveryState::Unknown);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

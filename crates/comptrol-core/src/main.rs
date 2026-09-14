@@ -1,6 +1,7 @@
 use comptrol::{
-    OperationRequest, PROTOCOL_VERSION, Runtime, SERVER_VERSION, TraceMode, capabilities,
-    default_state_dir, integration, read_trace,
+    MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime, SERVER_VERSION, TraceMode,
+    capabilities, default_state_dir, integration, privacy_network_endpoints, privacy_status,
+    read_trace,
 };
 use serde_json::{Value, json};
 use std::env;
@@ -24,6 +25,7 @@ fn main() {
         Some("record") => run_record(env::args().skip(2).collect()),
         Some("replay") => run_replay(env::args().skip(2).collect()),
         Some("integrate") => run_integrate(env::args().skip(2).collect()),
+        Some("privacy") => run_privacy(env::args().skip(2).collect()),
         Some("version") => {
             println!("{SERVER_VERSION}");
             0
@@ -31,13 +33,24 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor status capabilities stop resume serve-http record replay integrate version"
+                "commands are mcp doctor status capabilities stop resume serve-http record replay integrate privacy version"
             );
             2
         }
     };
     if result != 0 {
         std::process::exit(result);
+    }
+}
+
+fn run_privacy(args: Vec<String>) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("status") => print_json(privacy_status()),
+        Some("network-endpoints") => print_json(privacy_network_endpoints()),
+        _ => {
+            eprintln!("privacy accepts status or network-endpoints");
+            2
+        }
     }
 }
 
@@ -109,15 +122,33 @@ fn run_stdio() -> i32 {
         }
     };
     let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        match line {
-            Ok(line) if !line.trim().is_empty() => {
-                if let Some(response) = handle_message(&mut runtime, &line) {
+    let mut input = stdin.lock();
+    loop {
+        let mut line = Vec::new();
+        match input.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) if line.len() > MAX_PROTOCOL_BYTES => {
+                println!(
+                    "{}",
+                    json!({ "jsonrpc": "2.0", "id": Value::Null, "error": { "code": "message_too_large", "message": format!("MCP messages are limited to {MAX_PROTOCOL_BYTES} bytes") } })
+                );
+                let _ = io::stdout().flush();
+            }
+            Ok(_) => {
+                let line = match std::str::from_utf8(&line) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        eprintln!("stdin is not UTF-8: {error}");
+                        return 1;
+                    }
+                };
+                if !line.trim().is_empty()
+                    && let Some(response) = handle_message(&mut runtime, line)
+                {
                     println!("{}", response);
                     let _ = io::stdout().flush();
                 }
             }
-            Ok(_) => {}
             Err(error) => {
                 eprintln!("stdin failed: {error}");
                 return 1;
@@ -128,6 +159,11 @@ fn run_stdio() -> i32 {
 }
 
 fn handle_message(runtime: &mut Runtime, line: &str) -> Option<Value> {
+    if line.len() > MAX_PROTOCOL_BYTES {
+        return Some(
+            json!({ "jsonrpc": "2.0", "id": Value::Null, "error": { "code": "message_too_large", "message": format!("MCP messages are limited to {MAX_PROTOCOL_BYTES} bytes") } }),
+        );
+    }
     let request: Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(error) => {
@@ -258,6 +294,33 @@ fn handle_http(stream: &mut TcpStream, runtime: &mut Runtime) -> io::Result<()> 
     let mut buffer = vec![0_u8; 2 * 1024 * 1024];
     let size = stream.read(&mut buffer)?;
     let request = String::from_utf8_lossy(&buffer[..size]);
+    let declared_length = request
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+    if declared_length.is_some_and(|length| length > MAX_PROTOCOL_BYTES)
+        || (size == buffer.len() && !request.contains("\r\n\r\n"))
+    {
+        let payload = serde_json::to_vec(&json!({
+            "error": "message_too_large",
+            "limit": MAX_PROTOCOL_BYTES
+        }))
+        .unwrap_or_default();
+        write!(
+            stream,
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        )?;
+        stream.write_all(&payload)?;
+        return Ok(());
+    }
     let mut sections = request.split("\r\n\r\n");
     let header = sections.next().unwrap_or_default();
     let body = sections.next().unwrap_or_default();

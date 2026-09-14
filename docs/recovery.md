@@ -1,5 +1,7 @@
 # Recovery
 
+Dispatched mutations become unknown on restart. Unknown results are not loaded into the successful idempotency cache, so a retry cannot be mistaken for a completed replay. Filesystem writes, sandbox copies, browser downloads, and browser fixture submissions reconcile from observed local state. Reconciliation records a new durable reconciled state and never repeats the original mutation.
+
 Every permitted mutation is written to the local operation journal before dispatch. The journal records prepared and dispatched state without storing typed content.
 
 If the process restarts after dispatch and before completion, a repeated idempotency key returns operation unknown. The runtime will not repeat the mutation. Call reconcile after observing the target state.

@@ -72,7 +72,7 @@ const server = createServer(async (request, response) => {
       return
     }
     const payload = await body(request)
-    const result = { state: "submitted", messageLength: String(payload.message || "").length, targetId, revision }
+    const result = { state: "submitted", idempotency_key: key, messageLength: String(payload.message || "").length, targetId, revision }
     submissions.set(key, result)
     json(response, 200, { state: "submitted", result })
     return
