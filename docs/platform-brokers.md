@@ -6,4 +6,6 @@ On macOS it checks the public System Events accessibility surface. On Windows it
 
 Detection is not actuation. A detected display or bus does not make semantic mutation available. `platform.broker.observe` returns the broker descriptor and the explicit read only boundary. The action capability stays unavailable until its adapter and verification suite pass.
 
+Doctor reports broker state explicitly. A configured but read only broker is degraded. A platform permission that needs user approval is requires human consent. A broker for another operating system is unsupported.
+
 The macOS fixture source is `fixtures/macos/AccessibilityFixture.swift`. `scripts/macos_ax_conformance.py` compiles it and exercises an AX press with a name postcondition. The harness reports a permission skip when the host has not granted Accessibility access and fails if permission is explicitly required.

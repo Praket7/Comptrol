@@ -11,7 +11,7 @@ use std::net::{TcpListener, TcpStream};
 fn main() {
     let result = match env::args().nth(1).as_deref() {
         None | Some("mcp") => run_stdio(),
-        Some("doctor") => print_json(run_inspect("doctor")),
+        Some("doctor") => run_doctor(env::args().skip(2).collect()),
         Some("status") => print_json(run_inspect("status")),
         Some("capabilities") => print_json(json!(capabilities())),
         Some("stop") => change_stop(true),
@@ -52,6 +52,50 @@ fn run_privacy(args: Vec<String>) -> i32 {
             2
         }
     }
+}
+
+fn run_doctor(args: Vec<String>) -> i32 {
+    let human = match args.as_slice() {
+        [] => false,
+        [flag] if flag == "--human" => true,
+        _ => {
+            eprintln!("doctor accepts --human");
+            return 2;
+        }
+    };
+    let value = run_inspect("doctor");
+    if !human {
+        return print_json(value);
+    }
+    println!("Comptrol doctor");
+    println!(
+        "Platform: {} {}",
+        value["platform"]["os"].as_str().unwrap_or("unknown"),
+        value["architecture"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Daemon: {}",
+        value["daemon"]["state"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Policy: maximum risk {}",
+        value["policy"]["max_risk"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Accessibility: {}",
+        value["platform"]["brokers"]["macos_ax"]["status"]
+            .as_str()
+            .unwrap_or("unknown")
+    );
+    println!(
+        "Browser: {}",
+        value["browser"]["status"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Remote: {}",
+        value["remote"]["binding"].as_str().unwrap_or("unknown")
+    );
+    0
 }
 
 fn run_integrate(args: Vec<String>) -> i32 {

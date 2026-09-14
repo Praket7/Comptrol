@@ -16,6 +16,8 @@ The protocol boundary now rejects MCP and browser messages larger than one mebib
 
 Restart recovery also excludes durable unknown results from the successful idempotency cache. Browser fixture submissions can be reconciled from the fixture state endpoint by idempotency key without resubmitting them.
 
+Doctor now has JSON and human readable output. Platform diagnostics label each broker as available, degraded, unavailable, requires human consent, or unsupported. Release packaging verifies archive checksums and metadata SBOMs before publication.
+
 ## Verification
 
 Rust format check passed.

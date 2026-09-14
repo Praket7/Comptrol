@@ -2642,6 +2642,11 @@ pub fn platform_capabilities() -> Vec<Capability> {
 }
 
 pub fn platform_diagnostics() -> Value {
+    let mac_accessible = cfg!(target_os = "macos") && macos_accessibility_reachable();
+    let windows_uia_configured = std::env::var("COMPTROL_WINDOWS_UIA").as_deref() == Ok("1");
+    let at_spi_configured = std::env::var_os("AT_SPI_BUS_ADDRESS").is_some();
+    let x11_configured = std::env::var_os("DISPLAY").is_some();
+    let wayland_configured = std::env::var_os("WAYLAND_DISPLAY").is_some();
     json!({
         "os": std::env::consts::OS,
         "desktop": std::env::var("XDG_CURRENT_DESKTOP").ok(),
@@ -2653,22 +2658,32 @@ pub fn platform_diagnostics() -> Value {
             "windows_uia": {
                 "configured": std::env::var("COMPTROL_WINDOWS_UIA").as_deref() == Ok("1"),
                 "actuation": false,
+                "status": if !cfg!(target_os = "windows") { "unsupported" } else if windows_uia_configured { "degraded" } else { "unavailable" },
                 "requires": "Windows UI Automation fixture validation"
             },
             "linux_atspi": {
                 "configured": std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
                 "actuation": false,
+                "status": if !cfg!(target_os = "linux") { "unsupported" } else if at_spi_configured { "degraded" } else { "unavailable" },
                 "requires": "AT SPI fixture validation"
             },
             "linux_x11": {
                 "configured": std::env::var_os("DISPLAY").is_some(),
                 "actuation": false,
+                "status": if !cfg!(target_os = "linux") { "unsupported" } else if x11_configured { "degraded" } else { "unavailable" },
                 "requires": "X11 fixture validation"
             },
             "linux_wayland": {
                 "configured": std::env::var_os("WAYLAND_DISPLAY").is_some(),
                 "actuation": false,
+                "status": if !cfg!(target_os = "linux") { "unsupported" } else if wayland_configured { "degraded" } else { "unavailable" },
                 "requires": "Wayland portal and fixture validation"
+            },
+            "macos_ax": {
+                "configured": cfg!(target_os = "macos"),
+                "actuation": mac_accessible,
+                "status": if !cfg!(target_os = "macos") { "unsupported" } else if mac_accessible { "available" } else { "requires_human_consent" },
+                "requires": "macOS Accessibility permission and fixture validation"
             }
         },
         "capabilities": platform_capabilities(),

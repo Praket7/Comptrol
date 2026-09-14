@@ -36,6 +36,7 @@ jobs:
       - run: cargo build --release
       - run: cargo test --workspace
       - run: python scripts/package_release.py --binary "${{ matrix.binary }}" --platform "${{ matrix.artifact }}" --version "${{ github.ref_name }}" --output release-dist
+      - run: python scripts/verify_release.py --directory release-dist
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -62,6 +63,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
+      - name: Verify downloaded release assets
+        run: |
+          find release-assets -name '*.zip.sha256' -print0 | xargs -0 -n1 sh -c 'cd "$(dirname "$0")" && sha256sum -c "$(basename "$0")"'
       - name: Publish checksummed release assets
         env:
           GH_TOKEN: ${{ github.token }}
