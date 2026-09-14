@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions-rust-lang/audit@v1
+      - uses: rustsec/audit-check@v2.0.0
 
   dependency-review:
     if: github.event_name == 'pull_request'
