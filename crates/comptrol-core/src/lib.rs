@@ -289,6 +289,7 @@ impl Policy {
             policy.allow_sandbox_writes = true;
             policy.max_risk = Risk::R1;
             policy.allowed_intents.insert("filesystem.write".to_owned());
+            policy.allowed_intents.insert("filesystem.copy".to_owned());
             policy
                 .allowed_intents
                 .insert("filesystem.restore_checkpoint".to_owned());
@@ -720,6 +721,7 @@ impl Runtime {
             "desktop.observe" => desktop_observe(&request, operation_id),
             "platform.broker.observe" => platform_broker_observe(&request, operation_id),
             "filesystem.write" => sandbox_write(&request, operation_id, &self.checkpoints),
+            "filesystem.copy" => sandbox_copy(&request, operation_id, &self.checkpoints),
             "filesystem.restore_checkpoint" => {
                 restore_checkpoint(&request, operation_id, &self.checkpoints)
             }
@@ -813,7 +815,10 @@ impl Runtime {
         ) {
             return self.watch(operation_id);
         }
-        if record.intent == "filesystem.write" || record.intent == "browser.cdp.download" {
+        if record.intent == "filesystem.write"
+            || record.intent == "filesystem.copy"
+            || record.intent == "browser.cdp.download"
+        {
             let path = record
                 .metadata
                 .get("path")
@@ -890,7 +895,10 @@ fn classify(intent: &str) -> Risk {
         "system.ping" | "desktop.observe" | "platform.broker.observe" | "workflow.execute" => {
             Risk::R0
         }
-        "desktop.notify" | "filesystem.write" | "filesystem.restore_checkpoint" => Risk::R1,
+        "desktop.notify"
+        | "filesystem.write"
+        | "filesystem.copy"
+        | "filesystem.restore_checkpoint" => Risk::R1,
         "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
         "browser.fixture.submit" => Risk::R1,
         "browser.cdp.evaluate"
@@ -939,6 +947,18 @@ fn operation_metadata(request: &OperationRequest) -> Value {
             metadata["content_hash"] = json!(stable_hash(content.as_bytes()));
         }
     }
+    if request.intent == "filesystem.copy" {
+        if let Some(destination) = request.params.get("destination").and_then(Value::as_str) {
+            metadata["path"] = json!(state_dir().join("sandbox").join(destination));
+        }
+        if let Some(source) = request.params.get("source").and_then(Value::as_str)
+            && let Ok(path) = fs::canonicalize(state_dir().join("sandbox").join(source))
+            && let Ok(bytes) = fs::read(path)
+        {
+            metadata["content_hash"] = json!(stable_hash(&bytes));
+            metadata["content_len"] = json!(bytes.len());
+        }
+    }
     if request.intent == "browser.cdp.download" {
         let key = request.idempotency_key.as_deref().unwrap_or("unkeyed");
         let file_name = request
@@ -978,6 +998,7 @@ fn route_for(intent: &str) -> String {
         "platform.broker.observe" => "platform_broker",
         "workflow.execute" => "workflow",
         "filesystem.write" => "sandbox_filesystem",
+        "filesystem.copy" => "sandbox_filesystem",
         "filesystem.restore_checkpoint" => "sandbox_checkpoint",
         "desktop.notify" => "platform_notification",
         "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
@@ -1921,6 +1942,177 @@ fn sandbox_write(
     )
 }
 
+fn sandbox_copy(
+    request: &OperationRequest,
+    operation_id: String,
+    checkpoints: &CheckpointStore,
+) -> ActionResult {
+    sandbox_copy_at(
+        request,
+        operation_id,
+        checkpoints,
+        &state_dir().join("sandbox"),
+    )
+}
+
+fn sandbox_copy_at(
+    request: &OperationRequest,
+    operation_id: String,
+    checkpoints: &CheckpointStore,
+    sandbox_root: &Path,
+) -> ActionResult {
+    let Some(source) = request.params.get("source").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Sandbox copy needs a source path".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let Some(destination) = request.params.get("destination").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Sandbox copy needs a destination path".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    if !sandbox_relative(source) || !sandbox_relative(destination) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "Sandbox copy accepts relative paths without parent traversal".to_owned(),
+                recovery: Some("Use regular files inside the Comptrol sandbox".to_owned()),
+            },
+        );
+    }
+    let Ok(source) = fs::canonicalize(sandbox_root.join(source)) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "Sandbox copy source does not exist".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let Ok(root) = fs::canonicalize(sandbox_root) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "The Comptrol sandbox is unavailable".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    if !source.starts_with(&root) || !source.is_file() {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "Sandbox copy source must be a regular sandbox file".to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    let destination = root.join(destination);
+    let Some(parent) = destination.parent() else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "Sandbox copy destination has no parent".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let parent_safe = fs::create_dir_all(parent).is_ok()
+        && fs::canonicalize(parent).is_ok_and(|canonical| canonical.starts_with(&root));
+    if destination.is_symlink() || !parent_safe {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "path_denied".to_owned(),
+                message: "Sandbox copy destination is not a safe sandbox path".to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    let Ok(bytes) = fs::read(&source) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "read_failed".to_owned(),
+                message: "Sandbox copy source could not be read".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    if let Err(error) = checkpoints
+        .create(&operation_id, &destination)
+        .and_then(|_| fs::copy(&source, &destination).map(|_| ()))
+    {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "copy_failed".to_owned(),
+                message: error.to_string(),
+                recovery: None,
+            },
+        );
+    }
+    let verified =
+        fs::read(&destination).is_ok_and(|copied| stable_hash(&copied) == stable_hash(&bytes));
+    if !verified {
+        return ActionResult {
+            operation_id,
+            intent: request.intent.clone(),
+            route: "sandbox_filesystem".to_owned(),
+            target: request.target.clone(),
+            preflight: "passed".to_owned(),
+            delivery: DeliveryState::Delivered,
+            effect: EffectState::Changed,
+            verification: VerificationState::Failed,
+            disturbance: json!({ "foreground_changed": false }),
+            recovery: RecoveryState::None,
+            data: json!({ "source": source, "destination": destination }),
+            error: Some(ComptrolError {
+                code: "verification_failed".to_owned(),
+                message: "Sandbox copy did not match the source".to_owned(),
+                recovery: None,
+            }),
+        };
+    }
+    success(
+        request,
+        operation_id,
+        "sandbox_filesystem",
+        EffectState::Changed,
+        VerificationState::Verified,
+        json!({ "source": source, "destination": destination, "bytes": bytes.len() }),
+    )
+}
+
+fn sandbox_relative(path: &str) -> bool {
+    !path.is_empty() && !path.starts_with('/') && !path.split('/').any(|part| part == "..")
+}
+
 fn desktop_notify(request: &OperationRequest, operation_id: String) -> ActionResult {
     let title = request
         .params
@@ -2238,14 +2430,22 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "filesystem.write".to_owned(),
-            available: false,
+            available: std::env::var("COMPTROL_ALLOW_SANDBOX_WRITES").as_deref() == Ok("1"),
             risk: Risk::R1,
             route: "sandbox_filesystem".to_owned(),
             note: "Available only after local sandbox policy is enabled".to_owned(),
         },
         Capability {
+            name: "filesystem.copy".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_SANDBOX_WRITES").as_deref() == Ok("1"),
+            risk: Risk::R1,
+            route: "sandbox_filesystem".to_owned(),
+            note: "Copies regular files inside the sandbox after canonical path checks".to_owned(),
+        },
+        Capability {
             name: "desktop.notify".to_owned(),
-            available: false,
+            available: cfg!(target_os = "macos")
+                && std::env::var("COMPTROL_ALLOW_DESKTOP_NOTIFY").as_deref() == Ok("1"),
             risk: Risk::R1,
             route: "platform_notification".to_owned(),
             note: "Available only after local notification policy is enabled".to_owned(),
@@ -2276,10 +2476,12 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "desktop.semantic_input".to_owned(),
-            available: false,
+            available: cfg!(target_os = "macos")
+                && macos_accessibility_reachable()
+                && std::env::var("COMPTROL_ALLOW_MACOS_AX").as_deref() == Ok("1"),
             risk: Risk::R2,
-            route: "platform_accessibility".to_owned(),
-            note: "Not advertised until a platform backend and verification suite exist".to_owned(),
+            route: "macos_ax".to_owned(),
+            note: "macOS semantic press and value routes require explicit policy and Accessibility permission".to_owned(),
         },
     ];
     result.extend(platform_capabilities());
@@ -2554,6 +2756,38 @@ mod tests {
             result.error.as_ref().map(|e| e.code.as_str()),
             Some("stopped")
         );
+    }
+
+    #[test]
+    fn sandbox_copy_verifies_and_rejects_parent_traversal() {
+        let directory = std::env::temp_dir().join(format!("comptrol-copy-{}", now_ms()));
+        let sandbox = directory.join("sandbox");
+        fs::create_dir_all(&sandbox).expect("sandbox");
+        fs::write(sandbox.join("source.txt"), b"copy me").expect("source");
+        let checkpoints = CheckpointStore::new(&directory).expect("checkpoints");
+        let request = OperationRequest {
+            intent: "filesystem.copy".to_owned(),
+            target: None,
+            params: json!({"source":"source.txt","destination":"nested/copy.txt"}),
+            postcondition: None,
+            risk: Some(Risk::R1),
+            idempotency_key: Some("copy-test".to_owned()),
+            dry_run: false,
+        };
+        let result = sandbox_copy_at(&request, "copy-op".to_owned(), &checkpoints, &sandbox);
+        assert_eq!(result.verification, VerificationState::Verified);
+        assert_eq!(
+            fs::read(sandbox.join("nested/copy.txt")).expect("copy"),
+            b"copy me"
+        );
+        let mut invalid = request;
+        invalid.params["source"] = json!("../outside.txt");
+        let result = sandbox_copy_at(&invalid, "copy-invalid".to_owned(), &checkpoints, &sandbox);
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("path_denied")
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
