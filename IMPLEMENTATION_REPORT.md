@@ -30,7 +30,7 @@ The optimized Rust build passed.
 
 ## Platform matrix
 
-macOS has real basic process observation through System Events. Semantic desktop mutation is not advertised.
+macOS has real basic process observation through System Events and a semantic AX press and value route with exact application, window, role, and control matching. The controlled Cocoa fixture and conformance harness are present. The live host correctly reported missing Accessibility permission, so the fixture action was not falsely marked verified.
 
 The macOS semantic route is implemented and policy gated. It supports exact application, window, role, and control matching with bounded AppleScript provider calls. Value changes read the value back before reporting verified. Press actions report unverified because macOS does not provide a safe general postcondition for every control. This host returned the correct assistive access refusal during live probing, so no UI action was claimed as verified.
 
