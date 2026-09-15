@@ -17,7 +17,8 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Browser multiplexer primitives provide one WebSocket, flattened-session command correlation, and out-of-order response routing.
 - Target and frame graphs consume CDP lifecycle events and execution-context changes.
 - Download verification uses browser download lifecycle events and exact GUID binding.
-- Upload responses expose honest selected/transfer/accepted/persisted stages.
+- Typed upload and download transactions enforce ordered evidence; generic CDP reports selection/browser completion only, while transfer, application acceptance, persistence, and filesystem verification remain explicit stages.
+- Browser locators have typed semantic kinds and reject empty or invalid identities before dispatch; click and fill actionability requirements are distinct.
 - Typed workflow IR validation is enforced during trace compilation.
 - Typed workflow executor runs compiled actions through the normal runtime, resolves lifted parameters, enforces a step budget, and supports bounded branches, loops, waits, verification, and parallel reads.
 - Workflow candidates can now be promoted only after clean-fixture replay, independent verification, minimum repeated success, and fingerprint equality; promotion creates a new version without mutating the candidate.
@@ -55,6 +56,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Upgrade VS Code authentication, exact LibreOffice document identity, persistent OBS, Blender live IPC, adapter deadlines, and truthful kernel-isolation reporting.
 - Add the complete benchmark matrix and collect stable performance history before hard regression thresholds.
 - Build and publish platform-specific npm/Homebrew release artifacts after release CI produces fresh binaries.
+- Wire the typed locator/actionability and upload/download transaction primitives into every remaining legacy browser helper.
 
 ## Verification run
 
