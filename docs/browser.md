@@ -12,6 +12,8 @@ The fixture now includes a minimal websocket protocol route for `Runtime.evaluat
 
 `browser.cdp.accessibility_snapshot` reads a bounded Chrome accessibility tree from the exact target. It is observation only and returns no mouse, keyboard, or clipboard effect.
 
+`browser.cdp.screenshot` captures bounded visual evidence for the exact target, context, and revision. It returns a SHA-256 digest and encoded size rather than pixels by default, so recovery logic can compare the same target after a dynamic-site change without flooding MCP. Optional `clip`, `format`, and `quality` values are bounded and invalid clips are refused. A digest is evidence of the captured target state; it is not a claim that a visual action succeeded.
+
 `browser.cdp.reopen_closed_group` is an explicit safe refusal. It returns `closed_group_unsupported` because a closed group is not a live DevTools target. Comptrol does not guess a URL or recreate a group from stale history.
 
 On macOS, `browser.chrome.reopen_closed_group` is the explicit foreground alternative. With `COMPTROL_ALLOW_MACOS_AX=1` and Accessibility permission, it matches one exact saved group button by name, invokes its semantic Accessibility action, and verifies that the closed button is gone. The route does not synthesize mouse input or use the clipboard. It requires an exact group name and refuses strict background posture.

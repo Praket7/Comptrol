@@ -1,5 +1,6 @@
 use crate::{BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_target};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -531,6 +532,65 @@ pub fn wait_for_url(
         message: format!("Browser URL did not contain {contains}"),
         recovery: Some("Inspect the target and retry with a bounded postcondition".to_owned()),
     })
+}
+
+/// Capture bounded visual evidence for one exact target. The image itself is
+/// intentionally not returned through MCP by default: callers get a stable
+/// digest and encoded size that can be compared during target-scoped recovery
+/// without flooding the control channel with pixels.
+pub fn capture_screenshot(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+    format: &str,
+    quality: Option<u64>,
+    clip: Value,
+) -> Result<Value, ComptrolError> {
+    let params = json!({
+        "format": format,
+        "captureBeyondViewport": false,
+        "fromSurface": true,
+        "quality": quality,
+        "clip": clip
+    });
+    let value = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+        "Page.captureScreenshot",
+        params,
+    )?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not return screenshot data".to_owned(),
+            recovery: Some("Inspect the exact browser target and screenshot support".to_owned()),
+        })?;
+    if data.len() > MAX_PROTOCOL_BYTES {
+        return Err(ComptrolError {
+            code: "browser_message_too_large".to_owned(),
+            message: "The browser screenshot exceeded the bounded evidence size".to_owned(),
+            recovery: Some("Use a smaller clip or a lower quality setting".to_owned()),
+        });
+    }
+    let mut digest = Sha256::new();
+    digest.update(data.as_bytes());
+    let digest = digest.finalize();
+    Ok(json!({
+        "target_id": target_id,
+        "browser_context_id": browser_context_id,
+        "revision": revision,
+        "format": format,
+        "encoded_bytes": data.len(),
+        "sha256_base64_payload": format!("{digest:x}"),
+        "clip": clip,
+        "verified": true,
+        "evidence": "target_scoped_visual_digest"
+    }))
 }
 
 fn protocol_call(

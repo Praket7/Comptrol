@@ -193,8 +193,10 @@ server.on("upgrade", (request, socket) => {
           ? { currentIndex: fixtureHistoryIndex, entries: fixtureHistory }
       : message.method === "Page.navigateToHistoryEntry"
             ? (fixtureHistoryIndex = fixtureHistory.findIndex(entry => entry.id === message.params.entryId), fixtureUrl = fixtureHistory[fixtureHistoryIndex]?.url || fixtureUrl, {})
-        : message.method === "Page.navigate"
+      : message.method === "Page.navigate"
           ? (fixtureUrl = message.params.url, { frameId: "fixture-frame" })
+          : message.method === "Page.captureScreenshot"
+            ? { data: Buffer.from(`fixture:${pageTarget || "comptrol-fixture-page"}:${fixtureUrl}`).toString("base64") }
           : {}
     const event = browserSocket && message.method === "Target.createTarget"
       ? { method: "Target.targetCreated", params: { targetInfo: { targetId: result.targetId } } }

@@ -31,7 +31,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.24";
+pub const SERVER_VERSION: &str = "0.1.25";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -469,6 +469,7 @@ impl Policy {
                 "browser.cdp.history_forward".to_owned(),
                 "browser.cdp.semantic_click".to_owned(),
                 "browser.cdp.workflow".to_owned(),
+                "browser.cdp.screenshot".to_owned(),
             ]);
         }
         if std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1") {
@@ -1018,6 +1019,7 @@ impl Runtime {
             | "browser.cdp.history_forward"
             | "browser.cdp.semantic_click"
             | "browser.cdp.workflow"
+            | "browser.cdp.screenshot"
             | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             intent if is_first_party_adapter_intent(intent) => {
@@ -1305,6 +1307,7 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward"
         | "browser.cdp.semantic_click" => Risk::R2,
+        "browser.cdp.screenshot" => Risk::R0,
         "browser.cdp.workflow" => Risk::R2,
         "obs.recording.start" | "obs.recording.stop" => Risk::R3,
         intent if is_first_party_adapter_intent(intent) => Risk::R2,
@@ -1867,6 +1870,7 @@ fn route_catalog() -> Vec<RoutePlan> {
         "blender.scene.object.list",
         "browser.cdp.open_tab",
         "browser.cdp.semantic_click",
+        "browser.cdp.screenshot",
     ]
     .into_iter()
     .map(|intent| route_plan_for_intent(intent, Value::Null, None))
@@ -2241,6 +2245,60 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
                 EffectState::None,
                 VerificationState::Verified,
                 json!({ "snapshot": data, "depth": depth, "verified": true }),
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
+    if request.intent == "browser.cdp.screenshot" {
+        let format = request
+            .params
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("png");
+        if !matches!(format, "png" | "jpeg" | "webp") {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Browser screenshots support png, jpeg, or webp".to_owned(),
+                    recovery: Some("Use a supported screenshot format".to_owned()),
+                },
+            );
+        }
+        let quality = request
+            .params
+            .get("quality")
+            .and_then(Value::as_u64)
+            .map(|value| value.clamp(0, 100));
+        let clip = request.params.get("clip").cloned().unwrap_or(Value::Null);
+        if !clip.is_null() && !clip.is_object() {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Browser screenshot clip must be an object".to_owned(),
+                    recovery: None,
+                },
+            );
+        }
+        return match browser::capture_screenshot(
+            &endpoint.to_string_lossy(),
+            target_id,
+            browser_context_id,
+            revision,
+            format,
+            quality,
+            clip,
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::None,
+                VerificationState::Verified,
+                data,
             ),
             Err(error) => browser_failure(request, operation_id, error),
         };
@@ -4928,6 +4986,14 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
             note: "Reads a bounded accessibility tree from one exact live page target".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.screenshot".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R0,
+            route: "browser_protocol".to_owned(),
+            note: "Captures a bounded target-scoped visual digest without returning pixels through MCP".to_owned(),
         },
         Capability {
             name: "browser.cdp.focus".to_owned(),
