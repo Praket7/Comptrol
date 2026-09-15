@@ -870,14 +870,19 @@ fn handle_ipc_connection(
                 &json!({ "version": 1, "id": id, "result": { "ready": true, "server": SERVER_VERSION, "protocol": PROTOCOL_VERSION } }),
             )?,
             Some("mcp") => {
-                let Some(message) = request.get("message") else {
+                let raw_message = request.get("raw_message").and_then(Value::as_str);
+                let message = request.get("message");
+                if raw_message.is_none() && message.is_none() {
                     write_ipc_frame(
                         stream,
                         &json!({ "version": 1, "id": id, "error": { "code": "message_required", "message": "IPC mcp requests need a message" } }),
                     )?;
                     continue;
+                }
+                let line = match raw_message {
+                    Some(raw_message) => raw_message.to_owned(),
+                    None => serde_json::to_string(message.unwrap()).map_err(io::Error::other)?,
                 };
-                let line = serde_json::to_string(message).map_err(io::Error::other)?;
                 let mut notifications = Vec::new();
                 let response = handle_message_with_state(
                     runtime,

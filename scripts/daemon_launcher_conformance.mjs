@@ -8,14 +8,16 @@ const directory = await mkdtemp(join(tmpdir(), "comptrol-daemon-launcher-"));
 const fake = join(directory, "fake-comptrol.mjs");
 const driver = join(directory, "driver.mjs");
 const marker = join(directory, "starts");
+const received = join(directory, "received");
 const socket = join(directory, "comptrol.sock");
 await writeFile(
   driver,
   `
 import { createServer } from "node:net";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { appendFile, readFile, unlink, writeFile } from "node:fs/promises";
 const socketPath = process.env.COMPTROL_SOCKET_PATH;
 const marker = process.env.COMPTROL_TEST_MARKER;
+const received = process.env.COMPTROL_TEST_RECEIVED;
 const previous = await readFile(marker, "utf8").catch(() => "0");
 const generation = Number(previous) + 1;
 await writeFile(marker, String(generation));
@@ -35,10 +37,12 @@ const server = createServer((connection) => {
       if (buffer.length < length + 4) return;
       const value = JSON.parse(buffer.subarray(4, length + 4).toString());
       buffer = buffer.subarray(length + 4);
-      connection.write(frame({ version: 1, id: value.id, result: value.message }));
-      if (generation === 1) {
-        setTimeout(() => { connection.destroy(); server.close(() => process.exit(7)); }, 20);
-      }
+      appendFile(received, String(value.message?.id ?? "unknown") + "\\n").then(() => {
+        connection.write(frame({ version: 1, id: value.id, result: value.message }));
+        if (generation === 1) {
+          setTimeout(() => { connection.destroy(); server.close(() => process.exit(7)); }, 20);
+        }
+      });
     }
   });
 });
@@ -57,6 +61,7 @@ const launcher = spawn(process.execPath, ["packages/mcp/bin/comptrol-mcp.js"], {
     COMPTROL_DAEMON: "1",
     COMPTROL_SOCKET_PATH: socket,
     COMPTROL_TEST_MARKER: marker,
+    COMPTROL_TEST_RECEIVED: received,
   },
   stdio: ["pipe", "pipe", "pipe"],
 });
@@ -95,5 +100,9 @@ launcher.kill("SIGTERM");
 await exited;
 const starts = await readFile(marker, "utf8");
 if (Number(starts) < 2) throw new Error(`daemon was not restarted ${starts}`);
+const requests = await readFile(received, "utf8");
+if (requests.split("\n").filter((id) => id === "1").length !== 1) {
+  throw new Error(`in flight request was replayed ${requests}`);
+}
 await rm(directory, { recursive: true, force: true });
 console.log("daemon launcher conformance passed");

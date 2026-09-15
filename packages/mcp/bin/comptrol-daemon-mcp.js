@@ -24,7 +24,23 @@ function socketPath() {
 }
 
 function frame(line) {
-  const payload = Buffer.from(line, "utf8");
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    message = undefined;
+  }
+  const envelope = {
+    version: 1,
+    id: message?.id ?? null,
+    method: "mcp",
+    message,
+  };
+  if (message === undefined) {
+    delete envelope.message;
+    envelope.raw_message = line;
+  }
+  const payload = Buffer.from(JSON.stringify(envelope), "utf8");
   if (payload.length > maxFrameBytes) {
     throw new Error("MCP message exceeds the daemon frame limit");
   }
