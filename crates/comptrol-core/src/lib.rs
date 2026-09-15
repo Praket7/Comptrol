@@ -26,7 +26,7 @@ pub use geometry::{DisplayGeometry, Point, VirtualDesktop};
 pub use trace::{TraceEntry, TraceMode, TraceRecorder, read_trace};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.9";
+pub const SERVER_VERSION: &str = "0.1.10";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 pub fn privacy_status() -> Value {
@@ -1859,7 +1859,9 @@ fn browser_cdp_semantic_click(
             ComptrolError {
                 code: "invalid_input".to_owned(),
                 message: "Semantic browser clicks need a locator object".to_owned(),
-                recovery: Some("Provide role/name, text, test_id, href_contains, or selector".to_owned()),
+                recovery: Some(
+                    "Provide role/name, text, test_id, href_contains, or selector".to_owned(),
+                ),
             },
         );
     };

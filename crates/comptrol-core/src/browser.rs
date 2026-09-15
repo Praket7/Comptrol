@@ -683,8 +683,12 @@ pub fn semantic_click(
                         .and_then(Value::as_str)
                         .unwrap_or("verification_failed")
                         .to_owned(),
-                    message: format!("Semantic locator did not resolve to one actionable element: {value}"),
-                    recovery: Some("Inspect the current accessibility tree and refine the locator".to_owned()),
+                    message: format!(
+                        "Semantic locator did not resolve to one actionable element: {value}"
+                    ),
+                    recovery: Some(
+                        "Inspect the current accessibility tree and refine the locator".to_owned(),
+                    ),
                 });
             }
             Err(error) if error.code == "stale_reference" && attempt == 0 => {
