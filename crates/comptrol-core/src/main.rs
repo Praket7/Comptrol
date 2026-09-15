@@ -1273,9 +1273,9 @@ where
         }
         "tasks/get" => task_get(tasks, &request),
         "tasks/result" => task_result(tasks, &request),
-        "tasks/list" => tasks
-            .map(TaskManager::list)
-            .unwrap_or_else(|| task_error("Tasks are available only on the stdio transport")),
+        "tasks/list" => tasks.map(TaskManager::list).unwrap_or_else(|| {
+            task_error("Tasks are unavailable because the task store is not initialized")
+        }),
         "tasks/cancel" => task_cancel(tasks, &request),
         "tasks/update" => task_error("Comptrol tasks do not accept input updates"),
         _ => {
@@ -1333,7 +1333,9 @@ fn task_cancel(tasks: Option<&TaskManager>, request: &Value) -> Value {
     };
     tasks
         .map(|manager| manager.cancel(task_id))
-        .unwrap_or_else(|| task_error("Tasks are available only on the stdio transport"))
+        .unwrap_or_else(|| {
+            task_error("Tasks are unavailable because the task store is not initialized")
+        })
 }
 
 fn task_error(message: &str) -> Value {
