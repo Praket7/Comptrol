@@ -26,7 +26,7 @@ pub use geometry::{DisplayGeometry, Point, VirtualDesktop};
 pub use trace::{TraceEntry, TraceMode, TraceRecorder, read_trace};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.10";
+pub const SERVER_VERSION: &str = "0.1.11";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 pub fn privacy_status() -> Value {
@@ -410,6 +410,7 @@ impl Policy {
                 "browser.cdp.history_back".to_owned(),
                 "browser.cdp.history_forward".to_owned(),
                 "browser.cdp.semantic_click".to_owned(),
+                "browser.cdp.workflow".to_owned(),
             ]);
         }
         if std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1") {
@@ -910,6 +911,7 @@ impl Runtime {
             | "browser.cdp.history_back"
             | "browser.cdp.history_forward"
             | "browser.cdp.semantic_click"
+            | "browser.cdp.workflow"
             | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             _ => ActionResult::refused(
@@ -1193,6 +1195,7 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward"
         | "browser.cdp.semantic_click" => Risk::R2,
+        "browser.cdp.workflow" => Risk::R2,
         "browser.cdp.wait_for"
         | "browser.cdp.accessibility_snapshot"
         | "browser.cdp.reopen_closed_group" => Risk::R0,
@@ -1391,6 +1394,7 @@ fn route_for(intent: &str) -> String {
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward"
         | "browser.cdp.semantic_click"
+        | "browser.cdp.workflow"
         | "browser.cdp.accessibility_snapshot"
         | "browser.cdp.reopen_closed_group"
         | "browser.cdp.wait_for" => "browser_protocol",
@@ -1628,6 +1632,9 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
     }
     if request.intent == "browser.cdp.semantic_click" {
         return browser_cdp_semantic_click(request, operation_id, &endpoint);
+    }
+    if request.intent == "browser.cdp.workflow" {
+        return browser_cdp_workflow(request, operation_id, &endpoint);
     }
     let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) else {
         return ActionResult::refused(
@@ -1890,6 +1897,229 @@ fn browser_cdp_semantic_click(
         ),
         Err(error) => browser_failure(request, operation_id, error),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum BrowserWorkflowStep {
+    Navigate {
+        url: String,
+        #[serde(default)]
+        url_contains: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    Click {
+        locator: Value,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    WaitUrl {
+        contains: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+}
+
+fn browser_cdp_workflow(
+    request: &OperationRequest,
+    operation_id: String,
+    endpoint: &std::ffi::OsStr,
+) -> ActionResult {
+    let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser workflows need a target id".to_owned(),
+                recovery: Some(
+                    "Inspect browser targets and include the exact target identity".to_owned(),
+                ),
+            },
+        );
+    };
+    let Some(browser_context_id) = request
+        .params
+        .get("browser_context_id")
+        .and_then(Value::as_str)
+    else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser workflows need a browser context id".to_owned(),
+                recovery: Some("Inspect targets and include the exact browser context".to_owned()),
+            },
+        );
+    };
+    let Some(steps_value) = request.params.get("steps") else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser workflows need a steps array".to_owned(),
+                recovery: Some("Use navigate, click, and wait_url steps".to_owned()),
+            },
+        );
+    };
+    let Ok(steps) = serde_json::from_value::<Vec<BrowserWorkflowStep>>(steps_value.clone()) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser workflow steps did not match the closed schema".to_owned(),
+                recovery: Some("Use data-only navigate, click, and wait_url steps".to_owned()),
+            },
+        );
+    };
+    if steps.is_empty() || steps.len() > 32 {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Browser workflows must contain between 1 and 32 steps".to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    let endpoint = endpoint.to_string_lossy();
+    let initial_revision = request.params.get("revision").and_then(Value::as_str);
+    let targets = match browser::discover(&endpoint) {
+        Ok(targets) => targets,
+        Err(error) => return browser_failure(request, operation_id, error),
+    };
+    let target = match browser::bind_browser_target(
+        &targets,
+        target_id,
+        Some(browser_context_id),
+        initial_revision,
+    ) {
+        Ok(target) => target,
+        Err(error) => return browser_failure(request, operation_id, error),
+    };
+    let mut revision = target.revision;
+    let mut completed = Vec::with_capacity(steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        let result = match step {
+            BrowserWorkflowStep::Navigate {
+                url,
+                url_contains,
+                timeout_ms,
+            } => {
+                if let Err(error) = browser::validate_url(url) {
+                    return browser_failure(request, operation_id, error);
+                }
+                match browser::cdp_call(
+                    &endpoint,
+                    target_id,
+                    Some(browser_context_id),
+                    revision.as_deref(),
+                    "Page.navigate",
+                    json!({"url": url}),
+                ) {
+                    Ok(data) => {
+                        if let Some(expected) = url_contains {
+                            if let Err(error) = browser_wait_for_url(
+                                &endpoint,
+                                target_id,
+                                browser_context_id,
+                                expected,
+                                timeout_ms.unwrap_or(2_000),
+                            ) {
+                                return browser_failure(request, operation_id, error);
+                            }
+                        }
+                        Ok(json!({"action":"navigate", "url": url, "protocol": data}))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            BrowserWorkflowStep::Click {
+                locator,
+                timeout_ms,
+            } => browser::semantic_click(
+                &endpoint,
+                target_id,
+                browser_context_id,
+                revision.as_deref(),
+                locator,
+                timeout_ms.unwrap_or(1_500).clamp(100, 10_000),
+            ),
+            BrowserWorkflowStep::WaitUrl {
+                contains,
+                timeout_ms,
+            } => browser_wait_for_url(
+                &endpoint,
+                target_id,
+                browser_context_id,
+                contains,
+                timeout_ms.unwrap_or(2_000),
+            )
+            .map(|_| json!({"action":"wait_url", "contains": contains})),
+        };
+        let data = match result {
+            Ok(data) => data,
+            Err(error) => return browser_failure(request, operation_id, error),
+        };
+        completed.push(json!({"index": index, "result": data}));
+        if let Ok(current) = browser::discover(&endpoint)
+            && let Ok(bound) =
+                browser::bind_browser_target(&current, target_id, Some(browser_context_id), None)
+        {
+            revision = bound.revision;
+        }
+    }
+    success(
+        request,
+        operation_id,
+        "browser_protocol",
+        EffectState::Changed,
+        VerificationState::Verified,
+        json!({"steps": completed, "step_count": completed.len(), "verified": true}),
+    )
+}
+
+fn browser_wait_for_url(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    contains: &str,
+    timeout_ms: u64,
+) -> Result<Value, ComptrolError> {
+    if contains.is_empty() || contains.chars().any(char::is_control) {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "URL postconditions must contain non-control text".to_owned(),
+            recovery: None,
+        });
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.clamp(100, 30_000));
+    loop {
+        if let Ok(targets) = browser::discover(endpoint)
+            && let Ok(target) =
+                browser::bind_browser_target(&targets, target_id, Some(browser_context_id), None)
+            && target
+                .url
+                .as_deref()
+                .is_some_and(|url| url.contains(contains))
+        {
+            return Ok(json!({"url": target.url, "verified": true}));
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(ComptrolError {
+        code: "verification_failed".to_owned(),
+        message: format!("Browser URL did not contain {contains}"),
+        recovery: Some("Inspect the target and retry with a bounded postcondition".to_owned()),
+    })
 }
 
 fn browser_cdp_dom_action(
@@ -4232,6 +4462,14 @@ pub fn capabilities() -> Vec<Capability> {
             note: "Resolves a fresh semantic locator, checks visibility and overlay coverage, then retries once after a stale target revision".to_owned(),
         },
         Capability {
+            name: "browser.cdp.workflow".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "browser_protocol".to_owned(),
+            note: "Executes a bounded data-only browser navigation and semantic-click workflow in one MCP operation with URL postconditions".to_owned(),
+        },
+        Capability {
             name: "browser.cdp.reopen_closed_group".to_owned(),
             available: false,
             risk: Risk::R0,
@@ -4723,6 +4961,23 @@ mod tests {
         });
         assert_eq!(result.verification, VerificationState::Verified);
         assert_eq!(result.data["done"], true);
+    }
+
+    #[test]
+    fn browser_workflow_schema_is_bounded_and_data_only() {
+        let steps: Vec<BrowserWorkflowStep> = serde_json::from_value(json!([
+            {"action":"navigate","url":"https://example.com","url_contains":"example.com"},
+            {"action":"click","locator":{"role":"link","name":"Example"},"timeout_ms":900},
+            {"action":"wait_url","contains":"/done","timeout_ms":1200}
+        ]))
+        .expect("browser workflow schema");
+        assert_eq!(steps.len(), 3);
+        assert!(
+            serde_json::from_value::<Vec<BrowserWorkflowStep>>(json!([
+                {"action":"evaluate","expression":"alert(1)"}
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

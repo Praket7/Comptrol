@@ -242,7 +242,7 @@ pub fn launch_chrome_tab(url: &str) -> Result<Value, ComptrolError> {
     }
 }
 
-fn validate_url(url: &str) -> Result<(), ComptrolError> {
+pub fn validate_url(url: &str) -> Result<(), ComptrolError> {
     if url.is_empty()
         || url
             .chars()
