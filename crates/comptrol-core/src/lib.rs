@@ -5175,7 +5175,7 @@ mod tests {
 
     #[test]
     fn event_bus_deduplicates_and_bounds_history() {
-        let mut events = EventBus::new(2);
+        let events = EventBus::new(2);
         let first = events.emit("file.changed", json!({"path":"a"}));
         let duplicate = events.emit("file.changed", json!({"path":"a"}));
         assert_eq!(first.sequence, duplicate.sequence);
@@ -5189,6 +5189,20 @@ mod tests {
                 .payload["path"],
             "c"
         );
+    }
+
+    #[test]
+    fn event_bus_waits_for_notification_instead_of_polling() {
+        let events = std::sync::Arc::new(EventBus::new(8));
+        let waiter = std::sync::Arc::clone(&events);
+        let started = std::time::Instant::now();
+        let thread =
+            std::thread::spawn(move || waiter.wait_for(0, Some("ready"), Duration::from_secs(1)));
+        std::thread::sleep(Duration::from_millis(20));
+        events.emit("ready", json!({"ok": true}));
+        let event = thread.join().expect("waiter thread").expect("event");
+        assert_eq!(event.kind, "ready");
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]
