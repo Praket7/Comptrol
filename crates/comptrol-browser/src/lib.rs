@@ -92,6 +92,48 @@ pub enum Locator {
 }
 
 impl Locator {
+    /// Parse the compact wire locator used by the core MCP surface.
+    ///
+    /// Keeping this conversion in the browser crate makes locator validation
+    /// consistent across CDP and future native browser backends.
+    pub fn from_value(value: &Value) -> Result<Self, BrowserError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| BrowserError::InvalidResponse("locator must be an object".to_owned()))?;
+        let string = |key: &str| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        };
+        let locator = if let (Some(role), Some(name)) = (string("role"), string("name")) {
+            Self::RoleName { role, name }
+        } else if let Some(value) = string("label") {
+            Self::Label(value)
+        } else if let Some(value) = string("placeholder") {
+            Self::Placeholder(value)
+        } else if let Some(value) = string("text") {
+            Self::Text(value)
+        } else if let Some(value) = string("test_id") {
+            Self::TestId(value)
+        } else if let Some(value) = string("alt_text") {
+            Self::AltText(value)
+        } else if let Some(value) = string("href_contains") {
+            Self::Href(value)
+        } else if let Some(value) = string("selector") {
+            Self::Css(value)
+        } else if let Some(value) = object.get("backend_node_id").and_then(Value::as_i64) {
+            Self::BackendNodeId(value)
+        } else {
+            return Err(BrowserError::InvalidResponse(
+                "locator must provide one supported identity".to_owned(),
+            ));
+        };
+        locator.validate()?;
+        Ok(locator)
+    }
+
     pub fn validate(&self) -> Result<(), BrowserError> {
         let valid = match self {
             Self::RoleName { role, name } => !role.trim().is_empty() && !name.trim().is_empty(),
@@ -723,6 +765,23 @@ mod tests {
             .unwrap();
         transaction.advance(DownloadStage::FileVerified).unwrap();
         assert_eq!(transaction.stage, DownloadStage::FileVerified);
+    }
+
+    #[test]
+    fn wire_locators_are_typed_and_reject_empty_identity() {
+        assert_eq!(
+            Locator::from_value(&serde_json::json!({"selector": "#save"})).unwrap(),
+            Locator::Css("#save".to_owned())
+        );
+        assert_eq!(
+            Locator::from_value(&serde_json::json!({"role": "button", "name": "Save"})).unwrap(),
+            Locator::RoleName {
+                role: "button".to_owned(),
+                name: "Save".to_owned()
+            }
+        );
+        assert!(Locator::from_value(&serde_json::json!({"selector": " "})).is_err());
+        assert!(Locator::from_value(&serde_json::json!({})).is_err());
     }
 
     #[test]

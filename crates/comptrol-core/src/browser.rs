@@ -998,13 +998,13 @@ pub fn semantic_click(
     locator: &Value,
     timeout_ms: u64,
 ) -> Result<Value, ComptrolError> {
-    if !locator.is_object() {
-        return Err(ComptrolError {
-            code: "invalid_input".to_owned(),
-            message: "Semantic browser locators must be an object".to_owned(),
-            recovery: Some("Use role/name, text, test_id, href_contains, or selector".to_owned()),
-        });
-    }
+    comptrol_browser::Locator::from_value(locator).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: Some(
+            "Use one supported locator identity and refine ambiguous matches".to_owned(),
+        ),
+    })?;
     let locator_json = serde_json::to_string(locator).map_err(|error| ComptrolError {
         code: "invalid_input".to_owned(),
         message: error.to_string(),
