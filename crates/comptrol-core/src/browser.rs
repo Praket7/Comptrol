@@ -1,11 +1,41 @@
 use crate::{BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_target};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
-use tungstenite::{Message, connect};
+use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
+
+type CdpSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+struct CdpSession {
+    socket: CdpSocket,
+    next_id: u64,
+    events: VecDeque<Value>,
+}
+
+struct TargetCacheEntry {
+    observed_at: Instant,
+    targets: Vec<BrowserTarget>,
+}
+
+type CdpSessions = HashMap<String, CdpSession>;
+type TargetCaches = HashMap<String, TargetCacheEntry>;
+
+fn cdp_sessions() -> &'static Mutex<CdpSessions> {
+    static SESSIONS: OnceLock<Mutex<CdpSessions>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn target_caches() -> &'static Mutex<TargetCaches> {
+    static CACHES: OnceLock<Mutex<TargetCaches>> = OnceLock::new();
+    CACHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
     let value = get_json(endpoint, "/json/list").map_err(|error| ComptrolError {
@@ -13,11 +43,44 @@ pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
         message: error.to_string(),
         recovery: Some("Start a supported browser with remote debugging enabled".to_owned()),
     })?;
-    parse_targets(&value).ok_or_else(|| ComptrolError {
+    let targets = parse_targets(&value).ok_or_else(|| ComptrolError {
         code: "browser_protocol_invalid".to_owned(),
         message: "The browser returned an invalid target list".to_owned(),
         recovery: Some("Inspect the configured DevTools endpoint".to_owned()),
-    })
+    })?;
+    if let Ok(mut caches) = target_caches().lock() {
+        caches.insert(
+            endpoint.to_owned(),
+            TargetCacheEntry {
+                observed_at: Instant::now(),
+                targets: targets.clone(),
+            },
+        );
+    }
+    Ok(targets)
+}
+
+fn discover_cached(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
+    if let Ok(caches) = target_caches().lock()
+        && let Some(entry) = caches.get(endpoint)
+        && entry.observed_at.elapsed() <= Duration::from_secs(2)
+    {
+        return Ok(entry.targets.clone());
+    }
+    discover(endpoint)
+}
+
+/// Return the current target snapshot, reusing the event-invalidated cache for
+/// normal actions. Explicit inspection still uses [`discover`] when callers
+/// request a fresh browser inventory.
+pub fn discover_cached_targets(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
+    discover_cached(endpoint)
+}
+
+fn invalidate_target_cache(endpoint: &str) {
+    if let Ok(mut caches) = target_caches().lock() {
+        caches.remove(endpoint);
+    }
 }
 
 pub fn parse_targets(value: &Value) -> Option<Vec<BrowserTarget>> {
@@ -32,7 +95,7 @@ pub fn fixture_submit(
     idempotency_key: &str,
     message: &str,
 ) -> Result<Value, ComptrolError> {
-    let targets = discover(endpoint)?;
+    let targets = discover_cached(endpoint)?;
     bind_browser_target(
         &targets,
         target_id,
@@ -159,32 +222,36 @@ pub fn open_tab(
             message: "The browser did not return the opened tab identity".to_owned(),
             recovery: Some("Inspect the browser target list".to_owned()),
         })?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if let Ok(targets) = discover(endpoint)
-            && let Some(target) = targets.into_iter().find(|target| target.id == target_id)
+    wait_for_event(web_socket_url, Duration::from_secs(2), |event| {
+        event.get("method").and_then(Value::as_str) == Some("Target.targetCreated")
+            && event
+                .get("params")
+                .and_then(|params| params.get("targetInfo"))
+                .and_then(|target| target.get("targetId"))
+                .and_then(Value::as_str)
+                == Some(target_id)
+    })?;
+    invalidate_target_cache(endpoint);
+    let targets = discover(endpoint)?;
+    if let Some(target) = targets.into_iter().find(|target| target.id == target_id) {
+        if browser_context_id
+            .is_some_and(|expected| target.browser_context_id.as_deref() != Some(expected))
         {
-            if browser_context_id
-                .is_some_and(|expected| target.browser_context_id.as_deref() != Some(expected))
-            {
-                return Err(ComptrolError {
-                    code: "stale_reference".to_owned(),
-                    message: "The browser created the tab in a different browser context"
-                        .to_owned(),
-                    recovery: Some("Inspect browser contexts and open the tab again".to_owned()),
-                });
-            }
-            return Ok(json!({
-                "target": target,
-                "visibility": if background { "background" } else { "foreground" },
-                "profile": "attached_existing_browser",
-                "account_state": "same_browser_profile",
-                "mouse": "untouched",
-                "clipboard": "untouched",
-                "verified": true
-            }));
+            return Err(ComptrolError {
+                code: "stale_reference".to_owned(),
+                message: "The browser created the tab in a different browser context".to_owned(),
+                recovery: Some("Inspect browser contexts and open the tab again".to_owned()),
+            });
         }
-        std::thread::sleep(Duration::from_millis(25));
+        return Ok(json!({
+            "target": target,
+            "visibility": if background { "background" } else { "foreground" },
+            "profile": "attached_existing_browser",
+            "account_state": "same_browser_profile",
+            "mouse": "untouched",
+            "clipboard": "untouched",
+            "verified": true
+        }));
     }
     Err(ComptrolError {
         code: "verification_failed".to_owned(),
@@ -264,7 +331,7 @@ pub fn close_tab(
     browser_context_id: &str,
     revision: &str,
 ) -> Result<Value, ComptrolError> {
-    let targets = discover(endpoint)?;
+    let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(
         &targets,
         target_id,
@@ -289,22 +356,27 @@ pub fn close_tab(
         "Target.closeTarget",
         json!({ "targetId": target_id }),
     )?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if discover(endpoint)
-            .map(|remaining| remaining.iter().all(|item| item.id != target_id))
-            .unwrap_or(false)
-        {
-            return Ok(json!({
-                "target": target,
-                "closed": true,
-                "response": value,
-                "mouse": "untouched",
-                "clipboard": "untouched",
-                "verified": true
-            }));
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    wait_for_event(web_socket_url, Duration::from_secs(2), |event| {
+        event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed")
+            && event
+                .get("params")
+                .and_then(|params| params.get("targetId"))
+                .and_then(Value::as_str)
+                == Some(target_id)
+    })?;
+    invalidate_target_cache(endpoint);
+    if discover(endpoint)
+        .map(|remaining| remaining.iter().all(|item| item.id != target_id))
+        .unwrap_or(false)
+    {
+        return Ok(json!({
+            "target": target,
+            "closed": true,
+            "response": value,
+            "mouse": "untouched",
+            "clipboard": "untouched",
+            "verified": true
+        }));
     }
     Err(ComptrolError {
         code: "verification_failed".to_owned(),
@@ -320,14 +392,19 @@ pub fn history(
     revision: &str,
     forward: bool,
 ) -> Result<Value, ComptrolError> {
-    let current = cdp_call(
-        endpoint,
+    let targets = discover_cached(endpoint)?;
+    let target = crate::bind_browser_target(
+        &targets,
         target_id,
         Some(browser_context_id),
         Some(revision),
-        "Page.getNavigationHistory",
-        json!({}),
     )?;
+    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
+        code: "browser_protocol_invalid".to_owned(),
+        message: "The target did not provide a websocket debugger URL".to_owned(),
+        recovery: Some("Inspect browser targets again".to_owned()),
+    })?;
+    let current = persistent_call(&web_socket_url, "Page.getNavigationHistory", json!({}))?;
     let current_index = current
         .get("currentIndex")
         .and_then(Value::as_i64)
@@ -370,35 +447,28 @@ pub fn history(
             message: "The browser history entry has no numeric id".to_owned(),
             recovery: Some("Inspect the exact browser target again".to_owned()),
         })?;
-    cdp_call(
-        endpoint,
-        target_id,
-        Some(browser_context_id),
-        Some(revision),
+    persistent_call(
+        &web_socket_url,
         "Page.navigateToHistoryEntry",
         json!({ "entryId": entry_id }),
     )?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if let Ok(observed) = cdp_call(
-            endpoint,
-            target_id,
-            Some(browser_context_id),
-            Some(revision),
-            "Page.getNavigationHistory",
-            json!({}),
-        ) && observed.get("currentIndex").and_then(Value::as_i64) == Some(destination_index)
-        {
-            return Ok(json!({
-                "direction": if forward { "forward" } else { "back" },
-                "entry": destination,
-                "current_index": destination_index,
-                "verified": true,
-                "mouse": "untouched",
-                "clipboard": "untouched"
-            }));
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    wait_for_event(&web_socket_url, Duration::from_secs(2), |event| {
+        matches!(
+            event.get("method").and_then(Value::as_str),
+            Some("Page.frameNavigated") | Some("Page.navigatedWithinDocument")
+        )
+    })?;
+    let observed = persistent_call(&web_socket_url, "Page.getNavigationHistory", json!({}))?;
+    if observed.get("currentIndex").and_then(Value::as_i64) == Some(destination_index) {
+        return Ok(json!({
+            "direction": if forward { "forward" } else { "back" },
+            "entry": destination,
+            "current_index": destination_index,
+            "verified": true,
+            "wait": "protocol_event",
+            "mouse": "untouched",
+            "clipboard": "untouched"
+        }));
     }
     Err(ComptrolError {
         code: "verification_failed".to_owned(),
@@ -409,7 +479,252 @@ pub fn history(
     })
 }
 
+/// Wait for a navigation event on the already-bound target, then verify the
+/// final URL from a fresh target observation. This avoids interval polling in
+/// compact workflows while preserving exact target identity at the finish gate.
+pub fn wait_for_url(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    contains: &str,
+    timeout: Duration,
+) -> Result<Value, ComptrolError> {
+    if contains.is_empty() || contains.chars().any(|character| character.is_control()) {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "URL postconditions must contain non-control text".to_owned(),
+            recovery: None,
+        });
+    }
+    let targets = discover_cached(endpoint)?;
+    let target = crate::bind_browser_target(&targets, target_id, Some(browser_context_id), None)?;
+    if target
+        .url
+        .as_deref()
+        .is_some_and(|url| url.contains(contains))
+    {
+        return Ok(json!({
+            "url": target.url,
+            "wait": "state_observation",
+            "verified": true
+        }));
+    }
+    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
+        code: "browser_protocol_invalid".to_owned(),
+        message: "The target did not provide a websocket debugger URL".to_owned(),
+        recovery: Some("Inspect browser targets again".to_owned()),
+    })?;
+    let event = wait_for_event(&web_socket_url, timeout, |event| {
+        let method = event.get("method").and_then(Value::as_str);
+        matches!(
+            method,
+            Some("Page.frameNavigated") | Some("Page.navigatedWithinDocument")
+        )
+    })?;
+    invalidate_target_cache(endpoint);
+    let observed = discover(endpoint)?;
+    let bound = crate::bind_browser_target(&observed, target_id, Some(browser_context_id), None)?;
+    if bound
+        .url
+        .as_deref()
+        .is_some_and(|url| url.contains(contains))
+    {
+        return Ok(json!({
+            "url": bound.url,
+            "event": event,
+            "wait": "protocol_event",
+            "verified": true
+        }));
+    }
+    Err(ComptrolError {
+        code: "verification_failed".to_owned(),
+        message: format!("Browser URL did not contain {contains}"),
+        recovery: Some("Inspect the target and retry with a bounded postcondition".to_owned()),
+    })
+}
+
+/// Capture bounded visual evidence for one exact target. The image itself is
+/// intentionally not returned through MCP by default: callers get a stable
+/// digest and encoded size that can be compared during target-scoped recovery
+/// without flooding the control channel with pixels.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_screenshot(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+    format: &str,
+    quality: Option<u64>,
+    clip: Value,
+    include_pixels: bool,
+) -> Result<Value, ComptrolError> {
+    let viewport = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+        "Runtime.evaluate",
+        json!({
+            "expression": "(() => ({ width: Math.max(1, Math.floor(window.innerWidth)), height: Math.max(1, Math.floor(window.innerHeight)), device_pixel_ratio: window.devicePixelRatio }))()",
+            "returnByValue": true
+        }),
+    )?;
+    let viewport = viewport
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .cloned()
+        .unwrap_or_else(|| json!({"width": 0, "height": 0}));
+    let params = json!({
+        "format": format,
+        "captureBeyondViewport": false,
+        "fromSurface": true,
+        "quality": quality,
+        "clip": clip
+    });
+    let value = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+        "Page.captureScreenshot",
+        params,
+    )?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not return screenshot data".to_owned(),
+            recovery: Some("Inspect the exact browser target and screenshot support".to_owned()),
+        })?;
+    if data.len() > MAX_PROTOCOL_BYTES {
+        return Err(ComptrolError {
+            code: "browser_message_too_large".to_owned(),
+            message: "The browser screenshot exceeded the bounded evidence size".to_owned(),
+            recovery: Some("Use a smaller clip or a lower quality setting".to_owned()),
+        });
+    }
+    let mut digest = Sha256::new();
+    digest.update(data.as_bytes());
+    let digest = digest.finalize();
+    let digest_hex = format!("{digest:x}");
+    let width = viewport.get("width").and_then(Value::as_u64).unwrap_or(0);
+    let height = viewport.get("height").and_then(Value::as_u64).unwrap_or(0);
+    let capture_id = format!(
+        "{target_id}:{browser_context_id}:{revision}:{format}:{width}x{height}:{digest_hex}"
+    );
+    let mut result = json!({
+        "target_id": target_id,
+        "browser_context_id": browser_context_id,
+        "revision": revision,
+        "format": format,
+        "encoded_bytes": data.len(),
+        "sha256_base64_payload": digest_hex,
+        "capture_id": capture_id,
+        "viewport": viewport,
+        "clip": clip,
+        "verified": true,
+        "evidence": if include_pixels { "target_scoped_pixels" } else { "target_scoped_visual_digest" }
+    });
+    if include_pixels {
+        result["data_base64"] = json!(data);
+    }
+    Ok(result)
+}
+
+/// Click one coordinate only when it is bound to an immediately verifiable
+/// screenshot capture. A changed pixel digest or viewport refuses the action
+/// as stale instead of guessing against moved page geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn coordinate_click(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+    capture_id: &str,
+    x: f64,
+    y: f64,
+    button: &str,
+) -> Result<Value, ComptrolError> {
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Coordinate clicks require finite non-negative viewport coordinates"
+                .to_owned(),
+            recovery: None,
+        });
+    }
+    if !matches!(button, "none" | "left" | "middle" | "right") {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Coordinate clicks support none, left, middle, or right buttons".to_owned(),
+            recovery: None,
+        });
+    }
+    let current = capture_screenshot(
+        endpoint,
+        target_id,
+        browser_context_id,
+        revision,
+        "png",
+        None,
+        Value::Null,
+        false,
+    )?;
+    let width = current["viewport"]["width"].as_u64().unwrap_or(0) as f64;
+    let height = current["viewport"]["height"].as_u64().unwrap_or(0) as f64;
+    if x >= width || y >= height || current["capture_id"].as_str() != Some(capture_id) {
+        return Err(ComptrolError {
+            code: "stale_geometry".to_owned(),
+            message: "The screenshot geometry no longer matches the requested coordinate"
+                .to_owned(),
+            recovery: Some("Capture a fresh screenshot and retry with its capture_id".to_owned()),
+        });
+    }
+    let targets = discover_cached(endpoint)?;
+    let target = crate::bind_browser_target(
+        &targets,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+    )?;
+    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
+        code: "browser_protocol_invalid".to_owned(),
+        message: "The target did not provide a websocket debugger URL".to_owned(),
+        recovery: Some("Inspect browser targets again".to_owned()),
+    })?;
+    persistent_call(
+        &web_socket_url,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mousePressed","x":x,"y":y,"button":button,"clickCount":1}),
+    )?;
+    persistent_call(
+        &web_socket_url,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mouseReleased","x":x,"y":y,"button":button,"clickCount":1}),
+    )?;
+    Ok(json!({
+        "clicked": true,
+        "x": x,
+        "y": y,
+        "button": button,
+        "capture_id": capture_id,
+        "viewport": current["viewport"],
+        "verified": false,
+        "verification": "dispatch_only",
+        "evidence": "fresh_pixel_capture_geometry"
+    }))
+}
+
 fn protocol_call(
+    web_socket_url: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, ComptrolError> {
+    persistent_call(web_socket_url, method, params)
+}
+
+fn persistent_call(
     web_socket_url: &str,
     method: &str,
     params: Value,
@@ -421,44 +736,183 @@ fn protocol_call(
             recovery: Some("Use a local browser endpoint".to_owned()),
         });
     }
-    let (mut socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
-    socket
-        .send(Message::Text(
-            json!({ "id": 1, "method": method, "params": params })
-                .to_string()
-                .into(),
-        ))
-        .map_err(browser_dispatch_error)?;
-    loop {
-        let message = socket.read().map_err(browser_response_error)?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        if text.len() > MAX_PROTOCOL_BYTES {
-            return Err(ComptrolError {
-                code: "browser_message_too_large".to_owned(),
-                message: format!(
-                    "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
-                ),
-                recovery: Some("Inspect the browser target".to_owned()),
-            });
-        }
-        let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: error.to_string(),
-            recovery: Some("Inspect the browser protocol version".to_owned()),
-        })?;
-        if value.get("id").and_then(Value::as_u64) != Some(1) {
-            continue;
-        }
-        if let Some(error) = value.get("error") {
-            return Err(ComptrolError {
-                code: "browser_command_failed".to_owned(),
+    let mut sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
+        code: "browser_session_unavailable".to_owned(),
+        message: "The browser session cache is unavailable".to_owned(),
+        recovery: Some("Retry after the browser session recovers".to_owned()),
+    })?;
+    if !sessions.contains_key(web_socket_url) {
+        let (socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
+        sessions.insert(
+            web_socket_url.to_owned(),
+            CdpSession {
+                socket,
+                next_id: 0,
+                events: VecDeque::new(),
+            },
+        );
+    }
+    let session = sessions
+        .get_mut(web_socket_url)
+        .expect("browser session inserted or present");
+    session.next_id += 1;
+    let id = session.next_id;
+    let result = (|| {
+        session
+            .socket
+            .send(Message::Text(
+                json!({ "id": id, "method": method, "params": params })
+                    .to_string()
+                    .into(),
+            ))
+            .map_err(browser_dispatch_error)?;
+        loop {
+            let message = session.socket.read().map_err(browser_response_error)?;
+            let Message::Text(text) = message else {
+                continue;
+            };
+            if text.len() > MAX_PROTOCOL_BYTES {
+                return Err(ComptrolError {
+                    code: "browser_message_too_large".to_owned(),
+                    message: format!(
+                        "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
+                    ),
+                    recovery: Some(
+                        "Inspect the target and retry with a bounded response".to_owned(),
+                    ),
+                });
+            }
+            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
+                code: "browser_protocol_invalid".to_owned(),
                 message: error.to_string(),
-                recovery: Some("Inspect the browser target and retry once".to_owned()),
-            });
+                recovery: Some("Inspect the browser protocol version".to_owned()),
+            })?;
+            if value.get("id").and_then(Value::as_u64) != Some(id) {
+                if session.events.len() == 256 {
+                    session.events.pop_front();
+                }
+                session.events.push_back(value);
+                continue;
+            }
+            if let Some(error) = value.get("error") {
+                return Err(ComptrolError {
+                    code: "browser_command_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Inspect the browser target and retry once".to_owned()),
+                });
+            }
+            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
-        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+    })();
+    if result.is_err() {
+        sessions.remove(web_socket_url);
+    }
+    result
+}
+
+fn wait_for_event<F>(
+    web_socket_url: &str,
+    timeout: Duration,
+    predicate: F,
+) -> Result<Value, ComptrolError>
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    let mut sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
+        code: "browser_session_unavailable".to_owned(),
+        message: "The browser session cache is unavailable".to_owned(),
+        recovery: Some("Retry after the browser session recovers".to_owned()),
+    })?;
+    let Some(session) = sessions.get_mut(web_socket_url) else {
+        return Err(ComptrolError {
+            code: "browser_session_changed".to_owned(),
+            message: "The browser protocol session is no longer cached".to_owned(),
+            recovery: Some("Rebind the exact browser target before retrying".to_owned()),
+        });
+    };
+    let result = (|| {
+        if let Some(position) = session.events.iter().position(&predicate) {
+            return Ok(session
+                .events
+                .remove(position)
+                .expect("event position exists"));
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ComptrolError {
+                    code: "verification_failed".to_owned(),
+                    message: "The browser did not emit the expected protocol event in time"
+                        .to_owned(),
+                    recovery: Some("Inspect the exact browser target before retrying".to_owned()),
+                });
+            }
+            set_socket_read_timeout(&mut session.socket, Some(remaining))
+                .map_err(browser_io_error)?;
+            let message = match session.socket.read() {
+                Ok(message) => message,
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(ComptrolError {
+                            code: "verification_failed".to_owned(),
+                            message: "The browser did not emit the expected protocol event in time"
+                                .to_owned(),
+                            recovery: Some(
+                                "Inspect the exact browser target before retrying".to_owned(),
+                            ),
+                        });
+                    }
+                    thread::yield_now();
+                    continue;
+                }
+                Err(error) => return Err(browser_response_error(error)),
+            };
+            let Message::Text(text) = message else {
+                continue;
+            };
+            if text.len() > MAX_PROTOCOL_BYTES {
+                return Err(ComptrolError {
+                    code: "browser_message_too_large".to_owned(),
+                    message: format!(
+                        "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
+                    ),
+                    recovery: Some("Inspect the browser protocol response size".to_owned()),
+                });
+            }
+            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
+                code: "browser_protocol_invalid".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect the browser protocol version".to_owned()),
+            })?;
+            if predicate(&value) {
+                return Ok(value);
+            }
+            if session.events.len() == 256 {
+                session.events.pop_front();
+            }
+            session.events.push_back(value);
+        }
+    })();
+    let _ = set_socket_read_timeout(&mut session.socket, None);
+    if result.is_err() {
+        sessions.remove(web_socket_url);
+    }
+    result
+}
+
+fn set_socket_read_timeout(socket: &mut CdpSocket, timeout: Option<Duration>) -> io::Result<()> {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TLS browser sessions do not expose a bounded socket timeout",
+        )),
     }
 }
 
@@ -482,8 +936,17 @@ pub fn cdp_call(
     method: &str,
     params: Value,
 ) -> Result<Value, ComptrolError> {
-    let targets = discover(endpoint)?;
-    let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
+    let targets = discover_cached(endpoint)?;
+    let target = match crate::bind_browser_target(&targets, target_id, browser_context_id, revision)
+    {
+        Ok(target) => target,
+        Err(error) if matches!(error.code.as_str(), "stale_reference" | "target_gone") => {
+            invalidate_target_cache(endpoint);
+            let refreshed = discover(endpoint)?;
+            crate::bind_browser_target(&refreshed, target_id, browser_context_id, revision)?
+        }
+        Err(error) => return Err(error),
+    };
     let Some(web_socket_url) = target.web_socket_url else {
         return Err(ComptrolError {
             code: "browser_protocol_invalid".to_owned(),
@@ -491,66 +954,11 @@ pub fn cdp_call(
             recovery: Some("Inspect browser targets again".to_owned()),
         });
     };
-    if !web_socket_url.starts_with("ws://") {
-        return Err(ComptrolError {
-            code: "browser_transport_unsupported".to_owned(),
-            message: "Only local unencrypted DevTools websocket endpoints are enabled".to_owned(),
-            recovery: Some(
-                "Use a local browser endpoint or configure a trusted transport".to_owned(),
-            ),
-        });
+    let result = persistent_call(&web_socket_url, method, params);
+    if matches!(method, "Page.navigate" | "Page.navigateToHistoryEntry") {
+        invalidate_target_cache(endpoint);
     }
-    let (mut socket, _) = connect(web_socket_url).map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Start the browser target and retry".to_owned()),
-    })?;
-    socket
-        .send(Message::Text(
-            json!({ "id": 1, "method": method, "params": params })
-                .to_string()
-                .into(),
-        ))
-        .map_err(|error| ComptrolError {
-            code: "browser_dispatch_failed".to_owned(),
-            message: error.to_string(),
-            recovery: Some("Reconnect to the exact browser target".to_owned()),
-        })?;
-    loop {
-        let message = socket.read().map_err(|error| ComptrolError {
-            code: "browser_response_failed".to_owned(),
-            message: error.to_string(),
-            recovery: Some("Inspect the browser target before retrying".to_owned()),
-        })?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        if text.len() > MAX_PROTOCOL_BYTES {
-            return Err(ComptrolError {
-                code: "browser_message_too_large".to_owned(),
-                message: format!(
-                    "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
-                ),
-                recovery: Some("Inspect the target and retry with a bounded response".to_owned()),
-            });
-        }
-        let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: error.to_string(),
-            recovery: Some("Inspect the browser protocol version".to_owned()),
-        })?;
-        if value.get("id").and_then(Value::as_u64) != Some(1) {
-            continue;
-        }
-        if let Some(error) = value.get("error") {
-            return Err(ComptrolError {
-                code: "browser_command_failed".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Refresh the target and retry once".to_owned()),
-            });
-        }
-        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-    }
+    result
 }
 
 /// Resolve and click a semantic locator in one bounded browser transaction.
@@ -594,14 +1002,30 @@ pub fn semantic_click(
                 (element.tagName === 'A' ? 'link' :
                  element.tagName === 'BUTTON' ? 'button' :
                  element.tagName === 'INPUT' ? 'textbox' : '');
+            const roots = () => {{
+                const pending = [document];
+                const seen = [];
+                while (pending.length) {{
+                    const root = pending.shift();
+                    seen.push(root);
+                    for (const element of root.querySelectorAll('*')) {{
+                        if (element.shadowRoot) pending.push(element.shadowRoot);
+                        if (element.tagName === 'IFRAME') {{
+                            try {{ if (element.contentDocument) pending.push(element.contentDocument); }} catch (_) {{}}
+                        }}
+                    }}
+                }}
+                return seen;
+            }};
+            const all = selector => roots().flatMap(root => [...root.querySelectorAll(selector)]);
             const candidates = () => {{
                 let elements;
                 if (locator.selector) {{
-                    elements = [...document.querySelectorAll(locator.selector)];
+                    elements = all(locator.selector);
                 }} else if (locator.test_id) {{
-                    elements = [...document.querySelectorAll('[data-testid], [data-test-id]')];
+                    elements = all('[data-testid], [data-test-id]');
                 }} else {{
-                    elements = [...document.querySelectorAll('button, a, input, select, textarea, [role], [tabindex]')];
+                    elements = all('button, a, input, select, textarea, [role], [tabindex]');
                 }}
                 return elements.filter(element => {{
                     if (locator.test_id &&
@@ -622,7 +1046,9 @@ pub fn semantic_click(
                 const x = Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2));
                 const y = Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2));
                 const hit = document.elementFromPoint(x, y);
-                return hit === element || Boolean(hit && element.contains(hit));
+                const host = element.getRootNode() && element.getRootNode().host;
+                return hit === element || Boolean(hit && element.contains(hit)) ||
+                    Boolean(host && (hit === host || host.contains(hit)));
             }};
             const stable = async element => {{
                 const first = element.getBoundingClientRect();
@@ -720,7 +1146,7 @@ pub fn cdp_upload(
             message: "Upload path needs a valid file name".to_owned(),
             recovery: None,
         })?;
-    let targets = discover(endpoint)?;
+    let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
     let Some(web_socket_url) = target.web_socket_url else {
         return Err(ComptrolError {
@@ -738,65 +1164,7 @@ pub fn cdp_upload(
             ),
         });
     }
-    let (mut socket, _) = connect(web_socket_url).map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Start the browser target and retry".to_owned()),
-    })?;
-    let mut command_id = 0_u64;
-    let mut call = |method: &str, params: Value| -> Result<Value, ComptrolError> {
-        command_id += 1;
-        let id = command_id;
-        socket
-            .send(Message::Text(
-                json!({ "id": id, "method": method, "params": params })
-                    .to_string()
-                    .into(),
-            ))
-            .map_err(|error| ComptrolError {
-                code: "browser_dispatch_failed".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Reconnect to the exact browser target".to_owned()),
-            })?;
-        loop {
-            let message = socket.read().map_err(|error| ComptrolError {
-                code: "browser_response_failed".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Inspect the browser target before retrying".to_owned()),
-            })?;
-            let Message::Text(text) = message else {
-                continue;
-            };
-            if text.len() > MAX_PROTOCOL_BYTES {
-                return Err(ComptrolError {
-                    code: "browser_message_too_large".to_owned(),
-                    message: format!(
-                        "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
-                    ),
-                    recovery: Some(
-                        "Inspect the target and retry with a bounded response".to_owned(),
-                    ),
-                });
-            }
-            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-                code: "browser_protocol_invalid".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Inspect the browser protocol version".to_owned()),
-            })?;
-            if value.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = value.get("error") {
-                return Err(ComptrolError {
-                    code: "browser_command_failed".to_owned(),
-                    message: error.to_string(),
-                    recovery: Some("Refresh the target and retry once".to_owned()),
-                });
-            }
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-        }
-    };
-    let document = call("DOM.getDocument", json!({ "depth": -1 }))?;
+    let document = persistent_call(&web_socket_url, "DOM.getDocument", json!({ "depth": -1 }))?;
     let root_id = document
         .get("root")
         .and_then(|root| root.get("nodeId"))
@@ -806,7 +1174,8 @@ pub fn cdp_upload(
             message: "The browser did not return a document root".to_owned(),
             recovery: Some("Refresh the browser target".to_owned()),
         })?;
-    let node = call(
+    let node = persistent_call(
+        &web_socket_url,
         "DOM.querySelector",
         json!({ "nodeId": root_id, "selector": selector }),
     )?;
@@ -819,7 +1188,8 @@ pub fn cdp_upload(
             message: "The browser upload control was not found".to_owned(),
             recovery: Some("Refresh the page and inspect the exact upload selector".to_owned()),
         })?;
-    call(
+    persistent_call(
+        &web_socket_url,
         "DOM.setFileInputFiles",
         json!({ "nodeId": node_id, "files": [path] }),
     )?;
@@ -833,7 +1203,8 @@ pub fn cdp_upload(
         message: error.to_string(),
         recovery: None,
     })?;
-    let verification = call(
+    let verification = persistent_call(
+        &web_socket_url,
         "Runtime.evaluate",
         json!({
             "expression": format!("(() => {{ const files = document.querySelector({selector}).files; return files.length === 1 && files[0].name === {file_name}; }})()"),
@@ -851,7 +1222,13 @@ pub fn cdp_upload(
             recovery: Some("Inspect the upload control and retry once".to_owned()),
         });
     }
-    Ok(json!({ "path": path, "file_name": file_name_text, "verified": true }))
+    Ok(json!({
+        "path": path,
+        "file_name": file_name_text,
+        "verified": false,
+        "stage": "selected",
+        "evidence": "DOM file input readback"
+    }))
 }
 
 pub fn cdp_download(
@@ -876,7 +1253,7 @@ pub fn cdp_download(
         });
     }
     fs_create_dir(download_dir)?;
-    let targets = discover(endpoint)?;
+    let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
     let Some(web_socket_url) = target.web_socket_url else {
         return Err(ComptrolError {
@@ -894,51 +1271,35 @@ pub fn cdp_download(
             ),
         });
     }
-    let (mut socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
-    let mut command_id = 0_u64;
-    let mut call = |method: &str, params: Value| -> Result<Value, ComptrolError> {
-        command_id += 1;
-        let id = command_id;
-        socket
-            .send(Message::Text(
-                json!({ "id": id, "method": method, "params": params })
-                    .to_string()
-                    .into(),
-            ))
-            .map_err(browser_dispatch_error)?;
-        loop {
-            let message = socket.read().map_err(browser_response_error)?;
-            let Message::Text(text) = message else {
-                continue;
-            };
-            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-                code: "browser_protocol_invalid".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Inspect the browser protocol version".to_owned()),
-            })?;
-            if value.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = value.get("error") {
-                return Err(ComptrolError {
-                    code: "browser_command_failed".to_owned(),
-                    message: error.to_string(),
-                    recovery: Some("Refresh the target and retry once".to_owned()),
-                });
-            }
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-        }
-    };
-    call(
-        "Page.setDownloadBehavior",
-        json!({ "behavior": "allow", "downloadPath": download_dir }),
+    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Inspect the existing browser websocket endpoint".to_owned()),
+    })?;
+    let browser_web_socket_url = version
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not provide a browser websocket".to_owned(),
+            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
+        })?;
+    protocol_call(
+        browser_web_socket_url,
+        "Browser.setDownloadBehavior",
+        json!({
+            "behavior": "allow",
+            "downloadPath": download_dir,
+            "browserContextId": browser_context_id.unwrap_or("default")
+        }),
     )?;
     let selector = serde_json::to_string(selector).map_err(|error| ComptrolError {
         code: "invalid_input".to_owned(),
         message: error.to_string(),
         recovery: None,
     })?;
-    call(
+    persistent_call(
+        &web_socket_url,
         "Runtime.evaluate",
         json!({
             "expression": format!("(() => {{ const link = document.querySelector({selector}); if (!link) throw new Error('download target missing'); link.click(); return true; }})()"),
@@ -1003,6 +1364,14 @@ fn browser_response_error(error: tungstenite::Error) -> ComptrolError {
         code: "browser_response_failed".to_owned(),
         message: error.to_string(),
         recovery: Some("Inspect the browser target before retrying".to_owned()),
+    }
+}
+
+fn browser_io_error(error: io::Error) -> ComptrolError {
+    ComptrolError {
+        code: "browser_response_failed".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Reconnect to the exact browser target".to_owned()),
     }
 }
 

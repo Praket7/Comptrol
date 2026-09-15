@@ -9,6 +9,8 @@ pub mod integration;
 pub mod pairing;
 pub mod trace;
 
+use comptrol_adapter_host::{AdapterHost, AdapterHostConfig};
+use comptrol_adapter_sdk::{AdapterManifest, HealthState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
@@ -23,11 +25,52 @@ pub use adapters::{AdapterDescriptor, AdapterRegistry};
 pub use checkpoints::{Checkpoint, CheckpointStore};
 pub use events::{Event, EventBus};
 pub use geometry::{DisplayGeometry, Point, VirtualDesktop};
-pub use trace::{TraceEntry, TraceMode, TraceRecorder, read_trace};
+pub use trace::{
+    CompiledStep, CompiledWorkflow, TraceEntry, TraceMode, TraceRecorder, WorkflowPrecondition,
+    compile_verified_trace, read_trace, validate_compiled_workflow,
+};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.11";
+pub const SERVER_VERSION: &str = "0.1.32";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
+
+const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
+    "vscode.workspace.list",
+    "vscode.setting.get",
+    "vscode.setting.set",
+    "vscode.document.open",
+    "vscode.document.save",
+    "libreoffice.document.open",
+    "libreoffice.document.save",
+    "libreoffice.calc.range.read",
+    "libreoffice.calc.range.write",
+    "libreoffice.writer.text.replace",
+    "obs.scene.list",
+    "obs.scene.switch",
+    "obs.source.visibility.set",
+    "obs.recording.status",
+    "obs.recording.start",
+    "obs.recording.stop",
+    "blender.scene.object.list",
+    "blender.scene.object.create",
+    "blender.scene.object.transform",
+    "blender.project.save",
+    "blender.render",
+];
+
+fn is_first_party_adapter_intent(intent: &str) -> bool {
+    FIRST_PARTY_ADAPTER_INTENTS.contains(&intent)
+}
+
+fn adapter_id_for_intent(intent: &str) -> Option<&'static str> {
+    match intent.split('.').next()? {
+        "vscode" => Some("vscode"),
+        "libreoffice" => Some("libreoffice"),
+        "obs" => Some("obs"),
+        "blender" => Some("blender"),
+        _ => None,
+    }
+}
 
 pub fn privacy_status() -> Value {
     json!({
@@ -204,6 +247,21 @@ pub struct Capability {
     pub risk: Risk,
     pub route: String,
     pub note: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RouteCandidate {
+    pub route: String,
+    pub feasible: bool,
+    pub rationale: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RoutePlan {
+    pub intent: String,
+    pub selected: Option<String>,
+    pub candidates: Vec<RouteCandidate>,
+    pub rationale: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -411,6 +469,8 @@ impl Policy {
                 "browser.cdp.history_forward".to_owned(),
                 "browser.cdp.semantic_click".to_owned(),
                 "browser.cdp.workflow".to_owned(),
+                "browser.cdp.screenshot".to_owned(),
+                "browser.cdp.coordinate_click".to_owned(),
             ]);
         }
         if std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1") {
@@ -418,6 +478,23 @@ impl Policy {
             policy
                 .allowed_intents
                 .insert("browser.chrome.open_tab".to_owned());
+        }
+        if env_enabled("COMPTROL_ALLOW_ADAPTERS") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            for intent in FIRST_PARTY_ADAPTER_INTENTS {
+                if classify(intent) <= Risk::R2 {
+                    policy.allowed_intents.insert((*intent).to_owned());
+                }
+            }
+            if env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS") {
+                policy.max_risk = policy.max_risk.max(Risk::R3);
+                policy
+                    .allowed_intents
+                    .insert("obs.recording.start".to_owned());
+                policy
+                    .allowed_intents
+                    .insert("obs.recording.stop".to_owned());
+            }
         }
         policy
     }
@@ -706,6 +783,7 @@ pub struct Runtime {
     pub events: EventBus,
     pub trace: Option<TraceRecorder>,
     pub stop: StopLatch,
+    adapter_hosts: HashMap<String, AdapterHost>,
     idempotent: HashMap<String, ActionResult>,
     sequence: u64,
 }
@@ -751,6 +829,7 @@ impl Runtime {
             events: EventBus::default(),
             trace,
             stop: StopLatch::new(&state_dir),
+            adapter_hosts: HashMap::new(),
             idempotent,
             sequence: 0,
         })
@@ -824,21 +903,50 @@ impl Runtime {
             self.remember(&request, result.clone());
             return result;
         }
+        let plan = route_plan(&request);
         if request.dry_run {
+            let route_error = plan.selected.is_none().then(|| ComptrolError {
+                code: "route_unavailable".to_owned(),
+                message: plan.rationale.clone(),
+                recovery: Some(
+                    "Inspect routes and satisfy the selected route's feasibility gates".to_owned(),
+                ),
+            });
             let result = ActionResult {
                 operation_id,
                 intent: request.intent.clone(),
-                route: route_for(&request.intent),
+                route: plan.selected.clone().unwrap_or_else(|| "none".to_owned()),
                 target: request.target.clone(),
-                preflight: "passed".to_owned(),
+                preflight: if plan.selected.is_some() {
+                    "passed"
+                } else {
+                    "failed"
+                }
+                .to_owned(),
                 delivery: DeliveryState::NotDispatched,
                 effect: EffectState::NotAttempted,
                 verification: VerificationState::NotAttempted,
                 disturbance: json!({ "foreground_changed": false }),
                 recovery: RecoveryState::None,
-                data: json!({ "dry_run": true, "risk": risk }),
-                error: None,
+                data: json!({ "dry_run": true, "risk": risk, "route_plan": plan }),
+                error: route_error,
             };
+            self.remember(&request, result.clone());
+            return result;
+        }
+        if plan.selected.is_none() {
+            let result = ActionResult::refused(
+                &request,
+                operation_id,
+                ComptrolError {
+                    code: "route_unavailable".to_owned(),
+                    message: plan.rationale.clone(),
+                    recovery: Some(
+                        "Inspect routes and satisfy the selected route's feasibility gates"
+                            .to_owned(),
+                    ),
+                },
+            );
             self.remember(&request, result.clone());
             return result;
         }
@@ -912,8 +1020,13 @@ impl Runtime {
             | "browser.cdp.history_forward"
             | "browser.cdp.semantic_click"
             | "browser.cdp.workflow"
+            | "browser.cdp.screenshot"
+            | "browser.cdp.coordinate_click"
             | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
+            intent if is_first_party_adapter_intent(intent) => {
+                execute_adapter_request(self, &request, operation_id)
+            }
             _ => ActionResult::refused(
                 &request,
                 operation_id,
@@ -932,6 +1045,7 @@ impl Runtime {
         match kind {
             "doctor" => doctor(self),
             "capabilities" => json!(capabilities()),
+            "routes" => json!(route_catalog()),
             "platform" => platform_diagnostics(),
             "browser" => match std::env::var("COMPTROL_CDP_ENDPOINT") {
                 Ok(endpoint) => match browser::discover(&endpoint) {
@@ -1194,12 +1308,222 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.close_tab"
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward"
-        | "browser.cdp.semantic_click" => Risk::R2,
+        | "browser.cdp.semantic_click"
+        | "browser.cdp.coordinate_click" => Risk::R2,
+        "browser.cdp.screenshot" => Risk::R0,
         "browser.cdp.workflow" => Risk::R2,
+        "obs.recording.start" | "obs.recording.stop" => Risk::R3,
+        intent if is_first_party_adapter_intent(intent) => Risk::R2,
         "browser.cdp.wait_for"
         | "browser.cdp.accessibility_snapshot"
         | "browser.cdp.reopen_closed_group" => Risk::R0,
         _ => Risk::R2,
+    }
+}
+
+fn execute_adapter_request(
+    runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    let Some(adapter_name) = adapter_id_for_intent(&request.intent) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "adapter_unavailable".to_owned(),
+                message: "The adapter intent has no registered first party adapter".to_owned(),
+                recovery: Some("Inspect adapter descriptors and use a supported intent".to_owned()),
+            },
+        );
+    };
+    let root = std::env::var_os("COMPTROL_ADAPTER_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("adapters"));
+    let manifest_path = root.join(adapter_name).join("adapter.toml");
+    let manifest_text = match fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_unavailable".to_owned(),
+                    message: format!("Adapter manifest could not be read: {error}"),
+                    recovery: Some(
+                        "Configure COMPTROL_ADAPTER_ROOT with the adapter bundle".to_owned(),
+                    ),
+                },
+            );
+        }
+    };
+    let manifest = match AdapterManifest::from_toml(&manifest_text) {
+        Ok(manifest) if manifest.declares(&request.intent) => manifest,
+        Ok(_) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_capability_undeclared".to_owned(),
+                    message: format!("Adapter {adapter_name} does not declare {}", request.intent),
+                    recovery: Some("Use the adapter's declared capability set".to_owned()),
+                },
+            );
+        }
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_manifest_invalid".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some(
+                        "Repair and validate adapter.toml before enabling the route".to_owned(),
+                    ),
+                },
+            );
+        }
+    };
+    if !runtime.adapter_hosts.contains_key(adapter_name) {
+        let python = std::env::var_os("COMPTROL_ADAPTER_PYTHON")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(if cfg!(windows) {
+                    "python.exe"
+                } else {
+                    "python3"
+                })
+            });
+        let script = root.join(adapter_name).join("src").join("adapter.py");
+        let config = AdapterHostConfig {
+            manifest,
+            executable: python,
+            arguments: vec![script.to_string_lossy().into_owned()],
+            instance_id: format!("{adapter_name}-{operation_id}"),
+            max_frame_bytes: comptrol_adapter_sdk::MAX_FRAME_BYTES,
+        };
+        let mut host = match AdapterHost::spawn(config) {
+            Ok(host) => host,
+            Err(error) => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "adapter_unavailable".to_owned(),
+                        message: error.to_string(),
+                        recovery: Some(
+                            "Install the adapter runtime and inspect adapter health".to_owned(),
+                        ),
+                    },
+                );
+            }
+        };
+        if let Err(error) = host.handshake() {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_handshake_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some(
+                        "Inspect the isolated adapter process before retrying".to_owned(),
+                    ),
+                },
+            );
+        }
+        runtime.adapter_hosts.insert(adapter_name.to_owned(), host);
+    }
+    let Some(host) = runtime.adapter_hosts.get_mut(adapter_name) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "adapter_unavailable".to_owned(),
+                message: "The adapter host was not retained".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let resource = request
+        .params
+        .get("resource")
+        .and_then(Value::as_str)
+        .unwrap_or("application")
+        .to_owned();
+    let token = match host.capability_token(&request.intent, &resource, &operation_id, 30_000) {
+        Ok(token) => token,
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_capability_denied".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Inspect the adapter manifest and resource scope".to_owned()),
+                },
+            );
+        }
+    };
+    let mut payload = request.params.clone();
+    if !payload.is_object() {
+        payload = json!({});
+    }
+    payload["intent"] = json!(request.intent);
+    match host.request("execute", &resource, payload, Some(token)) {
+        Ok(response) if response.ok && response.health == HealthState::Available => {
+            let verified = response
+                .payload
+                .get("verified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            success(
+                request,
+                operation_id,
+                &format!("adapter.{adapter_name}"),
+                EffectState::Changed,
+                if verified {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                json!({"adapter": adapter_name, "health": response.health, "payload": response.payload, "verified": verified}),
+            )
+        }
+        Ok(response) => ActionResult {
+            operation_id,
+            intent: request.intent.clone(),
+            route: format!("adapter.{adapter_name}"),
+            target: request.target.clone(),
+            preflight: "passed".to_owned(),
+            delivery: DeliveryState::Delivered,
+            effect: EffectState::NotAttempted,
+            verification: VerificationState::NotAttempted,
+            disturbance: json!({ "foreground_changed": false, "mouse": "untouched", "clipboard": "untouched" }),
+            recovery: RecoveryState::None,
+            data: json!({"adapter": adapter_name, "health": response.health, "payload": response.payload}),
+            error: Some(ComptrolError {
+                code: "adapter_execution_failed".to_owned(),
+                message: response
+                    .error
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "Adapter did not verify the operation".to_owned()),
+                recovery: Some(
+                    "Inspect adapter health and reconcile application state before retrying"
+                        .to_owned(),
+                ),
+            }),
+        },
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "adapter_execution_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some(
+                    "Inspect the adapter process and application state before retrying".to_owned(),
+                ),
+            },
+        ),
     }
 }
 
@@ -1364,43 +1688,201 @@ fn stable_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn route_for(intent: &str) -> String {
-    match intent {
-        "system.ping" => "native",
-        "desktop.observe" => "platform_observe",
-        "platform.broker.observe" => "platform_broker",
-        "workflow.execute" => "workflow",
-        "filesystem.write" => "sandbox_filesystem",
-        "filesystem.copy" => "sandbox_filesystem",
-        "filesystem.restore_checkpoint" => "sandbox_checkpoint",
-        "desktop.notify" => "platform_notification",
-        "desktop.open_app" => "platform_launch",
-        "browser.chrome.open_tab" => "browser_launcher",
-        "browser.chrome.reopen_closed_group" => "chrome_ax",
-        "command.run" => "process_argv",
-        "windows.uia.press" | "windows.uia.set_value" => "windows_uia",
-        "linux.atspi.press" | "linux.atspi.set_value" => "linux_atspi",
-        "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
-        "browser.fixture.submit" => "browser_fixture",
-        "browser.cdp.evaluate"
-        | "browser.cdp.navigate"
-        | "browser.cdp.upload"
-        | "browser.cdp.download"
-        | "browser.cdp.fill"
-        | "browser.cdp.click"
-        | "browser.cdp.focus"
-        | "browser.cdp.open_tab"
-        | "browser.cdp.close_tab"
-        | "browser.cdp.history_back"
-        | "browser.cdp.history_forward"
-        | "browser.cdp.semantic_click"
-        | "browser.cdp.workflow"
-        | "browser.cdp.accessibility_snapshot"
-        | "browser.cdp.reopen_closed_group"
-        | "browser.cdp.wait_for" => "browser_protocol",
-        _ => "none",
+fn route_plan(request: &OperationRequest) -> RoutePlan {
+    route_plan_for_intent(
+        &request.intent,
+        request.params.clone(),
+        request.background.as_deref(),
+    )
+}
+
+fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) -> RoutePlan {
+    let primary = match intent {
+        "system.ping" => Some(("native", true, "Built-in local readiness route")),
+        "desktop.observe" => Some((
+            "platform_observe",
+            true,
+            "Read-only host observation is available locally",
+        )),
+        "platform.broker.observe" => Some((
+            "platform_broker",
+            true,
+            "Read-only broker diagnostics do not require actuation",
+        )),
+        "workflow.execute" => Some(("workflow", true, "Bounded workflow VM route")),
+        "filesystem.write" | "filesystem.copy" => Some((
+            "sandbox_filesystem",
+            env_enabled("COMPTROL_ALLOW_SANDBOX_WRITES"),
+            "Sandbox write policy must be explicitly enabled",
+        )),
+        "filesystem.restore_checkpoint" => Some((
+            "sandbox_checkpoint",
+            env_enabled("COMPTROL_ALLOW_SANDBOX_WRITES"),
+            "Checkpoint restore is gated by sandbox write policy",
+        )),
+        "desktop.notify" => Some((
+            "platform_notification",
+            cfg!(target_os = "macos") && env_enabled("COMPTROL_ALLOW_DESKTOP_NOTIFY"),
+            "macOS notification route and explicit policy are required",
+        )),
+        "desktop.open_app" => Some((
+            "platform_launch",
+            cfg!(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "linux"
+            )) && env_enabled("COMPTROL_ALLOW_APP_LAUNCH"),
+            "Native app launch requires an explicit local policy",
+        )),
+        "browser.chrome.open_tab" => Some((
+            "browser_launcher",
+            cfg!(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "linux"
+            )) && env_enabled("COMPTROL_ALLOW_BROWSER_LAUNCH"),
+            "Default-profile browser launch requires an explicit local policy",
+        )),
+        "browser.chrome.reopen_closed_group" => Some((
+            "chrome_ax",
+            cfg!(target_os = "macos") && env_enabled("COMPTROL_ALLOW_MACOS_AX"),
+            "Chrome closed-group control requires macOS Accessibility and policy",
+        )),
+        "command.run" => Some((
+            "process_argv",
+            env_enabled("COMPTROL_ALLOW_COMMANDS")
+                && std::env::var_os("COMPTROL_COMMAND_ROOT").is_some(),
+            "Command execution requires an allowlist policy and command root",
+        )),
+        "windows.uia.press" | "windows.uia.set_value" => Some((
+            "windows_uia",
+            cfg!(target_os = "windows") && env_enabled("COMPTROL_ALLOW_WINDOWS_UIA"),
+            "Windows UI Automation requires Windows and explicit policy",
+        )),
+        "linux.atspi.press" | "linux.atspi.set_value" => Some((
+            "linux_atspi",
+            cfg!(target_os = "linux")
+                && env_enabled("COMPTROL_ALLOW_LINUX_ATSPI")
+                && std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
+            "AT-SPI requires Linux, a session bus, and explicit policy",
+        )),
+        "macos.ax.press" | "macos.ax.set_value" => Some((
+            "macos_ax",
+            cfg!(target_os = "macos") && env_enabled("COMPTROL_ALLOW_MACOS_AX"),
+            "macOS Accessibility requires explicit policy and a reachable provider",
+        )),
+        "browser.fixture.submit" => Some((
+            "browser_fixture",
+            true,
+            "Deterministic local browser fixture route",
+        )),
+        value if is_first_party_adapter_intent(value) => Some((
+            "isolated_adapter",
+            env_enabled("COMPTROL_ALLOW_ADAPTERS")
+                && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some(),
+            "First party application adapters require an explicit policy and adapter root",
+        )),
+        value if value.starts_with("browser.cdp.") => Some((
+            "browser_protocol",
+            std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
+            "Persistent local CDP requires an endpoint and explicit policy",
+        )),
+        _ => None,
+    };
+
+    let Some((route, available, base_reason)) = primary else {
+        return RoutePlan {
+            intent: intent.to_owned(),
+            selected: None,
+            candidates: vec![RouteCandidate {
+                route: "none".to_owned(),
+                feasible: false,
+                rationale: "No registered route exists for this intent".to_owned(),
+            }],
+            rationale: format!("No registered route exists for {intent}"),
+        };
+    };
+
+    let mut candidates = vec![RouteCandidate {
+        route: route.to_owned(),
+        feasible: available,
+        rationale: if available {
+            base_reason.to_owned()
+        } else {
+            format!("Rejected: {base_reason}")
+        },
+    }];
+
+    if intent == "browser.cdp.open_tab" {
+        let requested_background = params
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if background == Some("strict_background") && !requested_background {
+            candidates[0].feasible = false;
+            candidates[0].rationale =
+                "Rejected: strict_background requires params.background=true".to_owned();
+        } else if background == Some("foreground_required") && requested_background {
+            candidates[0].feasible = false;
+            candidates[0].rationale =
+                "Rejected: foreground_required conflicts with params.background=true".to_owned();
+        }
     }
-    .to_owned()
+
+    let selected = candidates
+        .iter()
+        .find(|candidate| candidate.feasible)
+        .map(|candidate| candidate.route.clone());
+    let rationale = match selected.as_deref() {
+        Some(route) => format!("Selected deterministic primary route {route}"),
+        None => candidates
+            .first()
+            .map(|candidate| candidate.rationale.clone())
+            .unwrap_or_else(|| "No feasible route".to_owned()),
+    };
+    RoutePlan {
+        intent: intent.to_owned(),
+        selected,
+        candidates,
+        rationale,
+    }
+}
+
+fn route_catalog() -> Vec<RoutePlan> {
+    [
+        "system.ping",
+        "desktop.observe",
+        "platform.broker.observe",
+        "workflow.execute",
+        "filesystem.write",
+        "filesystem.copy",
+        "filesystem.restore_checkpoint",
+        "desktop.notify",
+        "desktop.open_app",
+        "browser.chrome.open_tab",
+        "browser.chrome.reopen_closed_group",
+        "command.run",
+        "windows.uia.press",
+        "linux.atspi.press",
+        "macos.ax.press",
+        "browser.fixture.submit",
+        "vscode.workspace.list",
+        "libreoffice.calc.range.read",
+        "obs.scene.list",
+        "blender.scene.object.list",
+        "browser.cdp.open_tab",
+        "browser.cdp.semantic_click",
+        "browser.cdp.screenshot",
+        "browser.cdp.coordinate_click",
+    ]
+    .into_iter()
+    .map(|intent| route_plan_for_intent(intent, Value::Null, None))
+    .collect()
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
 }
 
 fn restore_checkpoint(
@@ -1441,6 +1923,38 @@ fn restore_checkpoint(
 }
 
 fn execute_workflow_request(request: &OperationRequest, operation_id: String) -> ActionResult {
+    if let Some(compiled) = request.params.get("compiled_workflow") {
+        let Ok(compiled) = serde_json::from_value::<CompiledWorkflow>(compiled.clone()) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "workflow_validation_failed".to_owned(),
+                    message: "Compiled workflow did not match the closed schema".to_owned(),
+                    recovery: Some("Recompile the workflow from a verified trace".to_owned()),
+                },
+            );
+        };
+        if let Err(error) = validate_compiled_workflow(
+            &compiled,
+            request.params.get("observed").unwrap_or(&Value::Null),
+        ) {
+            return ActionResult {
+                operation_id,
+                intent: request.intent.clone(),
+                route: "workflow".to_owned(),
+                target: request.target.clone(),
+                preflight: "failed".to_owned(),
+                delivery: DeliveryState::NotDispatched,
+                effect: EffectState::NotAttempted,
+                verification: VerificationState::NotAttempted,
+                disturbance: json!({ "foreground_changed": false }),
+                recovery: RecoveryState::RequiresReconciliation,
+                data: json!({ "workflow_id": compiled.workflow_id, "workflow_version": compiled.workflow_version }),
+                error: Some(error),
+            };
+        }
+    }
     let Some(ops) = request.params.get("ops") else {
         return ActionResult::refused(
             request,
@@ -1739,6 +2253,128 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             Err(error) => browser_failure(request, operation_id, error),
         };
     }
+    if request.intent == "browser.cdp.screenshot" {
+        let format = request
+            .params
+            .get("format")
+            .and_then(Value::as_str)
+            .unwrap_or("png");
+        if !matches!(format, "png" | "jpeg" | "webp") {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Browser screenshots support png, jpeg, or webp".to_owned(),
+                    recovery: Some("Use a supported screenshot format".to_owned()),
+                },
+            );
+        }
+        let quality = request
+            .params
+            .get("quality")
+            .and_then(Value::as_u64)
+            .map(|value| value.clamp(0, 100));
+        let clip = request.params.get("clip").cloned().unwrap_or(Value::Null);
+        if !clip.is_null() && !clip.is_object() {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Browser screenshot clip must be an object".to_owned(),
+                    recovery: None,
+                },
+            );
+        }
+        return match browser::capture_screenshot(
+            &endpoint.to_string_lossy(),
+            target_id,
+            browser_context_id,
+            revision,
+            format,
+            quality,
+            clip,
+            request
+                .params
+                .get("include_pixels")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::None,
+                VerificationState::Verified,
+                data,
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
+    if request.intent == "browser.cdp.coordinate_click" {
+        let Some(capture_id) = request.params.get("capture_id").and_then(Value::as_str) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Coordinate clicks require a capture_id from browser.cdp.screenshot"
+                        .to_owned(),
+                    recovery: Some(
+                        "Capture fresh pixels before requesting a coordinate click".to_owned(),
+                    ),
+                },
+            );
+        };
+        let Some(x) = request.params.get("x").and_then(Value::as_f64) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Coordinate clicks require x".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        let Some(y) = request.params.get("y").and_then(Value::as_f64) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Coordinate clicks require y".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        let button = request
+            .params
+            .get("button")
+            .and_then(Value::as_str)
+            .unwrap_or("left");
+        return match browser::coordinate_click(
+            &endpoint.to_string_lossy(),
+            target_id,
+            browser_context_id,
+            revision,
+            capture_id,
+            x,
+            y,
+            button,
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                VerificationState::Unverified,
+                data,
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
     if matches!(
         request.intent.as_str(),
         "browser.cdp.fill" | "browser.cdp.click" | "browser.cdp.focus" | "browser.cdp.wait_for"
@@ -1989,7 +2625,7 @@ fn browser_cdp_workflow(
     }
     let endpoint = endpoint.to_string_lossy();
     let initial_revision = request.params.get("revision").and_then(Value::as_str);
-    let targets = match browser::discover(&endpoint) {
+    let targets = match browser::discover_cached_targets(&endpoint) {
         Ok(targets) => targets,
         Err(error) => return browser_failure(request, operation_id, error),
     };
@@ -2067,7 +2703,7 @@ fn browser_cdp_workflow(
             Err(error) => return browser_failure(request, operation_id, error),
         };
         completed.push(json!({"index": index, "result": data}));
-        if let Ok(current) = browser::discover(&endpoint)
+        if let Ok(current) = browser::discover_cached_targets(&endpoint)
             && let Ok(bound) =
                 crate::bind_browser_target(&current, target_id, Some(browser_context_id), None)
         {
@@ -2091,35 +2727,13 @@ fn browser_wait_for_url(
     contains: &str,
     timeout_ms: u64,
 ) -> Result<Value, ComptrolError> {
-    if contains.is_empty() || contains.chars().any(char::is_control) {
-        return Err(ComptrolError {
-            code: "invalid_input".to_owned(),
-            message: "URL postconditions must contain non-control text".to_owned(),
-            recovery: None,
-        });
-    }
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.clamp(100, 30_000));
-    loop {
-        if let Ok(targets) = browser::discover(endpoint)
-            && let Ok(target) =
-                crate::bind_browser_target(&targets, target_id, Some(browser_context_id), None)
-            && target
-                .url
-                .as_deref()
-                .is_some_and(|url| url.contains(contains))
-        {
-            return Ok(json!({"url": target.url, "verified": true}));
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    Err(ComptrolError {
-        code: "verification_failed".to_owned(),
-        message: format!("Browser URL did not contain {contains}"),
-        recovery: Some("Inspect the target and retry with a bounded postcondition".to_owned()),
-    })
+    browser::wait_for_url(
+        endpoint,
+        target_id,
+        browser_context_id,
+        contains,
+        Duration::from_millis(timeout_ms.clamp(100, 30_000)),
+    )
 }
 
 fn browser_cdp_dom_action(
@@ -2494,8 +3108,13 @@ fn browser_cdp_upload(
             operation_id,
             "browser_protocol",
             EffectState::Changed,
-            VerificationState::Verified,
-            data,
+            VerificationState::Unverified,
+            json!({
+                "selection": data,
+                "stage": "selected",
+                "verification": "unverified",
+                "next": "A site or application adapter must verify transfer or application acceptance"
+            }),
         ),
         Err(error) => browser_failure(request, operation_id, error),
     }
@@ -3648,6 +4267,7 @@ if ($env:COMPTROL_UIA_VERIFY_ATTRIBUTE -eq 'value') {
 ([pscustomobject]@{ verified = $verified; action = $env:COMPTROL_UIA_ACTION } | ConvertTo-Json -Compress)
 "#;
 
+#[cfg(not(target_os = "linux"))]
 const LINUX_ATSPI_SCRIPT: &str = r#"
 import json
 import os
@@ -3836,6 +4456,73 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     }
+    #[cfg(windows)]
+    if std::env::var("COMPTROL_WINDOWS_UIA_LEGACY").as_deref() != Ok("1") {
+        let action = if request.intent.ends_with("press") {
+            comptrol_platform_windows::Action::Press
+        } else {
+            comptrol_platform_windows::Action::SetValue
+        };
+        let (expected_attribute, expected_value) = request
+            .postcondition
+            .as_ref()
+            .and_then(|postcondition| {
+                Some((
+                    postcondition.get("attribute")?.as_str()?,
+                    postcondition.get("equals")?.as_str()?,
+                ))
+            })
+            .unzip();
+        let result = comptrol_platform_windows::execute(comptrol_platform_windows::Request {
+            process_id: process_id as u32,
+            name,
+            automation_id,
+            role: request.params.get("role").and_then(Value::as_str),
+            action,
+            value: request.params.get("value").and_then(Value::as_str),
+            expected_attribute,
+            expected_value,
+        });
+        return match result {
+            Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
+                request,
+                operation_id,
+                "windows_uia_direct",
+                EffectState::Changed,
+                VerificationState::Verified,
+                data,
+            ),
+            Ok(data) => success(
+                request,
+                operation_id,
+                "windows_uia_direct",
+                EffectState::Changed,
+                VerificationState::Unverified,
+                data,
+            ),
+            Err(message) => ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: if message.contains("ambiguous") {
+                        "target_ambiguous"
+                    } else if message.contains("missing") {
+                        "target_gone"
+                    } else if message.contains("disabled") {
+                        "not_actionable"
+                    } else {
+                        "adapter_unavailable"
+                    }
+                    .to_owned(),
+                    message,
+                    recovery: Some(
+                        "Refresh the exact UI Automation target and inspect Windows permissions"
+                            .to_owned(),
+                    ),
+                },
+            ),
+        };
+    }
     let mut command = Command::new("powershell.exe");
     command
         .args([
@@ -3922,7 +4609,74 @@ fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    #[cfg(target_os = "linux")]
+    {
+        let action = if request.intent.ends_with("press") {
+            comptrol_platform_linux::Action::Press
+        } else {
+            comptrol_platform_linux::Action::SetValue
+        };
+        let (expected_attribute, expected_value) = request
+            .postcondition
+            .as_ref()
+            .and_then(|postcondition| {
+                Some((
+                    postcondition.get("attribute")?.as_str()?,
+                    postcondition.get("equals")?.as_str()?,
+                ))
+            })
+            .unzip();
+        let result = comptrol_platform_linux::execute(comptrol_platform_linux::Request {
+            process_id: process_id as u32,
+            name,
+            role: request.params.get("role").and_then(Value::as_str),
+            action,
+            value: request.params.get("value").and_then(Value::as_str),
+            expected_attribute,
+            expected_value,
+            timeout: Duration::from_millis(1500),
+        });
+        match result {
+            Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
+                request,
+                operation_id,
+                "linux_atspi_direct",
+                EffectState::Changed,
+                VerificationState::Verified,
+                data,
+            ),
+            Ok(data) => success(
+                request,
+                operation_id,
+                "linux_atspi_direct",
+                EffectState::Changed,
+                VerificationState::Unverified,
+                data,
+            ),
+            Err(message) => ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: if message.contains("ambiguous") {
+                        "target_ambiguous"
+                    } else if message.contains("missing") {
+                        "target_gone"
+                    } else {
+                        "adapter_unavailable"
+                    }
+                    .to_owned(),
+                    message,
+                    recovery: Some(
+                        "Refresh the exact AT-SPI target and inspect the Linux accessibility bus"
+                            .to_owned(),
+                    ),
+                },
+            ),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     let mut command = Command::new("python3");
+    #[cfg(not(target_os = "linux"))]
     command
         .args(["-c", LINUX_ATSPI_SCRIPT])
         .env("COMPTROL_ATSPI_PROCESS_ID", process_id.to_string())
@@ -3935,15 +4689,19 @@ fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> Actio
                 "set_value"
             },
         );
+    #[cfg(not(target_os = "linux"))]
     if let Some(role) = request.params.get("role").and_then(Value::as_str) {
         command.env("COMPTROL_ATSPI_ROLE", role);
     }
+    #[cfg(not(target_os = "linux"))]
     if let Some(action) = request.params.get("action").and_then(Value::as_str) {
         command.env("COMPTROL_ATSPI_ACTION", action);
     }
+    #[cfg(not(target_os = "linux"))]
     if let Some(value) = request.params.get("value").and_then(Value::as_str) {
         command.env("COMPTROL_ATSPI_VALUE", value);
     }
+    #[cfg(not(target_os = "linux"))]
     if let Some(postcondition) = request.postcondition.as_ref()
         && let (Some(attribute), Some(expected)) = (
             postcondition.get("attribute").and_then(Value::as_str),
@@ -3959,17 +4717,32 @@ fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> Actio
                 .unwrap_or_else(|| expected.to_string()),
         );
     }
-    semantic_provider_result(
+    #[cfg(not(target_os = "linux"))]
+    return semantic_provider_result(
         request,
         operation_id,
         "linux_atspi",
         run_bounded(command, Duration::from_millis(1500)),
-    )
+    );
 }
 
 fn macos_ax_press(request: &OperationRequest, operation_id: String) -> ActionResult {
     if !cfg!(target_os = "macos") {
         return unsupported_ax(request, operation_id);
+    }
+    #[cfg(target_os = "macos")]
+    if let (Some(process_id), Some(control)) = (
+        request.params.get("process_id").and_then(Value::as_u64),
+        request.params.get("control").and_then(Value::as_str),
+    ) {
+        return macos_ax_direct_result(
+            request,
+            operation_id,
+            comptrol_platform_macos::Action::Press,
+            process_id,
+            control,
+            None,
+        );
     }
     let Some(script) = ax_script(request, "press") else {
         return ActionResult::refused(
@@ -4033,6 +4806,20 @@ fn macos_ax_set_value(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    #[cfg(target_os = "macos")]
+    if let (Some(process_id), Some(control)) = (
+        request.params.get("process_id").and_then(Value::as_u64),
+        request.params.get("control").and_then(Value::as_str),
+    ) {
+        return macos_ax_direct_result(
+            request,
+            operation_id,
+            comptrol_platform_macos::Action::SetValue,
+            process_id,
+            control,
+            Some(value),
+        );
+    }
     let Some(script) = ax_script(request, &format!("set_value:{}", apple_quote(value))) else {
         return ActionResult::refused(
             request,
@@ -4066,6 +4853,75 @@ fn macos_ax_set_value(request: &OperationRequest, operation_id: String) -> Actio
                 code: "adapter_unavailable".to_owned(),
                 message: error.to_string(),
                 recovery: Some("Check macOS Accessibility permission".to_owned()),
+            },
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ax_direct_result(
+    request: &OperationRequest,
+    operation_id: String,
+    action: comptrol_platform_macos::Action,
+    process_id: u64,
+    control: &str,
+    value: Option<&str>,
+) -> ActionResult {
+    let (expected_attribute, expected_value) = request
+        .postcondition
+        .as_ref()
+        .and_then(|postcondition| {
+            Some((
+                postcondition.get("attribute")?.as_str()?,
+                postcondition.get("equals")?.as_str()?,
+            ))
+        })
+        .unzip();
+    match comptrol_platform_macos::execute(comptrol_platform_macos::Request {
+        process_id: process_id as u32,
+        name: control,
+        role: request.params.get("role").and_then(Value::as_str),
+        action,
+        value,
+        expected_attribute,
+        expected_value,
+        timeout: Duration::from_millis(1500),
+    }) {
+        Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
+            request,
+            operation_id,
+            "macos_ax_direct",
+            EffectState::Changed,
+            VerificationState::Verified,
+            data,
+        ),
+        Ok(data) => success(
+            request,
+            operation_id,
+            "macos_ax_direct",
+            EffectState::Changed,
+            VerificationState::Unverified,
+            data,
+        ),
+        Err(message) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: if message.contains("ambiguous") {
+                    "target_ambiguous"
+                } else if message.contains("missing") {
+                    "target_gone"
+                } else if message.contains("permission") {
+                    "permission_required"
+                } else {
+                    "adapter_unavailable"
+                }
+                .to_owned(),
+                message,
+                recovery: Some(
+                    "Refresh the exact AX target and inspect macOS Accessibility permission"
+                        .to_owned(),
+                ),
             },
         ),
     }
@@ -4446,6 +5302,22 @@ pub fn capabilities() -> Vec<Capability> {
             note: "Reads a bounded accessibility tree from one exact live page target".to_owned(),
         },
         Capability {
+            name: "browser.cdp.screenshot".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R0,
+            route: "browser_protocol".to_owned(),
+            note: "Captures a bounded target-scoped visual digest without returning pixels through MCP".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.coordinate_click".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "browser_protocol".to_owned(),
+            note: "Dispatches one coordinate click only when a fresh screenshot capture_id proves the viewport geometry is current".to_owned(),
+        },
+        Capability {
             name: "browser.cdp.focus".to_owned(),
             available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
@@ -4501,6 +5373,18 @@ pub fn capabilities() -> Vec<Capability> {
             note: "macOS semantic press and value routes require explicit policy and Accessibility permission".to_owned(),
         },
     ];
+    for intent in FIRST_PARTY_ADAPTER_INTENTS {
+        result.push(Capability {
+            name: (*intent).to_owned(),
+            available: env_enabled("COMPTROL_ALLOW_ADAPTERS")
+                && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some()
+                && (!matches!(*intent, "obs.recording.start" | "obs.recording.stop")
+                    || env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS")),
+            risk: classify(intent),
+            route: "isolated_adapter".to_owned(),
+            note: "Runs through a bounded out of process first party adapter and requires application state verification".to_owned(),
+        });
+    }
     result.extend(platform_capabilities());
     result
 }
@@ -4758,6 +5642,79 @@ mod tests {
             result.error.as_ref().map(|error| error.code.as_str()),
             Some("invalid_input")
         );
+    }
+
+    #[test]
+    fn dry_run_returns_deterministic_route_plan_and_rationale() {
+        let mut runtime = runtime();
+        let result = runtime.operate(OperationRequest {
+            intent: "system.ping".to_owned(),
+            target: None,
+            params: Value::Null,
+            postcondition: None,
+            risk: None,
+            idempotency_key: Some("route-plan-ping".to_owned()),
+            dry_run: true,
+            background: None,
+        });
+        assert_eq!(result.route, "native");
+        assert_eq!(result.data["route_plan"]["selected"], "native");
+        assert!(
+            result.data["route_plan"]["rationale"]
+                .as_str()
+                .is_some_and(|value| value.contains("deterministic"))
+        );
+        assert_eq!(result.data["route_plan"]["candidates"][0]["feasible"], true);
+    }
+
+    #[test]
+    fn route_planner_rejects_unknown_intents_explicitly() {
+        let plan = route_plan_for_intent("unknown.intent", Value::Null, None);
+        assert!(plan.selected.is_none());
+        assert_eq!(plan.candidates[0].route, "none");
+        assert!(plan.rationale.contains("No registered route"));
+    }
+
+    #[test]
+    fn strict_background_rejects_foreground_only_browser_opening() {
+        let plan = route_plan_for_intent(
+            "browser.cdp.open_tab",
+            json!({"background": false}),
+            Some("strict_background"),
+        );
+        assert!(plan.selected.is_none());
+        assert!(
+            plan.candidates[0]
+                .rationale
+                .contains("strict_background requires")
+        );
+    }
+
+    #[test]
+    fn unavailable_dry_run_preserves_route_rejection_rationale() {
+        let mut runtime = runtime();
+        runtime
+            .policy
+            .allowed_intents
+            .insert("browser.cdp.open_tab".to_owned());
+        runtime.policy.max_risk = Risk::R2;
+        let result = runtime.operate(OperationRequest {
+            intent: "browser.cdp.open_tab".to_owned(),
+            target: None,
+            params: json!({"url":"https://example.test", "background":false}),
+            postcondition: None,
+            risk: None,
+            idempotency_key: Some("route-plan-unavailable".to_owned()),
+            dry_run: true,
+            background: Some("strict_background".to_owned()),
+        });
+        assert_eq!(result.route, "none");
+        assert_eq!(result.preflight, "failed");
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("route_unavailable")
+        );
+        assert!(result.data["route_plan"]["rationale"].as_str().is_some());
     }
 
     #[test]
@@ -5175,7 +6132,7 @@ mod tests {
 
     #[test]
     fn event_bus_deduplicates_and_bounds_history() {
-        let mut events = EventBus::new(2);
+        let events = EventBus::new(2);
         let first = events.emit("file.changed", json!({"path":"a"}));
         let duplicate = events.emit("file.changed", json!({"path":"a"}));
         assert_eq!(first.sequence, duplicate.sequence);
@@ -5189,6 +6146,20 @@ mod tests {
                 .payload["path"],
             "c"
         );
+    }
+
+    #[test]
+    fn event_bus_waits_for_notification_instead_of_polling() {
+        let events = std::sync::Arc::new(EventBus::new(8));
+        let waiter = std::sync::Arc::clone(&events);
+        let started = std::time::Instant::now();
+        let thread =
+            std::thread::spawn(move || waiter.wait_for(0, Some("ready"), Duration::from_secs(1)));
+        std::thread::sleep(Duration::from_millis(20));
+        events.emit("ready", json!({"ok": true}));
+        let event = thread.join().expect("waiter thread").expect("event");
+        assert_eq!(event.kind, "ready");
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

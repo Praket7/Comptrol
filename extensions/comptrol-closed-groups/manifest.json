@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Comptrol Closed Groups",
+  "version": "0.1.0",
+  "description": "Safely records and restores named Chrome tab groups in this profile.",
+  "permissions": ["sessions", "tabs", "tabGroups", "storage", "alarms"],
+  "background": { "service_worker": "service_worker.js", "type": "module" },
+  "action": { "default_title": "Comptrol closed groups", "default_popup": "popup.html" }
+}

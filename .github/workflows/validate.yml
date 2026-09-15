@@ -33,6 +33,10 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release
       - run: python3 scripts/lint_readme.py
+      - run: python3 scripts/adapter_conformance.py
+      - run: python3 scripts/adapter_runtime_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
       - run: npm run test:browser
       - run: python3 scripts/client_conformance.py
         env:

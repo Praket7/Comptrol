@@ -1,0 +1,33 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "comptrol",
+  "version": "0.1.32",
+  "description": "Local first, policy bound computer control with verified browser and desktop routes.",
+  "author": {
+    "name": "Comptrol contributors",
+    "url": "https://github.com/Praket7/Comptrol"
+  },
+  "homepage": "https://github.com/Praket7/Comptrol",
+  "repository": "https://github.com/Praket7/Comptrol",
+  "license": "Apache-2.0",
+  "keywords": ["computer-use", "MCP", "browser", "verification"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Comptrol",
+        "shortDescription": "Verified local computer control",
+        "longDescription": "Use policy-bound browser and desktop routes with explicit target identity, recovery, and outcome verification.",
+        "developerName": "Comptrol contributors",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "websiteURL": "https://github.com/Praket7/Comptrol",
+        "privacyPolicyURL": "https://github.com/Praket7/Comptrol/blob/main/PRIVACY.md",
+        "defaultPrompt": [
+          "Use Comptrol for a local action only when the exact target and verification level are clear.",
+          "Prefer a verified programmatic or browser route over screenshot-driven interaction."
+        ],
+        "brandColor": "#2457A6"
+      }
+    }
+  }
+}

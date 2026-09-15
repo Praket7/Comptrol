@@ -10,7 +10,9 @@ The default MCP tools are operate, inspect, watch, and capabilities. Unsupported
 
 Stdio calls that provide an MCP progress token receive bounded start and completion progress notifications around the returned operation result. The operation id remains the durable recovery identity.
 
-The stdio server also supports a durable completed task subset when the client advertises the Tasks extension and sends a task request. It persists the task handle and final result across restart and serves `tasks/get`, `tasks/result`, and `tasks/list`. Long running asynchronous execution and task cancellation remain unavailable and are refused rather than implied.
+The stdio server also supports asynchronous MCP Tasks when the client advertises the Tasks extension and sends a task request. The server returns a durable `queued` handle immediately, executes the bounded tool call on a worker, transitions it through `running` to `completed`, and serves `tasks/get`, `tasks/result`, and `tasks/list`. Cancellation is cooperative before execution starts. A cancellation request that races with an already started operation produces `unknown` rather than hiding a potentially dispatched mutation. Queued or running tasks found after restart are also marked `unknown` and must be reconciled before retry.
+
+Task state is stored in `<state_dir>/comptrol.db` using SQLite WAL, foreign key enforcement, a schema migration table, transactional task rows, and append only task transition events. Existing `tasks.jsonl` files are imported with conflict safe inserts and retained as a rollback artifact. The migration never treats a queued or running legacy task as safely replayable.
 
 The loopback HTTP transport binds only to localhost. It assigns a random session id after initialization and requires that id for later MCP requests. It supports origin validation, session deletion, concurrent long lived server sent event streams, persistent session state under the configured state directory, bounded event replay with `Last-Event-ID`, and a bounded connection count. It remains local because it does not provide remote authentication.
 

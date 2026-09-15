@@ -57,7 +57,12 @@ def oversized_request(port):
             b"Content-Length: 1048577\r\n"
             b"Connection: close\r\n\r\n"
         )
-        response = connection.recv(4096)
+        response = b""
+        while True:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response += chunk
     return response
 
 

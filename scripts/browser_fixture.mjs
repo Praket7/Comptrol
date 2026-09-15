@@ -9,7 +9,13 @@ const browserContextId = "comptrol-fixture-context"
 const revision = "fixture-revision-1"
 const submissions = new Map()
 const openedTabs = new Map()
+let websocketConnections = 0
+let browserWebsocketConnections = 0
+let pageWebsocketConnections = 0
+let targetListRequests = 0
+let protocolEvents = 0
 let fixtureHistoryIndex = 1
+let fixtureUrl = `http://127.0.0.1:${port}/`
 const fixtureHistory = [
   { id: 1, url: "http://127.0.0.1:17417/previous" },
   { id: 2, url: "http://127.0.0.1:17417/" },
@@ -35,7 +41,7 @@ const server = createServer(async (request, response) => {
   }
   if (request.method === "GET" && request.url === "/frame.html") {
     response.writeHead(200, { "content-type": "text/html; charset=utf8", "cache-control": "no-store" })
-    response.end("<!doctype html><title>Nested fixture frame</title><p id=frame-state>frame ready</p>")
+    response.end("<!doctype html><title>Nested fixture frame</title><p id=frame-state>frame ready</p><button id=frame-button>Frame action</button>")
     return
   }
   if (request.method === "GET" && request.url === "/json/version") {
@@ -60,11 +66,16 @@ const server = createServer(async (request, response) => {
     return
   }
   if (request.method === "GET" && request.url === "/json/list") {
-    json(response, 200, [{ id: targetId, type: "page", title: "Comptrol browser fixture", url: `http://127.0.0.1:${port}/`, browserContextId, revision, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${targetId}` }, ...openedTabs.values()])
+    targetListRequests += 1
+    json(response, 200, [{ id: targetId, type: "page", title: "Comptrol browser fixture", url: fixtureUrl, browserContextId, revision, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${targetId}` }, ...openedTabs.values()])
     return
   }
   if (request.method === "GET" && request.url === "/state") {
     json(response, 200, { targetId, browserContextId, revision, submissions: [...submissions.values()] })
+    return
+  }
+  if (request.method === "GET" && request.url === "/metrics") {
+    json(response, 200, { websocketConnections, browserWebsocketConnections, pageWebsocketConnections, targetListRequests, protocolEvents })
     return
   }
   if (request.method === "GET" && request.url === "/download/fixture.txt") {
@@ -140,6 +151,9 @@ server.on("upgrade", (request, socket) => {
     socket.destroy()
     return
   }
+  websocketConnections += 1
+  if (browserSocket) browserWebsocketConnections += 1
+  else pageWebsocketConnections += 1
   const accept = createHash("sha1").update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64")
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
   let buffer = Buffer.alloc(0)
@@ -164,16 +178,37 @@ server.on("upgrade", (request, socket) => {
       : message.method === "Runtime.evaluate"
         ? message.params.expression === "document.title"
           ? { result: { type: "string", value: "Comptrol browser fixture" } }
+          : message.params.expression.includes("Add dynamic node")
+            ? { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Add dynamic node" } } }
+          : message.params.expression.includes("Shadow action")
+            ? { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Shadow action" } } }
+          : message.params.expression.includes("Frame action")
+            ? { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Frame action" } } }
+          : message.params.expression.includes("dynamic ready")
+            ? { result: { type: "boolean", value: true } }
           : message.params.expression.includes("element.focus()")
             ? { result: { type: "boolean", value: true } }
             : { result: { type: "string", value: "fixture evaluation" } }
         : message.method === "Page.getNavigationHistory"
           ? { currentIndex: fixtureHistoryIndex, entries: fixtureHistory }
-          : message.method === "Page.navigateToHistoryEntry"
-            ? (fixtureHistoryIndex = fixtureHistory.findIndex(entry => entry.id === message.params.entryId), {})
-        : message.method === "Page.navigate"
-          ? { frameId: "fixture-frame" }
+      : message.method === "Page.navigateToHistoryEntry"
+            ? (fixtureHistoryIndex = fixtureHistory.findIndex(entry => entry.id === message.params.entryId), fixtureUrl = fixtureHistory[fixtureHistoryIndex]?.url || fixtureUrl, {})
+      : message.method === "Page.navigate"
+          ? (fixtureUrl = message.params.url, { frameId: "fixture-frame" })
+          : message.method === "Page.captureScreenshot"
+            ? { data: Buffer.from(`fixture:${pageTarget || "comptrol-fixture-page"}:${fixtureUrl}`).toString("base64") }
           : {}
+    const event = browserSocket && message.method === "Target.createTarget"
+      ? { method: "Target.targetCreated", params: { targetInfo: { targetId: result.targetId } } }
+      : browserSocket && message.method === "Target.closeTarget"
+        ? { method: "Target.targetDestroyed", params: { targetId: message.params.targetId } }
+        : message.method === "Page.navigateToHistoryEntry" || message.method === "Page.navigate"
+          ? { method: "Page.frameNavigated", params: { frame: { id: "fixture-frame", url: fixtureUrl } } }
+        : null
+    if (event) {
+      protocolEvents += 1
+      socket.write(websocketFrame(JSON.stringify(event)))
+    }
     socket.write(websocketFrame(JSON.stringify({ id: message.id, result })))
   })
 })

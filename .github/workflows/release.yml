@@ -81,7 +81,14 @@ jobs:
       - name: Publish checksummed release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" $(find release-assets -type f -print) --generate-notes --verify-tag
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find release-assets -type f -print)
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" --generate-notes --verify-tag
+          fi
 
   npm-publish:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -97,6 +104,11 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@^11.5.1
       - run: npm --version
+      - name: Show npm publication context
+        run: |
+          npm config get registry
+          npm config get provenance
+          npm view comptrolling version --json || true
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -131,4 +143,34 @@ jobs:
           test -f packages/mcp/native/linux-arm64/comptrol
           test -f packages/mcp/native/linux-x64/comptrol
           test -f packages/mcp/native/win32-x64/comptrol.exe
-      - run: npm publish --workspace packages/mcp --access public
+      - name: Publish package with trusted provenance
+        run: |
+          set -o pipefail
+          for attempt in 1 2 3; do
+            if npm publish --workspace packages/mcp --access public --provenance 2>&1 | tee "npm-publish-${attempt}.log"; then
+              exit 0
+            fi
+            if grep -Eqi 'E403|ENEEDAUTH|forbidden|not authorized|trusted publisher' "npm-publish-${attempt}.log"; then
+              echo "npm publication was rejected by registry authorization; retries will not change publisher permissions" >&2
+              exit 1
+            fi
+            echo "transient npm publication failure on attempt ${attempt}; retrying" >&2
+            sleep $((attempt * 10))
+          done
+          exit 1
+      - name: Verify npm package visibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for attempt in $(seq 1 20); do
+            published="$(npm view "comptrolling@${version}" version --json 2>/dev/null || true)"
+            if [ "$published" = "\"${version}\"" ]; then
+              npm view "comptrolling@${version}" bin --json
+              exit 0
+            fi
+            echo "npm version ${version} is still processing (attempt ${attempt}/20)"
+            sleep 15
+          done
+          echo "npm version ${version} was published but did not become visible within the verification window" >&2
+          exit 1

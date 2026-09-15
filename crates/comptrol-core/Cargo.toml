@@ -6,12 +6,24 @@ license.workspace = true
 description = "Local first computer control runtime and MCP server"
 
 [dependencies]
+comptrol-adapter-host = { path = "../comptrol-adapter-host" }
+comptrol-adapter-sdk = { path = "../comptrol-adapter-sdk" }
+comptrol-platform-windows = { path = "../comptrol-platform-windows" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 tungstenite = "0.27"
 getrandom = "0.3"
 sha2 = "0.10"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustls = "0.23"
+rustls-pemfile = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+comptrol-platform-linux = { path = "../comptrol-platform-linux" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+comptrol-platform-macos = { path = "../comptrol-platform-macos" }

@@ -1,8 +1,15 @@
 use comptrol::{
-    MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime, SERVER_VERSION, TraceMode,
-    capabilities, default_state_dir, integration, pairing::PairingStore, privacy_network_endpoints,
-    privacy_status, read_trace,
+    CompiledWorkflow, MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime,
+    SERVER_VERSION, TraceMode, capabilities, compile_verified_trace, default_state_dir,
+    integration, pairing::PairingStore, privacy_network_endpoints, privacy_status, read_trace,
+    validate_compiled_workflow,
 };
+use comptrol_adapter_sdk::AdapterManifest;
+use rusqlite::{Connection, OptionalExtension, params};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls_pemfile::{certs, private_key};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -53,9 +60,14 @@ struct StoredTask {
 }
 
 struct TaskStore {
-    file: File,
-    records: HashMap<String, StoredTask>,
+    connection: Connection,
     sequence: u64,
+}
+
+struct TaskManager {
+    store: Arc<Mutex<TaskStore>>,
+    runtime: Arc<Mutex<Runtime>>,
+    cancellation: Arc<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -245,57 +257,358 @@ fn valid_session_id(session: &str) -> bool {
 impl TaskStore {
     fn open(state_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(state_dir)?;
-        let path = state_dir.join("tasks.jsonl");
-        let mut records = HashMap::new();
-        if path.exists() {
-            for line in BufReader::new(File::open(&path)?).lines() {
-                if let Ok(task) = serde_json::from_str::<StoredTask>(&line?) {
-                    records.insert(task.task_id.clone(), task);
-                }
+        let path = state_dir.join("comptrol.db");
+        let mut connection = Connection::open(path).map_err(sqlite_io_error)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
+            .map_err(sqlite_io_error)?;
+        let foreign_keys: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .map_err(sqlite_io_error)?;
+        if foreign_keys != 1 {
+            return Err(io::Error::other(
+                "SQLite refused to enable foreign key enforcement",
+            ));
+        }
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE IF NOT EXISTS schema_migrations (
+                   version INTEGER PRIMARY KEY,
+                   applied_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS tasks (
+                   task_id TEXT PRIMARY KEY,
+                   status TEXT NOT NULL,
+                   ttl_ms INTEGER NOT NULL,
+                   poll_interval_ms INTEGER NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   result_json TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS task_events (
+                   seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                   task_id TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   payload_json TEXT NOT NULL,
+                   at_ms INTEGER NOT NULL,
+                   FOREIGN KEY(task_id) REFERENCES tasks(task_id)
+                 );
+                 INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms)
+                   VALUES (1, strftime('%s','now') * 1000);",
+            )
+            .map_err(sqlite_io_error)?;
+        migrate_legacy_tasks(&mut connection, &state_dir.join("tasks.jsonl"))?;
+        let mut store = Self {
+            connection,
+            sequence: 0,
+        };
+        let interrupted = store.task_ids_with_status().map_err(sqlite_io_error)?;
+        for task_id in interrupted {
+            if let Some(previous) = store.get_record(&task_id).map_err(sqlite_io_error)? {
+                store.write(StoredTask {
+                    status: "unknown".to_owned(),
+                    result: json!({
+                        "code": "operation_unknown",
+                        "message": "Task was interrupted by daemon restart; reconcile before retrying"
+                    }),
+                    ..previous
+                })?;
             }
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self {
-            file,
-            records,
-            sequence: 0,
-        })
+        Ok(store)
     }
 
-    fn create(&mut self, result: Value, ttl_ms: u64) -> io::Result<Value> {
+    fn create_pending(&mut self, ttl_ms: u64) -> io::Result<StoredTask> {
         self.sequence = self.sequence.saturating_add(1);
         let task_id = format!("task-{}-{}", now_ms(), self.sequence);
         let task = StoredTask {
             task_id: task_id.clone(),
-            status: "completed".to_owned(),
+            status: "queued".to_owned(),
             ttl_ms,
             poll_interval_ms: TASK_POLL_INTERVAL_MS,
             created_at_ms: now_ms(),
-            result,
+            result: Value::Null,
         };
         self.write(task.clone())?;
+        Ok(task)
+    }
+
+    fn get(&self, task_id: &str) -> Option<Value> {
+        self.get_record(task_id)
+            .ok()
+            .flatten()
+            .map(|task| task_view(&task))
+    }
+
+    fn result(&self, task_id: &str) -> Option<Value> {
+        self.get_record(task_id).ok().flatten().map(|task| {
+            if task.status == "completed" {
+                task.result.clone()
+            } else {
+                json!({
+                    "taskId": task.task_id,
+                    "status": task.status,
+                    "result": task.result
+                })
+            }
+        })
+    }
+
+    fn list(&self) -> Value {
+        let mut statement = match self.connection.prepare(
+            "SELECT task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json
+             FROM tasks ORDER BY created_at_ms, task_id",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => return task_error(&format!("task store query failed: {error}")),
+        };
+        let rows = match statement.query_map([], task_from_row) {
+            Ok(rows) => rows,
+            Err(error) => return task_error(&format!("task store query failed: {error}")),
+        };
+        let tasks = rows
+            .filter_map(Result::ok)
+            .map(|task| task_view(&task))
+            .collect::<Vec<_>>();
+        json!({ "tasks": tasks })
+    }
+
+    fn write(&mut self, task: StoredTask) -> io::Result<()> {
+        let result_json = serde_json::to_string(&task.result).map_err(io::Error::other)?;
+        let transaction = self.connection.transaction().map_err(sqlite_io_error)?;
+        let previous_status = transaction
+            .query_row(
+                "SELECT status FROM tasks WHERE task_id = ?1",
+                params![&task.task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_io_error)?;
+        transaction
+            .execute(
+                "INSERT INTO tasks(task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(task_id) DO UPDATE SET
+                   status = excluded.status,
+                   ttl_ms = excluded.ttl_ms,
+                   poll_interval_ms = excluded.poll_interval_ms,
+                   created_at_ms = excluded.created_at_ms,
+                   result_json = excluded.result_json",
+                params![
+                    &task.task_id,
+                    &task.status,
+                    task.ttl_ms as i64,
+                    task.poll_interval_ms as i64,
+                    task.created_at_ms as i64,
+                    result_json,
+                ],
+            )
+            .map_err(sqlite_io_error)?;
+        if previous_status.as_deref() != Some(task.status.as_str()) {
+            transaction
+                .execute(
+                    "INSERT INTO task_events(task_id, kind, payload_json, at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        &task.task_id,
+                        &task.status,
+                        serde_json::to_string(&task.result).map_err(io::Error::other)?,
+                        now_ms() as i64,
+                    ],
+                )
+                .map_err(sqlite_io_error)?;
+        }
+        transaction.commit().map_err(sqlite_io_error)
+    }
+
+    fn get_record(&self, task_id: &str) -> rusqlite::Result<Option<StoredTask>> {
+        self.connection
+            .query_row(
+                "SELECT task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json
+                 FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                task_from_row,
+            )
+            .optional()
+    }
+
+    fn task_ids_with_status(&self) -> rusqlite::Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT task_id FROM tasks WHERE status IN ('queued', 'running') ORDER BY task_id",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect()
+    }
+}
+
+fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
+    let result_json: String = row.get(5)?;
+    Ok(StoredTask {
+        task_id: row.get(0)?,
+        status: row.get(1)?,
+        ttl_ms: row.get::<_, i64>(2)?.max(0) as u64,
+        poll_interval_ms: row.get::<_, i64>(3)?.max(0) as u64,
+        created_at_ms: row.get::<_, i64>(4)?.max(0) as u128,
+        result: serde_json::from_str(&result_json).unwrap_or(Value::Null),
+    })
+}
+
+fn migrate_legacy_tasks(connection: &mut Connection, path: &Path) -> io::Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut legacy = Vec::new();
+    for line in BufReader::new(File::open(path)?).lines() {
+        if let Ok(task) = serde_json::from_str::<StoredTask>(&line?) {
+            legacy.push(task);
+        }
+    }
+    let transaction = connection.transaction().map_err(sqlite_io_error)?;
+    for task in legacy {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO tasks(task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    task.task_id,
+                    task.status,
+                    task.ttl_ms as i64,
+                    task.poll_interval_ms as i64,
+                    task.created_at_ms as i64,
+                    serde_json::to_string(&task.result).map_err(io::Error::other)?,
+                ],
+            )
+            .map_err(sqlite_io_error)?;
+    }
+    transaction.commit().map_err(sqlite_io_error)
+}
+
+fn sqlite_io_error(error: rusqlite::Error) -> io::Error {
+    io::Error::other(format!("SQLite task store error: {error}"))
+}
+
+impl TaskManager {
+    fn new(runtime: Arc<Mutex<Runtime>>, store: TaskStore) -> Self {
+        Self {
+            store: Arc::new(Mutex::new(store)),
+            runtime,
+            cancellation: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn spawn(&self, params: Value, ttl_ms: u64) -> io::Result<Value> {
+        let task = self
+            .store
+            .lock()
+            .expect("task store lock poisoned")
+            .create_pending(ttl_ms)?;
+        let task_id = task.task_id.clone();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancellation
+            .lock()
+            .expect("task cancellation lock poisoned")
+            .insert(task_id.clone(), Arc::clone(&cancelled));
+        let store = Arc::clone(&self.store);
+        let runtime = Arc::clone(&self.runtime);
+        let cancellation = Arc::clone(&self.cancellation);
+        thread::Builder::new()
+            .name(format!("comptrol-task-{task_id}"))
+            .spawn(move || {
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = update_task(&store, &task_id, "cancelled", json!({
+                        "code": "operation_cancelled",
+                        "message": "Task was cancelled before execution started"
+                    }));
+                    cancellation
+                        .lock()
+                        .expect("task cancellation lock poisoned")
+                        .remove(&task_id);
+                    return;
+                }
+                let _ = update_task(&store, &task_id, "running", Value::Null);
+                let result = {
+                    let mut runtime = runtime.lock().expect("runtime lock poisoned");
+                    call_tool(&mut runtime, params)
+                };
+                let requested = cancelled.load(Ordering::Acquire);
+                let (status, stored_result) = if requested {
+                    (
+                        "unknown",
+                        json!({
+                            "code": "operation_unknown",
+                            "message": "Cancellation arrived after execution began; reconcile the operation before retrying",
+                            "result": result
+                        }),
+                    )
+                } else {
+                    ("completed", result)
+                };
+                let _ = update_task(&store, &task_id, status, stored_result);
+                cancellation
+                    .lock()
+                    .expect("task cancellation lock poisoned")
+                    .remove(&task_id);
+            })
+            .map_err(io::Error::other)?;
         Ok(task_view(&task))
     }
 
     fn get(&self, task_id: &str) -> Option<Value> {
-        self.records.get(task_id).map(task_view)
+        self.store
+            .lock()
+            .expect("task store lock poisoned")
+            .get(task_id)
     }
 
     fn result(&self, task_id: &str) -> Option<Value> {
-        self.records.get(task_id).map(|task| task.result.clone())
+        self.store
+            .lock()
+            .expect("task store lock poisoned")
+            .result(task_id)
     }
 
     fn list(&self) -> Value {
-        json!({ "tasks": self.records.values().map(task_view).collect::<Vec<_>>() })
+        self.store.lock().expect("task store lock poisoned").list()
     }
 
-    fn write(&mut self, task: StoredTask) -> io::Result<()> {
-        serde_json::to_writer(&mut self.file, &task)?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()?;
-        self.records.insert(task.task_id.clone(), task);
-        Ok(())
+    fn cancel(&self, task_id: &str) -> Value {
+        let Some(flag) = self
+            .cancellation
+            .lock()
+            .expect("task cancellation lock poisoned")
+            .get(task_id)
+            .cloned()
+        else {
+            return self
+                .get(task_id)
+                .map(|task| json!({ "task": task, "cancelled": false }))
+                .unwrap_or_else(|| task_error("task not found"));
+        };
+        flag.store(true, Ordering::Release);
+        json!({ "taskId": task_id, "cancelRequested": true })
     }
+}
+
+fn update_task(
+    store: &Arc<Mutex<TaskStore>>,
+    task_id: &str,
+    status: &str,
+    result: Value,
+) -> io::Result<()> {
+    let mut store = store.lock().expect("task store lock poisoned");
+    let Some(previous) = store.get_record(task_id).map_err(sqlite_io_error)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "task record disappeared",
+        ));
+    };
+    let task = StoredTask {
+        status: status.to_owned(),
+        result,
+        ..previous
+    };
+    store.write(task)
 }
 
 fn task_view(task: &StoredTask) -> Value {
@@ -332,10 +645,18 @@ fn main() {
                 .and_then(|port| port.parse().ok())
                 .unwrap_or(7317),
         ),
+        Some("serve-mtls") => run_mtls(
+            env::args()
+                .nth(2)
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(7443),
+        ),
         Some("daemon") => run_daemon(),
         Some("daemon-health") => run_daemon_health(),
         Some("record") => run_record(env::args().skip(2).collect()),
         Some("replay") => run_replay(env::args().skip(2).collect()),
+        Some("workflow") => run_workflow(env::args().skip(2).collect()),
+        Some("adapter") => run_adapter(env::args().skip(2).collect()),
         Some("integrate") => run_integrate(env::args().skip(2).collect()),
         Some("pair") => run_pair(env::args().skip(2).collect()),
         Some("privacy") => run_privacy(env::args().skip(2).collect()),
@@ -346,7 +667,7 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor status capabilities stop resume serve-http daemon daemon-health record replay integrate pair privacy version"
+                "commands are mcp doctor status capabilities stop resume serve-http serve-mtls daemon daemon-health record replay workflow adapter integrate pair privacy version"
             );
             2
         }
@@ -680,20 +1001,22 @@ fn run_integrate(args: Vec<String>) -> i32 {
 }
 
 fn run_stdio() -> i32 {
-    let mut runtime = match Runtime::new(default_state_dir()) {
+    let runtime = match Runtime::new(default_state_dir()) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("startup failed: {error}");
             return 1;
         }
     };
-    let mut tasks = match TaskStore::open(&default_state_dir()) {
+    let tasks = match TaskStore::open(&default_state_dir()) {
         Ok(tasks) => tasks,
         Err(error) => {
             eprintln!("task store startup failed: {error}");
             return 1;
         }
     };
+    let runtime = Arc::new(Mutex::new(runtime));
+    let tasks = TaskManager::new(Arc::clone(&runtime), tasks);
     let mut tasks_enabled = false;
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -718,8 +1041,8 @@ fn run_stdio() -> i32 {
                 };
                 if !line.trim().is_empty() {
                     let response = handle_message_with_state(
-                        &mut runtime,
-                        Some(&mut tasks),
+                        &runtime,
+                        Some(&tasks),
                         &mut tasks_enabled,
                         line,
                         |notification| {
@@ -743,8 +1066,8 @@ fn run_stdio() -> i32 {
 }
 
 fn handle_message_with_state<F>(
-    runtime: &mut Runtime,
-    mut tasks: Option<&mut TaskStore>,
+    runtime: &Arc<Mutex<Runtime>>,
+    tasks: Option<&TaskManager>,
     tasks_enabled: &mut bool,
     line: &str,
     mut emit: F,
@@ -836,30 +1159,28 @@ where
                     .and_then(Value::as_u64)
                     .unwrap_or(DEFAULT_TASK_TTL_MS)
                     .clamp(1_000, 86_400_000);
-                let result = call_tool(runtime, params.clone());
-                match tasks.as_deref_mut() {
-                    Some(store) => match store.create(result, ttl_ms) {
+                match tasks {
+                    Some(manager) => match manager.spawn(params.clone(), ttl_ms) {
                         Ok(task) => json!({ "resultType": "task", "task": task }),
                         Err(error) => {
                             json!({ "error": { "code": "task_store_failed", "message": error.to_string() } })
                         }
                     },
                     None => call_tool(
-                        runtime,
+                        &mut runtime.lock().expect("runtime lock poisoned"),
                         request.get("params").cloned().unwrap_or(Value::Null),
                     ),
                 }
             } else {
-                call_tool(runtime, params)
+                call_tool(&mut runtime.lock().expect("runtime lock poisoned"), params)
             }
         }
-        "tasks/get" => task_get(tasks.as_deref(), &request),
-        "tasks/result" => task_result(tasks.as_deref(), &request),
+        "tasks/get" => task_get(tasks, &request),
+        "tasks/result" => task_result(tasks, &request),
         "tasks/list" => tasks
-            .as_deref()
-            .map(TaskStore::list)
+            .map(TaskManager::list)
             .unwrap_or_else(|| task_error("Tasks are available only on the stdio transport")),
-        "tasks/cancel" => task_error("Completed Comptrol tasks cannot be cancelled"),
+        "tasks/cancel" => task_cancel(tasks, &request),
         "tasks/update" => task_error("Comptrol tasks do not accept input updates"),
         _ => {
             json!({ "error": { "code": "method_not_found", "message": format!("Unknown MCP method {method}") } })
@@ -880,7 +1201,7 @@ where
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-fn task_get(tasks: Option<&TaskStore>, request: &Value) -> Value {
+fn task_get(tasks: Option<&TaskManager>, request: &Value) -> Value {
     let Some(task_id) = request
         .get("params")
         .and_then(|params| params.get("taskId"))
@@ -889,11 +1210,11 @@ fn task_get(tasks: Option<&TaskStore>, request: &Value) -> Value {
         return task_error("tasks/get needs taskId");
     };
     tasks
-        .and_then(|store| store.get(task_id))
+        .and_then(|manager| manager.get(task_id))
         .unwrap_or_else(|| task_error("task not found"))
 }
 
-fn task_result(tasks: Option<&TaskStore>, request: &Value) -> Value {
+fn task_result(tasks: Option<&TaskManager>, request: &Value) -> Value {
     let Some(task_id) = request
         .get("params")
         .and_then(|params| params.get("taskId"))
@@ -902,8 +1223,21 @@ fn task_result(tasks: Option<&TaskStore>, request: &Value) -> Value {
         return task_error("tasks/result needs taskId");
     };
     tasks
-        .and_then(|store| store.result(task_id))
+        .and_then(|manager| manager.result(task_id))
         .unwrap_or_else(|| task_error("task not found"))
+}
+
+fn task_cancel(tasks: Option<&TaskManager>, request: &Value) -> Value {
+    let Some(task_id) = request
+        .get("params")
+        .and_then(|params| params.get("taskId"))
+        .and_then(Value::as_str)
+    else {
+        return task_error("tasks/cancel needs taskId");
+    };
+    tasks
+        .map(|manager| manager.cancel(task_id))
+        .unwrap_or_else(|| task_error("Tasks are available only on the stdio transport"))
 }
 
 fn task_error(message: &str) -> Value {
@@ -913,7 +1247,7 @@ fn task_error(message: &str) -> Value {
 fn tools() -> Value {
     json!([
         { "name": "operate", "description": "Execute one bounded local intent with policy, idempotency, background posture, and verification state", "inputSchema": { "type": "object", "required": ["intent"], "properties": { "intent": {"type":"string"}, "target": {"type":"object"}, "params": {"type":"object"}, "postcondition": {"type":"object"}, "risk": {"type":"string"}, "idempotency_key": {"type":"string"}, "dry_run": {"type":"boolean"}, "background": {"type":"string", "enum":["strict_background","prefer_background","foreground_allowed","foreground_required"]} } } },
-        { "name": "inspect", "description": "Inspect doctor, status, capabilities, platform state, events, checkpoints, adapters, or current desktop observation", "inputSchema": { "type": "object", "properties": { "kind": {"type":"string", "enum":["doctor","status","capabilities","platform","desktop","events","checkpoints","adapters"]} } } },
+        { "name": "inspect", "description": "Inspect doctor, status, capabilities, deterministic route plans, platform state, events, checkpoints, adapters, or current desktop observation", "inputSchema": { "type": "object", "properties": { "kind": {"type":"string", "enum":["doctor","status","capabilities","routes","platform","desktop","events","checkpoints","adapters"]} } } },
         { "name": "watch", "description": "Return the known state of an operation without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
         { "name": "reconcile", "description": "Reconcile a durable unknown operation from observed local state without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
         { "name": "restore_checkpoint", "description": "Restore a local sandbox checkpoint under explicit local write policy", "inputSchema": { "type": "object", "required":["checkpoint"], "properties": { "checkpoint": {"type":"string"}, "idempotency_key": {"type":"string"} } } },
@@ -1033,6 +1367,124 @@ fn run_http(port: u16) -> i32 {
     0
 }
 
+fn load_certificates(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
+    let file = File::open(path)?;
+    certs(&mut BufReader::new(file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
+    let file = File::open(path)?;
+    private_key(&mut BufReader::new(file))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no private key found"))
+}
+
+fn mtls_config() -> io::Result<Arc<ServerConfig>> {
+    let cert_path = env::var_os("COMPTROL_MTLS_CERT")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "COMPTROL_MTLS_CERT is required",
+            )
+        })?;
+    let key_path = env::var_os("COMPTROL_MTLS_KEY")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "COMPTROL_MTLS_KEY is required")
+        })?;
+    let client_ca_path = env::var_os("COMPTROL_MTLS_CLIENT_CA")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "COMPTROL_MTLS_CLIENT_CA is required",
+            )
+        })?;
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in load_certificates(&client_ca_path)? {
+        roots
+            .add(certificate)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    }
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(load_certificates(&cert_path)?, load_private_key(&key_path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok(Arc::new(config))
+}
+
+fn run_mtls(port: u16) -> i32 {
+    let bind = env::var("COMPTROL_MTLS_BIND").unwrap_or_else(|_| "0.0.0.0".to_owned());
+    let listener = match TcpListener::bind((bind.as_str(), port)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("mTLS bind failed: {error}");
+            return 1;
+        }
+    };
+    let config = match mtls_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("mTLS configuration failed: {error}");
+            return 1;
+        }
+    };
+    let runtime = match Runtime::new(default_state_dir()) {
+        Ok(runtime) => Arc::new(Mutex::new(runtime)),
+        Err(error) => {
+            eprintln!("startup failed: {error}");
+            return 1;
+        }
+    };
+    let http_state = match HttpStore::open(&default_state_dir()) {
+        Ok(state) => Arc::new(state),
+        Err(error) => {
+            eprintln!("HTTP state startup failed: {error}");
+            return 1;
+        }
+    };
+    eprintln!("comptrol mutual-TLS HTTP listening on {bind}:{port}/mcp");
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else {
+            continue;
+        };
+        if active_connections.fetch_add(1, Ordering::AcqRel) + 1 > HTTP_MAX_CONNECTIONS {
+            active_connections.fetch_sub(1, Ordering::AcqRel);
+            continue;
+        }
+        let config = Arc::clone(&config);
+        let runtime = Arc::clone(&runtime);
+        let http_state = Arc::clone(&http_state);
+        let active_connections = Arc::clone(&active_connections);
+        thread::spawn(move || {
+            let result = (|| -> io::Result<()> {
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                let mut connection = rustls::ServerConnection::new(config).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                })?;
+                while connection.is_handshaking() {
+                    connection.complete_io(&mut stream)?;
+                }
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                handle_http(&mut tls, &runtime, &http_state)
+            })();
+            if let Err(error) = result {
+                eprintln!("mTLS request failed: {error}");
+            }
+            active_connections.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+    0
+}
+
 #[cfg(windows)]
 fn daemon_pipe_name() -> String {
     env::var("COMPTROL_PIPE_NAME").unwrap_or_else(|_| r"\\.\pipe\comptrol".to_owned())
@@ -1095,25 +1547,27 @@ fn run_daemon() -> i32 {
         eprintln!("daemon socket permissions failed: {error}");
         return 1;
     }
-    let mut runtime = match Runtime::new(default_state_dir()) {
+    let runtime = match Runtime::new(default_state_dir()) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("startup failed: {error}");
             return 1;
         }
     };
-    let mut tasks = match TaskStore::open(&default_state_dir()) {
+    let tasks = match TaskStore::open(&default_state_dir()) {
         Ok(tasks) => tasks,
         Err(error) => {
             eprintln!("task store startup failed: {error}");
             return 1;
         }
     };
+    let runtime = Arc::new(Mutex::new(runtime));
+    let tasks = TaskManager::new(Arc::clone(&runtime), tasks);
     eprintln!("comptrol daemon listening on {}", path.display());
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(error) = handle_ipc_connection(&mut stream, &mut runtime, &mut tasks) {
+                if let Err(error) = handle_ipc_connection(&mut stream, &runtime, &tasks) {
                     eprintln!("daemon connection failed: {error}");
                 }
             }
@@ -1128,20 +1582,22 @@ fn run_daemon() -> i32 {
     #[cfg(windows)]
     {
         let pipe_name = wide_pipe_name(&daemon_pipe_name());
-        let mut runtime = match Runtime::new(default_state_dir()) {
+        let runtime = match Runtime::new(default_state_dir()) {
             Ok(runtime) => runtime,
             Err(error) => {
                 eprintln!("startup failed: {error}");
                 return 1;
             }
         };
-        let mut tasks = match TaskStore::open(&default_state_dir()) {
+        let tasks = match TaskStore::open(&default_state_dir()) {
             Ok(tasks) => tasks,
             Err(error) => {
                 eprintln!("task store startup failed: {error}");
                 return 1;
             }
         };
+        let runtime = Arc::new(Mutex::new(runtime));
+        let tasks = TaskManager::new(Arc::clone(&runtime), tasks);
         eprintln!("comptrol daemon listening on {}", daemon_pipe_name());
         loop {
             let handle = unsafe {
@@ -1168,9 +1624,7 @@ fn run_daemon() -> i32 {
                     || GetLastError() == ERROR_PIPE_CONNECTED
             };
             let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
-            if connected
-                && let Err(error) = handle_ipc_connection(&mut stream, &mut runtime, &mut tasks)
-            {
+            if connected && let Err(error) = handle_ipc_connection(&mut stream, &runtime, &tasks) {
                 eprintln!("daemon connection failed: {error}");
             }
         }
@@ -1271,8 +1725,8 @@ fn run_daemon_health() -> i32 {
 
 fn handle_ipc_connection<S: Read + Write>(
     stream: &mut S,
-    runtime: &mut Runtime,
-    tasks: &mut TaskStore,
+    runtime: &Arc<Mutex<Runtime>>,
+    tasks: &TaskManager,
 ) -> io::Result<()> {
     let mut tasks_enabled = false;
     while let Some(frame) = read_ipc_frame(stream)? {
@@ -1383,8 +1837,38 @@ fn restrict_socket(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-fn handle_http(
-    stream: &mut TcpStream,
+trait HttpStream: Read + Write {
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl HttpStream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+impl HttpStream for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.get_ref().set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.get_ref().set_write_timeout(timeout)
+    }
+}
+
+fn handle_http<S: HttpStream>(
+    stream: &mut S,
     runtime: &Arc<Mutex<Runtime>>,
     http_state: &Arc<HttpStore>,
 ) -> io::Result<()> {
@@ -1623,7 +2107,7 @@ fn handle_http(
     let mut notifications = Vec::new();
     let mut tasks_enabled = false;
     let value = handle_message_with_state(
-        &mut runtime.lock().expect("runtime lock poisoned"),
+        runtime,
         None,
         &mut tasks_enabled,
         body.as_ref(),
@@ -1673,7 +2157,7 @@ fn handle_http(
     )
 }
 
-fn write_sse_headers(stream: &mut TcpStream) -> io::Result<()> {
+fn write_sse_headers<S: Write>(stream: &mut S) -> io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -1681,8 +2165,8 @@ fn write_sse_headers(stream: &mut TcpStream) -> io::Result<()> {
     stream.flush()
 }
 
-fn write_sse_event(
-    stream: &mut TcpStream,
+fn write_sse_event<S: Write>(
+    stream: &mut S,
     id: Option<u64>,
     event: &str,
     data: &Value,
@@ -1696,13 +2180,13 @@ fn write_sse_event(
     stream.flush()
 }
 
-fn write_sse_end(stream: &mut TcpStream) -> io::Result<()> {
+fn write_sse_end<S: Write>(stream: &mut S) -> io::Result<()> {
     stream.write_all(b"0\r\n\r\n")?;
     stream.flush()
 }
 
-fn write_http_response(
-    stream: &mut TcpStream,
+fn write_http_response<S: Write>(
+    stream: &mut S,
     status: u16,
     reason: &str,
     content_type: &str,
@@ -1720,7 +2204,7 @@ fn write_http_response(
     stream.write_all(&payload)
 }
 
-fn write_http_error(stream: &mut TcpStream, status: u16, error: &str) -> io::Result<()> {
+fn write_http_error<S: Write>(stream: &mut S, status: u16, error: &str) -> io::Result<()> {
     let payload = serde_json::to_vec(&json!({
         "error": error,
         "limit": MAX_PROTOCOL_BYTES
@@ -1864,4 +2348,159 @@ fn run_replay(args: Vec<String>) -> i32 {
         }
     }
     0
+}
+
+fn run_workflow(args: Vec<String>) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("compile") => {
+            let Some(trace_path) = args.get(1) else {
+                eprintln!("workflow compile needs a trace JSONL path and workflow id");
+                return 2;
+            };
+            let Some(workflow_id) = args.get(2) else {
+                eprintln!("workflow compile needs a workflow id");
+                return 2;
+            };
+            let entries = match read_trace(Path::new(trace_path)) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    eprintln!("trace read failed: {error}");
+                    return 1;
+                }
+            };
+            match compile_verified_trace(&entries, workflow_id) {
+                Ok(workflow) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&workflow).unwrap_or_else(|_| "{}".to_owned())
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("workflow compilation failed: {}", error.message);
+                    1
+                }
+            }
+        }
+        Some("validate") => {
+            let Some(workflow_path) = args.get(1) else {
+                eprintln!("workflow validate needs a compiled workflow JSON path");
+                return 2;
+            };
+            let workflow: CompiledWorkflow = match std::fs::read_to_string(workflow_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str(&contents).ok())
+            {
+                Some(workflow) => workflow,
+                None => {
+                    eprintln!("compiled workflow JSON is invalid or unreadable");
+                    return 2;
+                }
+            };
+            let observed = args
+                .get(2)
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or(Value::Null);
+            match validate_compiled_workflow(&workflow, &observed) {
+                Ok(()) => {
+                    println!(
+                        "{}",
+                        json!({"valid": true, "workflow_id": workflow.workflow_id, "workflow_version": workflow.workflow_version})
+                    );
+                    0
+                }
+                Err(error) => {
+                    println!("{}", json!({"valid": false, "error": error}));
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "workflow commands: compile <trace.jsonl> <workflow-id> | validate <workflow.json> [observed-json]"
+            );
+            2
+        }
+    }
+}
+
+fn run_adapter(args: Vec<String>) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("validate") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("adapter validate needs an adapter.toml path");
+                return 2;
+            };
+            match std::fs::read_to_string(path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    AdapterManifest::from_toml(&text).map_err(|error| error.to_string())
+                }) {
+                Ok(manifest) => {
+                    println!(
+                        "{}",
+                        json!({"valid": true, "id": manifest.id, "version": manifest.version, "capabilities": manifest.capabilities.len()})
+                    );
+                    0
+                }
+                Err(error) => {
+                    println!("{}", json!({"valid": false, "error": error}));
+                    1
+                }
+            }
+        }
+        Some("scaffold") => {
+            let Some(name) = args.get(1) else {
+                eprintln!("adapter scaffold needs a lowercase adapter name");
+                return 2;
+            };
+            if name.is_empty()
+                || name.chars().any(|character| {
+                    !(character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || character == '-')
+                })
+            {
+                eprintln!(
+                    "adapter name must contain only lowercase ASCII letters, digits, and hyphens"
+                );
+                return 2;
+            }
+            let root = env::var_os("COMPTROL_ADAPTER_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("adapters"));
+            let directory = root.join(name);
+            if directory.exists() {
+                eprintln!("adapter directory already exists: {}", directory.display());
+                return 1;
+            }
+            if let Err(error) = std::fs::create_dir_all(directory.join("src")) {
+                eprintln!("adapter scaffold failed: {error}");
+                return 1;
+            }
+            let manifest = format!(
+                "manifest_version = 1\nid = \"comptrol.{name}\"\nname = \"{name}\"\nversion = \"0.1.0\"\nplatforms = [\"windows\", \"macos\", \"linux\"]\napplications = [\"{name}\"]\n\n[isolation]\nmode = \"out_of_process\"\nnetwork = \"loopback_only\"\nfilesystem = \"declared_scopes\"\n\n[[capabilities]]\nintent = \"{name}.observe\"\nrisk = \"R0\"\nbackground = \"supported\"\nverification = \"application_state\"\n"
+            );
+            let files = [
+                ("adapter.toml", manifest),
+                ("README.md", format!("# {name} adapter\n\nDescribe the real application backend and its support boundary here.\n")),
+                ("VERIFY.md", "# Verification contract\n\nDocument an independent postcondition for every capability.\n".to_owned()),
+                ("SUPPORT.md", "# Support boundary\n\nDocument supported versions, platforms, and explicit refusals.\n".to_owned()),
+                ("THREAT_MODEL.md", "# Threat model\n\nDocument isolation, capabilities, resource scopes, and failure behavior.\n".to_owned()),
+                ("src/adapter.py", "#!/usr/bin/env python3\n# Implement the bounded adapter RPC protocol before advertising capabilities.\n".to_owned()),
+            ];
+            for (relative, content) in files {
+                if let Err(error) = std::fs::write(directory.join(relative), content) {
+                    eprintln!("adapter scaffold failed while writing {relative}: {error}");
+                    return 1;
+                }
+            }
+            println!("{}", json!({"scaffolded": true, "path": directory}));
+            0
+        }
+        _ => {
+            eprintln!("adapter commands: validate <adapter.toml> | scaffold <name>");
+            2
+        }
+    }
 }

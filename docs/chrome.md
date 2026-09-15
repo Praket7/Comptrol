@@ -33,6 +33,12 @@ python scripts/visible_chrome_conformance.py
 
 The Chrome process remains open until its dedicated window is closed. The endpoint binds only to loopback.
 
+For a remotely reachable transport, use `comptrol serve-mtls <port>` with `COMPTROL_MTLS_CERT`, `COMPTROL_MTLS_KEY`, and `COMPTROL_MTLS_CLIENT_CA`. The server does not parse MCP until the client certificate chains to the configured CA. Keep the bind address explicit with `COMPTROL_MTLS_BIND`; no remote listener is enabled by default.
+
+`browser.cdp.screenshot` returns a bounded digest by default. Set `include_pixels` to true to receive the bounded base64 PNG/JPEG/WebP payload plus `capture_id` and viewport geometry. A following `browser.cdp.coordinate_click` must provide that exact capture token and is refused with `stale_geometry` if the pixels or viewport changed. This is deterministic coordinate recovery, not a claim that pixels were semantically understood.
+
+Chrome closed tab groups are not restored through CDP because the protocol exposes neither portable closed-group history nor a cross-platform group identity. `browser.cdp.reopen_closed_group` therefore refuses safely. The native macOS Accessibility route may be used when its exact semantic control is exposed and permission is granted.
+
 Run `python3 scripts/visible_chrome_conformance.py` for an opt in acceptance check. It opens one visible and one background `about:blank` tab in that profile, checks the profile and input invariants, and closes only those exact test tabs. Set `COMPTROL_REQUIRE_VISIBLE_CHROME=1` when the endpoint must be present.
 
 Run `COMPTROL_RUN_LIVE_NATIVE_BROWSER_CONFORMANCE=1 python3 scripts/native_browser_conformance.py` for the native launcher acceptance check. It first requires responsive Chrome Automation access so it can close the exact unique test URL after verification. Without that permission it skips before opening a tab. The route itself remains foreground only and reports launcher acceptance rather than exact target verification.

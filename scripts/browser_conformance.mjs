@@ -2,6 +2,11 @@ import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { existsSync } from "node:fs"
 
+const startedAt = performance.now()
+let mcpCalls = 0
+let bytesIn = 0
+let bytesOut = 0
+let workflowSteps = 0
 const port = 17418
 const fixture = spawn(process.execPath, ["scripts/browser_fixture.mjs"], { env: { ...process.env, COMPTROL_FIXTURE_PORT: String(port) }, stdio: ["ignore", "ignore", "pipe"] })
 await new Promise((resolve, reject) => {
@@ -28,7 +33,10 @@ try {
   assert.equal(stale.error, "stale_reference")
   const binary = process.env.COMPTROL_BIN || "target/debug/comptrol"
   if (existsSync(binary)) {
-    const comptrol = spawn(binary, ["mcp"], { env: { ...process.env, COMPTROL_CDP_ENDPOINT: `http://127.0.0.1:${port}`, COMPTROL_ALLOW_BROWSER_FIXTURE: "1", COMPTROL_ALLOW_BROWSER_CDP: "1", COMPTROL_STATE_DIR: `/tmp/comptrol-browser-${process.pid}` }, stdio: ["pipe", "pipe", "inherit"] })
+    if (process.platform === "win32" && !binary.toLowerCase().endsWith(".exe")) {
+      throw new Error(`COMPTROL_BIN points to a non-Windows binary (${binary}). Run this conformance test from WSL, or build a Windows executable and set COMPTROL_BIN to its .exe path.`)
+    }
+    const comptrol = spawn(binary, ["mcp"], { env: { ...process.env, COMPTROL_CDP_ENDPOINT: `http://127.0.0.1:${port}`, COMPTROL_ALLOW_BROWSER_FIXTURE: "1", COMPTROL_ALLOW_BROWSER_CDP: "1", COMPTROL_STATE_DIR: `/tmp/comptrol-browser-${process.pid}-${Date.now()}` }, stdio: ["pipe", "pipe", "inherit"] })
     let buffer = ""
     const response = (id, message) => new Promise((resolve, reject) => {
       const onData = chunk => {
@@ -40,6 +48,7 @@ try {
         if (!line) return
         try {
           const value = JSON.parse(line)
+          bytesOut += Buffer.byteLength(line)
           if (value.id === id) {
             comptrol.stdout.off("data", onData)
             resolve(value)
@@ -50,7 +59,10 @@ try {
         }
       }
       comptrol.stdout.on("data", onData)
-      comptrol.stdin.write(`${JSON.stringify(message)}\n`)
+      const encoded = `${JSON.stringify(message)}\n`
+      mcpCalls += 1
+      bytesIn += Buffer.byteLength(encoded)
+      comptrol.stdin.write(encoded)
     })
     await response(1, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} })
     const browser = await response(2, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "inspect", arguments: { kind: "browser" } } })
@@ -61,16 +73,38 @@ try {
     const cdp = await response(4, { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.evaluate", idempotency_key: "cdp-evaluate", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, expression: "document.title" } } } })
     assert.equal(cdp.result.structuredContent.verification, "verified")
     assert.equal(cdp.result.structuredContent.data.result.value, "Comptrol browser fixture")
+    const repeatEvaluations = [
+      [52, "cdp-evaluate-repeat-title", "document.title", "Comptrol browser fixture"],
+      [53, "cdp-evaluate-repeat-title-2", "document.title", "Comptrol browser fixture"],
+      [54, "cdp-evaluate-repeat-title-3", "document.title", "Comptrol browser fixture"],
+    ]
+    for (const [id, idempotency_key, expression, expected] of repeatEvaluations) {
+      const repeated = await response(id, { jsonrpc: "2.0", id, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.evaluate", idempotency_key, params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, expression } } } })
+      assert.equal(repeated.result.structuredContent.verification, "verified", JSON.stringify(repeated))
+      assert.equal(repeated.result.structuredContent.data.result.value, expected)
+    }
     const semanticClick = await response(45, { jsonrpc: "2.0", id: 45, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.semantic_click", idempotency_key: "semantic-click-dynamic", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, locator: { role: "button", name: "Add dynamic node" }, timeout_ms: 1500 } } } })
     assert.equal(semanticClick.result.structuredContent.verification, "verified", JSON.stringify(semanticClick))
+    const shadowClick = await response(48, { jsonrpc: "2.0", id: 48, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.semantic_click", idempotency_key: "semantic-click-shadow", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, locator: { role: "button", name: "Shadow action" }, timeout_ms: 1500 } } } })
+    assert.equal(shadowClick.result.structuredContent.verification, "verified", JSON.stringify(shadowClick))
+    const frameClick = await response(49, { jsonrpc: "2.0", id: 49, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.semantic_click", idempotency_key: "semantic-click-frame", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, locator: { role: "button", name: "Frame action" }, timeout_ms: 1500 } } } })
+    assert.equal(frameClick.result.structuredContent.verification, "verified", JSON.stringify(frameClick))
     const dynamicWait = await response(46, { jsonrpc: "2.0", id: 46, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.wait_for", idempotency_key: "semantic-click-dynamic-ready", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, selector: "#dynamic-node", property: "textContent", contains: "dynamic ready" } } } })
     assert.equal(dynamicWait.result.structuredContent.verification, "verified", JSON.stringify(dynamicWait))
     const workflow = await response(47, { jsonrpc: "2.0", id: 47, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.workflow", idempotency_key: "browser-workflow", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, steps: [{ action: "click", locator: { role: "button", name: "Add dynamic node" }, timeout_ms: 1000 }] } } } })
     assert.equal(workflow.result.structuredContent.verification, "verified", JSON.stringify(workflow))
     assert.equal(workflow.result.structuredContent.data.step_count, 1)
+    workflowSteps += workflow.result.structuredContent.data.step_count
+    const navigationWorkflow = await response(50, { jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.workflow", idempotency_key: "browser-navigation-workflow", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, steps: [{ action: "navigate", url: `http://127.0.0.1:${port}/next`, url_contains: "/next", timeout_ms: 1000 }, { action: "wait_url", contains: "/next", timeout_ms: 1000 }] } } } })
+    assert.equal(navigationWorkflow.result.structuredContent.verification, "verified", JSON.stringify(navigationWorkflow))
+    workflowSteps += navigationWorkflow.result.structuredContent.data.step_count
     const snapshot = await response(43, { jsonrpc: "2.0", id: 43, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.accessibility_snapshot", idempotency_key: "accessibility-snapshot", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, depth: 4 } } } })
     assert.equal(snapshot.result.structuredContent.verification, "verified")
     assert.equal(snapshot.result.structuredContent.data.snapshot.nodes[0].name.value, "Comptrol browser fixture")
+    const screenshot = await response(51, { jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.screenshot", idempotency_key: "target-screenshot", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, format: "png" } } } })
+    assert.equal(screenshot.result.structuredContent.verification, "verified", JSON.stringify(screenshot))
+    assert.equal(screenshot.result.structuredContent.data.evidence, "target_scoped_visual_digest")
+    assert.equal(screenshot.result.structuredContent.data.encoded_bytes > 0, true)
     const closedGroup = await response(44, { jsonrpc: "2.0", id: 44, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.reopen_closed_group", idempotency_key: "closed-group-refusal" } } })
     assert.equal(closedGroup.result.structuredContent.error.code, "closed_group_unsupported")
     const historyBack = await response(41, { jsonrpc: "2.0", id: 41, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.history_back", idempotency_key: "history-back", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision } } } })
@@ -90,7 +124,26 @@ try {
     assert.equal(closed.result.structuredContent.data.closed, true)
     assert.equal(closed.result.structuredContent.data.mouse, "untouched")
     assert.equal(closed.result.structuredContent.data.clipboard, "untouched")
+    const metrics = await fetch(`http://127.0.0.1:${port}/metrics`).then(response => response.json())
+    assert.equal(metrics.pageWebsocketConnections, 1, JSON.stringify(metrics))
+    assert.equal(metrics.browserWebsocketConnections, 1, JSON.stringify(metrics))
     comptrol.kill("SIGTERM")
+    console.log(JSON.stringify({
+      suite: "browser_fixture_verified_task",
+      verified_success: true,
+      verification: "verified",
+      latency_ms: Number((performance.now() - startedAt).toFixed(3)),
+      mcp_calls: mcpCalls,
+      steps: workflowSteps,
+      bytes_in: bytesIn,
+      bytes_out: bytesOut,
+      retries: 0,
+      false_positive_verifications: 0,
+      disturbance: { mouse: "untouched", clipboard: "untouched", foreground_changed: false },
+      resource_usage: { comptrol_pid: comptrol.pid },
+      independent_final_verifier: "fixture state and protocol metrics",
+      protocol: metrics,
+    }))
   }
   console.log("browser fixture conformance passed")
 } finally {

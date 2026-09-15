@@ -59,6 +59,7 @@ try:
     if structured.get("error"):
         raise RuntimeError(structured)
     assert structured["verification"] == "verified", structured
+    assert structured["route"] == "windows_uia_direct", structured
     print("Windows UI Automation conformance passed")
 finally:
     if runtime is not None:
