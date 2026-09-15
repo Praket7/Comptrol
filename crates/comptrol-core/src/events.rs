@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -23,6 +23,7 @@ struct EventState {
 pub struct EventBus {
     state: Mutex<EventState>,
     notification: Condvar,
+    subscribers: Mutex<Vec<mpsc::Sender<Event>>>,
 }
 
 impl EventBus {
@@ -34,6 +35,7 @@ impl EventBus {
                 events: VecDeque::new(),
             }),
             notification: Condvar::new(),
+            subscribers: Mutex::new(Vec::new()),
         }
     }
 
@@ -57,8 +59,33 @@ impl EventBus {
         while state.events.len() > state.capacity {
             state.events.pop_front();
         }
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        }
         self.notification.notify_all();
         event
+    }
+
+    /// Subscribe without coupling producers to a consumer's processing speed.
+    /// The channel is unbounded and delivery is best-effort; replay remains
+    /// available through `snapshot_since` for reconnecting consumers.
+    pub fn subscribe(&self) -> mpsc::Receiver<Event> {
+        let (sender, receiver) = mpsc::channel();
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.push(sender);
+        }
+        receiver
+    }
+
+    pub fn snapshot_since(&self, sequence: u64, kind: Option<&str>) -> Vec<Event> {
+        self.since(sequence, kind)
+    }
+
+    pub fn latest_sequence(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.next_sequence)
+            .unwrap_or_default()
     }
 
     pub fn since(&self, sequence: u64, kind: Option<&str>) -> Vec<Event> {
@@ -130,4 +157,30 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn subscription_is_non_blocking_and_replay_is_bounded() {
+        let bus = EventBus::new(2);
+        let receiver = bus.subscribe();
+        bus.emit("one", json!({"n": 1}));
+        bus.emit("two", json!({"n": 2}));
+        bus.emit("three", json!({"n": 3}));
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_millis(20))
+                .unwrap()
+                .kind,
+            "one"
+        );
+        assert_eq!(bus.latest_sequence(), 3);
+        assert_eq!(bus.snapshot_since(0, None).len(), 2);
+        assert_eq!(bus.snapshot_since(1, Some("three")).len(), 1);
+    }
 }
