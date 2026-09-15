@@ -5,6 +5,7 @@ if (process.env.COMPTROL_DAEMON === "1") {
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { ensureChromeCdp, closeOwnedChrome } = require("./chrome-cdp.js");
 
 function bundledBinary() {
   const platform = `${process.platform}-${process.arch}`;
@@ -103,8 +104,9 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     clearTimeout(restartTimer);
     process.stdin.destroy();
     child?.kill(signal);
+    closeOwnedChrome();
   });
 }
 
-start();
+ensureChromeCdp().finally(() => start());
 }
