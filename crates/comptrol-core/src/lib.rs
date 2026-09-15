@@ -16,9 +16,8 @@ use comptrol_workflow::{Workflow, WorkflowExecutor, WorkflowNode};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -34,7 +33,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.35";
+pub const SERVER_VERSION: &str = "0.1.36";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -1886,10 +1885,12 @@ fn operation_metadata(request: &OperationRequest) -> Value {
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
-    // ponytail: local reconciliation fingerprint, replace with a cryptographic digest when remote integrity is added
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+    // Use a process-independent digest for durable reconciliation metadata.
+    // The compact u64 projection preserves the existing protocol shape; the
+    // digest itself remains cryptographically stable across runtimes.
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix length"))
 }
 
 fn route_plan(request: &OperationRequest) -> RoutePlan {
