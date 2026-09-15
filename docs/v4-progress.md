@@ -27,6 +27,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Durable Tasks now persist a progress snapshot alongside status and result, with migration support for existing SQLite stores; reconnecting clients can inspect progress without relying on transient notifications.
 - Cancellation events are accepted only for queued or running tasks; completed, failed, cancelled, and unknown tasks are not mutated by a late cancel request.
 - EventBus now provides non-blocking subscriptions, bounded replay via `snapshot_since`, and sequence inspection for reconnecting consumers.
+- Browser protocol events now use a bounded shared replay buffer plus broadcast delivery, preventing an event emitted immediately after a command from being lost before a compatibility waiter subscribes.
 - Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.
 - Browser manager bootstraps required CDP domains for all targets already attached in the live graph without holding graph locks across I/O.
 - Browser multiplexer exposes generation- and revision-checked target commands so warm operations can fail with `stale_reference` before dispatch instead of rediscovering or cross-targeting.
@@ -52,7 +53,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 
 ## Still required for the full V4 specification
 
-- Add event replay/cursor semantics for late subscribers and wire the shared browser event stream into the durable MCP EventHub.
+- Wire browser event sequence/cursor metadata into the durable MCP EventHub and add end-to-end replay conformance for reconnecting clients.
 - Complete universal verification wiring across every adapter and high-level operation.
 - Complete target attachment/domain bootstrap coverage for all migrated compatibility helpers and remove the remaining legacy per-session socket path.
 - Extend persisted route statistics with latency samples and planner feedback across adapter/application versions.

@@ -8,7 +8,7 @@ pub use manager::BrowserManager;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -251,6 +251,7 @@ pub struct BrowserConnection {
     generation: Arc<AtomicU64>,
     cancellation: CancellationToken,
     events: broadcast::Sender<Value>,
+    event_replay: Arc<Mutex<VecDeque<Value>>>,
 }
 
 impl BrowserConnection {
@@ -271,6 +272,8 @@ impl BrowserConnection {
         let generation_for_disconnect = Arc::clone(&generation_for_reader);
         let (events, _) = broadcast::channel(512);
         let events_for_reader = events.clone();
+        let event_replay = Arc::new(Mutex::new(VecDeque::with_capacity(512)));
+        let replay_for_reader = Arc::clone(&event_replay);
         let cancellation = CancellationToken::new();
         let cancellation_for_tasks = cancellation.clone();
         tokio::spawn(async move {
@@ -314,6 +317,11 @@ impl BrowserConnection {
                 };
                 let Some(id) = value.get("id").and_then(Value::as_u64) else {
                     let _ = events_for_reader.send(value.clone());
+                    let mut replay = replay_for_reader.lock().await;
+                    if replay.len() == 512 {
+                        replay.pop_front();
+                    }
+                    replay.push_back(value.clone());
                     targets_for_reader.write().await.apply_event(&value);
                     let generation = generation_for_disconnect.load(Ordering::Acquire);
                     frames_for_reader
@@ -348,6 +356,7 @@ impl BrowserConnection {
             generation: generation_for_reader,
             cancellation,
             events,
+            event_replay,
         })
     }
 
@@ -379,6 +388,9 @@ impl BrowserConnection {
     /// is intentionally separate from command correlation so event waits never
     /// need to open or lock a target WebSocket.
     pub async fn next_event(&self, duration: Duration) -> Result<Value, BrowserError> {
+        if let Some(event) = self.event_replay.lock().await.pop_front() {
+            return Ok(event);
+        }
         let mut receiver = self.events.subscribe();
         timeout(duration, receiver.recv())
             .await
@@ -943,6 +955,7 @@ mod tests {
             generation: Arc::new(AtomicU64::new(0)),
             cancellation: CancellationToken::new(),
             events: broadcast::channel(8).0,
+            event_replay: Arc::new(Mutex::new(VecDeque::new())),
         };
         connection.targets.write().await.apply_created(target());
         let result = connection
