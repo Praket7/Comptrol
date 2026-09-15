@@ -20,6 +20,9 @@ def make_archive(directory: Path, name: str, members: dict[str, bytes]) -> None:
             package.writestr(member, data)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (directory / f"{name}.sha256").write_text(f"{digest}  {name}\n", encoding="utf-8")
+    (directory / f"{name.removesuffix('.zip')}.sbom.json").write_text(
+        '{"packages": []}\n', encoding="utf-8"
+    )
 
 
 def run(directory: Path, expected_success: bool) -> None:
@@ -43,6 +46,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-release-test-") as temporary:
         package.writestr("comptrol/comptrol", b"binary")
     digest = hashlib.sha256(invalid.read_bytes()).hexdigest()
     (root / "invalid.zip.sha256").write_text(f"{digest}  invalid.zip\n", encoding="utf-8")
+    (root / "invalid.sbom.json").write_text('{"packages": []}\n', encoding="utf-8")
     run(root, False)
 
 print("release verification regression tests passed")
