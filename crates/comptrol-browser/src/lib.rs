@@ -62,6 +62,50 @@ impl UploadTransaction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum DownloadStage {
+    Started,
+    InProgress,
+    BrowserCompleted,
+    FileVerified,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DownloadTransaction {
+    pub operation_id: String,
+    pub guid: String,
+    pub stage: DownloadStage,
+}
+
+impl DownloadTransaction {
+    pub fn new(operation_id: impl Into<String>, guid: impl Into<String>) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            guid: guid.into(),
+            stage: DownloadStage::Started,
+        }
+    }
+
+    pub fn advance(&mut self, next: DownloadStage) -> Result<(), BrowserError> {
+        let allowed = matches!(
+            (self.stage, next),
+            (DownloadStage::Started, DownloadStage::InProgress)
+                | (DownloadStage::InProgress, DownloadStage::BrowserCompleted)
+                | (DownloadStage::BrowserCompleted, DownloadStage::FileVerified)
+                | (_, DownloadStage::Failed)
+        );
+        if !allowed {
+            return Err(BrowserError::InvalidResponse(format!(
+                "invalid download transition {:?} -> {:?}",
+                self.stage, next
+            )));
+        }
+        self.stage = next;
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
     #[error("browser connection failed: {0}")]
@@ -606,6 +650,18 @@ mod tests {
         transaction.advance(UploadStage::Failed).unwrap();
         assert!(transaction.advance(UploadStage::Persisted).is_err());
         assert_eq!(transaction.stage, UploadStage::Failed);
+    }
+
+    #[test]
+    fn download_transaction_requires_browser_and_filesystem_evidence() {
+        let mut transaction = DownloadTransaction::new("download-1", "guid-1");
+        assert!(transaction.advance(DownloadStage::FileVerified).is_err());
+        transaction.advance(DownloadStage::InProgress).unwrap();
+        transaction
+            .advance(DownloadStage::BrowserCompleted)
+            .unwrap();
+        transaction.advance(DownloadStage::FileVerified).unwrap();
+        assert_eq!(transaction.stage, DownloadStage::FileVerified);
     }
 
     #[test]
