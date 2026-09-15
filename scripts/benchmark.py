@@ -76,6 +76,7 @@ def run_transport(process, iterations):
         bytes_out += len(json.dumps(response, separators=(",", ":")).encode())
     return {
         "suite": "transport",
+        "measurement_scope": "stdio_transport_fixture",
         "iterations": len(samples),
         "p50_ms": round(statistics.median(samples), 3),
         "p95_ms": round(percentile(samples, 0.95), 3),
@@ -83,6 +84,16 @@ def run_transport(process, iterations):
         "max_ms": round(max(samples), 3),
         "bytes_in": bytes_in,
         "bytes_out": bytes_out,
+        "mcp_calls": len(samples) + 1,
+        "external_model_turns": 0,
+        "internal_route_actions": len(samples),
+        "websocket_handshakes": 0,
+        "json_list_requests": 0,
+        "screenshots": 0,
+        "retries": 0,
+        "target_mismatches": 0,
+        "duplicate_mutations": 0,
+        "disturbance_events": 0,
     }
 
 
