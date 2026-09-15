@@ -25,12 +25,12 @@ use std::os::windows::io::{FromRawHandle, RawHandle};
 use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 
 const DEFAULT_TASK_TTL_MS: u64 = 300_000;
@@ -1137,6 +1137,12 @@ fn run_daemon_health() -> i32 {
             return 1;
         }
         match read_ipc_frame(&mut stream).and_then(|frame| {
+            let frame = frame.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "missing daemon health response",
+                )
+            })?;
             serde_json::from_slice::<Value>(&frame)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         }) {
