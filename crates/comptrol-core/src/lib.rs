@@ -12,6 +12,7 @@ pub mod trace;
 
 use comptrol_adapter_host::{AdapterHost, AdapterHostConfig};
 use comptrol_adapter_sdk::{AdapterManifest, HealthState};
+use comptrol_browser::{DownloadStage, DownloadTransaction, UploadTransaction};
 pub use comptrol_verification::{
     VerificationCriterion, VerificationEvidence, VerificationLevel, VerificationReport,
     VerificationSource, VerificationState as StructuredVerificationState,
@@ -3473,6 +3474,7 @@ fn browser_cdp_upload(
         .get("selector")
         .and_then(Value::as_str)
         .unwrap_or("#upload");
+    let transaction = UploadTransaction::new(&operation_id);
     match browser::cdp_upload(
         &endpoint.to_string_lossy(),
         target_id,
@@ -3490,6 +3492,7 @@ fn browser_cdp_upload(
             json!({
                 "selection": data,
                 "stage": "selected",
+                "transaction": transaction,
                 "verification": "unverified",
                 "next": "A site or application adapter must verify transfer or application acceptance"
             }),
@@ -3551,14 +3554,25 @@ fn browser_cdp_download(
         &download_dir,
         file_name,
     ) {
-        Ok(data) => success(
-            request,
-            operation_id,
-            "browser_protocol",
-            EffectState::Changed,
-            VerificationState::Verified,
-            data,
-        ),
+        Ok(data) => {
+            let guid = data
+                .get("guid")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            let mut transaction = DownloadTransaction::new(&operation_id, guid);
+            let _ = transaction.advance(DownloadStage::InProgress);
+            let _ = transaction.advance(DownloadStage::BrowserCompleted);
+            let _ = transaction.advance(DownloadStage::FileVerified);
+            success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                VerificationState::Verified,
+                json!({ "download": data, "transaction": transaction }),
+            )
+        }
         Err(error) => browser_failure(request, operation_id, error),
     }
 }
