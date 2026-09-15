@@ -1127,6 +1127,7 @@ impl Runtime {
             self.remember(&request, result.clone());
             return result;
         }
+        let route_started = Instant::now();
         let result = match request.intent.as_str() {
             "system.ping" => success(
                 &request,
@@ -1193,17 +1194,21 @@ impl Runtime {
                 },
             ),
         };
-        self.record_route_outcome(&result);
+        self.record_route_outcome(&result, route_started.elapsed().as_secs_f64() * 1_000.0);
         self.remember(&request, result.clone());
         result
     }
 
-    fn record_route_outcome(&mut self, result: &ActionResult) {
+    fn record_route_outcome(&mut self, result: &ActionResult, latency_ms: f64) {
         let entry = self.route_history.entry(result.route.clone()).or_default();
         entry.attempts = entry.attempts.saturating_add(1);
         if result.verification == VerificationState::Verified && result.error.is_none() {
             entry.verified_successes = entry.verified_successes.saturating_add(1);
         }
+        entry.p95_latency_ms = Some(match entry.p95_latency_ms {
+            Some(previous) => previous.max(latency_ms),
+            None => latency_ms,
+        });
         let _ = self.route_stats_db.execute(
             "INSERT INTO route_stats(route_key, attempts, verified_successes, p95_latency_ms)
              VALUES (?1, ?2, ?3, ?4)
