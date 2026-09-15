@@ -25,7 +25,23 @@ def main():
         raise SystemExit(f"invalid benchmark task contract: {task_path}")
     command = [sys.executable, str(ROOT / "scripts" / "benchmark.py"), "--binary", args.binary, "--suite", "transport", "--iterations", str(args.iterations)]
     result = json.loads(subprocess.check_output(command, cwd=ROOT, text=True))
-    result.update({"task_id": args.task, "final_verifier": task["final_verifier"], "verified_success": result["iterations"] == args.iterations})
+    required_metrics = {
+        "measurement_scope",
+        "mcp_calls",
+        "external_model_turns",
+        "internal_route_actions",
+        "websocket_handshakes",
+        "json_list_requests",
+        "screenshots",
+        "retries",
+        "target_mismatches",
+        "duplicate_mutations",
+        "disturbance_events",
+    }
+    missing = sorted(required_metrics.difference(result))
+    if missing:
+        raise SystemExit(f"benchmark result is missing required metrics: {', '.join(missing)}")
+    result.update({"task_id": args.task, "final_verifier": task["final_verifier"], "verified_success": result["iterations"] == args.iterations and not missing})
     print(json.dumps(result, sort_keys=True))
 
 
