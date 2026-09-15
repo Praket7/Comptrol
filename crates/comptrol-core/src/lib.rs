@@ -38,7 +38,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.51";
+pub const SERVER_VERSION: &str = "0.1.52";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -2902,22 +2902,87 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
         method,
         params,
     ) {
-        Ok(data) => success(
-            request,
-            operation_id,
-            "browser_protocol",
-            EffectState::Changed,
-            if request.intent == "browser.cdp.evaluate" {
-                if data.get("exceptionDetails").is_some() {
-                    VerificationState::Failed
-                } else {
-                    VerificationState::Verified
+        Ok(mut data) => {
+            if request.intent == "browser.cdp.navigate" {
+                if data.get("errorText").is_some() {
+                    return success(
+                        request,
+                        operation_id,
+                        "browser_protocol",
+                        EffectState::Unknown,
+                        VerificationState::Failed,
+                        data,
+                    );
                 }
-            } else {
-                VerificationState::Unverified
-            },
-            data,
-        ),
+                let observed = browser::cdp_call(
+                    &endpoint.to_string_lossy(),
+                    target_id,
+                    Some(browser_context_id),
+                    None,
+                    "Runtime.evaluate",
+                    json!({"expression":"location.href", "returnByValue":true}),
+                )
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("result")
+                        .and_then(|result| result.get("value"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+                let expected = request
+                    .params
+                    .get("url_contains")
+                    .and_then(Value::as_str)
+                    .or_else(|| request.params.get("url").and_then(Value::as_str));
+                let verified =
+                    observed
+                        .as_deref()
+                        .zip(expected)
+                        .is_some_and(|(actual, expected)| {
+                            actual == expected || actual.contains(expected)
+                        });
+                data["final_url"] = observed.map_or(Value::Null, Value::String);
+                data["verification"] = json!({
+                    "level": "surface_state",
+                    "source": "browser_dom",
+                    "criterion": "final_url_matches_request",
+                    "passed": verified
+                });
+                return success(
+                    request,
+                    operation_id,
+                    "browser_protocol",
+                    if verified {
+                        EffectState::Changed
+                    } else {
+                        EffectState::Unknown
+                    },
+                    if verified {
+                        VerificationState::Verified
+                    } else {
+                        VerificationState::Unverified
+                    },
+                    data,
+                );
+            }
+            success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                if request.intent == "browser.cdp.evaluate" {
+                    if data.get("exceptionDetails").is_some() {
+                        VerificationState::Failed
+                    } else {
+                        VerificationState::Verified
+                    }
+                } else {
+                    VerificationState::Unverified
+                },
+                data,
+            )
+        }
         Err(error) => browser_failure(request, operation_id, error),
     }
 }

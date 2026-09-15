@@ -50,6 +50,8 @@ jobs:
         env:
           COMPTROL_BIN: target/release/comptrol
       - run: python3 scripts/mcp_http_current_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
       - run: python3 scripts/mtls_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol

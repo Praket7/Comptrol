@@ -43,17 +43,18 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--url", default="about:blank")
 parser.add_argument("--port", type=int, default=0)
 parser.add_argument("--profile", type=pathlib.Path)
+parser.add_argument("--address", default="127.0.0.1")
 args = parser.parse_args()
 
 root = pathlib.Path(__file__).resolve().parents[1]
 profile = args.profile or root / "work" / "chrome-cdp-profile"
 profile.mkdir(parents=True, exist_ok=True)
 port = args.port or free_port()
-endpoint = f"http://127.0.0.1:{port}"
+endpoint = f"http://{args.address}:{port}"
 chrome = find_chrome()
 process = subprocess.Popen([
     str(chrome),
-    "--remote-debugging-address=127.0.0.1",
+    f"--remote-debugging-address={args.address}",
     f"--remote-debugging-port={port}",
     f"--user-data-dir={profile}",
     "--no-first-run",
