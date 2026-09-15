@@ -404,6 +404,7 @@ impl Policy {
                 "browser.cdp.download".to_owned(),
                 "browser.cdp.fill".to_owned(),
                 "browser.cdp.click".to_owned(),
+                "browser.cdp.focus".to_owned(),
                 "browser.cdp.open_tab".to_owned(),
                 "browser.cdp.close_tab".to_owned(),
                 "browser.cdp.history_back".to_owned(),
@@ -902,6 +903,7 @@ impl Runtime {
             | "browser.cdp.download"
             | "browser.cdp.fill"
             | "browser.cdp.click"
+            | "browser.cdp.focus"
             | "browser.cdp.open_tab"
             | "browser.cdp.close_tab"
             | "browser.cdp.history_back"
@@ -1183,6 +1185,7 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.download"
         | "browser.cdp.fill"
         | "browser.cdp.click"
+        | "browser.cdp.focus"
         | "browser.cdp.open_tab"
         | "browser.cdp.close_tab"
         | "browser.cdp.history_back"
@@ -1379,6 +1382,7 @@ fn route_for(intent: &str) -> String {
         | "browser.cdp.download"
         | "browser.cdp.fill"
         | "browser.cdp.click"
+        | "browser.cdp.focus"
         | "browser.cdp.open_tab"
         | "browser.cdp.close_tab"
         | "browser.cdp.history_back"
@@ -1723,7 +1727,7 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
     }
     if matches!(
         request.intent.as_str(),
-        "browser.cdp.fill" | "browser.cdp.click" | "browser.cdp.wait_for"
+        "browser.cdp.fill" | "browser.cdp.click" | "browser.cdp.focus" | "browser.cdp.wait_for"
     ) {
         return browser_cdp_dom_action(
             request,
@@ -1835,6 +1839,36 @@ fn browser_cdp_dom_action(
         .unwrap_or(5_000)
         .min(30_000);
     let (expression, verified_by_default) = match request.intent.as_str() {
+        "browser.cdp.focus" => {
+            let Some(selector) = request.params.get("selector").and_then(Value::as_str) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser focus needs a selector".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            let Ok(selector) = serde_json::to_string(selector) else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: "Browser selector is not serializable".to_owned(),
+                        recovery: None,
+                    },
+                );
+            };
+            (
+                format!(
+                    "(() => {{ const element = document.querySelector({selector}); if (!element) throw new Error('target missing'); element.focus(); return document.activeElement === element; }})()"
+                ),
+                true,
+            )
+        }
         "browser.cdp.fill" => {
             let Some(selector) = request.params.get("selector").and_then(Value::as_str) else {
                 return ActionResult::refused(
@@ -4109,6 +4143,14 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
             note: "Reads a bounded accessibility tree from one exact live page target".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.focus".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R1,
+            route: "browser_protocol".to_owned(),
+            note: "Focuses one exact live page element without mouse or clipboard input".to_owned(),
         },
         Capability {
             name: "browser.cdp.reopen_closed_group".to_owned(),

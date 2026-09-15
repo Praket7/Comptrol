@@ -162,7 +162,11 @@ server.on("upgrade", (request, socket) => {
       : message.method === "Accessibility.getFullAXTree"
         ? { nodes: [{ nodeId: "fixture-root", role: { value: "RootWebArea" }, name: { value: "Comptrol browser fixture" } }] }
       : message.method === "Runtime.evaluate"
-        ? { result: { type: "string", value: message.params.expression === "document.title" ? "Comptrol browser fixture" : "fixture evaluation" } }
+        ? message.params.expression === "document.title"
+          ? { result: { type: "string", value: "Comptrol browser fixture" } }
+          : message.params.expression.includes("element.focus()")
+            ? { result: { type: "boolean", value: true } }
+            : { result: { type: "string", value: "fixture evaluation" } }
         : message.method === "Page.getNavigationHistory"
           ? { currentIndex: fixtureHistoryIndex, entries: fixtureHistory }
           : message.method === "Page.navigateToHistoryEntry"

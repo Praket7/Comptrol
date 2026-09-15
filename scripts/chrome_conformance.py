@@ -88,6 +88,8 @@ try:
         env={**os.environ, "COMPTROL_CDP_ENDPOINT": f"http://127.0.0.1:{debug_port}", "COMPTROL_ALLOW_BROWSER_CDP": "1", "COMPTROL_STATE_DIR": state.name},
     )
     call(runtime, 1, "initialize", {})
+    capabilities = call(runtime, 20, "tools/call", {"name": "inspect", "arguments": {"kind": "capabilities"}})
+    focus_available = any(item["name"] == "browser.cdp.focus" for item in capabilities["result"]["structuredContent"])
     inspection = call(runtime, 2, "tools/call", {"name": "inspect", "arguments": {"kind": "browser"}})
     assert any(item["id"] == target["id"] for item in inspection["result"]["structuredContent"]["targets"])
     opened = call(runtime, 12, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.open_tab", "idempotency_key": "chrome-background-tab", "params": {"url": f"http://127.0.0.1:{fixture_port}/", "background": True}}})
@@ -121,6 +123,13 @@ try:
         time.sleep(0.05)
     assert rebound is not None, rebound
     identity = {"target_id": rebound["id"], "browser_context_id": rebound.get("browserContextId", "default"), "revision": rebound.get("revision", f"url:{rebound['url']}")}
+    if focus_available:
+        focus = call(runtime, 21, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.focus", "idempotency_key": "chrome-focus", "params": {**identity, "selector": "#message"}}})
+        focus_data = focus["result"]["structuredContent"]
+        assert focus_data["verification"] == "verified", focus
+        assert focus_data["data"]["postcondition"] == "verified"
+        assert focus_data["disturbance"]["mouse"] == "untouched"
+        assert focus_data["disturbance"]["clipboard"] == "untouched"
     evaluation = call(runtime, 4, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.evaluate", "idempotency_key": "chrome-evaluation", "params": {**identity, "expression": "(() => { const input = document.querySelector('#message'); input.value = 'real chrome'; return input.value })()"}}})
     structured = evaluation["result"]["structuredContent"]
     assert structured["verification"] == "verified", structured
