@@ -1,0 +1,9 @@
+{
+  "task_id": "v4.desktop.matrix",
+  "goal": "Exercise scoped native accessibility operations, cache invalidation, window lifecycle, and multi-display geometry contracts.",
+  "initial_state": "fixture desktop application with a bounded accessibility subtree and synthetic display geometry",
+  "timeout_ms": 120000,
+  "required_capabilities": ["desktop.observe", "desktop.accessibility", "desktop.geometry"],
+  "final_verifier": "independent fixture verifier checks exact process/window identity, generation changes, stale references, and geometry revisions",
+  "disturbance_budget": {"foreground_changed": 0, "screenshots": 0}
+}

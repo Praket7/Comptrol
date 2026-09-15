@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use adapters::{AdapterDescriptor, AdapterRegistry};
 pub use checkpoints::{Checkpoint, CheckpointStore};
-pub use events::{Event, EventBus};
+pub use events::{DurableEventHub, Event, EventBus};
 pub use geometry::{DisplayGeometry, Point, VirtualDesktop};
 pub use trace::{
     CompiledStep, CompiledWorkflow, TraceEntry, TraceMode, TraceRecorder, WorkflowPrecondition,
@@ -38,7 +38,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.47";
+pub const SERVER_VERSION: &str = "0.1.48";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -904,6 +904,7 @@ pub struct Runtime {
     pub checkpoints: CheckpointStore,
     pub adapters: AdapterRegistry,
     pub events: EventBus,
+    pub durable_events: DurableEventHub,
     pub trace: Option<TraceRecorder>,
     pub stop: StopLatch,
     adapter_hosts: HashMap<String, AdapterHost>,
@@ -1012,6 +1013,8 @@ impl Runtime {
             checkpoints,
             adapters: AdapterRegistry::builtin(),
             events: EventBus::default(),
+            durable_events: DurableEventHub::open(state_dir.join("events.sqlite3"), 4096)
+                .map_err(io::Error::other)?,
             trace,
             stop: StopLatch::new(&state_dir),
             adapter_hosts: HashMap::new(),
@@ -1536,6 +1539,12 @@ impl Runtime {
             "operation.completed",
             json!({ "operation_id": result.operation_id, "intent": result.intent, "verification": result.verification }),
         );
+        if let Err(error) = self.durable_events.emit(
+            "operation.completed",
+            json!({ "operation_id": result.operation_id, "intent": result.intent, "verification": result.verification }),
+        ) {
+            eprintln!("comptrol durable event error: {error}");
+        }
         if let Some(trace) = &self.trace
             && let Err(error) = trace.append(request, &result)
         {

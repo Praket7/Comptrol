@@ -1,0 +1,9 @@
+{
+  "task_id": "v4.workflow.warm",
+  "goal": "Compile a verified trace, promote it after clean replay, execute repeated warm runs, and fall back safely after a state change.",
+  "initial_state": "clean application fixture and a successful trace containing lifted sensitive parameters",
+  "timeout_ms": 180000,
+  "required_capabilities": ["workflow.compile", "workflow.promote", "workflow.execute"],
+  "final_verifier": "the same independent finish gate passes for cold, warm, changed-state, and repaired runs with zero per-step model calls on warm runs",
+  "disturbance_budget": {"foreground_changed": 0, "screenshots": 0}
+}

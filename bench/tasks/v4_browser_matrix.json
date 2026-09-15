@@ -1,0 +1,9 @@
+{
+  "task_id": "v4.browser.matrix",
+  "goal": "Exercise browser transport, target/frame lifecycle, download, upload, reconnect, and restore contracts against a controlled browser fixture.",
+  "initial_state": "fixture browser with three targets, one cross-origin frame, one dynamic rerender, and an isolated download directory",
+  "timeout_ms": 120000,
+  "required_capabilities": ["browser.cdp", "browser.download", "browser.restore"],
+  "final_verifier": "independent fixture verifier checks target identity, frame generation, download completion, reconnect reconciliation, and restore mode",
+  "disturbance_budget": {"foreground_changed": 0, "screenshots": 0}
+}

@@ -1,0 +1,9 @@
+{
+  "task_id": "v4.adapter.matrix",
+  "goal": "Exercise adapter lifecycle, authentication, deadlines, exact resource binding, application readback, and persistence verification.",
+  "initial_state": "fixture VS Code, LibreOffice, OBS, and Blender adapter endpoints with isolated test resources",
+  "timeout_ms": 180000,
+  "required_capabilities": ["vscode", "libreoffice", "obs", "blender"],
+  "final_verifier": "independent fixture verifier checks persisted application state and confirms no unrelated resource changed",
+  "disturbance_budget": {"foreground_changed": 0, "screenshots": 0}
+}

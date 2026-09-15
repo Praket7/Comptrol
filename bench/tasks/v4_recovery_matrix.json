@@ -1,0 +1,9 @@
+{
+  "task_id": "v4.recovery.matrix",
+  "goal": "Exercise cancellation, crash after dispatch, reconnect, idempotency, reconciliation, and duplicate-side-effect prevention.",
+  "initial_state": "durable state store with a mutation fixture and an injected transport interruption point",
+  "timeout_ms": 120000,
+  "required_capabilities": ["tasks", "cancellation", "reconciliation"],
+  "final_verifier": "independent fixture verifier confirms the final state and at most one external mutation",
+  "disturbance_budget": {"foreground_changed": 0, "screenshots": 0}
+}

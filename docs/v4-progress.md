@@ -29,6 +29,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - EventBus now provides non-blocking subscriptions, bounded replay via `snapshot_since`, and sequence inspection for reconnecting consumers.
 - Browser protocol events now use a bounded shared replay buffer plus broadcast delivery, preventing an event emitted immediately after a command from being lost before a compatibility waiter subscribes.
 - Browser protocol events now carry a monotonic connection-local cursor and expose resume-after-cursor delivery for reconnecting consumers; the durable MCP transport still needs to persist and replay these cursors end to end.
+- Runtime operation-completion events are persisted in a bounded SQLite EventHub with explicit consumer cursors and monotonic acknowledgement across process restart.
 - Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.
 - Browser manager bootstraps required CDP domains for all targets already attached in the live graph without holding graph locks across I/O.
 - Browser multiplexer exposes generation- and revision-checked target commands so warm operations can fail with `stale_reference` before dispatch instead of rediscovering or cross-targeting.
@@ -62,7 +63,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Workflow execution now accepts a host cancellation callback, and promoted candidates can be stored atomically in a durable host registry; repair remains explicit and never silently rewrites an active workflow.
 - Implement persistent native accessibility workers and event-driven caches for all three desktop platforms.
 - Upgrade VS Code authentication, exact LibreOffice document identity, persistent OBS, Blender live IPC, and truthful kernel-isolation reporting.
-- Add the complete benchmark matrix and collect stable performance history before hard regression thresholds.
+- Add the complete benchmark matrix and collect stable performance history before hard regression thresholds. Checked-in browser, desktop, adapter, recovery, and warm-workflow task contracts now define the required independent verifiers; live runners remain environment-gated.
 - Build and publish platform-specific npm/Homebrew release artifacts after release CI produces fresh binaries.
 - Wire the typed locator/actionability and upload/download transaction primitives into every remaining legacy browser helper.
 
