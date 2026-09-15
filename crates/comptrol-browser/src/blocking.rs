@@ -70,6 +70,37 @@ impl BlockingBrowserManager {
                             } => {
                                 let result = async {
                                     let connection = manager.connect(&endpoint).await?;
+                                    if generation == u64::MAX {
+                                        let (current_generation, current_revision, current_url) = {
+                                            let graph = connection.targets.read().await;
+                                            let target =
+                                                graph.targets.get(&target_id).ok_or_else(|| {
+                                                    BrowserError::StaleReference(target_id.clone())
+                                                })?;
+                                            (
+                                                graph.generation,
+                                                target.revision.clone(),
+                                                target.url.clone(),
+                                            )
+                                        };
+                                        if revision.starts_with("url:")
+                                            && current_url.as_deref()
+                                                != Some(revision.trim_start_matches("url:"))
+                                        {
+                                            return Err(BrowserError::StaleReference(
+                                                target_id.clone(),
+                                            ));
+                                        }
+                                        return connection
+                                            .target_command(
+                                                &target_id,
+                                                current_generation,
+                                                &current_revision,
+                                                method,
+                                                params,
+                                            )
+                                            .await;
+                                    }
                                     connection
                                         .target_command(
                                             &target_id, generation, &revision, method, params,
@@ -122,6 +153,33 @@ impl BlockingBrowserManager {
                 target_id: target_id.to_owned(),
                 generation,
                 revision: revision.to_owned(),
+                method: method.to_owned(),
+                params,
+                response,
+            })
+            .map_err(|_| BrowserError::Closed)?;
+        receiver.recv().map_err(|_| BrowserError::Closed)?
+    }
+
+    /// Compatibility target command for callers that still hold the legacy
+    /// `/json/list` revision. The live graph supplies the current generation
+    /// and session; a URL revision is checked before dispatch so a navigation
+    /// cannot silently retarget the operation.
+    pub fn target_command_legacy_revision(
+        &self,
+        endpoint: &str,
+        target_id: &str,
+        legacy_revision: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
+        let (response, receiver) = mpsc::channel();
+        self.requests
+            .send(Request::TargetCommand {
+                endpoint: endpoint.to_owned(),
+                target_id: target_id.to_owned(),
+                generation: u64::MAX,
+                revision: legacy_revision.unwrap_or_default().to_owned(),
                 method: method.to_owned(),
                 params,
                 response,

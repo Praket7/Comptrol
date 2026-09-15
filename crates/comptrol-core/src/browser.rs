@@ -979,18 +979,49 @@ pub fn cdp_call(
         }
         Err(error) => return Err(error),
     };
-    let Some(web_socket_url) = target.web_socket_url else {
-        return Err(ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: "The target did not provide a websocket debugger URL".to_owned(),
-            recovery: Some("Inspect browser targets again".to_owned()),
+    let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
+    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
+    let result = BRIDGE
+        .get_or_init(BlockingBrowserManager::new)
+        .target_command_legacy_revision(
+            &browser_web_socket_url,
+            target_id,
+            target.revision.as_deref(),
+            method,
+            params,
+        )
+        .map_err(|error| ComptrolError {
+            code: match error {
+                BrowserError::StaleReference(_) => "stale_reference",
+                BrowserError::Closed => "browser_disconnected",
+                _ => "browser_protocol_error",
+            }
+            .to_owned(),
+            message: error.to_string(),
+            recovery: Some("Refresh the live target graph and retry".to_owned()),
         });
-    };
-    let result = persistent_call(&web_socket_url, method, params);
     if matches!(method, "Page.navigate" | "Page.navigateToHistoryEntry") {
         invalidate_target_cache(endpoint);
     }
     result
+}
+
+fn browser_websocket_endpoint(endpoint: &str) -> Result<String, ComptrolError> {
+    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Inspect the browser debugger endpoint".to_owned()),
+    })?;
+    version
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("ws://"))
+        .map(str::to_owned)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser version response did not contain a local websocket".to_owned(),
+            recovery: Some("Start Chrome with a supported local debugger endpoint".to_owned()),
+        })
 }
 
 /// Resolve and click a semantic locator in one bounded browser transaction.
