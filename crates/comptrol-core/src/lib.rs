@@ -26,7 +26,7 @@ pub use geometry::{DisplayGeometry, Point, VirtualDesktop};
 pub use trace::{TraceEntry, TraceMode, TraceRecorder, read_trace};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.0";
+pub const SERVER_VERSION: &str = "0.1.8";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 pub fn privacy_status() -> Value {
