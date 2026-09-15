@@ -904,18 +904,49 @@ fn handle_http(
             None,
         );
     }
-    let value = handle_message(runtime, body.as_ref()).unwrap_or_else(|| json!({}));
+    let mut notifications = Vec::new();
+    let mut tasks_enabled = false;
+    let value = handle_message_with_state(
+        runtime,
+        None,
+        &mut tasks_enabled,
+        body.as_ref(),
+        |notification| notifications.push(notification),
+    )
+    .unwrap_or_else(|| json!({}));
     let new_session = if is_initialize {
         Some(http_state.create_session()?)
     } else {
         None
     };
+    let (content_type, payload) = if notifications.is_empty() {
+        (
+            "application/json",
+            serde_json::to_vec(&value).unwrap_or_default(),
+        )
+    } else {
+        let mut payload = notifications;
+        payload.push(value);
+        (
+            "text/event-stream",
+            payload
+                .into_iter()
+                .map(|message| {
+                    format!(
+                        "event: message\ndata: {}\n\n",
+                        serde_json::to_string(&message).unwrap_or_else(|_| "{}".to_owned())
+                    )
+                })
+                .collect::<String>()
+                .into_bytes(),
+        )
+    };
     write_http_response(
         stream,
         200,
         "OK",
-        "application/json",
-        serde_json::to_vec(&value).unwrap_or_default(),
+        content_type,
+        payload,
         new_session.as_deref(),
     )
 }

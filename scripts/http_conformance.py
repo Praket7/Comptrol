@@ -80,10 +80,15 @@ with tempfile.TemporaryDirectory(prefix="comptrol-http-") as state:
         status, _, _, payload = request(port, "POST", "/mcp", initialize, origin="http://evil.example")
         assert status == 403
         assert json.loads(payload)["error"] == "origin_denied"
-        status, _, _, payload = request(port, "POST", "/mcp", initialize)
+        status, _, _, payload = request(
+            port,
+            "POST",
+            "/mcp",
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ping"}).encode(),
+        )
         assert status == 400
         assert json.loads(payload)["error"] == "session_required"
-        status, content_type, _, payload = request(
+        status, _, _, payload = request(
             port,
             "POST",
             "/mcp",
@@ -99,6 +104,32 @@ with tempfile.TemporaryDirectory(prefix="comptrol-http-") as state:
         )
         assert status == 200
         assert json.loads(payload)["result"] == {}
+        status, content_type, _, payload = request(
+            port,
+            "POST",
+            "/mcp",
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "operate",
+                        "arguments": {
+                            "intent": "system.ping",
+                            "idempotency_key": "http-progress",
+                        },
+                        "_meta": {"progressToken": "http-progress"},
+                    },
+                }
+            ).encode(),
+            session=session,
+        )
+        assert status == 200
+        assert "text/event-stream" in content_type
+        assert payload.find(b'"message":"operation_started"') < payload.find(
+            b'"message":"operation_completed"'
+        )
         status, content_type, _, payload = request(port, "GET", "/mcp", session=session)
         assert status == 200
         assert "text/event-stream" in content_type
