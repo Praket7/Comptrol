@@ -5,14 +5,15 @@ use comptrol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -34,6 +35,10 @@ use windows_sys::Win32::System::Pipes::{
 
 const DEFAULT_TASK_TTL_MS: u64 = 300_000;
 const TASK_POLL_INTERVAL_MS: u64 = 50;
+const HTTP_SESSION_TTL_MS: u128 = 86_400_000;
+const HTTP_EVENT_CAPACITY: usize = 256;
+const HTTP_STREAM_IDLE_MS: u64 = 300_000;
+const HTTP_MAX_CONNECTIONS: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredTask {
@@ -51,28 +56,188 @@ struct TaskStore {
     sequence: u64,
 }
 
-struct HttpState {
-    sessions: HashSet<String>,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HttpEvent {
+    id: u64,
+    data: Value,
 }
 
-impl HttpState {
-    fn new() -> Self {
-        Self {
-            sessions: HashSet::new(),
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredHttpSession {
+    session_id: String,
+    created_at_ms: u128,
+    next_event_id: u64,
+    events: VecDeque<HttpEvent>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct HttpStateFile {
+    sessions: Vec<StoredHttpSession>,
+}
+
+struct HttpState {
+    path: PathBuf,
+    sessions: HashMap<String, StoredHttpSession>,
+}
+
+struct HttpStore {
+    state: Mutex<HttpState>,
+    changed: Condvar,
+}
+
+enum HttpWait {
+    Missing,
+    Timeout,
+    Events(Vec<HttpEvent>),
+}
+
+impl HttpStore {
+    fn open(state_dir: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(state_dir)?;
+        let path = state_dir.join("http-sessions.json");
+        let mut sessions = HashMap::new();
+        if path.exists() {
+            let bytes = std::fs::read(&path)?;
+            let file = serde_json::from_slice::<HttpStateFile>(&bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid HTTP state: {error}"),
+                )
+            })?;
+            for mut session in file.sessions {
+                if valid_session_id(&session.session_id)
+                    && now_ms().saturating_sub(session.created_at_ms) <= HTTP_SESSION_TTL_MS
+                {
+                    session.events.truncate(HTTP_EVENT_CAPACITY);
+                    sessions.insert(session.session_id.clone(), session);
+                }
+            }
         }
+        Ok(Self {
+            state: Mutex::new(HttpState { path, sessions }),
+            changed: Condvar::new(),
+        })
     }
 
-    fn create_session(&mut self) -> io::Result<String> {
+    fn persist(state: &HttpState) -> io::Result<()> {
+        let file = HttpStateFile {
+            sessions: state.sessions.values().cloned().collect(),
+        };
+        let bytes = serde_json::to_vec(&file).map_err(io::Error::other)?;
+        let temporary = state
+            .path
+            .with_extension(format!("tmp-{}", std::process::id()));
+        let mut output = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        output.write_all(&bytes)?;
+        output.sync_all()?;
+        std::fs::rename(temporary, &state.path)
+    }
+
+    fn create_session(&self) -> io::Result<String> {
         let mut bytes = [0_u8; 24];
         getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
         let session = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        self.sessions.insert(session.clone());
+        let mut state = self.state.lock().expect("HTTP state lock poisoned");
+        state.sessions.insert(
+            session.clone(),
+            StoredHttpSession {
+                session_id: session.clone(),
+                created_at_ms: now_ms(),
+                next_event_id: 1,
+                events: VecDeque::new(),
+            },
+        );
+        if let Err(error) = Self::persist(&state) {
+            state.sessions.remove(&session);
+            return Err(error);
+        }
         Ok(session)
     }
 
     fn contains(&self, session: Option<&str>) -> bool {
-        session.is_some_and(|session| self.sessions.contains(session))
+        let state = self.state.lock().expect("HTTP state lock poisoned");
+        session.is_some_and(|session| state.sessions.contains_key(session))
     }
+
+    fn latest(&self, session: &str) -> Option<u64> {
+        let state = self.state.lock().expect("HTTP state lock poisoned");
+        state
+            .sessions
+            .get(session)
+            .and_then(|session| session.events.back().map(|event| event.id))
+    }
+
+    fn delete(&self, session: &str) -> io::Result<bool> {
+        let mut state = self.state.lock().expect("HTTP state lock poisoned");
+        let Some(removed) = state.sessions.remove(session) else {
+            return Ok(false);
+        };
+        if let Err(error) = Self::persist(&state) {
+            state.sessions.insert(session.to_owned(), removed);
+            return Err(error);
+        }
+        self.changed.notify_all();
+        Ok(true)
+    }
+
+    fn append(&self, session: &str, data: Value) -> io::Result<Option<u64>> {
+        let mut state = self.state.lock().expect("HTTP state lock poisoned");
+        let Some(record) = state.sessions.get_mut(session) else {
+            return Ok(None);
+        };
+        let previous = record.clone();
+        let id = record.next_event_id;
+        record.next_event_id = record.next_event_id.saturating_add(1);
+        record.events.push_back(HttpEvent { id, data });
+        while record.events.len() > HTTP_EVENT_CAPACITY {
+            record.events.pop_front();
+        }
+        if let Err(error) = Self::persist(&state) {
+            state.sessions.insert(session.to_owned(), previous);
+            return Err(error);
+        }
+        self.changed.notify_all();
+        Ok(Some(id))
+    }
+
+    fn wait_for_events(&self, session: &str, after: u64, timeout: Duration) -> HttpWait {
+        let mut state = self.state.lock().expect("HTTP state lock poisoned");
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let Some(record) = state.sessions.get(session) else {
+                return HttpWait::Missing;
+            };
+            let events = record
+                .events
+                .iter()
+                .filter(|event| event.id > after)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !events.is_empty() {
+                return HttpWait::Events(events);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return HttpWait::Timeout;
+            }
+            let (next_state, result) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("HTTP state lock poisoned");
+            state = next_state;
+            if result.timed_out() {
+                return HttpWait::Timeout;
+            }
+        }
+    }
+}
+
+fn valid_session_id(session: &str) -> bool {
+    session.len() == 48 && session.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl TaskStore {
@@ -709,21 +874,49 @@ fn run_http(port: u16) -> i32 {
         }
     };
     eprintln!("comptrol Streamable HTTP preview listening on 127.0.0.1:{port}/mcp");
-    let mut runtime = match Runtime::new(default_state_dir()) {
+    let runtime = match Runtime::new(default_state_dir()) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("startup failed: {error}");
             return 1;
         }
     };
-    let mut http_state = HttpState::new();
-    // ponytail: one blocking loop, add bounded concurrency when multiple clients need simultaneous long operations
+    let http_state = match HttpStore::open(&default_state_dir()) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("HTTP state startup failed: {error}");
+            return 1;
+        }
+    };
+    let runtime = Arc::new(Mutex::new(runtime));
+    let http_state = Arc::new(http_state);
+    let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(error) = handle_http(&mut stream, &mut runtime, &mut http_state) {
-                    eprintln!("http request failed: {error}");
+                let active = active_connections.fetch_add(1, Ordering::AcqRel) + 1;
+                if active > HTTP_MAX_CONNECTIONS {
+                    active_connections.fetch_sub(1, Ordering::AcqRel);
+                    let _ = write_http_response(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        "application/json",
+                        serde_json::to_vec(&json!({"error":"too_many_connections"}))
+                            .unwrap_or_default(),
+                        None,
+                    );
+                    continue;
                 }
+                let runtime = Arc::clone(&runtime);
+                let http_state = Arc::clone(&http_state);
+                let active_connections = Arc::clone(&active_connections);
+                thread::spawn(move || {
+                    if let Err(error) = handle_http(&mut stream, &runtime, &http_state) {
+                        eprintln!("http request failed: {error}");
+                    }
+                    active_connections.fetch_sub(1, Ordering::AcqRel);
+                });
             }
             Err(error) => eprintln!("http accept failed: {error}"),
         }
@@ -1071,8 +1264,8 @@ fn restrict_socket(path: &Path) -> io::Result<()> {
 
 fn handle_http(
     stream: &mut TcpStream,
-    runtime: &mut Runtime,
-    http_state: &mut HttpState,
+    runtime: &Arc<Mutex<Runtime>>,
+    http_state: &Arc<HttpStore>,
 ) -> io::Result<()> {
     // ponytail: bounded local parser, replace with a full HTTP implementation before public network exposure
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -1134,6 +1327,23 @@ fn handle_http(
     };
     let origin = header_value("Origin");
     let session = header_value("MCP-Session-Id");
+    let last_event_id = match header_value("Last-Event-ID") {
+        Some(value) => match value.parse::<u64>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return write_http_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    serde_json::to_vec(&json!({"error":"invalid_last_event_id"}))
+                        .unwrap_or_default(),
+                    None,
+                );
+            }
+        },
+        None => None,
+    };
     let origin_ok = origin.is_none_or(|value| {
         matches!(
             value,
@@ -1152,6 +1362,7 @@ fn handle_http(
         );
     }
     if request_line.starts_with("GET /dashboard ") {
+        let mut runtime = runtime.lock().expect("runtime lock poisoned");
         return write_http_response(
             stream,
             200,
@@ -1172,7 +1383,7 @@ fn handle_http(
                 None,
             );
         };
-        if !http_state.sessions.remove(session) {
+        if !http_state.delete(session)? {
             return write_http_response(
                 stream,
                 404,
@@ -1202,14 +1413,34 @@ fn handle_http(
                 None,
             );
         }
-        return write_http_response(
-            stream,
-            200,
-            "OK",
-            "text/event-stream",
-            b"event: ready\ndata: {}\n\n".to_vec(),
-            None,
-        );
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        write_sse_headers(stream)?;
+        let mut cursor = last_event_id.unwrap_or_else(|| http_state.latest(session).unwrap_or(0));
+        write_sse_event(stream, None, "ready", &json!({}))?;
+        loop {
+            match http_state.wait_for_events(
+                session,
+                cursor,
+                Duration::from_millis(
+                    env::var("COMPTROL_HTTP_STREAM_IDLE_MS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(HTTP_STREAM_IDLE_MS),
+                ),
+            ) {
+                HttpWait::Missing | HttpWait::Timeout => {
+                    let _ = write_sse_end(stream);
+                    return Ok(());
+                }
+                HttpWait::Events(events) => {
+                    for event in events {
+                        cursor = event.id;
+                        write_sse_event(stream, Some(event.id), "message", &event.data)?;
+                    }
+                }
+            }
+        }
     }
     if !request_line.starts_with("POST /mcp ") {
         return write_http_response(
@@ -1261,7 +1492,7 @@ fn handle_http(
     let mut notifications = Vec::new();
     let mut tasks_enabled = false;
     let value = handle_message_with_state(
-        runtime,
+        &mut runtime.lock().expect("runtime lock poisoned"),
         None,
         &mut tasks_enabled,
         body.as_ref(),
@@ -1273,17 +1504,23 @@ fn handle_http(
     } else {
         None
     };
-    let (content_type, payload) = if notifications.is_empty() {
+    let event_session = new_session.as_deref().or(session);
+    let mut messages = notifications;
+    messages.push(value);
+    if let Some(event_session) = event_session {
+        for message in &messages {
+            http_state.append(event_session, message.clone())?;
+        }
+    }
+    let (content_type, payload) = if messages.len() == 1 {
         (
             "application/json",
-            serde_json::to_vec(&value).unwrap_or_default(),
+            serde_json::to_vec(&messages[0]).unwrap_or_default(),
         )
     } else {
-        let mut payload = notifications;
-        payload.push(value);
         (
             "text/event-stream",
-            payload
+            messages
                 .into_iter()
                 .map(|message| {
                     format!(
@@ -1303,6 +1540,34 @@ fn handle_http(
         payload,
         new_session.as_deref(),
     )
+}
+
+fn write_sse_headers(stream: &mut TcpStream) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )?;
+    stream.flush()
+}
+
+fn write_sse_event(
+    stream: &mut TcpStream,
+    id: Option<u64>,
+    event: &str,
+    data: &Value,
+) -> io::Result<()> {
+    let id_line = id.map(|id| format!("id: {id}\n")).unwrap_or_default();
+    let payload = format!(
+        "{id_line}event: {event}\ndata: {}\n\n",
+        serde_json::to_string(data).unwrap_or_else(|_| "{}".to_owned())
+    );
+    write!(stream, "{:X}\r\n{}\r\n", payload.len(), payload)?;
+    stream.flush()
+}
+
+fn write_sse_end(stream: &mut TcpStream) -> io::Result<()> {
+    stream.write_all(b"0\r\n\r\n")?;
+    stream.flush()
 }
 
 fn write_http_response(

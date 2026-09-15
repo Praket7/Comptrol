@@ -12,7 +12,9 @@ Stdio calls that provide an MCP progress token receive bounded start and complet
 
 The stdio server also supports a durable completed task subset when the client advertises the Tasks extension and sends a task request. It persists the task handle and final result across restart and serves `tasks/get`, `tasks/result`, and `tasks/list`. Long running asynchronous execution and task cancellation remain unavailable and are refused rather than implied.
 
-The loopback HTTP preview binds only to localhost. It assigns a random session id after initialization and requires that id for later MCP requests. It supports origin validation, session deletion, and a finite server sent event readiness response. It remains a local preview because it does not yet provide concurrent long lived event streams or remote authentication.
+The loopback HTTP transport binds only to localhost. It assigns a random session id after initialization and requires that id for later MCP requests. It supports origin validation, session deletion, concurrent long lived server sent event streams, persistent session state under the configured state directory, bounded event replay with `Last-Event-ID`, and a bounded connection count. It remains local because it does not provide remote authentication.
+
+The session event history is bounded to 256 messages and sessions expire after 24 hours. A stream that is idle for five minutes closes while the session remains durable. Set `COMPTROL_HTTP_STREAM_IDLE_MS` to change that bounded idle period. The server writes the session file atomically before acknowledging a new session, event, or deletion.
 
 The native daemon mode uses a versioned length framed Unix socket on macOS and Linux, and a local named pipe on Windows. It provides health checks and forwards MCP messages through the same runtime while preserving ordered progress events. Local transports reject oversized frames.
 

@@ -21,7 +21,7 @@ def main() -> int:
   license "Apache-2.0"
 
   def install
-    bin.install "comptrol"
+    bin.install "comptrol/comptrol"
   end
 
   test do
@@ -36,4 +36,3 @@ end
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

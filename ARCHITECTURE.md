@@ -14,5 +14,4 @@ The library includes a closed workflow representation with sense, assert, set, w
 
 ## Transport
 
-The canonical transport is MCP stdio. A loopback HTTP preview is included with origin validation and bounded input. It is not yet advertised as a complete Streamable HTTP implementation because resumable event streams and session negotiation still need a conformance suite.
-
+The canonical transport is MCP stdio. A loopback Streamable HTTP transport is also included with origin validation, bounded input, concurrent long lived event streams, persistent session state, bounded replay, and session deletion. It remains loopback only.

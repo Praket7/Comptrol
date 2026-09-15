@@ -2,7 +2,7 @@
 
 The design was checked against current MCP transport documentation, Chromium DevTools Protocol documentation, GitHub source from CUA Driver, and recent GUI workflow compilation papers.
 
-MCP documents stdio as a standard local transport and Streamable HTTP as a separate transport with origin validation requirements. Comptrol therefore keeps stdio as the canonical first path and treats the loopback HTTP server as a bounded local preview. The preview assigns an in memory session id after initialization, validates it on later requests, supports a finite server sent event readiness response, and refuses invalid origins.
+MCP documents stdio as a standard local transport and Streamable HTTP as a separate transport with origin validation requirements. Comptrol therefore keeps stdio as the canonical first path and also provides a loopback HTTP transport. It assigns a durable session id after initialization, validates it on later requests, supports long lived server sent events with bounded replay, and refuses invalid origins. Remote authentication is still absent.
 
 CUA Driver source emphasizes exact tab binding, refusal when a route cannot preserve background posture, and independent verification. Comptrol carries those ideas into its result model without copying code.
 

@@ -61,6 +61,33 @@ def oversized_request(port):
     return response
 
 
+def open_stream(port, session, last_event_id=None):
+    connection = socket.create_connection(("127.0.0.1", port), timeout=3)
+    headers = [
+        "GET /mcp HTTP/1.1",
+        "Host: 127.0.0.1",
+        "Origin: http://127.0.0.1",
+        "Accept: text/event-stream",
+        f"MCP-Session-Id: {session}",
+    ]
+    if last_event_id is not None:
+        headers.append(f"Last-Event-ID: {last_event_id}")
+    connection.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
+    response = b""
+    while b"\r\n\r\n" not in response:
+        response += connection.recv(4096)
+    header, body = response.split(b"\r\n\r\n", 1)
+    assert b"200 OK" in header
+    assert b"text/event-stream" in header
+    return connection, body
+
+
+def read_until(connection, body, marker):
+    while marker not in body:
+        body += connection.recv(4096)
+    return body
+
+
 port = free_port()
 with tempfile.TemporaryDirectory(prefix="comptrol-http-") as state:
     process = subprocess.Popen(
@@ -104,6 +131,9 @@ with tempfile.TemporaryDirectory(prefix="comptrol-http-") as state:
         )
         assert status == 200
         assert json.loads(payload)["result"] == {}
+        stream, stream_body = open_stream(port, session)
+        stream_body = read_until(stream, stream_body, b"event: ready")
+        assert b"event: ready" in stream_body
         status, content_type, _, payload = request(
             port,
             "POST",
@@ -130,10 +160,28 @@ with tempfile.TemporaryDirectory(prefix="comptrol-http-") as state:
         assert payload.find(b'"message":"operation_started"') < payload.find(
             b'"message":"operation_completed"'
         )
-        status, content_type, _, payload = request(port, "GET", "/mcp", session=session)
-        assert status == 200
-        assert "text/event-stream" in content_type
-        assert b"event: ready" in payload
+        stream_body = read_until(stream, stream_body, b'"message":"operation_completed"')
+        assert b"event: message" in stream_body
+        event_ids = [line.split(b":", 1)[1].strip() for line in stream_body.splitlines() if line.startswith(b"id:")]
+        assert event_ids and int(event_ids[-1]) >= 2
+        stream.close()
+        replay, replay_body = open_stream(port, session, last_event_id=1)
+        replay_body = read_until(replay, replay_body, b'"message":"operation_completed"')
+        assert b"id: 2" in replay_body
+        replay.close()
+        process.terminate()
+        process.wait(timeout=5)
+        process = subprocess.Popen(
+            ["target/debug/comptrol", "serve-http", str(port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "COMPTROL_STATE_DIR": state},
+        )
+        wait_for(port)
+        resumed, resumed_body = open_stream(port, session, last_event_id=1)
+        resumed_body = read_until(resumed, resumed_body, b'"message":"operation_completed"')
+        assert b"id: 2" in resumed_body
+        resumed.close()
         status, _, _, _ = request(port, "DELETE", "/mcp", session=session)
         assert status == 204
         status, _, _, payload = request(port, "GET", "/mcp", session=session)
