@@ -55,6 +55,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -112,10 +113,15 @@ jobs:
             platform="${spec##* }"
             archive="$(find "release-assets/${artifact}" -name '*.zip' -type f | head -n1)"
             test -n "$archive"
-            mkdir -p "packages/mcp/native/${platform}"
-            unzip -q "$archive" -d "packages/mcp/native/${platform}"
-            mv "packages/mcp/native/${platform}/comptrol/"* "packages/mcp/native/${platform}/"
-            rmdir "packages/mcp/native/${platform}/comptrol"
+            destination="packages/mcp/native/${platform}"
+            staging="$(mktemp -d)"
+            mkdir -p "$destination"
+            unzip -q "$archive" -d "$staging"
+            if test "$platform" = "win32-x64"; then
+              mv "$staging/comptrol/comptrol.exe" "$destination/comptrol.exe"
+            else
+              mv "$staging/comptrol/comptrol" "$destination/comptrol"
+            fi
           done
           chmod +x packages/mcp/native/*/comptrol 2>/dev/null || true
           test -f packages/mcp/native/darwin-arm64/comptrol
