@@ -78,6 +78,67 @@ pub struct DownloadTransaction {
     pub stage: DownloadStage,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum Locator {
+    RoleName { role: String, name: String },
+    Label(String),
+    Placeholder(String),
+    Text(String),
+    TestId(String),
+    AltText(String),
+    Href(String),
+    Css(String),
+    BackendNodeId(i64),
+}
+
+impl Locator {
+    pub fn validate(&self) -> Result<(), BrowserError> {
+        let valid = match self {
+            Self::RoleName { role, name } => !role.trim().is_empty() && !name.trim().is_empty(),
+            Self::Label(value)
+            | Self::Placeholder(value)
+            | Self::Text(value)
+            | Self::TestId(value)
+            | Self::AltText(value)
+            | Self::Href(value)
+            | Self::Css(value) => !value.trim().is_empty(),
+            Self::BackendNodeId(value) => *value > 0,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(BrowserError::InvalidResponse(
+                "locator must contain a non-empty, positive identity".to_owned(),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Actionability {
+    pub attached: bool,
+    pub visible: bool,
+    pub stable: bool,
+    pub enabled: bool,
+    pub receives_events: bool,
+    pub unobscured: bool,
+}
+
+impl Actionability {
+    pub fn click_ready(self) -> bool {
+        self.attached
+            && self.visible
+            && self.stable
+            && self.enabled
+            && self.receives_events
+            && self.unobscured
+    }
+
+    pub fn fill_ready(self) -> bool {
+        self.attached && self.visible && self.stable && self.enabled
+    }
+}
+
 impl DownloadTransaction {
     pub fn new(operation_id: impl Into<String>, guid: impl Into<String>) -> Self {
         Self {
@@ -662,6 +723,30 @@ mod tests {
             .unwrap();
         transaction.advance(DownloadStage::FileVerified).unwrap();
         assert_eq!(transaction.stage, DownloadStage::FileVerified);
+    }
+
+    #[test]
+    fn locators_and_actionability_require_safe_targets() {
+        assert!(Locator::Text("  ".to_owned()).validate().is_err());
+        assert!(Locator::Css("button.save".to_owned()).validate().is_ok());
+        assert!(Locator::BackendNodeId(0).validate().is_err());
+        let ready = Actionability {
+            attached: true,
+            visible: true,
+            stable: true,
+            enabled: true,
+            receives_events: true,
+            unobscured: true,
+        };
+        assert!(ready.click_ready());
+        assert!(ready.fill_ready());
+        assert!(
+            !Actionability {
+                unobscured: false,
+                ..ready
+            }
+            .click_ready()
+        );
     }
 
     #[test]
