@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import time
 
+BIN = os.environ.get("COMPTROL_BIN", "target/debug/comptrol")
+
 
 def free_port():
     with socket.socket() as sock:
@@ -32,7 +34,7 @@ def request(port, method, body=None, session=None):
 
 port = free_port()
 with tempfile.TemporaryDirectory(prefix="comptrol-mcp-http-current-") as state:
-    process = subprocess.Popen(["target/debug/comptrol", "serve-http", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "COMPTROL_STATE_DIR": state})
+    process = subprocess.Popen([BIN, "serve-http", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "COMPTROL_STATE_DIR": state})
     try:
         deadline = time.time() + 10
         while time.time() < deadline:

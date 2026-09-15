@@ -41,4 +41,9 @@ jobs:
       - run: python3 scripts/client_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol
+      - run: python3 scripts/mcp_current_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
+      - run: python3 scripts/mcp_http_current_conformance.py
+      - run: python3 scripts/benchmark_v4.py --binary target/release/comptrol --iterations 25
       - run: python3 scripts/generate_homebrew_formula.py --version 0.1.0 --url https://example.invalid/comptrol.tar.gz --sha256 0000000000000000000000000000000000000000000000000000000000000000 --output /tmp/comptrol.rb
