@@ -1479,6 +1479,7 @@ fn execute_adapter_request(
             );
         }
     };
+    let isolation_dimensions = manifest.isolation.dimensions();
     if !runtime.adapter_hosts.contains_key(adapter_name) {
         let python = std::env::var_os("COMPTROL_ADAPTER_PYTHON")
             .map(PathBuf::from)
@@ -1587,7 +1588,7 @@ fn execute_adapter_request(
                 } else {
                     VerificationState::Unverified
                 },
-                json!({"adapter": adapter_name, "health": response.health, "payload": response.payload, "verified": verified}),
+                json!({"adapter": adapter_name, "health": response.health, "payload": response.payload, "verified": verified, "isolation": isolation_dimensions.clone()}),
             )
         }
         Ok(response) => ActionResult {
@@ -1601,7 +1602,7 @@ fn execute_adapter_request(
             verification: VerificationState::NotAttempted,
             disturbance: json!({ "foreground_changed": false, "mouse": "untouched", "clipboard": "untouched" }),
             recovery: RecoveryState::None,
-            data: json!({"adapter": adapter_name, "health": response.health, "payload": response.payload}),
+            data: json!({"adapter": adapter_name, "health": response.health, "payload": response.payload, "isolation": isolation_dimensions}),
             error: Some(ComptrolError {
                 code: "adapter_execution_failed".to_owned(),
                 message: response

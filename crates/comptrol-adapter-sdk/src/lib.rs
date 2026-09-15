@@ -24,6 +24,19 @@ pub struct Isolation {
     pub filesystem: String,
 }
 
+impl Isolation {
+    /// Declarative isolation settings are not kernel enforcement by themselves.
+    pub fn dimensions(&self) -> Value {
+        serde_json::json!({
+            "process_separated": self.mode == "out_of_process",
+            "rpc_capability_scoped": self.mode == "out_of_process",
+            "filesystem_enforced": false,
+            "network_enforced": false,
+            "kernel_sandboxed": false
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CapabilitySpec {
     pub intent: String,
@@ -280,5 +293,15 @@ mod tests {
             u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize,
             encoded.len() - 4
         );
+    }
+
+    #[test]
+    fn isolation_dimensions_do_not_overclaim_kernel_enforcement() {
+        let dimensions = manifest().isolation.dimensions();
+        assert_eq!(dimensions["process_separated"], true);
+        assert_eq!(dimensions["rpc_capability_scoped"], true);
+        assert_eq!(dimensions["filesystem_enforced"], false);
+        assert_eq!(dimensions["network_enforced"], false);
+        assert_eq!(dimensions["kernel_sandboxed"], false);
     }
 }
