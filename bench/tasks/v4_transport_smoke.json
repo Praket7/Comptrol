@@ -1,0 +1,9 @@
+{
+  "task_id": "v4.transport.smoke",
+  "goal": "Complete repeated MCP ping requests with no mutation or foreground disturbance.",
+  "initial_state": "fresh temporary Comptrol state directory",
+  "timeout_ms": 30000,
+  "required_capabilities": ["system.ping"],
+  "final_verifier": "every response is JSON-RPC success and contains the expected ping result",
+  "disturbance_budget": {"foreground_changed": 0, "screenshots": 0}
+}
