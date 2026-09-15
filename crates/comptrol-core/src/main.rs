@@ -447,11 +447,6 @@ fn run_stdio() -> i32 {
     0
 }
 
-fn handle_message(runtime: &mut Runtime, line: &str) -> Option<Value> {
-    let mut tasks_enabled = false;
-    handle_message_with_state(runtime, None, &mut tasks_enabled, line, |_| {})
-}
-
 fn handle_message_with_state<F>(
     runtime: &mut Runtime,
     mut tasks: Option<&mut TaskStore>,
