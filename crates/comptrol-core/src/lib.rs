@@ -13,6 +13,7 @@ pub mod trace;
 use comptrol_adapter_host::{AdapterHost, AdapterHostConfig};
 use comptrol_adapter_sdk::{AdapterManifest, HealthState};
 use comptrol_workflow::{Workflow, WorkflowExecutor, WorkflowNode};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
@@ -899,6 +900,7 @@ pub struct Runtime {
     adapter_hosts: HashMap<String, AdapterHost>,
     idempotent: HashMap<String, ActionResult>,
     route_history: HashMap<String, RouteHistory>,
+    route_stats_db: Connection,
     sequence: u64,
 }
 
@@ -927,6 +929,44 @@ impl Runtime {
     fn build(state_dir: PathBuf, trace: Option<TraceRecorder>) -> io::Result<Self> {
         let operations = OperationJournal::open(&state_dir)?;
         let checkpoints = CheckpointStore::new(&state_dir)?;
+        let route_stats_db = Connection::open(state_dir.join("route-stats.sqlite3"))
+            .map_err(|error| io::Error::other(format!("route stats database: {error}")))?;
+        route_stats_db
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA busy_timeout = 5000;
+                 CREATE TABLE IF NOT EXISTS route_stats (
+                   route_key TEXT PRIMARY KEY,
+                   attempts INTEGER NOT NULL,
+                   verified_successes INTEGER NOT NULL,
+                   p95_latency_ms REAL
+                 );",
+            )
+            .map_err(|error| io::Error::other(format!("route stats schema: {error}")))?;
+        let mut route_history = HashMap::new();
+        {
+            let mut statement = route_stats_db
+                .prepare("SELECT route_key, attempts, verified_successes, p95_latency_ms FROM route_stats")
+                .map_err(|error| io::Error::other(format!("route stats read: {error}")))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        RouteHistory {
+                            attempts: row.get::<_, i64>(1)?.max(0) as u64,
+                            verified_successes: row.get::<_, i64>(2)?.max(0) as u64,
+                            p95_latency_ms: row.get(3)?,
+                        },
+                    ))
+                })
+                .map_err(|error| io::Error::other(format!("route stats rows: {error}")))?;
+            for row in rows {
+                let (route, stats) =
+                    row.map_err(|error| io::Error::other(format!("route stats row: {error}")))?;
+                route_history.insert(route, stats);
+            }
+        }
         let mut idempotent = HashMap::new();
         for record in operations.completed() {
             if let (Some(key), Some(result)) = (&record.idempotency_key, &record.result) {
@@ -945,7 +985,8 @@ impl Runtime {
             stop: StopLatch::new(&state_dir),
             adapter_hosts: HashMap::new(),
             idempotent,
-            route_history: HashMap::new(),
+            route_history,
+            route_stats_db,
             sequence: 0,
         })
     }
@@ -1163,6 +1204,20 @@ impl Runtime {
         if result.verification == VerificationState::Verified && result.error.is_none() {
             entry.verified_successes = entry.verified_successes.saturating_add(1);
         }
+        let _ = self.route_stats_db.execute(
+            "INSERT INTO route_stats(route_key, attempts, verified_successes, p95_latency_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(route_key) DO UPDATE SET
+               attempts = excluded.attempts,
+               verified_successes = excluded.verified_successes,
+               p95_latency_ms = excluded.p95_latency_ms",
+            params![
+                result.route,
+                entry.attempts as i64,
+                entry.verified_successes as i64,
+                entry.p95_latency_ms,
+            ],
+        );
     }
 
     pub fn inspect(&mut self, kind: &str) -> Value {
