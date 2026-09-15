@@ -9,6 +9,9 @@ const browserContextId = "comptrol-fixture-context"
 const revision = "fixture-revision-1"
 const submissions = new Map()
 const openedTabs = new Map()
+let websocketConnections = 0
+let browserWebsocketConnections = 0
+let pageWebsocketConnections = 0
 let fixtureHistoryIndex = 1
 const fixtureHistory = [
   { id: 1, url: "http://127.0.0.1:17417/previous" },
@@ -65,6 +68,10 @@ const server = createServer(async (request, response) => {
   }
   if (request.method === "GET" && request.url === "/state") {
     json(response, 200, { targetId, browserContextId, revision, submissions: [...submissions.values()] })
+    return
+  }
+  if (request.method === "GET" && request.url === "/metrics") {
+    json(response, 200, { websocketConnections, browserWebsocketConnections, pageWebsocketConnections })
     return
   }
   if (request.method === "GET" && request.url === "/download/fixture.txt") {
@@ -140,6 +147,9 @@ server.on("upgrade", (request, socket) => {
     socket.destroy()
     return
   }
+  websocketConnections += 1
+  if (browserSocket) browserWebsocketConnections += 1
+  else pageWebsocketConnections += 1
   const accept = createHash("sha1").update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64")
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
   let buffer = Buffer.alloc(0)
@@ -164,6 +174,10 @@ server.on("upgrade", (request, socket) => {
       : message.method === "Runtime.evaluate"
         ? message.params.expression === "document.title"
           ? { result: { type: "string", value: "Comptrol browser fixture" } }
+          : message.params.expression.includes("Add dynamic node")
+            ? { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Add dynamic node" } } }
+          : message.params.expression.includes("dynamic ready")
+            ? { result: { type: "boolean", value: true } }
           : message.params.expression.includes("element.focus()")
             ? { result: { type: "boolean", value: true } }
             : { result: { type: "string", value: "fixture evaluation" } }

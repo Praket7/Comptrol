@@ -36,4 +36,6 @@ The CDP operation surface also provides target bound fill, click, and wait for c
 
 `browser.cdp.workflow` is the low-round-trip fast path for bounded browser tasks. It accepts the exact target identity plus a closed `steps` array containing `navigate`, `click`, and `wait_url` steps. Each click still uses a fresh data-only semantic locator, target context and revision are revalidated between steps, navigation URLs are restricted to `http`, `https`, or `about`, and URL postconditions are bounded. This keeps the safety properties of individual operations while avoiding a separate MCP request, target inspection, and model turn for every click.
 
+Normal target-bound CDP calls now reuse one local websocket per exact DevTools target URL. Command ids are monotonic within the session, protocol responses remain correlated by id, and any dispatch, read, protocol, or size failure evicts the session before the caller receives the error. The next call reconnects once through the normal target identity binding path. Reuse is a transport optimization only and never bypasses target, context, revision, policy, or verification checks. Upload and download transactions retain their own bounded command scopes until they are migrated to the shared session without weakening their filesystem verification.
+
 Run `node scripts/browser_conformance.mjs` from the repository root.

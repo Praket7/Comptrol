@@ -90,6 +90,9 @@ try {
     assert.equal(closed.result.structuredContent.data.closed, true)
     assert.equal(closed.result.structuredContent.data.mouse, "untouched")
     assert.equal(closed.result.structuredContent.data.clipboard, "untouched")
+    const metrics = await fetch(`http://127.0.0.1:${port}/metrics`).then(response => response.json())
+    assert.equal(metrics.pageWebsocketConnections, 1, JSON.stringify(metrics))
+    assert.equal(metrics.browserWebsocketConnections, 1, JSON.stringify(metrics))
     comptrol.kill("SIGTERM")
   }
   console.log("browser fixture conformance passed")

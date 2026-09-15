@@ -1,11 +1,21 @@
 use crate::{BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_target};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tungstenite::{Message, connect};
+use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
+
+type CdpSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+type CdpSessions = HashMap<String, (CdpSocket, u64)>;
+
+fn cdp_sessions() -> &'static Mutex<CdpSessions> {
+    static SESSIONS: OnceLock<Mutex<CdpSessions>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
     let value = get_json(endpoint, "/json/list").map_err(|error| ComptrolError {
@@ -414,6 +424,14 @@ fn protocol_call(
     method: &str,
     params: Value,
 ) -> Result<Value, ComptrolError> {
+    persistent_call(web_socket_url, method, params)
+}
+
+fn persistent_call(
+    web_socket_url: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, ComptrolError> {
     if !web_socket_url.starts_with("ws://") {
         return Err(ComptrolError {
             code: "browser_transport_unsupported".to_owned(),
@@ -421,45 +439,66 @@ fn protocol_call(
             recovery: Some("Use a local browser endpoint".to_owned()),
         });
     }
-    let (mut socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
-    socket
-        .send(Message::Text(
-            json!({ "id": 1, "method": method, "params": params })
-                .to_string()
-                .into(),
-        ))
-        .map_err(browser_dispatch_error)?;
-    loop {
-        let message = socket.read().map_err(browser_response_error)?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        if text.len() > MAX_PROTOCOL_BYTES {
-            return Err(ComptrolError {
-                code: "browser_message_too_large".to_owned(),
-                message: format!(
-                    "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
-                ),
-                recovery: Some("Inspect the browser target".to_owned()),
-            });
-        }
-        let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: error.to_string(),
-            recovery: Some("Inspect the browser protocol version".to_owned()),
-        })?;
-        if value.get("id").and_then(Value::as_u64) != Some(1) {
-            continue;
-        }
-        if let Some(error) = value.get("error") {
-            return Err(ComptrolError {
-                code: "browser_command_failed".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Inspect the browser target and retry once".to_owned()),
-            });
-        }
-        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+    let mut sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
+        code: "browser_session_unavailable".to_owned(),
+        message: "The browser session cache is unavailable".to_owned(),
+        recovery: Some("Retry after the browser session recovers".to_owned()),
+    })?;
+    if !sessions.contains_key(web_socket_url) {
+        let (socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
+        sessions.insert(web_socket_url.to_owned(), (socket, 0));
     }
+    let (socket, next_id) = sessions
+        .get_mut(web_socket_url)
+        .expect("browser session inserted or present");
+    *next_id += 1;
+    let id = *next_id;
+    let result = (|| {
+        socket
+            .send(Message::Text(
+                json!({ "id": id, "method": method, "params": params })
+                    .to_string()
+                    .into(),
+            ))
+            .map_err(browser_dispatch_error)?;
+        loop {
+            let message = socket.read().map_err(browser_response_error)?;
+            let Message::Text(text) = message else {
+                continue;
+            };
+            if text.len() > MAX_PROTOCOL_BYTES {
+                return Err(ComptrolError {
+                    code: "browser_message_too_large".to_owned(),
+                    message: format!(
+                        "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
+                    ),
+                    recovery: Some(
+                        "Inspect the target and retry with a bounded response".to_owned(),
+                    ),
+                });
+            }
+            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
+                code: "browser_protocol_invalid".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect the browser protocol version".to_owned()),
+            })?;
+            if value.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = value.get("error") {
+                return Err(ComptrolError {
+                    code: "browser_command_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Inspect the browser target and retry once".to_owned()),
+                });
+            }
+            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+        }
+    })();
+    if result.is_err() {
+        sessions.remove(web_socket_url);
+    }
+    result
 }
 
 fn encode_new_tab_url(url: &str) -> String {
@@ -491,66 +530,7 @@ pub fn cdp_call(
             recovery: Some("Inspect browser targets again".to_owned()),
         });
     };
-    if !web_socket_url.starts_with("ws://") {
-        return Err(ComptrolError {
-            code: "browser_transport_unsupported".to_owned(),
-            message: "Only local unencrypted DevTools websocket endpoints are enabled".to_owned(),
-            recovery: Some(
-                "Use a local browser endpoint or configure a trusted transport".to_owned(),
-            ),
-        });
-    }
-    let (mut socket, _) = connect(web_socket_url).map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Start the browser target and retry".to_owned()),
-    })?;
-    socket
-        .send(Message::Text(
-            json!({ "id": 1, "method": method, "params": params })
-                .to_string()
-                .into(),
-        ))
-        .map_err(|error| ComptrolError {
-            code: "browser_dispatch_failed".to_owned(),
-            message: error.to_string(),
-            recovery: Some("Reconnect to the exact browser target".to_owned()),
-        })?;
-    loop {
-        let message = socket.read().map_err(|error| ComptrolError {
-            code: "browser_response_failed".to_owned(),
-            message: error.to_string(),
-            recovery: Some("Inspect the browser target before retrying".to_owned()),
-        })?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        if text.len() > MAX_PROTOCOL_BYTES {
-            return Err(ComptrolError {
-                code: "browser_message_too_large".to_owned(),
-                message: format!(
-                    "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
-                ),
-                recovery: Some("Inspect the target and retry with a bounded response".to_owned()),
-            });
-        }
-        let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: error.to_string(),
-            recovery: Some("Inspect the browser protocol version".to_owned()),
-        })?;
-        if value.get("id").and_then(Value::as_u64) != Some(1) {
-            continue;
-        }
-        if let Some(error) = value.get("error") {
-            return Err(ComptrolError {
-                code: "browser_command_failed".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Refresh the target and retry once".to_owned()),
-            });
-        }
-        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-    }
+    persistent_call(&web_socket_url, method, params)
 }
 
 /// Resolve and click a semantic locator in one bounded browser transaction.
