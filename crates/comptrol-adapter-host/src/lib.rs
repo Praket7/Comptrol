@@ -3,10 +3,11 @@ use comptrol_adapter_sdk::{
     RpcRequest, RpcResponse, frame,
 };
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,7 @@ pub struct AdapterHost {
     child: Child,
     stdin: ChildStdin,
     stdout: Option<ChildStdout>,
+    stderr_tail: Arc<Mutex<VecDeque<u8>>>,
     request_sequence: u64,
 }
 
@@ -72,7 +74,7 @@ impl AdapterHost {
             .args(&config.arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = command.spawn()?;
         let stdin = child
             .stdin
@@ -82,13 +84,48 @@ impl AdapterHost {
             .stdout
             .take()
             .ok_or_else(|| HostError::Protocol("adapter stdout unavailable".to_owned()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| HostError::Protocol("adapter stderr unavailable".to_owned()))?;
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(64 * 1024)));
+        let stderr_tail_for_reader = Arc::clone(&stderr_tail);
+        std::thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(size) => {
+                        if let Ok(mut tail) = stderr_tail_for_reader.lock() {
+                            tail.extend(&buffer[..size]);
+                            while tail.len() > 64 * 1024 {
+                                tail.pop_front();
+                            }
+                        }
+                    }
+                }
+            }
+        });
         Ok(Self {
             config,
             child,
             stdin,
             stdout: Some(stdout),
+            stderr_tail,
             request_sequence: 0,
         })
+    }
+
+    /// Return the bounded, best-effort diagnostic tail emitted by the adapter.
+    pub fn recent_stderr(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| {
+                let bytes = tail.iter().copied().collect::<Vec<_>>();
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+            .unwrap_or_default()
     }
 
     pub fn capability_token(
