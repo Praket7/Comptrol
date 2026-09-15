@@ -10,6 +10,15 @@ enum Request {
         params: Value,
         response: mpsc::Sender<Result<Value, BrowserError>>,
     },
+    TargetCommand {
+        endpoint: String,
+        target_id: String,
+        generation: u64,
+        revision: String,
+        method: String,
+        params: Value,
+        response: mpsc::Sender<Result<Value, BrowserError>>,
+    },
 }
 
 /// Synchronous compatibility bridge for callers that cannot yet be async.
@@ -34,19 +43,44 @@ impl BlockingBrowserManager {
                     .expect("browser runtime must initialize");
                 runtime.block_on(async move {
                     let manager = BrowserManager::new();
-                    while let Ok(Request::Command {
-                        endpoint,
-                        method,
-                        params,
-                        response,
-                    }) = receiver.recv()
-                    {
-                        let result = async {
-                            let connection = manager.connect(&endpoint).await?;
-                            connection.command(None, method, params).await
+                    while let Ok(request) = receiver.recv() {
+                        match request {
+                            Request::Command {
+                                endpoint,
+                                method,
+                                params,
+                                response,
+                            } => {
+                                let result = async {
+                                    let connection = manager.connect(&endpoint).await?;
+                                    connection.command(None, method, params).await
+                                }
+                                .await;
+                                let _ = response.send(result);
+                                continue;
+                            }
+                            Request::TargetCommand {
+                                endpoint,
+                                target_id,
+                                generation,
+                                revision,
+                                method,
+                                params,
+                                response,
+                            } => {
+                                let result = async {
+                                    let connection = manager.connect(&endpoint).await?;
+                                    connection
+                                        .target_command(
+                                            &target_id, generation, &revision, method, params,
+                                        )
+                                        .await
+                                }
+                                .await;
+                                let _ = response.send(result);
+                                continue;
+                            }
                         }
-                        .await;
-                        let _ = response.send(result);
                     }
                 });
             })
@@ -64,6 +98,30 @@ impl BlockingBrowserManager {
         self.requests
             .send(Request::Command {
                 endpoint: endpoint.to_owned(),
+                method: method.to_owned(),
+                params,
+                response,
+            })
+            .map_err(|_| BrowserError::Closed)?;
+        receiver.recv().map_err(|_| BrowserError::Closed)?
+    }
+
+    pub fn target_command(
+        &self,
+        endpoint: &str,
+        target_id: &str,
+        generation: u64,
+        revision: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
+        let (response, receiver) = mpsc::channel();
+        self.requests
+            .send(Request::TargetCommand {
+                endpoint: endpoint.to_owned(),
+                target_id: target_id.to_owned(),
+                generation,
+                revision: revision.to_owned(),
                 method: method.to_owned(),
                 params,
                 response,

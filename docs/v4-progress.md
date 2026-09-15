@@ -31,6 +31,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Browser manager bootstraps required CDP domains for all targets already attached in the live graph without holding graph locks across I/O.
 - Browser multiplexer exposes generation- and revision-checked target commands so warm operations can fail with `stale_reference` before dispatch instead of rediscovering or cross-targeting.
 - Browser-level synchronous compatibility calls now use `BlockingBrowserManager`, whose dedicated long-lived Tokio runtime owns `BrowserManager` and reuses one browser-level WebSocket per debugger endpoint. Target-specific legacy helpers still need migration to generation-bound `target_command`.
+- The blocking bridge now also exposes generation- and revision-bound target commands, so migrated synchronous callers can use the live target graph without creating a per-target socket.
 - Runtime route history is persisted in SQLite and feeds conservative deterministic route scoring after safety gates.
 - OBS uses a persistent authenticated WebSocket client.
 - LibreOffice uses a persistent UNO connection and exact document identity.
