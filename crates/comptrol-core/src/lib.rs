@@ -5907,7 +5907,7 @@ fn doctor(runtime: &Runtime) -> Value {
             "blender": "offline_only_live_pending"
         },
         "workflow": { "typed_ir": "implemented", "parameter_lifting": "implemented", "clean_replay_promotion": "planned" },
-        "route_statistics": { "durable": "implemented", "planner_feedback": "planned" },
+        "route_statistics": { "durable": "implemented", "planner_feedback": "implemented", "latency": "implemented" },
         "client_configuration": integration::list(),
         "remote": { "available": false, "binding": "loopback_only" },
         "state_dir": state_dir()
@@ -6060,6 +6060,34 @@ mod tests {
             0
         );
         assert!(result.data["route_plan"]["candidates"][0]["utility"].is_number());
+    }
+
+    #[test]
+    fn route_history_survives_runtime_restart() {
+        let path = std::env::temp_dir().join(format!("comptrol-route-stats-{}", now_ms()));
+        {
+            let mut first = Runtime::new(path.clone()).expect("first runtime");
+            let result = first.operate(OperationRequest {
+                intent: "system.ping".to_owned(),
+                target: None,
+                params: Value::Null,
+                postcondition: None,
+                risk: None,
+                idempotency_key: Some("route-stats-ping".to_owned()),
+                dry_run: false,
+                background: None,
+            });
+            assert_eq!(result.verification, VerificationState::Verified);
+        }
+        let mut second = Runtime::new(path).expect("restarted runtime");
+        let stats = second.inspect("route_stats");
+        let native = stats["routes"]
+            .as_array()
+            .and_then(|routes| routes.iter().find(|route| route["route"] == "native"))
+            .expect("native route stats");
+        assert!(native["attempts"].as_u64().unwrap_or_default() >= 1);
+        assert!(native["verified_successes"].as_u64().unwrap_or_default() >= 1);
+        assert!(native["p95_latency_ms"].is_number());
     }
 
     #[test]
