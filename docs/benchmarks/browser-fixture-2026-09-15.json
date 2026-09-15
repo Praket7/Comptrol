@@ -2,7 +2,7 @@
   "suite": "browser_fixture_verified_task",
   "verified_success": true,
   "verification": "verified",
-  "latency_ms": 268.793,
+  "latency_ms": 319.639,
   "mcp_calls": 20,
   "steps": 3,
   "bytes_in": 6000,
