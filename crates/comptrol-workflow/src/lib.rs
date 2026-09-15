@@ -119,7 +119,9 @@ impl WorkflowHostStore {
         let mut host = self.load()?;
         host.workflows.insert(workflow.id.clone(), workflow);
         let bytes = serde_json::to_vec_pretty(&host).map_err(io::Error::other)?;
-        let temporary = self.path.with_extension(format!("tmp-{}", std::process::id()));
+        let temporary = self
+            .path
+            .with_extension(format!("tmp-{}", std::process::id()));
         let mut file = fs::File::create(&temporary)?;
         use std::io::Write;
         file.write_all(&bytes)?;
