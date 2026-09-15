@@ -74,7 +74,7 @@ The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.049 ms
 
 ## Distribution status
 
-The `comptrolling@0.1.12` npm package is published with native binaries for Linux x64 and ARM64, macOS x64 and ARM64, and Windows x64. The `v0.1.12` GitHub release is published with 16 verified archives, checksums, SBOMs, and the generated Homebrew formula. The release and validate workflows both passed for tag `v0.1.12`. Detached signing remains opt-in because no operator signing identity was supplied. The fast verified work is pushed to `feat/fast-verified-execution-v3`; the release tag points to its release commit.
+The `comptrolling@0.1.14` npm package is published with native binaries for Linux x64 and ARM64, macOS x64 and ARM64, and Windows x64. The `v0.1.14` GitHub release is published with 16 verified archives, checksums, SBOMs, and the generated Homebrew formula. The release and validate workflows both passed for tag `v0.1.14`. Detached signing remains opt-in because no operator signing identity was supplied. The fast verified work is pushed to `feat/fast-verified-execution-v3`; the release tag points to its release commit. GitHub Dependency Graph is disabled for this repository, so dependency review reports a warning while RustSec `cargo-audit` remains enforced by the security workflow.
 
 ## Remaining issues ordered by impact
 
