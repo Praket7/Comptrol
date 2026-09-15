@@ -255,6 +255,100 @@ pub struct RouteCandidate {
     pub route: String,
     pub feasible: bool,
     pub rationale: String,
+    #[serde(default)]
+    pub historical_success: f64,
+    #[serde(default)]
+    pub expected_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub expected_model_turns: u32,
+    #[serde(default)]
+    pub expected_context_bytes: u64,
+    #[serde(default)]
+    pub verification_strength: String,
+    #[serde(default)]
+    pub disturbance_class: String,
+    #[serde(default)]
+    pub reversibility: String,
+    #[serde(default)]
+    pub target_binding: String,
+    #[serde(default)]
+    pub utility: Option<f64>,
+}
+
+impl RouteCandidate {
+    fn new(route: &str, feasible: bool, rationale: String) -> Self {
+        let (
+            expected_p95_ms,
+            expected_model_turns,
+            expected_context_bytes,
+            verification_strength,
+            disturbance_class,
+            reversibility,
+            target_binding,
+        ) = match route {
+            "native" | "workflow" => (
+                Some(5.0),
+                0,
+                512,
+                "application_state",
+                "none",
+                "reversible",
+                "exact",
+            ),
+            "browser_protocol" => (
+                Some(80.0),
+                0,
+                2_048,
+                "surface_state",
+                "background",
+                "partial",
+                "target_bound",
+            ),
+            "isolated_adapter" => (
+                Some(120.0),
+                0,
+                1_024,
+                "application_state",
+                "background",
+                "partial",
+                "resource_bound",
+            ),
+            _ => (
+                None,
+                0,
+                4_096,
+                "delivery",
+                "foreground_possible",
+                "unknown",
+                "discovered",
+            ),
+        };
+        let utility = feasible.then(|| {
+            let verification = match verification_strength {
+                "independent_outcome" => 1.0,
+                "persisted_artifact" => 0.95,
+                "application_state" => 0.85,
+                "surface_state" => 0.65,
+                _ => 0.35,
+            };
+            let latency_penalty: f64 = expected_p95_ms.unwrap_or(1_000.0) / 1_000.0;
+            (0.55 * verification) + (0.3 * (1.0 - latency_penalty.min(1.0))) + (0.15 * 1.0)
+        });
+        Self {
+            route: route.to_owned(),
+            feasible,
+            rationale,
+            historical_success: 0.5,
+            expected_p95_ms,
+            expected_model_turns,
+            expected_context_bytes,
+            verification_strength: verification_strength.to_owned(),
+            disturbance_class: disturbance_class.to_owned(),
+            reversibility: reversibility.to_owned(),
+            target_binding: target_binding.to_owned(),
+            utility,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1796,24 +1890,24 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
         return RoutePlan {
             intent: intent.to_owned(),
             selected: None,
-            candidates: vec![RouteCandidate {
-                route: "none".to_owned(),
-                feasible: false,
-                rationale: "No registered route exists for this intent".to_owned(),
-            }],
+            candidates: vec![RouteCandidate::new(
+                "none",
+                false,
+                "No registered route exists for this intent".to_owned(),
+            )],
             rationale: format!("No registered route exists for {intent}"),
         };
     };
 
-    let mut candidates = vec![RouteCandidate {
-        route: route.to_owned(),
-        feasible: available,
-        rationale: if available {
+    let mut candidates = vec![RouteCandidate::new(
+        route,
+        available,
+        if available {
             base_reason.to_owned()
         } else {
             format!("Rejected: {base_reason}")
         },
-    }];
+    )];
 
     if intent == "browser.cdp.open_tab" {
         let requested_background = params
@@ -1822,10 +1916,12 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
             .unwrap_or(false);
         if background == Some("strict_background") && !requested_background {
             candidates[0].feasible = false;
+            candidates[0].utility = None;
             candidates[0].rationale =
                 "Rejected: strict_background requires params.background=true".to_owned();
         } else if background == Some("foreground_required") && requested_background {
             candidates[0].feasible = false;
+            candidates[0].utility = None;
             candidates[0].rationale =
                 "Rejected: foreground_required conflicts with params.background=true".to_owned();
         }
@@ -5666,6 +5762,11 @@ mod tests {
                 .is_some_and(|value| value.contains("deterministic"))
         );
         assert_eq!(result.data["route_plan"]["candidates"][0]["feasible"], true);
+        assert_eq!(
+            result.data["route_plan"]["candidates"][0]["expected_model_turns"],
+            0
+        );
+        assert!(result.data["route_plan"]["candidates"][0]["utility"].is_number());
     }
 
     #[test]
