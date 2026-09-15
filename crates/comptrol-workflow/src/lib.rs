@@ -105,6 +105,183 @@ pub fn validate_workflow(workflow: &Workflow) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ExecutionError {
+    #[error("workflow node is missing: {0}")]
+    MissingNode(String),
+    #[error("workflow execution exceeded its step budget")]
+    StepBudgetExceeded,
+    #[error("workflow action failed at {node}: {message}")]
+    ActionFailed { node: String, message: String },
+    #[error("workflow verification failed at {node}")]
+    VerificationFailed { node: String },
+    #[error("workflow wait failed at {node}: {message}")]
+    WaitFailed { node: String, message: String },
+}
+
+/// Execute a validated typed workflow without evaluating caller-supplied code.
+///
+/// Application-specific work remains behind callbacks owned by the host. The
+/// executor only controls the closed state-machine transitions and enforces a
+/// finite step budget, so a repaired or malformed workflow cannot run forever.
+pub struct WorkflowExecutor<'a, A, V, W>
+where
+    A: FnMut(&str, &Value) -> Result<Value, String>,
+    V: FnMut(&Value, &Value) -> bool,
+    W: FnMut(&str, u64) -> Result<(), String>,
+{
+    pub action: A,
+    pub verify: V,
+    pub wait: W,
+    pub max_steps: usize,
+    marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, A, V, W> WorkflowExecutor<'a, A, V, W>
+where
+    A: FnMut(&str, &Value) -> Result<Value, String>,
+    V: FnMut(&Value, &Value) -> bool,
+    W: FnMut(&str, u64) -> Result<(), String>,
+{
+    pub fn run(&mut self, workflow: &Workflow) -> Result<Value, ExecutionError> {
+        validate_workflow(workflow).map_err(|message| ExecutionError::ActionFailed {
+            node: workflow.start.clone(),
+            message,
+        })?;
+        let mut current = workflow.start.clone();
+        let mut last = Value::Null;
+        let mut steps = 0usize;
+        let mut loop_counts = BTreeMap::<String, u32>::new();
+        loop {
+            steps = steps.saturating_add(1);
+            if steps > self.max_steps.max(1) {
+                return Err(ExecutionError::StepBudgetExceeded);
+            }
+            let node = workflow
+                .nodes
+                .get(&current)
+                .ok_or_else(|| ExecutionError::MissingNode(current.clone()))?;
+            match node {
+                WorkflowNode::Observe { intent, next } => {
+                    last = (self.action)(intent, &Value::Null).map_err(|message| {
+                        ExecutionError::ActionFailed {
+                            node: current.clone(),
+                            message,
+                        }
+                    })?;
+                    current = next
+                        .clone()
+                        .ok_or_else(|| ExecutionError::MissingNode(current.clone()))?;
+                }
+                WorkflowNode::Act {
+                    intent,
+                    params,
+                    next,
+                } => {
+                    last = (self.action)(intent, params).map_err(|message| {
+                        ExecutionError::ActionFailed {
+                            node: current.clone(),
+                            message,
+                        }
+                    })?;
+                    current = next
+                        .clone()
+                        .ok_or_else(|| ExecutionError::MissingNode(current.clone()))?;
+                }
+                WorkflowNode::Assert { condition, next } => {
+                    if !(self.verify)(condition, &last) {
+                        return Err(ExecutionError::VerificationFailed { node: current });
+                    }
+                    current = next
+                        .clone()
+                        .ok_or_else(|| ExecutionError::MissingNode(current.clone()))?;
+                }
+                WorkflowNode::Verify { criterion, next } => {
+                    if !(self.verify)(criterion, &last) {
+                        return Err(ExecutionError::VerificationFailed { node: current });
+                    }
+                    current = next
+                        .clone()
+                        .ok_or_else(|| ExecutionError::MissingNode(current.clone()))?;
+                }
+                WorkflowNode::Wait {
+                    event,
+                    timeout_ms,
+                    next,
+                } => {
+                    (self.wait)(event, *timeout_ms).map_err(|message| {
+                        ExecutionError::WaitFailed {
+                            node: current.clone(),
+                            message,
+                        }
+                    })?;
+                    current = next
+                        .clone()
+                        .ok_or_else(|| ExecutionError::MissingNode(current.clone()))?;
+                }
+                WorkflowNode::Checkpoint { next, .. } => {
+                    current = next
+                        .clone()
+                        .ok_or_else(|| ExecutionError::MissingNode(current.clone()))?;
+                }
+                WorkflowNode::Branch {
+                    if_true,
+                    if_false,
+                    condition,
+                } => {
+                    current = if (self.verify)(condition, &last) {
+                        if_true.clone()
+                    } else {
+                        if_false.clone()
+                    };
+                }
+                WorkflowNode::Loop {
+                    body,
+                    next,
+                    max_iterations,
+                } => {
+                    let count = loop_counts.entry(current.clone()).or_default();
+                    if *count >= *max_iterations {
+                        current = next
+                            .clone()
+                            .ok_or_else(|| ExecutionError::MissingNode(current.clone()))?;
+                    } else {
+                        *count += 1;
+                        current = body.clone();
+                    }
+                }
+                WorkflowNode::ParallelRead { nodes, next } => {
+                    for node_id in nodes {
+                        let observe = workflow
+                            .nodes
+                            .get(node_id)
+                            .ok_or_else(|| ExecutionError::MissingNode(node_id.clone()))?;
+                        if let WorkflowNode::Observe { intent, .. } = observe {
+                            last = (self.action)(intent, &Value::Null).map_err(|message| {
+                                ExecutionError::ActionFailed {
+                                    node: node_id.clone(),
+                                    message,
+                                }
+                            })?;
+                        } else {
+                            return Err(ExecutionError::ActionFailed {
+                                node: node_id.clone(),
+                                message: "parallel_read accepts Observe nodes only".to_owned(),
+                            });
+                        }
+                    }
+                    current = next
+                        .clone()
+                        .ok_or_else(|| ExecutionError::MissingNode(current.clone()))?;
+                }
+                WorkflowNode::Return { value } => {
+                    return Ok(if value.is_null() { last } else { value.clone() });
+                }
+            }
+        }
+    }
+}
+
 fn node_edges(node: &WorkflowNode) -> Vec<&str> {
     match node {
         WorkflowNode::Observe { next, .. }
@@ -264,5 +441,55 @@ mod tests {
         );
         let workflow = Workflow { nodes, ..workflow };
         assert!(validate_workflow(&workflow).is_err());
+    }
+
+    #[test]
+    fn executor_runs_typed_action_and_verification_before_return() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            "act".to_owned(),
+            WorkflowNode::Act {
+                intent: "fixture.write".to_owned(),
+                params: serde_json::json!({"value": 7}),
+                next: Some("verify".to_owned()),
+            },
+        );
+        nodes.insert(
+            "verify".to_owned(),
+            WorkflowNode::Verify {
+                criterion: serde_json::json!({"value": 7}),
+                next: Some("return".to_owned()),
+            },
+        );
+        nodes.insert(
+            "return".to_owned(),
+            WorkflowNode::Return { value: Value::Null },
+        );
+        let workflow = Workflow {
+            id: "fixture".to_owned(),
+            version: 1,
+            intent: "fixture.write".to_owned(),
+            parameters: Vec::new(),
+            fingerprint: "sha256:test".to_owned(),
+            start: "act".to_owned(),
+            nodes,
+        };
+        let mut calls = 0;
+        let mut executor = WorkflowExecutor {
+            action: |intent: &str, params: &Value| {
+                calls += 1;
+                assert_eq!(intent, "fixture.write");
+                Ok(params.clone())
+            },
+            verify: |criterion: &Value, observed: &Value| criterion == observed,
+            wait: |_event: &str, _timeout: u64| Ok(()),
+            max_steps: 10,
+            marker: std::marker::PhantomData,
+        };
+        assert_eq!(
+            executor.run(&workflow).unwrap(),
+            serde_json::json!({"value": 7})
+        );
+        assert_eq!(calls, 1);
     }
 }
