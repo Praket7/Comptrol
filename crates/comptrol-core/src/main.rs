@@ -1168,10 +1168,10 @@ fn run_daemon() -> i32 {
                     || GetLastError() == ERROR_PIPE_CONNECTED
             };
             let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
-            if connected {
-                if let Err(error) = handle_ipc_connection(&mut stream, &mut runtime, &mut tasks) {
-                    eprintln!("daemon connection failed: {error}");
-                }
+            if connected
+                && let Err(error) = handle_ipc_connection(&mut stream, &mut runtime, &mut tasks)
+            {
+                eprintln!("daemon connection failed: {error}");
             }
         }
     }

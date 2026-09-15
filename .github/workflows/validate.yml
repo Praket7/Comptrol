@@ -35,4 +35,6 @@ jobs:
       - run: python3 scripts/lint_readme.py
       - run: npm run test:browser
       - run: python3 scripts/client_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
       - run: python3 scripts/generate_homebrew_formula.py --version 0.1.0 --url https://example.invalid/comptrol.tar.gz --sha256 0000000000000000000000000000000000000000000000000000000000000000 --output /tmp/comptrol.rb
