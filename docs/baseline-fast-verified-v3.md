@@ -41,4 +41,4 @@ This document is a baseline, not a performance claim. The warm MCP number measur
 
 ## Current measured evidence
 
-The v0.1.32 browser fixture benchmark lineage records one browser WebSocket and one page WebSocket across 17 MCP calls, three compiled workflow steps, five target-list requests, five protocol events, zero retries, zero false-positive verifications, untouched mouse and clipboard state, and verified fixture state. The raw result is retained at `docs/benchmarks/browser-fixture-2026-09-15.json`. This remains a fixture measurement and is not a matched comparison against native ChatGPT computer use or another MCP.
+The v0.1.32 browser fixture benchmark lineage records one browser WebSocket and one page WebSocket across 20 MCP calls, three compiled workflow steps, five target-list requests, five protocol events, zero retries, zero false-positive verifications, untouched mouse and clipboard state, and verified fixture state. The raw result is retained at `docs/benchmarks/browser-fixture-2026-09-15.json`. This remains a fixture measurement and is not a matched comparison against native ChatGPT computer use or another MCP.

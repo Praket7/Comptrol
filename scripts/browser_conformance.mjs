@@ -73,6 +73,16 @@ try {
     const cdp = await response(4, { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.evaluate", idempotency_key: "cdp-evaluate", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, expression: "document.title" } } } })
     assert.equal(cdp.result.structuredContent.verification, "verified")
     assert.equal(cdp.result.structuredContent.data.result.value, "Comptrol browser fixture")
+    const repeatEvaluations = [
+      [52, "cdp-evaluate-repeat-title", "document.title", "Comptrol browser fixture"],
+      [53, "cdp-evaluate-repeat-title-2", "document.title", "Comptrol browser fixture"],
+      [54, "cdp-evaluate-repeat-title-3", "document.title", "Comptrol browser fixture"],
+    ]
+    for (const [id, idempotency_key, expression, expected] of repeatEvaluations) {
+      const repeated = await response(id, { jsonrpc: "2.0", id, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.evaluate", idempotency_key, params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, expression } } } })
+      assert.equal(repeated.result.structuredContent.verification, "verified", JSON.stringify(repeated))
+      assert.equal(repeated.result.structuredContent.data.result.value, expected)
+    }
     const semanticClick = await response(45, { jsonrpc: "2.0", id: 45, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.semantic_click", idempotency_key: "semantic-click-dynamic", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, locator: { role: "button", name: "Add dynamic node" }, timeout_ms: 1500 } } } })
     assert.equal(semanticClick.result.structuredContent.verification, "verified", JSON.stringify(semanticClick))
     const shadowClick = await response(48, { jsonrpc: "2.0", id: 48, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.semantic_click", idempotency_key: "semantic-click-shadow", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, locator: { role: "button", name: "Shadow action" }, timeout_ms: 1500 } } } })
