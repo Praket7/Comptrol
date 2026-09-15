@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "comptrol-adapter-host",
  "comptrol-adapter-sdk",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-adapter-host"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "comptrol-adapter-sdk",
  "getrandom 0.3.4",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-adapter-sdk"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "serde",
  "serde_json",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-browser"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "futures-util",
  "serde",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-platform-linux"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "atspi",
  "serde_json",
@@ -352,14 +352,14 @@ dependencies = [
 
 [[package]]
 name = "comptrol-platform-macos"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "comptrol-platform-windows"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "serde_json",
  "windows",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-verification"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "serde",
  "serde_json",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-workflow"
-version = "0.1.37"
+version = "0.1.38"
 dependencies = [
  "serde",
  "serde_json",

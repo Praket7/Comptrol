@@ -11,6 +11,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: comptrol-release
+  cancel-in-progress: true
+
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
