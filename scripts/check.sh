@@ -6,6 +6,7 @@ cargo build
 python3 scripts/lint_readme.py
 npm run test:browser
 npm run test:launcher
+npm run test:daemon-launcher
 python3 scripts/client_conformance.py
 python3 scripts/progress_conformance.py
 python3 scripts/tasks_conformance.py

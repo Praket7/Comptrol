@@ -6,6 +6,7 @@
   "scripts": {
     "test:browser": "node scripts/browser_conformance.mjs",
     "test:launcher": "node scripts/launcher_conformance.mjs",
+    "test:daemon-launcher": "node scripts/daemon_launcher_conformance.mjs",
     "benchmark:local": "python3 scripts/benchmark.py"
   },
   "workspaces": ["packages/mcp"]
