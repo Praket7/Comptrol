@@ -1,0 +1,12 @@
+[package]
+name = "comptrol-adapter-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bounded out of process host for Comptrol application adapters"
+
+[dependencies]
+comptrol-adapter-sdk = { path = "../comptrol-adapter-sdk" }
+getrandom = "0.3"
+serde_json = "1"
+

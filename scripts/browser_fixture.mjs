@@ -13,7 +13,9 @@ let websocketConnections = 0
 let browserWebsocketConnections = 0
 let pageWebsocketConnections = 0
 let targetListRequests = 0
+let protocolEvents = 0
 let fixtureHistoryIndex = 1
+let fixtureUrl = `http://127.0.0.1:${port}/`
 const fixtureHistory = [
   { id: 1, url: "http://127.0.0.1:17417/previous" },
   { id: 2, url: "http://127.0.0.1:17417/" },
@@ -65,7 +67,7 @@ const server = createServer(async (request, response) => {
   }
   if (request.method === "GET" && request.url === "/json/list") {
     targetListRequests += 1
-    json(response, 200, [{ id: targetId, type: "page", title: "Comptrol browser fixture", url: `http://127.0.0.1:${port}/`, browserContextId, revision, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${targetId}` }, ...openedTabs.values()])
+    json(response, 200, [{ id: targetId, type: "page", title: "Comptrol browser fixture", url: fixtureUrl, browserContextId, revision, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${targetId}` }, ...openedTabs.values()])
     return
   }
   if (request.method === "GET" && request.url === "/state") {
@@ -73,7 +75,7 @@ const server = createServer(async (request, response) => {
     return
   }
   if (request.method === "GET" && request.url === "/metrics") {
-    json(response, 200, { websocketConnections, browserWebsocketConnections, pageWebsocketConnections, targetListRequests })
+    json(response, 200, { websocketConnections, browserWebsocketConnections, pageWebsocketConnections, targetListRequests, protocolEvents })
     return
   }
   if (request.method === "GET" && request.url === "/download/fixture.txt") {
@@ -189,19 +191,22 @@ server.on("upgrade", (request, socket) => {
             : { result: { type: "string", value: "fixture evaluation" } }
         : message.method === "Page.getNavigationHistory"
           ? { currentIndex: fixtureHistoryIndex, entries: fixtureHistory }
-          : message.method === "Page.navigateToHistoryEntry"
-            ? (fixtureHistoryIndex = fixtureHistory.findIndex(entry => entry.id === message.params.entryId), {})
+      : message.method === "Page.navigateToHistoryEntry"
+            ? (fixtureHistoryIndex = fixtureHistory.findIndex(entry => entry.id === message.params.entryId), fixtureUrl = fixtureHistory[fixtureHistoryIndex]?.url || fixtureUrl, {})
         : message.method === "Page.navigate"
-          ? { frameId: "fixture-frame" }
+          ? (fixtureUrl = message.params.url, { frameId: "fixture-frame" })
           : {}
     const event = browserSocket && message.method === "Target.createTarget"
       ? { method: "Target.targetCreated", params: { targetInfo: { targetId: result.targetId } } }
       : browserSocket && message.method === "Target.closeTarget"
         ? { method: "Target.targetDestroyed", params: { targetId: message.params.targetId } }
-        : message.method === "Page.navigateToHistoryEntry"
-          ? { method: "Page.frameNavigated", params: { frame: { id: "fixture-frame", url: fixtureHistory[fixtureHistoryIndex]?.url || "about:blank" } } }
+        : message.method === "Page.navigateToHistoryEntry" || message.method === "Page.navigate"
+          ? { method: "Page.frameNavigated", params: { frame: { id: "fixture-frame", url: fixtureUrl } } }
         : null
-    if (event) socket.write(websocketFrame(JSON.stringify(event)))
+    if (event) {
+      protocolEvents += 1
+      socket.write(websocketFrame(JSON.stringify(event)))
+    }
     socket.write(websocketFrame(JSON.stringify({ id: message.id, result })))
   })
 })

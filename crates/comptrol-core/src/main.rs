@@ -4,6 +4,7 @@ use comptrol::{
     integration, pairing::PairingStore, privacy_network_endpoints, privacy_status, read_trace,
     validate_compiled_workflow,
 };
+use comptrol_adapter_sdk::AdapterManifest;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -645,6 +646,7 @@ fn main() {
         Some("record") => run_record(env::args().skip(2).collect()),
         Some("replay") => run_replay(env::args().skip(2).collect()),
         Some("workflow") => run_workflow(env::args().skip(2).collect()),
+        Some("adapter") => run_adapter(env::args().skip(2).collect()),
         Some("integrate") => run_integrate(env::args().skip(2).collect()),
         Some("pair") => run_pair(env::args().skip(2).collect()),
         Some("privacy") => run_privacy(env::args().skip(2).collect()),
@@ -655,7 +657,7 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor status capabilities stop resume serve-http daemon daemon-health record replay workflow integrate pair privacy version"
+                "commands are mcp doctor status capabilities stop resume serve-http daemon daemon-health record replay workflow adapter integrate pair privacy version"
             );
             2
         }
@@ -2259,6 +2261,87 @@ fn run_workflow(args: Vec<String>) -> i32 {
             eprintln!(
                 "workflow commands: compile <trace.jsonl> <workflow-id> | validate <workflow.json> [observed-json]"
             );
+            2
+        }
+    }
+}
+
+fn run_adapter(args: Vec<String>) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("validate") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("adapter validate needs an adapter.toml path");
+                return 2;
+            };
+            match std::fs::read_to_string(path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    AdapterManifest::from_toml(&text).map_err(|error| error.to_string())
+                }) {
+                Ok(manifest) => {
+                    println!(
+                        "{}",
+                        json!({"valid": true, "id": manifest.id, "version": manifest.version, "capabilities": manifest.capabilities.len()})
+                    );
+                    0
+                }
+                Err(error) => {
+                    println!("{}", json!({"valid": false, "error": error}));
+                    1
+                }
+            }
+        }
+        Some("scaffold") => {
+            let Some(name) = args.get(1) else {
+                eprintln!("adapter scaffold needs a lowercase adapter name");
+                return 2;
+            };
+            if name.is_empty()
+                || name.chars().any(|character| {
+                    !(character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || character == '-')
+                })
+            {
+                eprintln!(
+                    "adapter name must contain only lowercase ASCII letters, digits, and hyphens"
+                );
+                return 2;
+            }
+            let root = env::var_os("COMPTROL_ADAPTER_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("adapters"));
+            let directory = root.join(name);
+            if directory.exists() {
+                eprintln!("adapter directory already exists: {}", directory.display());
+                return 1;
+            }
+            if let Err(error) = std::fs::create_dir_all(directory.join("src")) {
+                eprintln!("adapter scaffold failed: {error}");
+                return 1;
+            }
+            let manifest = format!(
+                "manifest_version = 1\nid = \"comptrol.{name}\"\nname = \"{name}\"\nversion = \"0.1.0\"\nplatforms = [\"windows\", \"macos\", \"linux\"]\napplications = [\"{name}\"]\n\n[isolation]\nmode = \"out_of_process\"\nnetwork = \"loopback_only\"\nfilesystem = \"declared_scopes\"\n\n[[capabilities]]\nintent = \"{name}.observe\"\nrisk = \"R0\"\nbackground = \"supported\"\nverification = \"application_state\"\n"
+            );
+            let files = [
+                ("adapter.toml", manifest),
+                ("README.md", format!("# {name} adapter\n\nDescribe the real application backend and its support boundary here.\n")),
+                ("VERIFY.md", "# Verification contract\n\nDocument an independent postcondition for every capability.\n".to_owned()),
+                ("SUPPORT.md", "# Support boundary\n\nDocument supported versions, platforms, and explicit refusals.\n".to_owned()),
+                ("THREAT_MODEL.md", "# Threat model\n\nDocument isolation, capabilities, resource scopes, and failure behavior.\n".to_owned()),
+                ("src/adapter.py", "#!/usr/bin/env python3\n# Implement the bounded adapter RPC protocol before advertising capabilities.\n".to_owned()),
+            ];
+            for (relative, content) in files {
+                if let Err(error) = std::fs::write(directory.join(relative), content) {
+                    eprintln!("adapter scaffold failed while writing {relative}: {error}");
+                    return 1;
+                }
+            }
+            println!("{}", json!({"scaffolded": true, "path": directory}));
+            0
+        }
+        _ => {
+            eprintln!("adapter commands: validate <adapter.toml> | scaffold <name>");
             2
         }
     }

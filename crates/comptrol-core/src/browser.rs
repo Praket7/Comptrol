@@ -6,6 +6,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
@@ -468,6 +469,70 @@ pub fn history(
     })
 }
 
+/// Wait for a navigation event on the already-bound target, then verify the
+/// final URL from a fresh target observation. This avoids interval polling in
+/// compact workflows while preserving exact target identity at the finish gate.
+pub fn wait_for_url(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    contains: &str,
+    timeout: Duration,
+) -> Result<Value, ComptrolError> {
+    if contains.is_empty() || contains.chars().any(|character| character.is_control()) {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "URL postconditions must contain non-control text".to_owned(),
+            recovery: None,
+        });
+    }
+    let targets = discover_cached(endpoint)?;
+    let target = crate::bind_browser_target(&targets, target_id, Some(browser_context_id), None)?;
+    if target
+        .url
+        .as_deref()
+        .is_some_and(|url| url.contains(contains))
+    {
+        return Ok(json!({
+            "url": target.url,
+            "wait": "state_observation",
+            "verified": true
+        }));
+    }
+    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
+        code: "browser_protocol_invalid".to_owned(),
+        message: "The target did not provide a websocket debugger URL".to_owned(),
+        recovery: Some("Inspect browser targets again".to_owned()),
+    })?;
+    let event = wait_for_event(&web_socket_url, timeout, |event| {
+        let method = event.get("method").and_then(Value::as_str);
+        matches!(
+            method,
+            Some("Page.frameNavigated") | Some("Page.navigatedWithinDocument")
+        )
+    })?;
+    invalidate_target_cache(endpoint);
+    let observed = discover(endpoint)?;
+    let bound = crate::bind_browser_target(&observed, target_id, Some(browser_context_id), None)?;
+    if bound
+        .url
+        .as_deref()
+        .is_some_and(|url| url.contains(contains))
+    {
+        return Ok(json!({
+            "url": bound.url,
+            "event": event,
+            "wait": "protocol_event",
+            "verified": true
+        }));
+    }
+    Err(ComptrolError {
+        code: "verification_failed".to_owned(),
+        message: format!("Browser URL did not contain {contains}"),
+        recovery: Some("Inspect the target and retry with a bounded postcondition".to_owned()),
+    })
+}
+
 fn protocol_call(
     web_socket_url: &str,
     method: &str,
@@ -602,7 +667,29 @@ where
             }
             set_socket_read_timeout(&mut session.socket, Some(remaining))
                 .map_err(browser_io_error)?;
-            let message = session.socket.read().map_err(browser_response_error)?;
+            let message = match session.socket.read() {
+                Ok(message) => message,
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(ComptrolError {
+                            code: "verification_failed".to_owned(),
+                            message: "The browser did not emit the expected protocol event in time"
+                                .to_owned(),
+                            recovery: Some(
+                                "Inspect the exact browser target before retrying".to_owned(),
+                            ),
+                        });
+                    }
+                    thread::yield_now();
+                    continue;
+                }
+                Err(error) => return Err(browser_response_error(error)),
+            };
             let Message::Text(text) = message else {
                 continue;
             };

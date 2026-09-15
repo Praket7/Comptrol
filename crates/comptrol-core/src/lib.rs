@@ -9,6 +9,8 @@ pub mod integration;
 pub mod pairing;
 pub mod trace;
 
+use comptrol_adapter_host::{AdapterHost, AdapterHostConfig};
+use comptrol_adapter_sdk::{AdapterManifest, HealthState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
@@ -29,8 +31,46 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.23";
+pub const SERVER_VERSION: &str = "0.1.24";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
+
+const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
+    "vscode.workspace.list",
+    "vscode.setting.get",
+    "vscode.setting.set",
+    "vscode.document.open",
+    "vscode.document.save",
+    "libreoffice.document.open",
+    "libreoffice.document.save",
+    "libreoffice.calc.range.read",
+    "libreoffice.calc.range.write",
+    "libreoffice.writer.text.replace",
+    "obs.scene.list",
+    "obs.scene.switch",
+    "obs.source.visibility.set",
+    "obs.recording.status",
+    "obs.recording.start",
+    "obs.recording.stop",
+    "blender.scene.object.list",
+    "blender.scene.object.create",
+    "blender.scene.object.transform",
+    "blender.project.save",
+    "blender.render",
+];
+
+fn is_first_party_adapter_intent(intent: &str) -> bool {
+    FIRST_PARTY_ADAPTER_INTENTS.contains(&intent)
+}
+
+fn adapter_id_for_intent(intent: &str) -> Option<&'static str> {
+    match intent.split('.').next()? {
+        "vscode" => Some("vscode"),
+        "libreoffice" => Some("libreoffice"),
+        "obs" => Some("obs"),
+        "blender" => Some("blender"),
+        _ => None,
+    }
+}
 
 pub fn privacy_status() -> Value {
     json!({
@@ -437,6 +477,23 @@ impl Policy {
                 .allowed_intents
                 .insert("browser.chrome.open_tab".to_owned());
         }
+        if env_enabled("COMPTROL_ALLOW_ADAPTERS") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            for intent in FIRST_PARTY_ADAPTER_INTENTS {
+                if classify(intent) <= Risk::R2 {
+                    policy.allowed_intents.insert((*intent).to_owned());
+                }
+            }
+            if env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS") {
+                policy.max_risk = policy.max_risk.max(Risk::R3);
+                policy
+                    .allowed_intents
+                    .insert("obs.recording.start".to_owned());
+                policy
+                    .allowed_intents
+                    .insert("obs.recording.stop".to_owned());
+            }
+        }
         policy
     }
 
@@ -724,6 +781,7 @@ pub struct Runtime {
     pub events: EventBus,
     pub trace: Option<TraceRecorder>,
     pub stop: StopLatch,
+    adapter_hosts: HashMap<String, AdapterHost>,
     idempotent: HashMap<String, ActionResult>,
     sequence: u64,
 }
@@ -769,6 +827,7 @@ impl Runtime {
             events: EventBus::default(),
             trace,
             stop: StopLatch::new(&state_dir),
+            adapter_hosts: HashMap::new(),
             idempotent,
             sequence: 0,
         })
@@ -961,6 +1020,9 @@ impl Runtime {
             | "browser.cdp.workflow"
             | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
+            intent if is_first_party_adapter_intent(intent) => {
+                execute_adapter_request(self, &request, operation_id)
+            }
             _ => ActionResult::refused(
                 &request,
                 operation_id,
@@ -1244,10 +1306,218 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.history_forward"
         | "browser.cdp.semantic_click" => Risk::R2,
         "browser.cdp.workflow" => Risk::R2,
+        "obs.recording.start" | "obs.recording.stop" => Risk::R3,
+        intent if is_first_party_adapter_intent(intent) => Risk::R2,
         "browser.cdp.wait_for"
         | "browser.cdp.accessibility_snapshot"
         | "browser.cdp.reopen_closed_group" => Risk::R0,
         _ => Risk::R2,
+    }
+}
+
+fn execute_adapter_request(
+    runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    let Some(adapter_name) = adapter_id_for_intent(&request.intent) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "adapter_unavailable".to_owned(),
+                message: "The adapter intent has no registered first party adapter".to_owned(),
+                recovery: Some("Inspect adapter descriptors and use a supported intent".to_owned()),
+            },
+        );
+    };
+    let root = std::env::var_os("COMPTROL_ADAPTER_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("adapters"));
+    let manifest_path = root.join(adapter_name).join("adapter.toml");
+    let manifest_text = match fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_unavailable".to_owned(),
+                    message: format!("Adapter manifest could not be read: {error}"),
+                    recovery: Some(
+                        "Configure COMPTROL_ADAPTER_ROOT with the adapter bundle".to_owned(),
+                    ),
+                },
+            );
+        }
+    };
+    let manifest = match AdapterManifest::from_toml(&manifest_text) {
+        Ok(manifest) if manifest.declares(&request.intent) => manifest,
+        Ok(_) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_capability_undeclared".to_owned(),
+                    message: format!("Adapter {adapter_name} does not declare {}", request.intent),
+                    recovery: Some("Use the adapter's declared capability set".to_owned()),
+                },
+            );
+        }
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_manifest_invalid".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some(
+                        "Repair and validate adapter.toml before enabling the route".to_owned(),
+                    ),
+                },
+            );
+        }
+    };
+    if !runtime.adapter_hosts.contains_key(adapter_name) {
+        let python = std::env::var_os("COMPTROL_ADAPTER_PYTHON")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(if cfg!(windows) {
+                    "python.exe"
+                } else {
+                    "python3"
+                })
+            });
+        let script = root.join(adapter_name).join("src").join("adapter.py");
+        let config = AdapterHostConfig {
+            manifest,
+            executable: python,
+            arguments: vec![script.to_string_lossy().into_owned()],
+            instance_id: format!("{adapter_name}-{operation_id}"),
+            max_frame_bytes: comptrol_adapter_sdk::MAX_FRAME_BYTES,
+        };
+        let mut host = match AdapterHost::spawn(config) {
+            Ok(host) => host,
+            Err(error) => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "adapter_unavailable".to_owned(),
+                        message: error.to_string(),
+                        recovery: Some(
+                            "Install the adapter runtime and inspect adapter health".to_owned(),
+                        ),
+                    },
+                );
+            }
+        };
+        if let Err(error) = host.handshake() {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_handshake_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some(
+                        "Inspect the isolated adapter process before retrying".to_owned(),
+                    ),
+                },
+            );
+        }
+        runtime.adapter_hosts.insert(adapter_name.to_owned(), host);
+    }
+    let Some(host) = runtime.adapter_hosts.get_mut(adapter_name) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "adapter_unavailable".to_owned(),
+                message: "The adapter host was not retained".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let resource = request
+        .params
+        .get("resource")
+        .and_then(Value::as_str)
+        .unwrap_or("application")
+        .to_owned();
+    let token = match host.capability_token(&request.intent, &resource, &operation_id, 30_000) {
+        Ok(token) => token,
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_capability_denied".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Inspect the adapter manifest and resource scope".to_owned()),
+                },
+            );
+        }
+    };
+    let mut payload = request.params.clone();
+    if !payload.is_object() {
+        payload = json!({});
+    }
+    payload["intent"] = json!(request.intent);
+    match host.request("execute", &resource, payload, Some(token)) {
+        Ok(response) if response.ok && response.health == HealthState::Available => {
+            let verified = response
+                .payload
+                .get("verified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            success(
+                request,
+                operation_id,
+                &format!("adapter.{adapter_name}"),
+                EffectState::Changed,
+                if verified {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                json!({"adapter": adapter_name, "health": response.health, "payload": response.payload, "verified": verified}),
+            )
+        }
+        Ok(response) => ActionResult {
+            operation_id,
+            intent: request.intent.clone(),
+            route: format!("adapter.{adapter_name}"),
+            target: request.target.clone(),
+            preflight: "passed".to_owned(),
+            delivery: DeliveryState::Delivered,
+            effect: EffectState::NotAttempted,
+            verification: VerificationState::NotAttempted,
+            disturbance: json!({ "foreground_changed": false, "mouse": "untouched", "clipboard": "untouched" }),
+            recovery: RecoveryState::None,
+            data: json!({"adapter": adapter_name, "health": response.health, "payload": response.payload}),
+            error: Some(ComptrolError {
+                code: "adapter_execution_failed".to_owned(),
+                message: response
+                    .error
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "Adapter did not verify the operation".to_owned()),
+                recovery: Some(
+                    "Inspect adapter health and reconcile application state before retrying"
+                        .to_owned(),
+                ),
+            }),
+        },
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "adapter_execution_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some(
+                    "Inspect the adapter process and application state before retrying".to_owned(),
+                ),
+            },
+        ),
     }
 }
 
@@ -1500,6 +1770,12 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
             true,
             "Deterministic local browser fixture route",
         )),
+        value if is_first_party_adapter_intent(value) => Some((
+            "isolated_adapter",
+            env_enabled("COMPTROL_ALLOW_ADAPTERS")
+                && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some(),
+            "First party application adapters require an explicit policy and adapter root",
+        )),
         value if value.starts_with("browser.cdp.") => Some((
             "browser_protocol",
             std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
@@ -1585,6 +1861,10 @@ fn route_catalog() -> Vec<RoutePlan> {
         "linux.atspi.press",
         "macos.ax.press",
         "browser.fixture.submit",
+        "vscode.workspace.list",
+        "libreoffice.calc.range.read",
+        "obs.scene.list",
+        "blender.scene.object.list",
         "browser.cdp.open_tab",
         "browser.cdp.semantic_click",
     ]
@@ -2317,35 +2597,13 @@ fn browser_wait_for_url(
     contains: &str,
     timeout_ms: u64,
 ) -> Result<Value, ComptrolError> {
-    if contains.is_empty() || contains.chars().any(char::is_control) {
-        return Err(ComptrolError {
-            code: "invalid_input".to_owned(),
-            message: "URL postconditions must contain non-control text".to_owned(),
-            recovery: None,
-        });
-    }
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.clamp(100, 30_000));
-    loop {
-        if let Ok(targets) = browser::discover(endpoint)
-            && let Ok(target) =
-                crate::bind_browser_target(&targets, target_id, Some(browser_context_id), None)
-            && target
-                .url
-                .as_deref()
-                .is_some_and(|url| url.contains(contains))
-        {
-            return Ok(json!({"url": target.url, "verified": true}));
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    Err(ComptrolError {
-        code: "verification_failed".to_owned(),
-        message: format!("Browser URL did not contain {contains}"),
-        recovery: Some("Inspect the target and retry with a bounded postcondition".to_owned()),
-    })
+    browser::wait_for_url(
+        endpoint,
+        target_id,
+        browser_context_id,
+        contains,
+        Duration::from_millis(timeout_ms.clamp(100, 30_000)),
+    )
 }
 
 fn browser_cdp_dom_action(
@@ -4727,6 +4985,18 @@ pub fn capabilities() -> Vec<Capability> {
             note: "macOS semantic press and value routes require explicit policy and Accessibility permission".to_owned(),
         },
     ];
+    for intent in FIRST_PARTY_ADAPTER_INTENTS {
+        result.push(Capability {
+            name: (*intent).to_owned(),
+            available: env_enabled("COMPTROL_ALLOW_ADAPTERS")
+                && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some()
+                && (!matches!(*intent, "obs.recording.start" | "obs.recording.stop")
+                    || env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS")),
+            risk: classify(intent),
+            route: "isolated_adapter".to_owned(),
+            note: "Runs through a bounded out of process first party adapter and requires application state verification".to_owned(),
+        });
+    }
     result.extend(platform_capabilities());
     result
 }

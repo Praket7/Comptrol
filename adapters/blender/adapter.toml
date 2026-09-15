@@ -1,0 +1,42 @@
+manifest_version = 1
+id = "comptrol.blender"
+name = "Blender"
+version = "0.1.0"
+platforms = ["windows", "macos", "linux"]
+applications = ["blender", "blender.exe", "Blender"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "blender.scene.object.list"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "blender.scene.object.create"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "blender.scene.object.transform"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "blender.project.save"
+risk = "R2"
+background = "supported"
+verification = "persisted_artifact"
+
+[[capabilities]]
+intent = "blender.render"
+risk = "R2"
+background = "supported"
+verification = "persisted_artifact"
+

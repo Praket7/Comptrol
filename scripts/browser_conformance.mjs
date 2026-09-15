@@ -31,7 +31,7 @@ try {
     if (process.platform === "win32" && !binary.toLowerCase().endsWith(".exe")) {
       throw new Error(`COMPTROL_BIN points to a non-Windows binary (${binary}). Run this conformance test from WSL, or build a Windows executable and set COMPTROL_BIN to its .exe path.`)
     }
-    const comptrol = spawn(binary, ["mcp"], { env: { ...process.env, COMPTROL_CDP_ENDPOINT: `http://127.0.0.1:${port}`, COMPTROL_ALLOW_BROWSER_FIXTURE: "1", COMPTROL_ALLOW_BROWSER_CDP: "1", COMPTROL_STATE_DIR: `/tmp/comptrol-browser-${process.pid}` }, stdio: ["pipe", "pipe", "inherit"] })
+    const comptrol = spawn(binary, ["mcp"], { env: { ...process.env, COMPTROL_CDP_ENDPOINT: `http://127.0.0.1:${port}`, COMPTROL_ALLOW_BROWSER_FIXTURE: "1", COMPTROL_ALLOW_BROWSER_CDP: "1", COMPTROL_STATE_DIR: `/tmp/comptrol-browser-${process.pid}-${Date.now()}` }, stdio: ["pipe", "pipe", "inherit"] })
     let buffer = ""
     const response = (id, message) => new Promise((resolve, reject) => {
       const onData = chunk => {
@@ -75,6 +75,8 @@ try {
     const workflow = await response(47, { jsonrpc: "2.0", id: 47, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.workflow", idempotency_key: "browser-workflow", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, steps: [{ action: "click", locator: { role: "button", name: "Add dynamic node" }, timeout_ms: 1000 }] } } } })
     assert.equal(workflow.result.structuredContent.verification, "verified", JSON.stringify(workflow))
     assert.equal(workflow.result.structuredContent.data.step_count, 1)
+    const navigationWorkflow = await response(50, { jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.workflow", idempotency_key: "browser-navigation-workflow", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, steps: [{ action: "navigate", url: `http://127.0.0.1:${port}/next`, url_contains: "/next", timeout_ms: 1000 }, { action: "wait_url", contains: "/next", timeout_ms: 1000 }] } } } })
+    assert.equal(navigationWorkflow.result.structuredContent.verification, "verified", JSON.stringify(navigationWorkflow))
     const snapshot = await response(43, { jsonrpc: "2.0", id: 43, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.accessibility_snapshot", idempotency_key: "accessibility-snapshot", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, depth: 4 } } } })
     assert.equal(snapshot.result.structuredContent.verification, "verified")
     assert.equal(snapshot.result.structuredContent.data.snapshot.nodes[0].name.value, "Comptrol browser fixture")

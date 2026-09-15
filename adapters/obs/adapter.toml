@@ -1,0 +1,48 @@
+manifest_version = 1
+id = "comptrol.obs"
+name = "OBS Studio"
+version = "0.1.0"
+platforms = ["windows", "macos", "linux"]
+applications = ["obs64.exe", "OBS", "obs"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "obs.scene.list"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "obs.scene.switch"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "obs.source.visibility.set"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "obs.recording.status"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "obs.recording.start"
+risk = "R3"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "obs.recording.stop"
+risk = "R3"
+background = "supported"
+verification = "application_state"
+

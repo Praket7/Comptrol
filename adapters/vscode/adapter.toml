@@ -1,0 +1,42 @@
+manifest_version = 1
+id = "comptrol.vscode"
+name = "Visual Studio Code"
+version = "0.1.0"
+platforms = ["windows", "macos", "linux"]
+applications = ["com.microsoft.VSCode", "Code.exe", "code"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "vscode.workspace.list"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "vscode.setting.get"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "vscode.setting.set"
+risk = "R2"
+background = "supported"
+verification = "persisted_artifact"
+
+[[capabilities]]
+intent = "vscode.document.open"
+risk = "R1"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "vscode.document.save"
+risk = "R2"
+background = "supported"
+verification = "persisted_artifact"
+

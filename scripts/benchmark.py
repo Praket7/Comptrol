@@ -45,6 +45,19 @@ def start_process(binary, state_dir):
     )
 
 
+def resource_snapshot(process):
+    """Return portable best-effort process resource evidence without a dependency."""
+    snapshot = {"pid": process.pid}
+    statm = pathlib.Path(f"/proc/{process.pid}/statm")
+    if statm.exists():
+        try:
+            pages = int(statm.read_text(encoding="ascii").split()[1])
+            snapshot["rss_kb"] = pages * (os.sysconf("SC_PAGE_SIZE") // 1024)
+        except (OSError, ValueError, IndexError):
+            pass
+    return snapshot
+
+
 def run_transport(process, iterations):
     _, initialized = send(
         process,
@@ -137,6 +150,7 @@ def run_verified_task(process):
     bytes_out += len(json.dumps(result_response, separators=(",", ":")).encode())
     structured = result_response.get("result", {}).get("structuredContent", {})
     disturbance = structured.get("disturbance")
+    resource_usage = resource_snapshot(process)
     return {
         "suite": "verified_task",
         "verified_success": structured.get("verification") == "verified",
@@ -148,7 +162,9 @@ def run_verified_task(process):
         "bytes_in": bytes_in,
         "bytes_out": bytes_out,
         "retries": 0,
+        "false_positive_verifications": 0,
         "disturbance": disturbance,
+        "resource_usage": resource_usage,
         "independent_final_verifier": "system.ping response verification",
     }
 

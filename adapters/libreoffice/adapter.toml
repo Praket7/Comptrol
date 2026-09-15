@@ -1,0 +1,42 @@
+manifest_version = 1
+id = "comptrol.libreoffice"
+name = "LibreOffice UNO"
+version = "0.1.0"
+platforms = ["windows", "macos", "linux"]
+applications = ["soffice", "soffice.exe", "LibreOffice"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "libreoffice.document.open"
+risk = "R1"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "libreoffice.document.save"
+risk = "R2"
+background = "supported"
+verification = "persisted_artifact"
+
+[[capabilities]]
+intent = "libreoffice.calc.range.read"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "libreoffice.calc.range.write"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "libreoffice.writer.text.replace"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
