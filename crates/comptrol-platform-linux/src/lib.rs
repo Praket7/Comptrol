@@ -82,17 +82,22 @@ fn worker() -> &'static WorkerSender {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build();
+                let connection = match &runtime {
+                    Ok(runtime) => runtime.block_on(AccessibilityConnection::new()).ok(),
+                    Err(_) => None,
+                };
                 while let Ok((request, response)) = receiver.recv() {
-                    let result = match &runtime {
-                        Ok(runtime) => runtime.block_on(async {
+                    let result = match (&runtime, &connection) {
+                        (Ok(runtime), Some(connection)) => runtime.block_on(async {
                             tokio::time::timeout(
                                 request.timeout,
-                                execute_async(request.as_request()),
+                                execute_async(connection, request.as_request()),
                             )
                             .await
                             .map_err(|_| "AT-SPI operation timed out".to_owned())?
                         }),
-                        Err(error) => Err(format!("AT-SPI runtime unavailable: {error}")),
+                        (_, None) => Err("AT-SPI connection unavailable".to_owned()),
+                        (Err(error), _) => Err(format!("AT-SPI runtime unavailable: {error}")),
                     };
                     let _ = response.send(result);
                 }
@@ -112,10 +117,10 @@ pub fn execute(request: Request<'_>) -> Result<Value, String> {
         .map_err(|_| "Linux AT-SPI worker stopped before responding".to_owned())?
 }
 
-async fn execute_async(request: Request<'_>) -> Result<Value, String> {
-    let connection = AccessibilityConnection::new()
-        .await
-        .map_err(|error| format!("AT-SPI connection unavailable: {error}"))?;
+async fn execute_async(
+    connection: &AccessibilityConnection,
+    request: Request<'_>,
+) -> Result<Value, String> {
     let root = connection
         .root_accessible_on_registry()
         .await
