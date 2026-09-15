@@ -3531,13 +3531,17 @@ fn browser_cdp_download(
         .join(format!("{:016x}", stable_hash(key.as_bytes())));
     let expected_path = download_dir.join(file_name);
     if expected_path.is_file() {
+        let mut transaction = DownloadTransaction::new(&operation_id, "reconciled");
+        let _ = transaction.advance(DownloadStage::InProgress);
+        let _ = transaction.advance(DownloadStage::BrowserCompleted);
+        let _ = transaction.advance(DownloadStage::FileVerified);
         return success(
             request,
             operation_id,
             "browser_protocol",
             EffectState::None,
             VerificationState::Verified,
-            json!({ "path": expected_path, "file_name": file_name, "verified": true, "replayed": true }),
+            json!({ "path": expected_path, "file_name": file_name, "verified": true, "replayed": true, "transaction": transaction }),
         );
     }
     let selector = request
