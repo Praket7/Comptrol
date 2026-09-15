@@ -307,7 +307,11 @@ impl BrowserConnection {
                 };
                 let Some(id) = value.get("id").and_then(Value::as_u64) else {
                     targets_for_reader.write().await.apply_event(&value);
-                    frames_for_reader.write().await.apply_event(&value);
+                    let generation = generation_for_disconnect.load(Ordering::Acquire);
+                    frames_for_reader
+                        .write()
+                        .await
+                        .apply_event_at_generation(&value, generation);
                     continue;
                 };
                 if let Some(sender) = pending_for_responses.lock().await.remove(&id) {
@@ -454,6 +458,61 @@ impl BrowserConnection {
                 .ok_or_else(|| BrowserError::StaleReference(target_id.to_owned()))?
         };
         self.command(Some(session_id), method, params).await
+    }
+
+    /// Send a Runtime command in the execution context owned by a specific
+    /// frame. OOPIF events arrive on the browser socket with a flattened
+    /// session id, so the frame graph is the authoritative session/context
+    /// binding and no second page WebSocket is needed.
+    pub async fn frame_command(
+        &self,
+        frame_id: &str,
+        expected_generation: u64,
+        expected_revision: u64,
+        method: impl Into<String>,
+        mut params: Value,
+    ) -> Result<Value, BrowserError> {
+        let method = method.into();
+        let (target_id, context_id) = {
+            let frames = self.frames.read().await;
+            let frame = frames
+                .frames
+                .get(frame_id)
+                .ok_or_else(|| BrowserError::StaleReference(frame_id.to_owned()))?;
+            if frame.generation != expected_generation || frame.revision != expected_revision {
+                return Err(BrowserError::StaleReference(format!(
+                    "frame {frame_id} generation/revision changed"
+                )));
+            }
+            (
+                frame.target_id.clone(),
+                frame.execution_context_ids.last().copied(),
+            )
+        };
+        let target = {
+            let targets = self.targets.read().await;
+            let target = targets
+                .targets
+                .get(&target_id)
+                .ok_or_else(|| BrowserError::StaleReference(target_id.clone()))?;
+            if targets.generation != expected_generation
+                || target.generation != expected_generation
+                || !target.attached
+            {
+                return Err(BrowserError::StaleReference(target_id));
+            }
+            target
+                .session_id
+                .clone()
+                .ok_or_else(|| BrowserError::StaleReference(target_id.clone()))?
+        };
+        if method == "Runtime.evaluate"
+            && let Some(context_id) = context_id
+            && let Some(object) = params.as_object_mut()
+        {
+            object.insert("contextId".to_owned(), Value::from(context_id));
+        }
+        self.command(Some(target), method, params).await
     }
 
     pub fn generation(&self) -> u64 {
@@ -642,6 +701,10 @@ impl FrameGraph {
     }
 
     pub fn apply_event(&mut self, event: &Value) {
+        self.apply_event_at_generation(event, 0);
+    }
+
+    pub fn apply_event_at_generation(&mut self, event: &Value, generation: u64) {
         match event.get("method").and_then(Value::as_str) {
             Some("Page.frameAttached") => {
                 if let Some(params) = event.get("params")
@@ -660,9 +723,36 @@ impl FrameGraph {
                             .to_owned(),
                         loader_id: None,
                         execution_context_ids: Vec::new(),
-                        generation: 0,
+                        generation,
                         revision: 0,
                     });
+                }
+            }
+            Some("Page.frameNavigated") => {
+                if let Some(frame) = event
+                    .get("params")
+                    .and_then(|params| params.get("frame"))
+                    .and_then(|frame| frame.get("id").and_then(Value::as_str))
+                    .and_then(|id| self.frames.get_mut(id))
+                {
+                    let info = event.get("params").and_then(|params| params.get("frame"));
+                    frame.loader_id = info
+                        .and_then(|value| value.get("loaderId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    frame.generation = generation;
+                    frame.revision = frame.revision.saturating_add(1);
+                }
+            }
+            Some("Page.navigatedWithinDocument") => {
+                if let Some(frame_id) = event
+                    .get("params")
+                    .and_then(|params| params.get("frameId"))
+                    .and_then(Value::as_str)
+                    && let Some(frame) = self.frames.get_mut(frame_id)
+                {
+                    frame.generation = generation;
+                    frame.revision = frame.revision.saturating_add(1);
                 }
             }
             Some("Page.frameDetached") => {
@@ -687,6 +777,7 @@ impl FrameGraph {
                     && !frame.execution_context_ids.contains(&context_id)
                 {
                     frame.execution_context_ids.push(context_id);
+                    frame.generation = generation;
                     frame.revision = frame.revision.saturating_add(1);
                 }
             }

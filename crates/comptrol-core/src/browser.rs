@@ -1,7 +1,7 @@
 use crate::{BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_target};
 // Compatibility facade: new browser callers should use the async persistent
-// multiplexer. The legacy synchronous helpers below remain available for
-// protocol compatibility while their call sites migrate.
+// multiplexer. The event-only compatibility helpers below are retained while
+// their predicates are moved onto the browser EventHub.
 pub use comptrol_browser::{
     BlockingBrowserManager, BrowserCommand, BrowserConnection, BrowserError, BrowserManager,
     FrameGraph, FrameRecord, TargetGraph, TargetRecord,
@@ -20,6 +20,7 @@ use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
 type CdpSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
+#[allow(dead_code)]
 struct CdpSession {
     socket: CdpSocket,
     next_id: u64,
@@ -411,7 +412,14 @@ pub fn history(
         message: "The target did not provide a websocket debugger URL".to_owned(),
         recovery: Some("Inspect browser targets again".to_owned()),
     })?;
-    let current = persistent_call(&web_socket_url, "Page.getNavigationHistory", json!({}))?;
+    let current = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        target.revision.as_deref(),
+        "Page.getNavigationHistory",
+        json!({}),
+    )?;
     let current_index = current
         .get("currentIndex")
         .and_then(Value::as_i64)
@@ -454,8 +462,11 @@ pub fn history(
             message: "The browser history entry has no numeric id".to_owned(),
             recovery: Some("Inspect the exact browser target again".to_owned()),
         })?;
-    persistent_call(
-        &web_socket_url,
+    cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        target.revision.as_deref(),
         "Page.navigateToHistoryEntry",
         json!({ "entryId": entry_id }),
     )?;
@@ -465,7 +476,14 @@ pub fn history(
             Some("Page.frameNavigated") | Some("Page.navigatedWithinDocument")
         )
     })?;
-    let observed = persistent_call(&web_socket_url, "Page.getNavigationHistory", json!({}))?;
+    let observed = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        None,
+        "Page.getNavigationHistory",
+        json!({}),
+    )?;
     if observed.get("currentIndex").and_then(Value::as_i64) == Some(destination_index) {
         return Ok(json!({
             "direction": if forward { "forward" } else { "back" },
@@ -695,18 +713,20 @@ pub fn coordinate_click(
         Some(browser_context_id),
         Some(revision),
     )?;
-    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
-        code: "browser_protocol_invalid".to_owned(),
-        message: "The target did not provide a websocket debugger URL".to_owned(),
-        recovery: Some("Inspect browser targets again".to_owned()),
-    })?;
-    persistent_call(
-        &web_socket_url,
+    let target_revision = target.revision.clone();
+    cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        target_revision.as_deref(),
         "Input.dispatchMouseEvent",
         json!({"type":"mousePressed","x":x,"y":y,"button":button,"clickCount":1}),
     )?;
-    persistent_call(
-        &web_socket_url,
+    cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        target_revision.as_deref(),
         "Input.dispatchMouseEvent",
         json!({"type":"mouseReleased","x":x,"y":y,"button":button,"clickCount":1}),
     )?;
@@ -739,6 +759,7 @@ fn protocol_call(
         })
 }
 
+#[allow(dead_code)]
 fn persistent_call(
     web_socket_url: &str,
     method: &str,
@@ -1225,23 +1246,15 @@ pub fn cdp_upload(
         })?;
     let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
-    let Some(web_socket_url) = target.web_socket_url else {
-        return Err(ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: "The target did not provide a websocket debugger URL".to_owned(),
-            recovery: Some("Inspect browser targets again".to_owned()),
-        });
-    };
-    if !web_socket_url.starts_with("ws://") {
-        return Err(ComptrolError {
-            code: "browser_transport_unsupported".to_owned(),
-            message: "Only local unencrypted DevTools websocket endpoints are enabled".to_owned(),
-            recovery: Some(
-                "Use a local browser endpoint or configure a trusted transport".to_owned(),
-            ),
-        });
-    }
-    let document = persistent_call(&web_socket_url, "DOM.getDocument", json!({ "depth": -1 }))?;
+    let target_revision = target.revision.clone();
+    let document = cdp_call(
+        endpoint,
+        target_id,
+        browser_context_id,
+        target_revision.as_deref(),
+        "DOM.getDocument",
+        json!({ "depth": -1 }),
+    )?;
     let root_id = document
         .get("root")
         .and_then(|root| root.get("nodeId"))
@@ -1251,8 +1264,11 @@ pub fn cdp_upload(
             message: "The browser did not return a document root".to_owned(),
             recovery: Some("Refresh the browser target".to_owned()),
         })?;
-    let node = persistent_call(
-        &web_socket_url,
+    let node = cdp_call(
+        endpoint,
+        target_id,
+        browser_context_id,
+        target_revision.as_deref(),
         "DOM.querySelector",
         json!({ "nodeId": root_id, "selector": selector }),
     )?;
@@ -1265,8 +1281,11 @@ pub fn cdp_upload(
             message: "The browser upload control was not found".to_owned(),
             recovery: Some("Refresh the page and inspect the exact upload selector".to_owned()),
         })?;
-    persistent_call(
-        &web_socket_url,
+    cdp_call(
+        endpoint,
+        target_id,
+        browser_context_id,
+        target_revision.as_deref(),
         "DOM.setFileInputFiles",
         json!({ "nodeId": node_id, "files": [path] }),
     )?;
@@ -1280,8 +1299,11 @@ pub fn cdp_upload(
         message: error.to_string(),
         recovery: None,
     })?;
-    let verification = persistent_call(
-        &web_socket_url,
+    let verification = cdp_call(
+        endpoint,
+        target_id,
+        browser_context_id,
+        None,
         "Runtime.evaluate",
         json!({
             "expression": format!("(() => {{ const files = document.querySelector({selector}).files; return files.length === 1 && files[0].name === {file_name}; }})()"),
@@ -1340,22 +1362,7 @@ pub fn cdp_download(
     fs_create_dir(download_dir)?;
     let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
-    let Some(web_socket_url) = target.web_socket_url else {
-        return Err(ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: "The target did not provide a websocket debugger URL".to_owned(),
-            recovery: Some("Inspect browser targets again".to_owned()),
-        });
-    };
-    if !web_socket_url.starts_with("ws://") {
-        return Err(ComptrolError {
-            code: "browser_transport_unsupported".to_owned(),
-            message: "Only local unencrypted DevTools websocket endpoints are enabled".to_owned(),
-            recovery: Some(
-                "Use a local browser endpoint or configure a trusted transport".to_owned(),
-            ),
-        });
-    }
+    let target_revision = target.revision.clone();
     let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
         code: "browser_unavailable".to_owned(),
         message: error.to_string(),
@@ -1369,22 +1376,33 @@ pub fn cdp_download(
             message: "The browser did not provide a browser websocket".to_owned(),
             recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
         })?;
-    protocol_call(
-        browser_web_socket_url,
-        "Browser.setDownloadBehavior",
-        json!({
+    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
+    BRIDGE
+        .get_or_init(BlockingBrowserManager::new)
+        .command(
+            browser_web_socket_url,
+            "Browser.setDownloadBehavior",
+            json!({
             "behavior": "allow",
             "downloadPath": download_dir,
             "browserContextId": browser_context_id.unwrap_or("default")
-        }),
-    )?;
+            }),
+        )
+        .map_err(|error| ComptrolError {
+            code: "browser_protocol_error".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Refresh the browser connection and retry".to_owned()),
+        })?;
     let selector = serde_json::to_string(selector).map_err(|error| ComptrolError {
         code: "invalid_input".to_owned(),
         message: error.to_string(),
         recovery: None,
     })?;
-    persistent_call(
-        &web_socket_url,
+    cdp_call(
+        endpoint,
+        target_id,
+        browser_context_id,
+        target_revision.as_deref(),
         "Runtime.evaluate",
         json!({
             "expression": format!("(() => {{ const link = document.querySelector({selector}); if (!link) throw new Error('download target missing'); link.click(); return true; }})()"),
@@ -1453,6 +1471,7 @@ fn browser_file_error(error: io::Error) -> ComptrolError {
     }
 }
 
+#[allow(dead_code)]
 fn browser_connect_error(error: tungstenite::Error) -> ComptrolError {
     ComptrolError {
         code: "browser_unavailable".to_owned(),
@@ -1461,6 +1480,7 @@ fn browser_connect_error(error: tungstenite::Error) -> ComptrolError {
     }
 }
 
+#[allow(dead_code)]
 fn browser_dispatch_error(error: tungstenite::Error) -> ComptrolError {
     ComptrolError {
         code: "browser_dispatch_failed".to_owned(),
