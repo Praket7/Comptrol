@@ -1,7 +1,9 @@
 #![deny(unsafe_code)]
 
+mod blocking;
 mod manager;
 
+pub use blocking::BlockingBrowserManager;
 pub use manager::BrowserManager;
 
 use serde::{Deserialize, Serialize};

@@ -3,8 +3,8 @@ use crate::{BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_targe
 // multiplexer. The legacy synchronous helpers below remain available for
 // protocol compatibility while their call sites migrate.
 pub use comptrol_browser::{
-    BrowserCommand, BrowserConnection, BrowserError, BrowserManager, FrameGraph, FrameRecord,
-    TargetGraph, TargetRecord,
+    BlockingBrowserManager, BrowserCommand, BrowserConnection, BrowserError, BrowserManager,
+    FrameGraph, FrameRecord, TargetGraph, TargetRecord,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -728,7 +728,15 @@ fn protocol_call(
     method: &str,
     params: Value,
 ) -> Result<Value, ComptrolError> {
-    persistent_call(web_socket_url, method, params)
+    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
+    BRIDGE
+        .get_or_init(BlockingBrowserManager::new)
+        .command(web_socket_url, method, params)
+        .map_err(|error| ComptrolError {
+            code: "browser_protocol_error".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Inspect the browser connection and retry".to_owned()),
+        })
 }
 
 fn persistent_call(

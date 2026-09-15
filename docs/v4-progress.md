@@ -29,6 +29,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.
 - Browser manager bootstraps required CDP domains for all targets already attached in the live graph without holding graph locks across I/O.
 - Browser multiplexer exposes generation- and revision-checked target commands so warm operations can fail with `stale_reference` before dispatch instead of rediscovering or cross-targeting.
+- Browser-level synchronous compatibility calls now use `BlockingBrowserManager`, whose dedicated long-lived Tokio runtime owns `BrowserManager` and reuses one browser-level WebSocket per debugger endpoint. Target-specific legacy helpers still need migration to generation-bound `target_command`.
 - Runtime route history is persisted in SQLite and feeds conservative deterministic route scoring after safety gates.
 - OBS uses a persistent authenticated WebSocket client.
 - LibreOffice uses a persistent UNO connection and exact document identity.
@@ -47,9 +48,9 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 
 ## Still required for the full V4 specification
 
-- Replace the remaining synchronous CDP session implementation with the full single-reader/single-writer flattened-session multiplexer.
+- Migrate the remaining target-specific synchronous CDP helpers from the compatibility socket to generation-bound `target_command`; the browser-level path is now on the single-reader/single-writer multiplexer.
 - Complete universal verification wiring across every adapter and high-level operation.
-- Wire the extracted async browser connection into the remaining synchronous compatibility facade and enable full target attachment/domain bootstrap.
+- Complete target attachment/domain bootstrap coverage for all migrated compatibility helpers and remove the remaining legacy per-session socket path.
 - Extend persisted route statistics with latency samples and planner feedback across adapter/application versions.
 - Extend MCP cancellation propagation into every adapter/browser operation and add task progress replay coverage.
 - Add workflow repair fallback and host persistence for promoted candidates; the clean replay promotion gate is implemented.
