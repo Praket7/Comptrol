@@ -34,6 +34,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-live-chrome-") as state:
         text=True,
     )
     runtime = None
+    chrome_pid = None
     try:
         line = chrome.stdout.readline()
         if not line:
@@ -91,5 +92,6 @@ with tempfile.TemporaryDirectory(prefix="comptrol-live-chrome-") as state:
         if runtime is not None:
             runtime.terminate()
             runtime.wait(timeout=10)
-        subprocess.run(["taskkill", "/PID", chrome_pid, "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if chrome_pid is not None:
+            subprocess.run(["taskkill", "/PID", chrome_pid, "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         chrome.wait(timeout=10)
