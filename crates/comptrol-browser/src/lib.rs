@@ -22,6 +22,8 @@ pub enum BrowserError {
     InvalidResponse(String),
     #[error("browser command cancelled")]
     Cancelled,
+    #[error("target reference is stale or unavailable: {0}")]
+    StaleReference(String),
 }
 
 #[derive(Debug)]
@@ -197,6 +199,43 @@ impl BrowserConnection {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Send a command to an already-attached target from the live graph.
+    ///
+    /// The caller must provide the target generation and revision it observed.
+    /// This makes target binding explicit and prevents a warm operation from
+    /// silently reusing a session after navigation, reconnect, or target
+    /// replacement. Ordinary warm calls therefore do not need `/json/list`.
+    pub async fn target_command(
+        &self,
+        target_id: &str,
+        expected_generation: u64,
+        expected_revision: &str,
+        method: impl Into<String>,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
+        let session_id = {
+            let graph = self.targets.read().await;
+            let target = graph
+                .targets
+                .get(target_id)
+                .ok_or_else(|| BrowserError::StaleReference(target_id.to_owned()))?;
+            if graph.generation != expected_generation
+                || target.generation != expected_generation
+                || target.revision != expected_revision
+                || !target.attached
+            {
+                return Err(BrowserError::StaleReference(format!(
+                    "target {target_id} generation/revision changed"
+                )));
+            }
+            target
+                .session_id
+                .clone()
+                .ok_or_else(|| BrowserError::StaleReference(target_id.to_owned()))?
+        };
+        self.command(Some(session_id), method, params).await
     }
 
     pub fn generation(&self) -> u64 {
@@ -488,6 +527,23 @@ mod tests {
         assert_eq!(target.session_id, None);
         assert!(!target.attached);
         assert_eq!(target.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn target_command_rejects_stale_graph_reference_before_dispatch() {
+        let connection = BrowserConnection {
+            outgoing: tokio::sync::mpsc::channel(1).0,
+            targets: Arc::new(RwLock::new(TargetGraph::default())),
+            frames: Arc::new(RwLock::new(FrameGraph::default())),
+            next_command_id: Arc::new(AtomicU64::new(1)),
+            generation: Arc::new(AtomicU64::new(0)),
+            cancellation: CancellationToken::new(),
+        };
+        connection.targets.write().await.apply_created(target());
+        let result = connection
+            .target_command("tab", 0, "wrong-revision", "Runtime.evaluate", Value::Null)
+            .await;
+        assert!(matches!(result, Err(BrowserError::StaleReference(_))));
     }
 
     #[tokio::test]
