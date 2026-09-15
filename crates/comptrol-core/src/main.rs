@@ -369,16 +369,15 @@ impl TaskStore {
 
     fn request_cancel(&mut self, task_id: &str) -> io::Result<bool> {
         let transaction = self.connection.transaction().map_err(sqlite_io_error)?;
-        let exists = transaction
+        let status = transaction
             .query_row(
-                "SELECT 1 FROM tasks WHERE task_id = ?1",
+                "SELECT status FROM tasks WHERE task_id = ?1",
                 params![task_id],
-                |_| Ok(true),
+                |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(sqlite_io_error)?
-            .unwrap_or(false);
-        if !exists {
+            .map_err(sqlite_io_error)?;
+        if !matches!(status.as_deref(), Some("queued" | "running")) {
             return Ok(false);
         }
         transaction

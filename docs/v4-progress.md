@@ -22,6 +22,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Typed workflow executor runs compiled actions through the normal runtime, resolves lifted parameters, enforces a step budget, and supports bounded branches, loops, waits, verification, and parallel reads.
 - Durable MCP Tasks are available across stdio, stateless HTTP, and mutual-TLS HTTP with SQLite persistence and cancellation reconciliation.
 - Task cancellation requests are persisted as task events and rechecked after execution, so cancellation state is not only an in-memory transport flag.
+- Cancellation events are accepted only for queued or running tasks; completed, failed, cancelled, and unknown tasks are not mutated by a late cancel request.
 - EventBus now provides non-blocking subscriptions, bounded replay via `snapshot_since`, and sequence inspection for reconnecting consumers.
 - Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.
 - Browser manager bootstraps required CDP domains for all targets already attached in the live graph without holding graph locks across I/O.
