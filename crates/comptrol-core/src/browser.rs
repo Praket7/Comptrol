@@ -892,6 +892,28 @@ pub fn cdp_download(
             ),
         });
     }
+    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
+        code: "browser_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Inspect the existing browser websocket endpoint".to_owned()),
+    })?;
+    let browser_web_socket_url = version
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser did not provide a browser websocket".to_owned(),
+            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
+        })?;
+    protocol_call(
+        browser_web_socket_url,
+        "Browser.setDownloadBehavior",
+        json!({
+            "behavior": "allow",
+            "downloadPath": download_dir,
+            "browserContextId": browser_context_id.unwrap_or("default")
+        }),
+    )?;
     let (mut socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
     let mut command_id = 0_u64;
     let mut call = |method: &str, params: Value| -> Result<Value, ComptrolError> {
@@ -927,10 +949,6 @@ pub fn cdp_download(
             return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
     };
-    call(
-        "Page.setDownloadBehavior",
-        json!({ "behavior": "allow", "downloadPath": download_dir }),
-    )?;
     let selector = serde_json::to_string(selector).map_err(|error| ComptrolError {
         code: "invalid_input".to_owned(),
         message: error.to_string(),
