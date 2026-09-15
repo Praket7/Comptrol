@@ -14,6 +14,8 @@ The fixture now includes a minimal websocket protocol route for `Runtime.evaluat
 
 `browser.cdp.reopen_closed_group` is an explicit safe refusal. It returns `closed_group_unsupported` because a closed group is not a live DevTools target. Comptrol does not guess a URL or recreate a group from stale history.
 
+On macOS, `browser.chrome.reopen_closed_group` is the explicit foreground alternative. With `COMPTROL_ALLOW_MACOS_AX=1` and Accessibility permission, it matches one exact saved group button by name, invokes its semantic Accessibility action, and verifies that the closed button is gone. The route does not synthesize mouse input or use the clipboard. It requires an exact group name and refuses strict background posture.
+
 Enable the route only for a browser endpoint the user intentionally started with local DevTools enabled, using `COMPTROL_CDP_ENDPOINT=http://127.0.0.1:PORT` and `COMPTROL_ALLOW_BROWSER_CDP=1`. The endpoint must remain loopback only.
 
 Inactive and grouped live tabs remain addressable through exact target identity and do not need foreground focus. A closed tab or closed tab group is not a live DevTools target, so it must be reopened by the browser before Comptrol can control it. Chrome does not expose a portable closed group control surface through the route used here.

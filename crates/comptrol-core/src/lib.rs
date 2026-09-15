@@ -359,6 +359,9 @@ impl Policy {
             policy
                 .allowed_intents
                 .insert("macos.ax.set_value".to_owned());
+            policy
+                .allowed_intents
+                .insert("browser.chrome.reopen_closed_group".to_owned());
         }
         if std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1") {
             policy.max_risk = Risk::R2;
@@ -877,6 +880,9 @@ impl Runtime {
             "desktop.notify" => desktop_notify(&request, operation_id),
             "desktop.open_app" => desktop_open_app(&request, operation_id),
             "browser.chrome.open_tab" => browser_chrome_open_tab(&request, operation_id),
+            "browser.chrome.reopen_closed_group" => {
+                browser_chrome_reopen_closed_group(&request, operation_id)
+            }
             "command.run" => command_run(&request, operation_id),
             "windows.uia.press" | "windows.uia.set_value" => {
                 windows_uia_action(&request, operation_id)
@@ -1162,8 +1168,11 @@ fn classify(intent: &str) -> Risk {
         | "filesystem.write"
         | "filesystem.copy"
         | "filesystem.restore_checkpoint" => Risk::R1,
-        "desktop.open_app" | "macos.ax.press" | "macos.ax.set_value" => Risk::R2,
-        "browser.chrome.open_tab" => Risk::R2,
+        "desktop.open_app"
+        | "macos.ax.press"
+        | "macos.ax.set_value"
+        | "browser.chrome.open_tab"
+        | "browser.chrome.reopen_closed_group" => Risk::R2,
         "command.run" => Risk::R3,
         "windows.uia.press" | "windows.uia.set_value" => Risk::R2,
         "linux.atspi.press" | "linux.atspi.set_value" => Risk::R2,
@@ -1308,6 +1317,20 @@ fn operation_metadata(request: &OperationRequest) -> Value {
         }
         metadata["action"] = json!(request.intent.strip_prefix("macos.ax.").unwrap_or_default());
     }
+    if request.intent == "browser.chrome.reopen_closed_group"
+        && let Some(group) = request.params.get("group").and_then(Value::as_str)
+    {
+        metadata["app"] = json!("Google Chrome");
+        metadata["control"] = json!(format!("{group} group Closed"));
+        metadata["role"] = json!("button");
+        if let Some(window) = request.params.get("window").and_then(Value::as_str) {
+            metadata["window"] = json!(window);
+        }
+        metadata["group"] = json!(group);
+        metadata["action"] = json!("reopen_closed_group");
+        metadata["postcondition_attribute"] = json!("closed_group_absent");
+        metadata["postcondition_bool"] = json!(true);
+    }
     if request.intent == "command.run" {
         if let Some(program) = request.params.get("program").and_then(Value::as_str) {
             metadata["program"] = json!(program);
@@ -1344,6 +1367,7 @@ fn route_for(intent: &str) -> String {
         "desktop.notify" => "platform_notification",
         "desktop.open_app" => "platform_launch",
         "browser.chrome.open_tab" => "browser_launcher",
+        "browser.chrome.reopen_closed_group" => "chrome_ax",
         "command.run" => "process_argv",
         "windows.uia.press" | "windows.uia.set_value" => "windows_uia",
         "linux.atspi.press" | "linux.atspi.set_value" => "linux_atspi",
@@ -2292,6 +2316,7 @@ fn foreground_changed(request: &OperationRequest) -> bool {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         "browser.chrome.open_tab" => true,
+        "browser.chrome.reopen_closed_group" => true,
         _ => false,
     }
 }
@@ -2818,6 +2843,94 @@ fn browser_chrome_open_tab(request: &OperationRequest, operation_id: String) -> 
         ),
         Err(error) => ActionResult::refused(request, operation_id, error),
     }
+}
+
+fn browser_chrome_reopen_closed_group(
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    if !cfg!(target_os = "macos") {
+        return unsupported_ax(request, operation_id);
+    }
+    if request.background.as_deref() == Some("strict_background") {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "background_unavailable".to_owned(),
+                message: "Reopening a closed Chrome group activates the visible browser".to_owned(),
+                recovery: Some("Use a live CDP target for strict background control".to_owned()),
+            },
+        );
+    }
+    let Some(group) = request.params.get("group").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Reopening a closed Chrome group needs an exact group name".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    if group.is_empty() || group.chars().any(char::is_control) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Chrome group names cannot be empty or contain control characters"
+                    .to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    let script = chrome_closed_group_ax_script(request, group);
+    match run_osascript(&script) {
+        Ok(output)
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "true" =>
+        {
+            success(
+                request,
+                operation_id,
+                "chrome_ax",
+                EffectState::Changed,
+                VerificationState::Verified,
+                json!({
+                    "group": group,
+                    "postcondition": "closed_group_button_absent",
+                    "mouse": "untouched",
+                    "clipboard": "untouched"
+                }),
+            )
+        }
+        Ok(output) => ax_failure(request, operation_id, &output),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "adapter_unavailable".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Check Chrome and macOS Accessibility permission".to_owned()),
+            },
+        ),
+    }
+}
+
+fn chrome_closed_group_ax_script(request: &OperationRequest, group: &str) -> String {
+    let control = apple_quote(&format!("{group} group Closed"));
+    let window = request
+        .params
+        .get("window")
+        .and_then(Value::as_str)
+        .map(apple_quote)
+        .map(|name| format!("first window whose name is {name}"))
+        .unwrap_or_else(|| "window 1".to_owned());
+    format!(
+        "tell application \"System Events\"\ntell application process \"Google Chrome\"\nset targetWindow to {window}\nset matches to (every button of targetWindow whose name is {control})\nif (count of matches) is not 1 then error \"target_ambiguous\"\nperform action \"AXPress\" of item 1 of matches\ndelay 0.05\nset remaining to (every button of targetWindow whose name is {control})\nreturn ((count of remaining) is 0)\nend tell\nend tell"
+    )
 }
 
 const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -3633,6 +3746,23 @@ fn ax_reconcile(metadata: &Value) -> bool {
     let Some(control) = metadata.get("control").and_then(Value::as_str) else {
         return false;
     };
+    if metadata.get("action").and_then(Value::as_str) == Some("reopen_closed_group") {
+        let window = metadata
+            .get("window")
+            .and_then(Value::as_str)
+            .map(apple_quote)
+            .map(|name| format!("first window whose name is {name}"))
+            .unwrap_or_else(|| "window 1".to_owned());
+        let script = format!(
+            "tell application \"System Events\"\ntell application process {}\nset targetWindow to {window}\nset remaining to (every button of targetWindow whose name is {})\nreturn ((count of remaining) is 0)\nend tell\nend tell",
+            apple_quote(app),
+            apple_quote(control)
+        );
+        let Ok(output) = run_osascript(&script) else {
+            return false;
+        };
+        return output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true";
+    }
     let Some(role) = metadata.get("role").and_then(Value::as_str) else {
         return false;
     };
@@ -3897,6 +4027,15 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R2,
             route: "browser_launcher".to_owned(),
             note: "Opens a foreground Chrome tab in the existing default browser profile and reports launcher acceptance only".to_owned(),
+        },
+        Capability {
+            name: "browser.chrome.reopen_closed_group".to_owned(),
+            available: cfg!(target_os = "macos")
+                && macos_accessibility_reachable()
+                && std::env::var("COMPTROL_ALLOW_MACOS_AX").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "chrome_ax".to_owned(),
+            note: "Reopens one exact closed Chrome tab group through semantic Accessibility control with a postcondition".to_owned(),
         },
         Capability {
             name: "command.run".to_owned(),
@@ -4268,6 +4407,45 @@ mod tests {
         let script = ax_script(&request, "press").expect("semantic script");
         assert!(script.contains("perform action \"AXPress\""));
         assert!(script.contains("enabled of targetElement is true"));
+    }
+
+    #[test]
+    fn chrome_closed_group_script_uses_exact_accessibility_press() {
+        let request = OperationRequest {
+            intent: "browser.chrome.reopen_closed_group".to_owned(),
+            target: None,
+            params: json!({"group":"Research", "window":"Chrome Window"}),
+            postcondition: None,
+            risk: None,
+            idempotency_key: Some("closed-group-script".to_owned()),
+            dry_run: false,
+            background: None,
+        };
+        let script = chrome_closed_group_ax_script(&request, "Research");
+        assert!(script.contains("Research group Closed"));
+        assert!(script.contains("perform action \"AXPress\""));
+        assert!(script.contains("count of remaining"));
+        assert!(!script.contains("keystroke"));
+        assert!(!script.contains("clipboard"));
+    }
+
+    #[test]
+    fn chrome_closed_group_metadata_is_reconcilable_without_tab_content() {
+        let request = OperationRequest {
+            intent: "browser.chrome.reopen_closed_group".to_owned(),
+            target: None,
+            params: json!({"group":"Research"}),
+            postcondition: None,
+            risk: Some(Risk::R2),
+            idempotency_key: Some("closed-group-metadata".to_owned()),
+            dry_run: false,
+            background: None,
+        };
+        let metadata = operation_metadata(&request);
+        assert_eq!(metadata["app"], "Google Chrome");
+        assert_eq!(metadata["control"], "Research group Closed");
+        assert_eq!(metadata["postcondition_attribute"], "closed_group_absent");
+        assert_eq!(metadata["postcondition_bool"], true);
     }
 
     #[test]
