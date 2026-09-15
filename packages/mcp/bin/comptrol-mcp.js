@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-if (process.env.COMPTROL_DAEMON === "1" && process.platform !== "win32") {
+if (process.env.COMPTROL_DAEMON === "1") {
   require("./comptrol-daemon-mcp.js");
 } else {
 const { spawn } = require("node:child_process");

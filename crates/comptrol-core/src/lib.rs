@@ -4081,10 +4081,14 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "daemon.ipc".to_owned(),
-            available: cfg!(unix),
+            available: cfg!(unix) || cfg!(windows),
             risk: Risk::R0,
-            route: "local_unix_socket".to_owned(),
-            note: "Provides bounded versioned local daemon IPC on macOS and Linux".to_owned(),
+            route: if cfg!(windows) {
+                "local_named_pipe".to_owned()
+            } else {
+                "local_unix_socket".to_owned()
+            },
+            note: "Provides bounded versioned local daemon IPC on the host platform".to_owned(),
         },
         Capability {
             name: "windows.uia.semantic".to_owned(),

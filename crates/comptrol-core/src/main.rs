@@ -17,6 +17,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawHandle, RawHandle};
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+};
 
 const DEFAULT_TASK_TTL_MS: u64 = 300_000;
 const TASK_POLL_INTERVAL_MS: u64 = 50;
@@ -717,6 +731,16 @@ fn run_http(port: u16) -> i32 {
     0
 }
 
+#[cfg(windows)]
+fn daemon_pipe_name() -> String {
+    env::var("COMPTROL_PIPE_NAME").unwrap_or_else(|_| r"\\.\pipe\comptrol".to_owned())
+}
+
+#[cfg(windows)]
+fn wide_pipe_name(name: &str) -> Vec<u16> {
+    name.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 #[cfg(unix)]
 fn daemon_socket_path() -> PathBuf {
     env::var_os("COMPTROL_SOCKET_PATH")
@@ -799,8 +823,61 @@ fn run_daemon() -> i32 {
 
 #[cfg(not(unix))]
 fn run_daemon() -> i32 {
-    eprintln!("daemon named pipe transport is not implemented on this platform");
-    2
+    #[cfg(windows)]
+    {
+        let pipe_name = wide_pipe_name(&daemon_pipe_name());
+        let mut runtime = match Runtime::new(default_state_dir()) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("startup failed: {error}");
+                return 1;
+            }
+        };
+        let mut tasks = match TaskStore::open(&default_state_dir()) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                eprintln!("task store startup failed: {error}");
+                return 1;
+            }
+        };
+        eprintln!("comptrol daemon listening on {}", daemon_pipe_name());
+        loop {
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    pipe_name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    PIPE_UNLIMITED_INSTANCES,
+                    (MAX_PROTOCOL_BYTES + 4) as u32,
+                    (MAX_PROTOCOL_BYTES + 4) as u32,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                eprintln!(
+                    "daemon named pipe creation failed: {}",
+                    io::Error::last_os_error()
+                );
+                return 1;
+            }
+            let connected = unsafe {
+                ConnectNamedPipe(handle, std::ptr::null_mut()) != 0
+                    || GetLastError() == ERROR_PIPE_CONNECTED
+            };
+            let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
+            if connected {
+                if let Err(error) = handle_ipc_connection(&mut stream, &mut runtime, &mut tasks) {
+                    eprintln!("daemon connection failed: {error}");
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("daemon named pipe transport is not implemented on this platform");
+        2
+    }
 }
 
 #[cfg(unix)]
@@ -834,13 +911,52 @@ fn run_daemon_health() -> i32 {
 
 #[cfg(not(unix))]
 fn run_daemon_health() -> i32 {
-    eprintln!("daemon named pipe transport is not implemented on this platform");
-    2
+    #[cfg(windows)]
+    {
+        let name = wide_pipe_name(&daemon_pipe_name());
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                0,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            eprintln!("daemon unavailable: {}", io::Error::last_os_error());
+            return 1;
+        }
+        let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
+        if let Err(error) = write_ipc_frame(
+            &mut stream,
+            &json!({ "version": 1, "id": "health", "method": "health" }),
+        ) {
+            eprintln!("daemon health request failed: {error}");
+            return 1;
+        }
+        match read_ipc_frame(&mut stream).and_then(|frame| {
+            serde_json::from_slice::<Value>(&frame)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }) {
+            Ok(value) => print_json(value),
+            Err(error) => {
+                eprintln!("daemon health response failed: {error}");
+                1
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("daemon named pipe transport is not implemented on this platform");
+        2
+    }
 }
 
-#[cfg(unix)]
-fn handle_ipc_connection(
-    stream: &mut UnixStream,
+fn handle_ipc_connection<S: Read + Write>(
+    stream: &mut S,
     runtime: &mut Runtime,
     tasks: &mut TaskStore,
 ) -> io::Result<()> {
@@ -916,8 +1032,7 @@ fn handle_ipc_connection(
     Ok(())
 }
 
-#[cfg(unix)]
-fn read_ipc_frame(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
+fn read_ipc_frame<S: Read>(stream: &mut S) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0_u8; 4];
     match stream.read_exact(&mut header) {
         Ok(()) => {}
@@ -936,8 +1051,7 @@ fn read_ipc_frame(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(frame))
 }
 
-#[cfg(unix)]
-fn write_ipc_frame(stream: &mut UnixStream, value: &Value) -> io::Result<()> {
+fn write_ipc_frame<S: Write>(stream: &mut S, value: &Value) -> io::Result<()> {
     let frame = serde_json::to_vec(value).map_err(io::Error::other)?;
     if frame.len() > MAX_PROTOCOL_BYTES {
         return Err(io::Error::new(

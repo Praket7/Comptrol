@@ -17,6 +17,7 @@ let stopping = false;
 let restartTimer;
 
 function socketPath() {
+  if (process.platform === "win32") return process.env.COMPTROL_PIPE_NAME || "\\\\.\\pipe\\comptrol";
   return process.env.COMPTROL_SOCKET_PATH || path.join(
     process.env.COMPTROL_STATE_DIR || path.join(os.homedir(), ".comptrol"),
     "comptrol.sock",

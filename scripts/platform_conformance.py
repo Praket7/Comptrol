@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-platform-") as state:
     assert diagnostics["mcp_adapter"]["transport"] == "stdio"
     assert {item["client"] for item in diagnostics["client_configuration"]} >= {"codex", "claude-code", "cursor"}
     platform = os.uname().sysname.lower()
-    assert names["daemon.ipc"]["available"] == (platform != "windows")
+    assert names["daemon.ipc"]["available"] is True
     if platform == "darwin":
         assert names["platform.windows.uia"]["available"] is False
         assert names["platform.linux.atspi"]["available"] is False

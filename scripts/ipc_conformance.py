@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Exercise the local Unix socket IPC framing and health contract."""
+"""Exercise the local daemon IPC framing and health contract."""
 
 import json
 import os
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 
 
-if not hasattr(socket, "AF_UNIX"):
+is_windows = sys.platform == "win32"
+if not is_windows and not hasattr(socket, "AF_UNIX"):
     print("IPC conformance skipped because Unix sockets are unavailable")
     raise SystemExit(0)
 
@@ -20,38 +22,55 @@ def frame(value):
     return len(payload).to_bytes(4, "big") + payload
 
 
-def read_frame(connection):
-    header = connection.recv(4)
-    if len(header) != 4:
-        raise RuntimeError("IPC response did not include a complete frame header")
-    length = int.from_bytes(header, "big")
+def read_exact(connection, length):
     payload = b""
     while len(payload) < length:
-        chunk = connection.recv(length - len(payload))
+        chunk = connection.read(length - len(payload)) if is_windows else connection.recv(length - len(payload))
         if not chunk:
             raise RuntimeError("IPC response ended before the complete frame")
         payload += chunk
-    return json.loads(payload)
+    return payload
+
+
+def read_frame(connection):
+    header = read_exact(connection, 4)
+    if len(header) != 4:
+        raise RuntimeError("IPC response did not include a complete frame header")
+    length = int.from_bytes(header, "big")
+    return json.loads(read_exact(connection, length))
+
+
+def send_frame(connection, value):
+    payload = frame(value)
+    if is_windows:
+        connection.write(payload)
+        connection.flush()
+    else:
+        connection.sendall(payload)
 
 
 with tempfile.TemporaryDirectory(prefix="comptrol-ipc-") as state:
-    path = os.path.join(state, "comptrol.sock")
+    path = os.environ.get("COMPTROL_PIPE_NAME", r"\\.\pipe\comptrol") if is_windows else os.path.join(state, "comptrol.sock")
     process = subprocess.Popen(
         ["target/debug/comptrol", "daemon"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env={**os.environ, "COMPTROL_STATE_DIR": state, "COMPTROL_SOCKET_PATH": path},
+        env={**os.environ, "COMPTROL_STATE_DIR": state, "COMPTROL_SOCKET_PATH": path, "COMPTROL_PIPE_NAME": path},
     )
     try:
         deadline = time.time() + 10
-        while time.time() < deadline and not os.path.exists(path):
+        while time.time() < deadline and (is_windows or not os.path.exists(path)):
             time.sleep(0.05)
-        if not os.path.exists(path):
+        if not is_windows and not os.path.exists(path):
             raise RuntimeError("daemon socket did not appear")
-        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        if not is_windows:
+            assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             connection.connect(path)
-            connection.sendall(frame({"version": 1, "id": "health", "method": "health"}))
+        else:
+            connection = open(path, "r+b", buffering=0)
+        try:
+            send_frame(connection, {"version": 1, "id": "health", "method": "health"})
             health = read_frame(connection)
             assert health["result"]["ready"] is True
             initialize = {
@@ -60,12 +79,14 @@ with tempfile.TemporaryDirectory(prefix="comptrol-ipc-") as state:
                 "method": "initialize",
                 "params": {},
             }
-            connection.sendall(frame({"version": 1, "id": "mcp", "method": "mcp", "message": initialize}))
+            send_frame(connection, {"version": 1, "id": "mcp", "method": "mcp", "message": initialize})
             response = read_frame(connection)
             assert response["result"]["result"]["serverInfo"]["name"] == "comptrol"
-            connection.sendall(frame({"version": 2, "id": "bad", "method": "health"}))
+            send_frame(connection, {"version": 2, "id": "bad", "method": "health"})
             version_error = read_frame(connection)
             assert version_error["error"]["code"] == "protocol_version_unsupported"
+        finally:
+            connection.close()
         print("IPC conformance passed")
     finally:
         process.terminate()
