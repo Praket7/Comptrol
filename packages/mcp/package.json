@@ -1,10 +1,10 @@
 {
   "name": "comptrolling",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "Comptrol MCP launcher with bundled native binaries",
   "bin": { "comptrol-mcp": "bin/comptrol-mcp.js" },
   "files": ["bin", "native"],
   "engines": { "node": ">=18" },
-  "repository": "https://github.com/Praket7/Comptrol",
+  "repository": { "type": "git", "url": "git+https://github.com/Praket7/Comptrol.git" },
   "license": "Apache-2.0"
 }

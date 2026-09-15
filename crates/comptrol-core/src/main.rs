@@ -3,6 +3,7 @@ use comptrol::{
     capabilities, default_state_dir, integration, pairing::PairingStore, privacy_network_endpoints,
     privacy_status, read_trace,
 };
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -53,8 +54,7 @@ struct StoredTask {
 }
 
 struct TaskStore {
-    file: File,
-    records: HashMap<String, StoredTask>,
+    connection: Connection,
     sequence: u64,
 }
 
@@ -251,28 +251,54 @@ fn valid_session_id(session: &str) -> bool {
 impl TaskStore {
     fn open(state_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(state_dir)?;
-        let path = state_dir.join("tasks.jsonl");
-        let mut records = HashMap::new();
-        if path.exists() {
-            for line in BufReader::new(File::open(&path)?).lines() {
-                if let Ok(task) = serde_json::from_str::<StoredTask>(&line?) {
-                    records.insert(task.task_id.clone(), task);
-                }
-            }
+        let path = state_dir.join("comptrol.db");
+        let mut connection = Connection::open(path).map_err(sqlite_io_error)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
+            .map_err(sqlite_io_error)?;
+        let foreign_keys: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .map_err(sqlite_io_error)?;
+        if foreign_keys != 1 {
+            return Err(io::Error::other(
+                "SQLite refused to enable foreign key enforcement",
+            ));
         }
-        let interrupted = records
-            .values()
-            .filter(|task| matches!(task.status.as_str(), "queued" | "running"))
-            .map(|task| task.task_id.clone())
-            .collect::<Vec<_>>();
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE IF NOT EXISTS schema_migrations (
+                   version INTEGER PRIMARY KEY,
+                   applied_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS tasks (
+                   task_id TEXT PRIMARY KEY,
+                   status TEXT NOT NULL,
+                   ttl_ms INTEGER NOT NULL,
+                   poll_interval_ms INTEGER NOT NULL,
+                   created_at_ms INTEGER NOT NULL,
+                   result_json TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS task_events (
+                   seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                   task_id TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   payload_json TEXT NOT NULL,
+                   at_ms INTEGER NOT NULL,
+                   FOREIGN KEY(task_id) REFERENCES tasks(task_id)
+                 );
+                 INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms)
+                   VALUES (1, strftime('%s','now') * 1000);",
+            )
+            .map_err(sqlite_io_error)?;
+        migrate_legacy_tasks(&mut connection, &state_dir.join("tasks.jsonl"))?;
         let mut store = Self {
-            file,
-            records,
+            connection,
             sequence: 0,
         };
+        let interrupted = store.task_ids_with_status().map_err(sqlite_io_error)?;
         for task_id in interrupted {
-            if let Some(previous) = store.records.get(&task_id).cloned() {
+            if let Some(previous) = store.get_record(&task_id).map_err(sqlite_io_error)? {
                 store.write(StoredTask {
                     status: "unknown".to_owned(),
                     result: json!({
@@ -302,11 +328,14 @@ impl TaskStore {
     }
 
     fn get(&self, task_id: &str) -> Option<Value> {
-        self.records.get(task_id).map(task_view)
+        self.get_record(task_id)
+            .ok()
+            .flatten()
+            .map(|task| task_view(&task))
     }
 
     fn result(&self, task_id: &str) -> Option<Value> {
-        self.records.get(task_id).map(|task| {
+        self.get_record(task_id).ok().flatten().map(|task| {
             if task.status == "completed" {
                 task.result.clone()
             } else {
@@ -320,16 +349,137 @@ impl TaskStore {
     }
 
     fn list(&self) -> Value {
-        json!({ "tasks": self.records.values().map(task_view).collect::<Vec<_>>() })
+        let mut statement = match self.connection.prepare(
+            "SELECT task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json
+             FROM tasks ORDER BY created_at_ms, task_id",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => return task_error(&format!("task store query failed: {error}")),
+        };
+        let rows = match statement.query_map([], task_from_row) {
+            Ok(rows) => rows,
+            Err(error) => return task_error(&format!("task store query failed: {error}")),
+        };
+        let tasks = rows
+            .filter_map(Result::ok)
+            .map(|task| task_view(&task))
+            .collect::<Vec<_>>();
+        json!({ "tasks": tasks })
     }
 
     fn write(&mut self, task: StoredTask) -> io::Result<()> {
-        serde_json::to_writer(&mut self.file, &task)?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()?;
-        self.records.insert(task.task_id.clone(), task);
-        Ok(())
+        let result_json = serde_json::to_string(&task.result).map_err(io::Error::other)?;
+        let transaction = self.connection.transaction().map_err(sqlite_io_error)?;
+        let previous_status = transaction
+            .query_row(
+                "SELECT status FROM tasks WHERE task_id = ?1",
+                params![&task.task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_io_error)?;
+        transaction
+            .execute(
+                "INSERT INTO tasks(task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(task_id) DO UPDATE SET
+                   status = excluded.status,
+                   ttl_ms = excluded.ttl_ms,
+                   poll_interval_ms = excluded.poll_interval_ms,
+                   created_at_ms = excluded.created_at_ms,
+                   result_json = excluded.result_json",
+                params![
+                    &task.task_id,
+                    &task.status,
+                    task.ttl_ms as i64,
+                    task.poll_interval_ms as i64,
+                    task.created_at_ms as i64,
+                    result_json,
+                ],
+            )
+            .map_err(sqlite_io_error)?;
+        if previous_status.as_deref() != Some(task.status.as_str()) {
+            transaction
+                .execute(
+                    "INSERT INTO task_events(task_id, kind, payload_json, at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        &task.task_id,
+                        &task.status,
+                        serde_json::to_string(&task.result).map_err(io::Error::other)?,
+                        now_ms() as i64,
+                    ],
+                )
+                .map_err(sqlite_io_error)?;
+        }
+        transaction.commit().map_err(sqlite_io_error)
     }
+
+    fn get_record(&self, task_id: &str) -> rusqlite::Result<Option<StoredTask>> {
+        self.connection
+            .query_row(
+                "SELECT task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json
+                 FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                task_from_row,
+            )
+            .optional()
+    }
+
+    fn task_ids_with_status(&self) -> rusqlite::Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT task_id FROM tasks WHERE status IN ('queued', 'running') ORDER BY task_id",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect()
+    }
+}
+
+fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
+    let result_json: String = row.get(5)?;
+    Ok(StoredTask {
+        task_id: row.get(0)?,
+        status: row.get(1)?,
+        ttl_ms: row.get::<_, i64>(2)?.max(0) as u64,
+        poll_interval_ms: row.get::<_, i64>(3)?.max(0) as u64,
+        created_at_ms: row.get::<_, i64>(4)?.max(0) as u128,
+        result: serde_json::from_str(&result_json).unwrap_or(Value::Null),
+    })
+}
+
+fn migrate_legacy_tasks(connection: &mut Connection, path: &Path) -> io::Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut legacy = Vec::new();
+    for line in BufReader::new(File::open(path)?).lines() {
+        if let Ok(task) = serde_json::from_str::<StoredTask>(&line?) {
+            legacy.push(task);
+        }
+    }
+    let transaction = connection.transaction().map_err(sqlite_io_error)?;
+    for task in legacy {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO tasks(task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    task.task_id,
+                    task.status,
+                    task.ttl_ms as i64,
+                    task.poll_interval_ms as i64,
+                    task.created_at_ms as i64,
+                    serde_json::to_string(&task.result).map_err(io::Error::other)?,
+                ],
+            )
+            .map_err(sqlite_io_error)?;
+    }
+    transaction.commit().map_err(sqlite_io_error)
+}
+
+fn sqlite_io_error(error: rusqlite::Error) -> io::Error {
+    io::Error::other(format!("SQLite task store error: {error}"))
 }
 
 impl TaskManager {
@@ -441,7 +591,7 @@ fn update_task(
     result: Value,
 ) -> io::Result<()> {
     let mut store = store.lock().expect("task store lock poisoned");
-    let Some(previous) = store.records.get(task_id).cloned() else {
+    let Some(previous) = store.get_record(task_id).map_err(sqlite_io_error)? else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "task record disappeared",

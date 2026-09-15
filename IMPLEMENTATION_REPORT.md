@@ -74,7 +74,7 @@ The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.049 ms
 
 ## Distribution status
 
-The `comptrolling@0.1.16` npm package is the pending release for asynchronous task execution and event-driven browser lifecycle verification. The `v0.1.16` GitHub release is pending workflow completion. The prior `v0.1.15` release was published with 16 verified archives, checksums, SBOMs, and the generated Homebrew formula. Detached signing remains opt-in because no operator signing identity was supplied. The fast verified work is pushed to `feat/fast-verified-execution-v3`; the release tag points to its release commit. GitHub Dependency Graph is disabled for this repository, so dependency review reports a warning while RustSec `cargo-audit` remains enforced by the security workflow.
+The `comptrolling@0.1.17` npm package is the pending release for asynchronous task execution, SQLite WAL state, and event-driven browser lifecycle verification. The `v0.1.17` GitHub release is pending workflow completion. The prior `v0.1.16` release was published with 16 verified archives, checksums, SBOMs, and the generated Homebrew formula. Detached signing remains opt-in because no operator signing identity was supplied. The fast verified work is pushed to `feat/fast-verified-execution-v3`; the release tag points to its release commit. GitHub Dependency Graph is disabled for this repository, so dependency review reports a warning while RustSec `cargo-audit` remains enforced by the security workflow.
 
 ## Remaining issues ordered by impact
 
