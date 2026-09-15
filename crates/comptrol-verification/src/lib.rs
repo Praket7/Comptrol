@@ -89,6 +89,16 @@ impl VerificationReport {
     pub fn is_verified(&self) -> bool {
         self.state == VerificationState::Verified
     }
+
+    /// Apply an independent finish-gate report to an action report. Delivery
+    /// evidence alone can never upgrade the final state; the independent
+    /// report must contain a passing required criterion at its own level.
+    pub fn apply_finish_gate(mut self, finish_gate: VerificationReport) -> Self {
+        self.evidence.extend(finish_gate.evidence);
+        self.criteria.extend(finish_gate.criteria);
+        self.level = finish_gate.level;
+        self.finalize()
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +123,32 @@ mod tests {
         .finalize();
         assert_eq!(report.state, VerificationState::Failed);
         assert!(!report.is_verified());
+    }
+
+    #[test]
+    fn finish_gate_controls_final_verification_state() {
+        let action = VerificationReport {
+            level: VerificationLevel::Delivery,
+            state: VerificationState::Verified,
+            criteria: vec![],
+            evidence: vec![],
+        };
+        let gate = VerificationReport {
+            level: VerificationLevel::IndependentOutcome,
+            state: VerificationState::NotAttempted,
+            criteria: vec![VerificationCriterion {
+                id: "saved".to_owned(),
+                required: true,
+                expected: Value::Bool(true),
+                observed: Value::Bool(false),
+                passed: false,
+                source: VerificationSource::IndependentFixture,
+            }],
+            evidence: vec![],
+        };
+        let result = action.apply_finish_gate(gate);
+        assert_eq!(result.level, VerificationLevel::IndependentOutcome);
+        assert_eq!(result.state, VerificationState::Failed);
+        assert!(!result.is_verified());
     }
 }

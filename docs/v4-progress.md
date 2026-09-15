@@ -9,6 +9,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Target and frame graph primitives with generation invalidation on reconnect.
 - Reduced global CDP map lock scope so WebSocket I/O is performed under a per-session lock.
 - Required verification criteria cannot produce a verified report when they fail.
+- Verification reports support an independent finish gate that can only preserve or lower confidence; dispatch evidence cannot upgrade a failed independent outcome.
 - Typed workflow parameter lifting for trace values and cryptographic structural fingerprints.
 - Protocol negotiation for legacy MCP and the 2026-07-28 current mode.
 - Current stdio and HTTP behavior refuses legacy session operations instead of silently treating them as current protocol state.
