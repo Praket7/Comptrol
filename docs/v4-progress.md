@@ -28,6 +28,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Cancellation events are accepted only for queued or running tasks; completed, failed, cancelled, and unknown tasks are not mutated by a late cancel request.
 - EventBus now provides non-blocking subscriptions, bounded replay via `snapshot_since`, and sequence inspection for reconnecting consumers.
 - Browser protocol events now use a bounded shared replay buffer plus broadcast delivery, preventing an event emitted immediately after a command from being lost before a compatibility waiter subscribes.
+- Browser protocol events now carry a monotonic connection-local cursor and expose resume-after-cursor delivery for reconnecting consumers; the durable MCP transport still needs to persist and replay these cursors end to end.
 - Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.
 - Browser manager bootstraps required CDP domains for all targets already attached in the live graph without holding graph locks across I/O.
 - Browser multiplexer exposes generation- and revision-checked target commands so warm operations can fail with `stale_reference` before dispatch instead of rediscovering or cross-targeting.
@@ -58,7 +59,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Complete target attachment/domain bootstrap coverage for all migrated compatibility helpers and remove the remaining legacy per-session socket path.
 - Extend persisted route statistics with latency samples and planner feedback across adapter/application versions.
 - Extend MCP cancellation propagation into every adapter/browser operation and add task progress replay coverage.
-- Add workflow repair fallback and host persistence for promoted candidates; the clean replay promotion gate is implemented.
+- Workflow execution now accepts a host cancellation callback, and promoted candidates can be stored atomically in a durable host registry; repair remains explicit and never silently rewrites an active workflow.
 - Implement persistent native accessibility workers and event-driven caches for all three desktop platforms.
 - Upgrade VS Code authentication, exact LibreOffice document identity, persistent OBS, Blender live IPC, and truthful kernel-isolation reporting.
 - Add the complete benchmark matrix and collect stable performance history before hard regression thresholds.

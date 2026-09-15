@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct WorkflowParameter {
@@ -75,6 +78,67 @@ pub fn promote_candidate(
     promoted.version = candidate.version.saturating_add(1);
     promoted.id = format!("{}-promoted-v{}", candidate.id, promoted.version);
     Ok(promoted)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct PromotedWorkflowHost {
+    pub workflows: BTreeMap<String, Workflow>,
+}
+
+/// Small durable host registry for promoted workflows. The runtime may place
+/// this file inside its SQLite-backed state directory; the atomic replace
+/// keeps a crash from producing a half-written active workflow set.
+pub struct WorkflowHostStore {
+    path: PathBuf,
+}
+
+impl WorkflowHostStore {
+    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if !path.exists() {
+            fs::write(&path, br#"{"workflows":{}}"#)?;
+        }
+        Ok(Self { path })
+    }
+
+    pub fn load(&self) -> io::Result<PromotedWorkflowHost> {
+        let bytes = fs::read(&self.path)?;
+        serde_json::from_slice(&bytes).map_err(io::Error::other)
+    }
+
+    pub fn get(&self, id: &str) -> io::Result<Option<Workflow>> {
+        let mut host = self.load()?;
+        Ok(host.workflows.remove(id))
+    }
+
+    pub fn put(&self, workflow: Workflow) -> io::Result<()> {
+        validate_workflow(&workflow).map_err(io::Error::other)?;
+        let mut host = self.load()?;
+        host.workflows.insert(workflow.id.clone(), workflow);
+        let bytes = serde_json::to_vec_pretty(&host).map_err(io::Error::other)?;
+        let temporary = self.path.with_extension(format!("tmp-{}", std::process::id()));
+        let mut file = fs::File::create(&temporary)?;
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(temporary, &self.path)
+    }
+}
+
+/// Repair is deliberately explicit: a cold route supplies a replacement
+/// candidate, and the active workflow is never silently rewritten in place.
+pub fn repair_candidate(original: &Workflow, replacement: Workflow) -> Result<Workflow, String> {
+    validate_workflow(&replacement)?;
+    if original.intent != replacement.intent || original.parameters != replacement.parameters {
+        return Err("repaired workflow changed intent or parameter schema".to_owned());
+    }
+    let mut repaired = replacement;
+    repaired.version = original.version.saturating_add(1);
+    repaired.id = format!("{}-repaired-v{}", original.id, repaired.version);
+    Ok(repaired)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -162,6 +226,8 @@ pub enum ExecutionError {
     VerificationFailed { node: String },
     #[error("workflow wait failed at {node}: {message}")]
     WaitFailed { node: String, message: String },
+    #[error("workflow execution was cancelled")]
+    Cancelled,
 }
 
 /// Execute a validated typed workflow without evaluating caller-supplied code.
@@ -188,6 +254,20 @@ where
     W: FnMut(&str, u64) -> Result<(), String>,
 {
     pub fn run(&mut self, workflow: &Workflow) -> Result<Value, ExecutionError> {
+        self.run_with_cancel(workflow, || false)
+    }
+
+    /// Execute with a host-owned cancellation check. The callback is checked
+    /// before every state transition, including bounded waits and branches,
+    /// so task cancellation cannot leave a workflow running between nodes.
+    pub fn run_with_cancel<C>(
+        &mut self,
+        workflow: &Workflow,
+        mut cancelled: C,
+    ) -> Result<Value, ExecutionError>
+    where
+        C: FnMut() -> bool,
+    {
         validate_workflow(workflow).map_err(|message| ExecutionError::ActionFailed {
             node: workflow.start.clone(),
             message,
@@ -197,6 +277,9 @@ where
         let mut steps = 0usize;
         let mut loop_counts = BTreeMap::<String, u32>::new();
         loop {
+            if cancelled() {
+                return Err(ExecutionError::Cancelled);
+            }
             steps = steps.saturating_add(1);
             if steps > self.max_steps.max(1) {
                 return Err(ExecutionError::StepBudgetExceeded);
@@ -585,6 +668,62 @@ mod tests {
         assert_eq!(
             promote_candidate(&workflow, &evidence, 3),
             Err(PromotionError::FingerprintMismatch)
+        );
+    }
+
+    #[test]
+    fn promoted_workflow_host_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "comptrol-workflow-host-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workflow = Workflow {
+            id: "hosted".to_owned(),
+            version: 2,
+            intent: "fixture.read".to_owned(),
+            parameters: Vec::new(),
+            fingerprint: "sha256:hosted".to_owned(),
+            start: "return".to_owned(),
+            nodes: BTreeMap::from([(
+                "return".to_owned(),
+                WorkflowNode::Return { value: Value::Null },
+            )]),
+        };
+        let store = WorkflowHostStore::open(&path).unwrap();
+        store.put(workflow.clone()).unwrap();
+        drop(store);
+        let reopened = WorkflowHostStore::open(&path).unwrap();
+        assert_eq!(reopened.get("hosted").unwrap(), Some(workflow));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workflow_cancellation_stops_before_next_transition() {
+        let workflow = Workflow {
+            id: "cancelled".to_owned(),
+            version: 1,
+            intent: "fixture.read".to_owned(),
+            parameters: Vec::new(),
+            fingerprint: "sha256:cancelled".to_owned(),
+            start: "return".to_owned(),
+            nodes: BTreeMap::from([(
+                "return".to_owned(),
+                WorkflowNode::Return { value: Value::Null },
+            )]),
+        };
+        let mut executor = WorkflowExecutor {
+            action: |_intent: &str, _params: &Value| Ok(Value::Null),
+            verify: |_criterion: &Value, _observed: &Value| true,
+            wait: |_event: &str, _timeout: u64| Ok(()),
+            max_steps: 4,
+        };
+        assert_eq!(
+            executor.run_with_cancel(&workflow, || true),
+            Err(ExecutionError::Cancelled)
         );
     }
 }

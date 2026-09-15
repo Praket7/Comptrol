@@ -240,6 +240,12 @@ struct OutgoingCommand {
 
 type PendingCommands = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, BrowserError>>>>>;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowserEvent {
+    pub sequence: u64,
+    pub value: Value,
+}
+
 /// One browser-level WebSocket with a dedicated writer and reader.
 /// Commands are correlated by id and never hold a global lock during I/O.
 #[derive(Clone)]
@@ -250,8 +256,9 @@ pub struct BrowserConnection {
     next_command_id: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
     cancellation: CancellationToken,
-    events: broadcast::Sender<Value>,
-    event_replay: Arc<Mutex<VecDeque<Value>>>,
+    events: broadcast::Sender<BrowserEvent>,
+    event_replay: Arc<Mutex<VecDeque<BrowserEvent>>>,
+    event_sequence: Arc<AtomicU64>,
 }
 
 impl BrowserConnection {
@@ -274,6 +281,8 @@ impl BrowserConnection {
         let events_for_reader = events.clone();
         let event_replay = Arc::new(Mutex::new(VecDeque::with_capacity(512)));
         let replay_for_reader = Arc::clone(&event_replay);
+        let event_sequence = Arc::new(AtomicU64::new(0));
+        let sequence_for_reader = Arc::clone(&event_sequence);
         let cancellation = CancellationToken::new();
         let cancellation_for_tasks = cancellation.clone();
         tokio::spawn(async move {
@@ -316,12 +325,16 @@ impl BrowserConnection {
                     continue;
                 };
                 let Some(id) = value.get("id").and_then(Value::as_u64) else {
-                    let _ = events_for_reader.send(value.clone());
+                    let event = BrowserEvent {
+                        sequence: sequence_for_reader.fetch_add(1, Ordering::AcqRel) + 1,
+                        value: value.clone(),
+                    };
+                    let _ = events_for_reader.send(event.clone());
                     let mut replay = replay_for_reader.lock().await;
                     if replay.len() == 512 {
                         replay.pop_front();
                     }
-                    replay.push_back(value.clone());
+                    replay.push_back(event);
                     targets_for_reader.write().await.apply_event(&value);
                     let generation = generation_for_disconnect.load(Ordering::Acquire);
                     frames_for_reader
@@ -357,6 +370,7 @@ impl BrowserConnection {
             cancellation,
             events,
             event_replay,
+            event_sequence,
         })
     }
 
@@ -389,13 +403,45 @@ impl BrowserConnection {
     /// need to open or lock a target WebSocket.
     pub async fn next_event(&self, duration: Duration) -> Result<Value, BrowserError> {
         if let Some(event) = self.event_replay.lock().await.pop_front() {
-            return Ok(event);
+            return Ok(event.value);
         }
         let mut receiver = self.events.subscribe();
         timeout(duration, receiver.recv())
             .await
             .map_err(|_| BrowserError::Timeout)?
+            .map(|event| event.value)
             .map_err(|error| BrowserError::InvalidResponse(error.to_string()))
+    }
+
+    pub async fn next_event_after(
+        &self,
+        cursor: u64,
+        duration: Duration,
+    ) -> Result<BrowserEvent, BrowserError> {
+        if let Some(event) = self
+            .event_replay
+            .lock()
+            .await
+            .iter()
+            .find(|event| event.sequence > cursor)
+            .cloned()
+        {
+            return Ok(event);
+        }
+        let mut receiver = self.events.subscribe();
+        loop {
+            let event = timeout(duration, receiver.recv())
+                .await
+                .map_err(|_| BrowserError::Timeout)?
+                .map_err(|error| BrowserError::InvalidResponse(error.to_string()))?;
+            if event.sequence > cursor {
+                return Ok(event);
+            }
+        }
+    }
+
+    pub fn latest_event_sequence(&self) -> u64 {
+        self.event_sequence.load(Ordering::Acquire)
     }
 
     pub async fn bootstrap(&self) -> Result<(), BrowserError> {
@@ -956,6 +1002,7 @@ mod tests {
             cancellation: CancellationToken::new(),
             events: broadcast::channel(8).0,
             event_replay: Arc::new(Mutex::new(VecDeque::new())),
+            event_sequence: Arc::new(AtomicU64::new(0)),
         };
         connection.targets.write().await.apply_created(target());
         let result = connection
