@@ -70,7 +70,8 @@ def handler(request):
                 bridge = json.loads(data.decode("utf-8"))
                 if bridge.get("authenticated") is not True or bridge.get("ok") is not True:
                     return response(request, False, "degraded", error=bridge.get("error", {"code": "blender_bridge_rejected", "message": "live bridge rejected request"}))
-                return response(request, True, "available", {**bridge.get("payload", {}), "verified": True, "mode": "live"})
+                payload = bridge.get("payload", {})
+                return response(request, True, "available", {**payload, "verified": payload.get("verified") is True, "verification": "blender_bpy_readback", "mode": "live"})
         input_path = Path(str(payload.get("input_path", ""))).resolve()
         if not input_path.is_file() or input_path.suffix.lower() != ".blend":
             return response(request, False, "unsupported", error={"code": "blender_input_required", "message": "Offline Blender operations require an exact existing input_path .blend file"})

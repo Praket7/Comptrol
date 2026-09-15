@@ -132,12 +132,12 @@ def handler(request):
                         raise ValueError("batch contains an unsupported observation")
                     batch.append((item["name"], item.get("data", {})))
                 result = CLIENT.batch(batch)
-                return response(request, True, "available", {"responses": result, "verified": True})
+                return response(request, True, "available", {"responses": result, "verified": True, "verification": "obs_batch_readback"})
             return response(request, False, "unsupported", error={"code": "unsupported_intent", "message": str(intent)})
         result = obs_request(request, *mapping[intent])
         if intent.startswith("obs.recording.") and intent != "obs.recording.status":
             result = {**result, "verified_status": obs_request(request, "GetRecordStatus")}
-        result = {**result, "verified": True}
+        result = {**result, "verified": True, "verification": "obs_event_or_response_readback"}
         return response(request, True, "available", result)
     except Exception as exc:
         return response(request, False, "degraded", error={"code": "obs_request_failed", "message": str(exc)})

@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "comptrol",
-  "version": "0.1.57",
+  "version": "0.1.58",
   "description": "Local first, policy bound computer control with verified browser and desktop routes.",
   "author": {
     "name": "Comptrol contributors",

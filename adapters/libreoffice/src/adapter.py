@@ -63,7 +63,7 @@ def handler(request):
             sheet = document.Sheets.getByName(str(request["payload"].get("sheet", "Sheet1")))
             cell_range = sheet.getCellRangeByName(str(request["payload"]["range"]))
             values = [list(row) for row in cell_range.getDataArray()]
-            return response(request, True, "available", {"values": values, "verified": True})
+            return response(request, True, "available", {"values": values, "verified": True, "verification": "uno_range_readback"})
         if intent == "libreoffice.calc.range.write":
             document = select_document(current_desktop, payload)
             sheet = document.Sheets.getByName(str(request["payload"].get("sheet", "Sheet1")))
@@ -72,18 +72,18 @@ def handler(request):
             if not isinstance(values, list) or any(not isinstance(row, list) for row in values):
                 raise ValueError("values must be a two-dimensional array")
             cell_range.setDataArray(tuple(tuple(row) for row in values))
-            return response(request, True, "available", {"written": True, "values": [list(row) for row in cell_range.getDataArray()], "verified": True})
+            return response(request, True, "available", {"written": True, "values": [list(row) for row in cell_range.getDataArray()], "verified": True, "verification": "uno_range_readback"})
         if intent == "libreoffice.document.save":
             document = select_document(current_desktop, payload)
             document.store()
-            return response(request, True, "available", {"saved": True, "document_url": str(document.getURL()), "document_title": str(document.getTitle()), "modified": document.isModified(), "verified": not document.isModified()})
+            return response(request, True, "available", {"saved": True, "document_url": str(document.getURL()), "document_title": str(document.getTitle()), "modified": document.isModified(), "verified": not document.isModified(), "verification": "uno_persistence_readback"})
         if intent == "libreoffice.document.export":
             document = select_document(current_desktop, payload)
             output_url = str(payload.get("output_url", "")).strip()
             if not output_url:
                 raise ValueError("output_url is required")
             document.storeToURL(output_url, ())
-            return response(request, True, "available", {"exported": True, "output_url": output_url, "modified": document.isModified(), "verified": True})
+            return response(request, True, "available", {"exported": True, "output_url": output_url, "modified": document.isModified(), "verified": True, "verification": "uno_export_readback"})
         return response(request, False, "unsupported", error={"code": "unsupported_intent", "message": str(intent)})
     except ImportError as exc:
         return response(request, False, "unsupported", error={"code": "uno_unavailable", "message": str(exc)})

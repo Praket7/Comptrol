@@ -38,7 +38,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.56";
+pub const SERVER_VERSION: &str = "0.1.58";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -1759,7 +1759,8 @@ fn execute_adapter_request(
                 .payload
                 .get("verified")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && response.payload.get("verification").is_some();
             success(
                 request,
                 operation_id,

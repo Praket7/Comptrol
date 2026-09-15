@@ -46,27 +46,27 @@ export function activate(context: vscode.ExtensionContext): void {
 async function execute(intent: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   switch (intent) {
     case "vscode.workspace.list":
-      return { folders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString()), verified: true };
+      return { folders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString()), verified: true, verification: "vscode_workspace_readback" };
     case "vscode.setting.get": {
       const key = String(payload.key ?? "");
       if (!key || key.includes("..")) throw new Error("invalid setting key");
-      return { key, value: vscode.workspace.getConfiguration().get(key), verified: true };
+      return { key, value: vscode.workspace.getConfiguration().get(key), verified: true, verification: "vscode_configuration_readback" };
     }
     case "vscode.setting.set": {
       const key = String(payload.key ?? "");
       if (!key || key.includes("..")) throw new Error("invalid setting key");
       await vscode.workspace.getConfiguration().update(key, payload.value, vscode.ConfigurationTarget.Workspace);
-      return { key, value: vscode.workspace.getConfiguration().get(key), verified: true };
+      return { key, value: vscode.workspace.getConfiguration().get(key), verified: true, verification: "vscode_configuration_readback" };
     }
     case "vscode.document.open": {
       const uri = vscode.Uri.parse(String(payload.uri ?? ""));
       const document = await vscode.workspace.openTextDocument(uri);
-      return { uri: document.uri.toString(), languageId: document.languageId, isDirty: document.isDirty, verified: true };
+      return { uri: document.uri.toString(), languageId: document.languageId, isDirty: document.isDirty, verified: true, verification: "vscode_document_readback" };
     }
     case "vscode.document.save": {
       const uri = vscode.Uri.parse(String(payload.uri ?? ""));
       const document = await vscode.workspace.openTextDocument(uri);
-      return { uri: document.uri.toString(), saved: await document.save(), isDirty: document.isDirty, verified: !document.isDirty };
+      return { uri: document.uri.toString(), saved: await document.save(), isDirty: document.isDirty, verified: !document.isDirty, verification: "vscode_document_persistence_readback" };
     }
     default: throw new Error("unsupported intent");
   }
