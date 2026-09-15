@@ -33,6 +33,51 @@ pub struct Workflow {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ReplayEvidence {
+    pub clean_fixture: bool,
+    pub independent_verification: bool,
+    pub verified_runs: u32,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PromotionError {
+    #[error("workflow replay did not use a clean fixture")]
+    NotClean,
+    #[error("workflow replay lacks independent verification")]
+    NotIndependentlyVerified,
+    #[error("workflow replay has too few verified runs")]
+    TooFewVerifiedRuns,
+    #[error("workflow replay fingerprint does not match the candidate")]
+    FingerprintMismatch,
+}
+
+/// Promote only a candidate that was repeatedly verified in a clean fixture.
+/// Promotion creates a new workflow version and never rewrites the candidate.
+pub fn promote_candidate(
+    candidate: &Workflow,
+    evidence: &ReplayEvidence,
+    minimum_verified_runs: u32,
+) -> Result<Workflow, PromotionError> {
+    if !evidence.clean_fixture {
+        return Err(PromotionError::NotClean);
+    }
+    if !evidence.independent_verification {
+        return Err(PromotionError::NotIndependentlyVerified);
+    }
+    if evidence.verified_runs < minimum_verified_runs.max(1) {
+        return Err(PromotionError::TooFewVerifiedRuns);
+    }
+    if evidence.fingerprint != candidate.fingerprint {
+        return Err(PromotionError::FingerprintMismatch);
+    }
+    let mut promoted = candidate.clone();
+    promoted.version = candidate.version.saturating_add(1);
+    promoted.id = format!("{}-promoted-v{}", candidate.id, promoted.version);
+    Ok(promoted)
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkflowNode {
     Observe {
@@ -489,5 +534,57 @@ mod tests {
             serde_json::json!({"value": 7})
         );
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn promotion_requires_clean_independent_replay() {
+        let workflow = Workflow {
+            id: "candidate".to_owned(),
+            version: 1,
+            intent: "fixture.read".to_owned(),
+            parameters: Vec::new(),
+            fingerprint: "sha256:fixture".to_owned(),
+            start: "return".to_owned(),
+            nodes: BTreeMap::from([(
+                "return".to_owned(),
+                WorkflowNode::Return { value: Value::Null },
+            )]),
+        };
+        let evidence = ReplayEvidence {
+            clean_fixture: true,
+            independent_verification: true,
+            verified_runs: 3,
+            fingerprint: workflow.fingerprint.clone(),
+        };
+        let promoted = promote_candidate(&workflow, &evidence, 3).unwrap();
+        assert_eq!(promoted.version, 2);
+        assert_ne!(promoted.id, workflow.id);
+        assert_eq!(workflow.version, 1);
+    }
+
+    #[test]
+    fn promotion_rejects_fingerprint_drift() {
+        let workflow = Workflow {
+            id: "candidate".to_owned(),
+            version: 1,
+            intent: "fixture.read".to_owned(),
+            parameters: Vec::new(),
+            fingerprint: "sha256:fixture".to_owned(),
+            start: "return".to_owned(),
+            nodes: BTreeMap::from([(
+                "return".to_owned(),
+                WorkflowNode::Return { value: Value::Null },
+            )]),
+        };
+        let evidence = ReplayEvidence {
+            clean_fixture: true,
+            independent_verification: true,
+            verified_runs: 3,
+            fingerprint: "sha256:changed".to_owned(),
+        };
+        assert_eq!(
+            promote_candidate(&workflow, &evidence, 3),
+            Err(PromotionError::FingerprintMismatch)
+        );
     }
 }

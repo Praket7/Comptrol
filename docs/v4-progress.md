@@ -20,6 +20,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Upload responses expose honest selected/transfer/accepted/persisted stages.
 - Typed workflow IR validation is enforced during trace compilation.
 - Typed workflow executor runs compiled actions through the normal runtime, resolves lifted parameters, enforces a step budget, and supports bounded branches, loops, waits, verification, and parallel reads.
+- Workflow candidates can now be promoted only after clean-fixture replay, independent verification, minimum repeated success, and fingerprint equality; promotion creates a new version without mutating the candidate.
 - Durable MCP Tasks are available across stdio, stateless HTTP, and mutual-TLS HTTP with SQLite persistence and cancellation reconciliation.
 - Task cancellation requests are persisted as task events and rechecked after execution, so cancellation state is not only an in-memory transport flag.
 - Cancellation events are accepted only for queued or running tasks; completed, failed, cancelled, and unknown tasks are not mutated by a late cancel request.
@@ -49,7 +50,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Wire the extracted async browser connection into the remaining synchronous compatibility facade and enable full target attachment/domain bootstrap.
 - Extend persisted route statistics with latency samples and planner feedback across adapter/application versions.
 - Extend MCP cancellation propagation into every adapter/browser operation and add task progress replay coverage.
-- Add clean workflow replay promotion and repair fallback; the typed state-machine executor and bounded branches/loops/parallel reads are implemented.
+- Add workflow repair fallback and host persistence for promoted candidates; the clean replay promotion gate is implemented.
 - Implement persistent native accessibility workers and event-driven caches for all three desktop platforms.
 - Upgrade VS Code authentication, exact LibreOffice document identity, persistent OBS, Blender live IPC, adapter deadlines, and truthful kernel-isolation reporting.
 - Add the complete benchmark matrix and collect stable performance history before hard regression thresholds.
