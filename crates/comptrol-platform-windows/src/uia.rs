@@ -88,10 +88,19 @@ fn worker() -> &'static UiaWorker {
             .spawn(move || {
                 let com = ComGuard::initialize()
                     .map_err(|error| format!("COM initialization failed in UIA worker: {error}"));
+                let automation = match &com {
+                    Ok(_) => {
+                        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+                            .map_err(|error| format!("UI Automation activation failed: {error}"))
+                            .ok()
+                    }
+                    Err(_) => None,
+                };
                 while let Ok((request, response)) = receiver.recv() {
-                    let result = match &com {
-                        Ok(_) => execute_once(request.as_request()),
-                        Err(error) => Err(error.clone()),
+                    let result = match (&com, &automation) {
+                        (Ok(_), Some(automation)) => execute_once(automation, request.as_request()),
+                        (_, None) => Err("UI Automation activation unavailable".to_owned()),
+                        (Err(error), _) => Err(error.clone()),
                     };
                     let _ = response.send(result);
                 }
@@ -116,11 +125,8 @@ pub fn execute(request: Request<'_>) -> Result<Value, String> {
         .map_err(|_| "Windows UIA worker stopped before responding".to_owned())?
 }
 
-fn execute_once(request: Request<'_>) -> Result<Value, String> {
+fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Value, String> {
     let started = Instant::now();
-    let automation: IUIAutomation =
-        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
-            .map_err(|error| format!("UI Automation activation failed: {error}"))?;
     let root = unsafe { automation.GetRootElement() }
         .map_err(|error| format!("UI Automation root unavailable: {error}"))?;
     let condition = unsafe { automation.CreateTrueCondition() }
