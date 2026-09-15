@@ -21,6 +21,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Typed workflow executor runs compiled actions through the normal runtime, resolves lifted parameters, enforces a step budget, and supports bounded branches, loops, waits, verification, and parallel reads.
 - Durable MCP Tasks are available across stdio, stateless HTTP, and mutual-TLS HTTP with SQLite persistence and cancellation reconciliation.
 - Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.
+- Runtime route history is persisted in SQLite and feeds conservative deterministic route scoring after safety gates.
 - OBS uses a persistent authenticated WebSocket client.
 - LibreOffice uses a persistent UNO connection and exact document identity.
 - VS Code bridge calls require a configured token, nonce, and authenticated response.
@@ -40,7 +41,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Replace the remaining synchronous CDP session implementation with the full single-reader/single-writer flattened-session multiplexer.
 - Complete universal verification wiring across every adapter and high-level operation.
 - Wire the extracted async browser connection into the remaining synchronous compatibility facade and enable full target attachment/domain bootstrap.
-- Persist route statistics and add the V2 route planner score and hard gates.
+- Extend persisted route statistics with latency samples and planner feedback across adapter/application versions.
 - Extend MCP cancellation propagation into every adapter/browser operation and add task progress replay coverage.
 - Add clean workflow replay promotion and repair fallback; the typed state-machine executor and bounded branches/loops/parallel reads are implemented.
 - Implement persistent native accessibility workers and event-driven caches for all three desktop platforms.
