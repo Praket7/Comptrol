@@ -12,7 +12,8 @@ const allowed = new Set([
 
 export function activate(context: vscode.ExtensionContext): void {
   const socketPath = process.env.COMPTROL_VSCODE_BRIDGE_SOCKET;
-  if (!socketPath) return;
+  const bridgeToken = process.env.COMPTROL_VSCODE_BRIDGE_TOKEN;
+  if (!socketPath || !bridgeToken) return;
   const server = net.createServer((socket) => {
     let buffer = "";
     socket.on("data", async (chunk) => {
@@ -24,13 +25,16 @@ export function activate(context: vscode.ExtensionContext): void {
         newline = buffer.indexOf("\n");
         try {
           const envelope = JSON.parse(line);
+          if (envelope.version !== 1 || envelope.token !== bridgeToken || typeof envelope.nonce !== "string") {
+            throw new Error("bridge authentication failed");
+          }
           const request = envelope.request ?? {};
           const intent = request.payload?.intent;
           if (!allowed.has(intent)) throw new Error("intent is not allowlisted");
           const payload = await execute(intent, request.payload ?? {});
-          socket.write(JSON.stringify({ ok: true, health: "available", payload }) + "\n");
+          socket.write(JSON.stringify({ nonce: envelope.nonce, authenticated: true, ok: true, health: "available", payload }) + "\n");
         } catch (error) {
-          socket.write(JSON.stringify({ ok: false, health: "degraded", error: { code: "bridge_request_failed", message: String(error) } }) + "\n");
+          socket.write(JSON.stringify({ nonce: undefined, authenticated: false, ok: false, health: "degraded", error: { code: "bridge_request_failed", message: String(error) } }) + "\n");
         }
       }
     });

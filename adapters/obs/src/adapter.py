@@ -67,6 +67,31 @@ class ObsClient:
                 raise RuntimeError(json.dumps(result))
             return result["d"].get("responseData", {})
 
+    def batch(self, requests):
+        with self._lock:
+            if self._socket is None:
+                self._connect()
+            request_id = str(uuid.uuid4())
+            payload = {"haltOnFailure": True, "requests": [
+                {"requestType": name, "requestData": data or {}}
+                for name, data in requests
+            ]}
+            try:
+                self._socket.send(json.dumps({"op": 6, "d": {
+                    "requestType": "RequestBatch", "requestId": request_id,
+                    "requestData": payload,
+                }}))
+                result = json.loads(self._socket.recv())
+            except Exception:
+                if self._socket is not None:
+                    self._socket.close()
+                self._socket = None
+                raise
+            status = result.get("d", {}).get("requestStatus", {})
+            if result.get("op") != 7 or not status.get("result"):
+                raise RuntimeError(json.dumps(result))
+            return result["d"].get("responseData", {})
+
 
 CLIENT = ObsClient()
 
@@ -95,6 +120,19 @@ def handler(request):
             "obs.recording.stop": ("StopRecord", {}),
         }
         if intent not in mapping:
+            if intent == "obs.batch":
+                items = request.get("payload", {}).get("requests", [])
+                if not isinstance(items, list) or not items or len(items) > 32:
+                    raise ValueError("requests must contain between 1 and 32 operations")
+                batch = []
+                for item in items:
+                    if not isinstance(item, dict) or item.get("name") not in {
+                        "GetCurrentProgramScene", "GetRecordStatus", "GetStreamStatus",
+                    }:
+                        raise ValueError("batch contains an unsupported observation")
+                    batch.append((item["name"], item.get("data", {})))
+                result = CLIENT.batch(batch)
+                return response(request, True, "available", {"responses": result, "verified": True})
             return response(request, False, "unsupported", error={"code": "unsupported_intent", "message": str(intent)})
         result = obs_request(request, *mapping[intent])
         if intent.startswith("obs.recording.") and intent != "obs.recording.status":

@@ -77,6 +77,13 @@ def handler(request):
             document = select_document(current_desktop, payload)
             document.store()
             return response(request, True, "available", {"saved": True, "document_url": str(document.getURL()), "document_title": str(document.getTitle()), "modified": document.isModified(), "verified": not document.isModified()})
+        if intent == "libreoffice.document.export":
+            document = select_document(current_desktop, payload)
+            output_url = str(payload.get("output_url", "")).strip()
+            if not output_url:
+                raise ValueError("output_url is required")
+            document.storeToURL(output_url, ())
+            return response(request, True, "available", {"exported": True, "output_url": output_url, "modified": document.isModified(), "verified": True})
         return response(request, False, "unsupported", error={"code": "unsupported_intent", "message": str(intent)})
     except ImportError as exc:
         return response(request, False, "unsupported", error={"code": "uno_unavailable", "message": str(exc)})

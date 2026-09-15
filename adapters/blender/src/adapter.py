@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import socket
 import shutil
 import subprocess
 import sys
@@ -37,9 +38,12 @@ def script_for(payload):
 def handler(request):
     method = request.get("method")
     if method == "handshake":
-        return response(request, True, "available", {"adapter": "comptrol.blender", "modes": ["offline"], "route": "typed_background_script"})
+        modes = ["offline"]
+        if os.environ.get("COMPTROL_BLENDER_BRIDGE_SOCKET") and os.environ.get("COMPTROL_BLENDER_BRIDGE_TOKEN"):
+            modes.append("live")
+        return response(request, True, "available", {"adapter": "comptrol.blender", "modes": modes, "route": "typed_main_thread_bridge_or_exact_file"})
     if method == "capabilities":
-        return response(request, True, "available", {"backend": "blender_background_python", "mode": "offline", "live": False})
+        return response(request, True, "available", {"backend": "blender_typed_bridge", "mode": "live_or_offline", "live": bool(os.environ.get("COMPTROL_BLENDER_BRIDGE_SOCKET"))})
     if method == "shutdown":
         return response(request, True, "available", {"stopped": True})
     executable = os.environ.get("COMPTROL_BLENDER_BIN") or shutil.which("blender") or shutil.which("blender.exe")
@@ -47,6 +51,26 @@ def handler(request):
         return response(request, False, "unsupported", error={"code": "blender_not_found", "message": "Blender executable is not available"})
     try:
         payload = request.get("payload", {})
+        bridge_path = os.environ.get("COMPTROL_BLENDER_BRIDGE_SOCKET")
+        bridge_token = os.environ.get("COMPTROL_BLENDER_BRIDGE_TOKEN")
+        if bridge_path and bridge_token and payload.get("mode", "live") == "live":
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(5)
+                connection.connect(bridge_path)
+                envelope = {"version": 1, "request_id": request.get("request_id"), "token": bridge_token, "payload": payload}
+                connection.sendall((json.dumps(envelope) + "\n").encode("utf-8"))
+                data = b""
+                while not data.endswith(b"\n") and len(data) < 1024 * 1024:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                if not data:
+                    raise RuntimeError("Blender live bridge closed without a response")
+                bridge = json.loads(data.decode("utf-8"))
+                if bridge.get("authenticated") is not True or bridge.get("ok") is not True:
+                    return response(request, False, "degraded", error=bridge.get("error", {"code": "blender_bridge_rejected", "message": "live bridge rejected request"}))
+                return response(request, True, "available", {**bridge.get("payload", {}), "verified": True, "mode": "live"})
         input_path = Path(str(payload.get("input_path", ""))).resolve()
         if not input_path.is_file() or input_path.suffix.lower() != ".blend":
             return response(request, False, "unsupported", error={"code": "blender_input_required", "message": "Offline Blender operations require an exact existing input_path .blend file"})
