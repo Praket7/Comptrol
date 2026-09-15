@@ -729,7 +729,9 @@ fn run_daemon() -> i32 {
     use std::os::unix::fs::FileTypeExt;
 
     let path = daemon_socket_path();
-    if let Some(parent) = path.parent()
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         && let Err(error) = std::fs::create_dir_all(parent)
     {
         eprintln!("daemon state directory failed: {error}");
@@ -781,14 +783,11 @@ fn run_daemon() -> i32 {
             return 1;
         }
     };
-    let mut tasks_enabled = false;
     eprintln!("comptrol daemon listening on {}", path.display());
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(error) =
-                    handle_ipc_connection(&mut stream, &mut runtime, &mut tasks, &mut tasks_enabled)
-                {
+                if let Err(error) = handle_ipc_connection(&mut stream, &mut runtime, &mut tasks) {
                     eprintln!("daemon connection failed: {error}");
                 }
             }
@@ -844,8 +843,8 @@ fn handle_ipc_connection(
     stream: &mut UnixStream,
     runtime: &mut Runtime,
     tasks: &mut TaskStore,
-    tasks_enabled: &mut bool,
 ) -> io::Result<()> {
+    let mut tasks_enabled = false;
     while let Some(frame) = read_ipc_frame(stream)? {
         let request: Value = match serde_json::from_slice(&frame) {
             Ok(value) => value,
