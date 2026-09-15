@@ -19,6 +19,15 @@ enum Request {
         params: Value,
         response: mpsc::Sender<Result<Value, BrowserError>>,
     },
+    FrameCommand {
+        endpoint: String,
+        frame_id: String,
+        generation: u64,
+        revision: u64,
+        method: String,
+        params: Value,
+        response: mpsc::Sender<Result<Value, BrowserError>>,
+    },
     NextEvent {
         endpoint: String,
         timeout_ms: u64,
@@ -130,6 +139,26 @@ impl BlockingBrowserManager {
                                 .await;
                                 let _ = response.send(result);
                             }
+                            Request::FrameCommand {
+                                endpoint,
+                                frame_id,
+                                generation,
+                                revision,
+                                method,
+                                params,
+                                response,
+                            } => {
+                                let result = async {
+                                    let connection = manager.connect(&endpoint).await?;
+                                    connection
+                                        .frame_command(
+                                            &frame_id, generation, revision, method, params,
+                                        )
+                                        .await
+                                }
+                                .await;
+                                let _ = response.send(result);
+                            }
                         }
                     }
                 });
@@ -213,6 +242,30 @@ impl BlockingBrowserManager {
             .send(Request::NextEvent {
                 endpoint: endpoint.to_owned(),
                 timeout_ms,
+                response,
+            })
+            .map_err(|_| BrowserError::Closed)?;
+        receiver.recv().map_err(|_| BrowserError::Closed)?
+    }
+
+    pub fn frame_command(
+        &self,
+        endpoint: &str,
+        frame_id: &str,
+        generation: u64,
+        revision: u64,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
+        let (response, receiver) = mpsc::channel();
+        self.requests
+            .send(Request::FrameCommand {
+                endpoint: endpoint.to_owned(),
+                frame_id: frame_id.to_owned(),
+                generation,
+                revision,
+                method: method.to_owned(),
+                params,
                 response,
             })
             .map_err(|_| BrowserError::Closed)?;

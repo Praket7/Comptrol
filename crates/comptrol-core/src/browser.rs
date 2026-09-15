@@ -841,6 +841,38 @@ pub fn cdp_call(
     result
 }
 
+pub fn cdp_frame_call(
+    endpoint: &str,
+    frame_id: &str,
+    generation: u64,
+    revision: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, ComptrolError> {
+    let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
+    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
+    BRIDGE
+        .get_or_init(BlockingBrowserManager::new)
+        .frame_command(
+            &browser_web_socket_url,
+            frame_id,
+            generation,
+            revision,
+            method,
+            params,
+        )
+        .map_err(|error| ComptrolError {
+            code: match error {
+                BrowserError::StaleReference(_) => "stale_reference",
+                BrowserError::Closed => "browser_disconnected",
+                _ => "browser_protocol_error",
+            }
+            .to_owned(),
+            message: error.to_string(),
+            recovery: Some("Refresh the live frame graph and retry".to_owned()),
+        })
+}
+
 fn browser_websocket_endpoint(endpoint: &str) -> Result<String, ComptrolError> {
     let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
         code: "browser_unavailable".to_owned(),

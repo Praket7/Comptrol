@@ -38,7 +38,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.55";
+pub const SERVER_VERSION: &str = "0.1.56";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -580,6 +580,7 @@ impl Policy {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             policy.allowed_intents.extend([
                 "browser.cdp.evaluate".to_owned(),
+                "browser.cdp.frame_evaluate".to_owned(),
                 "browser.cdp.navigate".to_owned(),
                 "browser.cdp.upload".to_owned(),
                 "browser.cdp.download".to_owned(),
@@ -1199,6 +1200,7 @@ impl Runtime {
                 browser_closed_group_unsupported(&request, operation_id)
             }
             "browser.cdp.evaluate"
+            | "browser.cdp.frame_evaluate"
             | "browser.cdp.navigate"
             | "browser.cdp.upload"
             | "browser.cdp.download"
@@ -1572,6 +1574,7 @@ fn classify(intent: &str) -> Risk {
         "linux.atspi.press" | "linux.atspi.set_value" => Risk::R2,
         "browser.fixture.submit" => Risk::R1,
         "browser.cdp.evaluate"
+        | "browser.cdp.frame_evaluate"
         | "browser.cdp.navigate"
         | "browser.cdp.upload"
         | "browser.cdp.download"
@@ -2211,6 +2214,7 @@ fn route_catalog() -> Vec<RoutePlan> {
         "obs.scene.list",
         "blender.scene.object.list",
         "browser.cdp.open_tab",
+        "browser.cdp.frame_evaluate",
         "browser.cdp.semantic_click",
         "browser.cdp.screenshot",
         "browser.cdp.coordinate_click",
@@ -2539,6 +2543,82 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    if request.intent == "browser.cdp.frame_evaluate" {
+        let Some(frame_id) = request.params.get("frame_id").and_then(Value::as_str) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Frame evaluation needs a frame id".to_owned(),
+                    recovery: Some("Inspect the live frame graph and include frame_id".to_owned()),
+                },
+            );
+        };
+        let Some(generation) = request
+            .params
+            .get("frame_generation")
+            .and_then(Value::as_u64)
+        else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Frame evaluation needs frame_generation".to_owned(),
+                    recovery: Some(
+                        "Use the generation returned with the frame observation".to_owned(),
+                    ),
+                },
+            );
+        };
+        let Some(revision) = request.params.get("frame_revision").and_then(Value::as_u64) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Frame evaluation needs frame_revision".to_owned(),
+                    recovery: Some(
+                        "Use the revision returned with the frame observation".to_owned(),
+                    ),
+                },
+            );
+        };
+        let Some(expression) = request.params.get("expression").and_then(Value::as_str) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Frame evaluation needs an expression".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        return match browser::cdp_frame_call(
+            &endpoint.to_string_lossy(),
+            frame_id,
+            generation,
+            revision,
+            "Runtime.evaluate",
+            json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::None,
+                if data.get("exceptionDetails").is_some() {
+                    VerificationState::Failed
+                } else {
+                    VerificationState::Verified
+                },
+                json!({"frame_id": frame_id, "generation": generation, "revision": revision, "result": data}),
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
     if request.intent == "browser.cdp.open_tab" {
         let Some(url) = request.params.get("url").and_then(Value::as_str) else {
             return ActionResult::refused(

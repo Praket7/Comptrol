@@ -34,6 +34,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Browser manager bootstraps required CDP domains for all targets already attached in the live graph without holding graph locks across I/O.
 - Direct browser navigation now independently reads back the final URL and records a surface-state verification criterion; dispatch alone remains unverified.
 - Windows CI now has a real Chrome CDP acceptance harness using an isolated loopback debugging profile and the built release executable.
+- High-level frame evaluation is now wired through the persistent flattened-session frame graph with generation and revision validation, including OOPIF session/context routing.
 - Browser multiplexer exposes generation- and revision-checked target commands so warm operations can fail with `stale_reference` before dispatch instead of rediscovering or cross-targeting.
 - Browser-level synchronous compatibility calls now use `BlockingBrowserManager`, whose dedicated long-lived Tokio runtime owns `BrowserManager` and reuses one browser-level WebSocket per debugger endpoint. Target-specific legacy helpers still need migration to generation-bound `target_command`.
 - The blocking bridge now also exposes generation- and revision-bound target commands, so migrated synchronous callers can use the live target graph without creating a per-target socket.
