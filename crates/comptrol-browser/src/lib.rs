@@ -202,6 +202,74 @@ impl TargetGraph {
             target.revision = format!("generation:{}:target:{}", self.generation, target.id);
         }
     }
+
+    pub fn apply_event(&mut self, event: &Value) {
+        match event.get("method").and_then(Value::as_str) {
+            Some("Target.targetCreated") => {
+                if let Some(info) = event
+                    .get("params")
+                    .and_then(|params| params.get("targetInfo"))
+                {
+                    let id = info
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !id.is_empty() {
+                        self.apply_created(TargetRecord {
+                            id: id.to_owned(),
+                            target_type: info
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            browser_context_id: info
+                                .get("browserContextId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            session_id: None,
+                            url: info.get("url").and_then(Value::as_str).map(str::to_owned),
+                            title: info.get("title").and_then(Value::as_str).map(str::to_owned),
+                            opener_id: info
+                                .get("openerId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            attached: false,
+                            generation: self.generation,
+                            revision: format!("generation:{}:target:{}", self.generation, id),
+                        });
+                    }
+                }
+            }
+            Some("Target.targetInfoChanged") => {
+                if let Some(info) = event
+                    .get("params")
+                    .and_then(|params| params.get("targetInfo"))
+                {
+                    let id = info
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !id.is_empty() {
+                        self.apply_changed(
+                            id,
+                            info.get("url").and_then(Value::as_str).map(str::to_owned),
+                            info.get("title").and_then(Value::as_str).map(str::to_owned),
+                        );
+                    }
+                }
+            }
+            Some("Target.targetDestroyed") => {
+                if let Some(id) = event
+                    .get("params")
+                    .and_then(|params| params.get("targetId"))
+                    .and_then(Value::as_str)
+                {
+                    self.apply_destroyed(id);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -228,6 +296,70 @@ impl FrameGraph {
     pub fn remove(&mut self, id: &str) {
         self.frames
             .retain(|frame_id, frame| frame_id != id && frame.parent_id.as_deref() != Some(id));
+    }
+
+    pub fn apply_event(&mut self, event: &Value) {
+        match event.get("method").and_then(Value::as_str) {
+            Some("Page.frameAttached") => {
+                if let Some(params) = event.get("params")
+                    && let Some(id) = params.get("frameId").and_then(Value::as_str)
+                {
+                    self.upsert(FrameRecord {
+                        id: id.to_owned(),
+                        parent_id: params
+                            .get("parentFrameId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        target_id: params
+                            .get("targetId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        loader_id: None,
+                        execution_context_ids: Vec::new(),
+                        generation: 0,
+                        revision: 0,
+                    });
+                }
+            }
+            Some("Page.frameDetached") => {
+                if let Some(id) = event
+                    .get("params")
+                    .and_then(|params| params.get("frameId"))
+                    .and_then(Value::as_str)
+                {
+                    self.remove(id);
+                }
+            }
+            Some("Runtime.executionContextCreated") => {
+                if let Some(context) = event.get("params").and_then(|params| params.get("context"))
+                    && let (Some(frame_id), Some(context_id)) = (
+                        context
+                            .get("auxData")
+                            .and_then(|data| data.get("frameId"))
+                            .and_then(Value::as_str),
+                        context.get("id").and_then(Value::as_u64),
+                    )
+                    && let Some(frame) = self.frames.get_mut(frame_id)
+                    && !frame.execution_context_ids.contains(&context_id)
+                {
+                    frame.execution_context_ids.push(context_id);
+                    frame.revision = frame.revision.saturating_add(1);
+                }
+            }
+            Some("Runtime.executionContextDestroyed") => {
+                if let Some(context_id) = event
+                    .get("params")
+                    .and_then(|params| params.get("executionContextId"))
+                    .and_then(Value::as_u64)
+                {
+                    for frame in self.frames.values_mut() {
+                        frame.execution_context_ids.retain(|id| *id != context_id);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -302,5 +434,26 @@ mod tests {
         assert_eq!(first.unwrap()["method"], "Runtime.enable");
         assert_eq!(second.unwrap()["method"], "Page.enable");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn applies_target_and_frame_lifecycle_events() {
+        let mut targets = TargetGraph::default();
+        targets.apply_event(&serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"tab-1","type":"page","url":"https://example.test","title":"Example"}}}));
+        assert_eq!(targets.targets["tab-1"].title.as_deref(), Some("Example"));
+        targets.apply_event(&serde_json::json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"tab-1","url":"https://example.test/next","title":"Next"}}}));
+        assert_eq!(
+            targets.targets["tab-1"].url.as_deref(),
+            Some("https://example.test/next")
+        );
+
+        let mut frames = FrameGraph::default();
+        frames.apply_event(&serde_json::json!({"method":"Page.frameAttached","params":{"frameId":"frame-1","parentFrameId":"root","targetId":"tab-1"}}));
+        frames.apply_event(&serde_json::json!({"method":"Runtime.executionContextCreated","params":{"context":{"id":7,"auxData":{"frameId":"frame-1"}}}}));
+        assert_eq!(frames.frames["frame-1"].execution_context_ids, vec![7]);
+        frames.apply_event(
+            &serde_json::json!({"method":"Page.frameDetached","params":{"frameId":"frame-1"}}),
+        );
+        assert!(frames.frames.is_empty());
     }
 }
