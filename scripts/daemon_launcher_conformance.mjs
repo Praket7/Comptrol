@@ -9,13 +9,15 @@ const fake = join(directory, "fake-comptrol.mjs");
 const driver = join(directory, "driver.mjs");
 const marker = join(directory, "starts");
 const received = join(directory, "received");
-const socket = join(directory, "comptrol.sock");
+const socket = process.platform === "win32"
+  ? `\\\\.\\pipe\\comptrol-daemon-launcher-${process.pid}`
+  : join(directory, "comptrol.sock");
 await writeFile(
   driver,
   `
 import { createServer } from "node:net";
 import { appendFile, readFile, unlink, writeFile } from "node:fs/promises";
-const socketPath = process.env.COMPTROL_SOCKET_PATH;
+const socketPath = process.env.COMPTROL_SOCKET_PATH || process.env.COMPTROL_PIPE_NAME;
 const marker = process.env.COMPTROL_TEST_MARKER;
 const received = process.env.COMPTROL_TEST_RECEIVED;
 const previous = await readFile(marker, "utf8").catch(() => "0");
@@ -50,16 +52,20 @@ server.listen(socketPath);
 `,
 );
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
-await writeFile(fake, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(driver)} "$@"\n`, { mode: 0o755 });
-await chmod(fake, 0o755);
+const fakeCommand = process.platform === "win32"
+  ? `@echo off\r\n"${process.execPath}" "${driver}" %*\r\n`
+  : `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(driver)} "$@"\n`;
+const fakePath = process.platform === "win32" ? join(directory, "fake-comptrol.cmd") : fake;
+await writeFile(fakePath, fakeCommand, { mode: 0o755 });
+await chmod(fakePath, 0o755);
 
 const launcher = spawn(process.execPath, ["packages/mcp/bin/comptrol-mcp.js"], {
   cwd: new URL("..", import.meta.url),
   env: {
     ...process.env,
-    COMPTROL_BIN: fake,
+    COMPTROL_BIN: fakePath,
     COMPTROL_DAEMON: "1",
-    COMPTROL_SOCKET_PATH: socket,
+    ...(process.platform === "win32" ? { COMPTROL_PIPE_NAME: socket } : { COMPTROL_SOCKET_PATH: socket }),
     COMPTROL_TEST_MARKER: marker,
     COMPTROL_TEST_RECEIVED: received,
   },

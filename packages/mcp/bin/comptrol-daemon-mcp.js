@@ -171,6 +171,7 @@ function startDaemon() {
   daemon = spawn(binary, ["daemon"], {
     stdio: ["ignore", "ignore", "inherit"],
     env: process.env,
+    shell: process.platform === "win32" && binary.toLowerCase().endsWith(".cmd"),
   });
   daemon.on("error", (error) => scheduleRestart(`because daemon launch failed ${error.message}`));
   connectSocket();

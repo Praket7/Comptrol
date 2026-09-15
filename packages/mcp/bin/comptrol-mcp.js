@@ -46,6 +46,7 @@ function start() {
   const current = spawn(binary, args, {
     stdio: ["pipe", "pipe", "inherit"],
     env: process.env,
+    shell: process.platform === "win32" && binary.toLowerCase().endsWith(".cmd"),
   });
   child = current;
   let handled = false;

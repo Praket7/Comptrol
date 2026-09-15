@@ -28,14 +28,18 @@ process.stdin.on("data", async (chunk) => {
 `,
 );
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
-await writeFile(fake, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(driver)} "$@"\n`, {
+const fakeCommand = process.platform === "win32"
+  ? `@echo off\r\n"${process.execPath}" "${driver}" %*\r\n`
+  : `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(driver)} "$@"\n`;
+const fakePath = process.platform === "win32" ? join(directory, "fake-comptrol.cmd") : fake;
+await writeFile(fakePath, fakeCommand, {
   mode: 0o755,
 });
-await chmod(fake, 0o755);
+await chmod(fakePath, 0o755);
 
 const launcher = spawn(process.execPath, ["packages/mcp/bin/comptrol-mcp.js"], {
   cwd: new URL("..", import.meta.url),
-  env: { ...process.env, COMPTROL_BIN: fake, COMPTROL_TEST_MARKER: marker },
+  env: { ...process.env, COMPTROL_BIN: fakePath, COMPTROL_TEST_MARKER: marker },
   stdio: ["pipe", "pipe", "pipe"],
 });
 const exited = once(launcher, "exit");
