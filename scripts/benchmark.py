@@ -164,6 +164,7 @@ def run_verified_task(process):
     resource_usage = resource_snapshot(process)
     return {
         "suite": "verified_task",
+        "measurement_scope": "stdio_task_fixture",
         "verified_success": structured.get("verification") == "verified",
         "verification": structured.get("verification"),
         "submit_ms": round(submit_ms, 3),
@@ -173,6 +174,14 @@ def run_verified_task(process):
         "bytes_in": bytes_in,
         "bytes_out": bytes_out,
         "retries": 0,
+        "external_model_turns": 0,
+        "internal_route_actions": 1,
+        "websocket_handshakes": 0,
+        "json_list_requests": 0,
+        "screenshots": 0,
+        "target_mismatches": 0,
+        "duplicate_mutations": 0,
+        "disturbance_events": 0,
         "false_positive_verifications": 0,
         "disturbance": disturbance,
         "resource_usage": resource_usage,
