@@ -1012,6 +1012,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frame_command_routes_oopif_context_over_flattened_session() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = socket.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(&request.to_string()).unwrap();
+            assert_eq!(request["sessionId"], "session-oopif");
+            assert_eq!(request["method"], "Runtime.evaluate");
+            assert_eq!(request["params"]["contextId"], 99);
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id": request["id"], "sessionId":"session-oopif", "result":{"result":{"type":"string","value":"https://cross-origin.test/"}}}).to_string().into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        connection
+            .targets
+            .write()
+            .await
+            .apply_created(TargetRecord {
+                id: "oopif-target".to_owned(),
+                target_type: "iframe".to_owned(),
+                browser_context_id: Some("default".to_owned()),
+                session_id: Some("session-oopif".to_owned()),
+                url: Some("https://cross-origin.test/".to_owned()),
+                title: None,
+                opener_id: None,
+                attached: true,
+                generation: 0,
+                revision: "target-revision".to_owned(),
+            });
+        connection.frames.write().await.upsert(FrameRecord {
+            id: "frame-oopif".to_owned(),
+            parent_id: Some("root".to_owned()),
+            target_id: "oopif-target".to_owned(),
+            loader_id: None,
+            execution_context_ids: vec![99],
+            generation: 0,
+            revision: 4,
+        });
+        let result = connection
+            .frame_command(
+                "frame-oopif",
+                0,
+                4,
+                "Runtime.evaluate",
+                serde_json::json!({"expression":"location.href"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["result"]["value"], "https://cross-origin.test/");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn manager_rejects_empty_endpoint_without_creating_state() {
         let manager = BrowserManager::new();
         let result = manager.connect("").await;
