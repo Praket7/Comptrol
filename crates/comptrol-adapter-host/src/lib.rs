@@ -10,6 +10,18 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectExtendedLimitInformation, SetInformationJobObject,
+};
+
 #[derive(Clone, Debug)]
 pub struct AdapterHostConfig {
     pub manifest: AdapterManifest,
@@ -24,6 +36,8 @@ pub struct AdapterHostConfig {
 pub struct AdapterHost {
     config: AdapterHostConfig,
     child: Child,
+    #[cfg(windows)]
+    _job: JobObject,
     stdin: ChildStdin,
     stdout: Option<ChildStdout>,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
@@ -78,6 +92,8 @@ impl AdapterHost {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
+        #[cfg(windows)]
+        let job = JobObject::for_process(&child)?;
         let stdin = child
             .stdin
             .take()
@@ -112,6 +128,8 @@ impl AdapterHost {
         Ok(Self {
             config,
             child,
+            #[cfg(windows)]
+            _job: job,
             stdin,
             stdout: Some(stdout),
             stderr_tail,
@@ -264,6 +282,51 @@ impl AdapterHost {
 
     pub fn handshake(&mut self) -> Result<RpcResponse, HostError> {
         self.request("handshake", "adapter", Value::Null, None)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct JobObject {
+    handle: HANDLE,
+}
+
+#[cfg(windows)]
+impl JobObject {
+    fn for_process(child: &Child) -> Result<Self, HostError> {
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(HostError::Io(io::Error::last_os_error()));
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                ..unsafe { std::mem::zeroed() }
+            },
+            ..unsafe { std::mem::zeroed() }
+        };
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        let assigned = configured
+            && unsafe { AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) } != 0;
+        if !assigned {
+            unsafe { CloseHandle(handle) };
+            return Err(HostError::Io(io::Error::last_os_error()));
+        }
+        Ok(Self { handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobObject {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
