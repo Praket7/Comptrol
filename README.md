@@ -36,6 +36,21 @@ Install Rust and run the binary from this repository.
 
 The standard input and output transport is the compatibility path for Codex, Claude Code, Cursor, and other MCP clients.
 
+## Install the launcher
+
+The published npm launcher is named `comptrolling`.
+
+```text
+npm install comptrolling
+npx comptrolling
+```
+
+The Homebrew formula is generated for macOS Apple Silicon, macOS Intel, Linux ARM64, and Linux x64 when those native release archives exist. The current private release contains Apple Silicon and Intel macOS archives. Linux archives will be attached after native Linux CI runs. A public Homebrew install requires a public tap or public release assets. The private release formula is available as `comptrolling.rb` to authorized repository users.
+
+## Release trust
+
+Every native archive has a SHA256 checksum and a Cargo metadata SBOM. A signed release also includes a detached signature and a public key. The private signing key belongs to the release operator and is never committed to GitHub. Users verify the signature with the published public key before installing. A checksum detects accidental or transit corruption. A signature also authenticates the release source when the public key was obtained through a trusted channel.
+
 ## Safety
 
 The emergency stop command creates a local latch. Mutating requests refuse while that latch exists. Resume is a human local action.
