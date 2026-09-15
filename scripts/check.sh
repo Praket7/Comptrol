@@ -5,6 +5,7 @@ cargo test --workspace
 cargo build
 python3 scripts/lint_readme.py
 npm run test:browser
+npm run test:launcher
 python3 scripts/client_conformance.py
 python3 scripts/progress_conformance.py
 python3 scripts/tasks_conformance.py

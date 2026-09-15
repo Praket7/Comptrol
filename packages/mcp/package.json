@@ -1,10 +1,9 @@
 {
   "name": "@comptrol/mcp",
   "version": "0.1.0",
-  "description": "MCP launcher for a Comptrol binary installed on the host",
+  "description": "Supervised MCP launcher for a Comptrol binary installed on the host",
   "bin": { "comptrol-mcp": "bin/comptrol-mcp.js" },
   "files": ["bin"],
   "engines": { "node": ">=18" },
   "license": "Apache-2.0"
 }
-

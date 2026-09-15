@@ -12,7 +12,7 @@ The current host observer is real. On macOS it calls the public System Events ac
 
 The loopback HTTP preview validates the origin and binds only to localhost. It also serves a read only diagnostics dashboard. The standard compatibility path is MCP stdio.
 
-The repository also includes an npm launcher package, CI validation, a release workflow, browser target discovery, a narrow CDP websocket route for evaluation navigation and sandbox uploads, a fixture mutation route with exact target binding and duplicate submission protection, platform capability brokers, an adapter registry contract, client conformance harnesses, Homebrew formula generation, threat model, privacy notes, contribution guidance, and research notes.
+The repository also includes an npm launcher package with bounded native process supervision, CI validation, a release workflow, browser target discovery, a narrow CDP websocket route for evaluation navigation and sandbox uploads, a fixture mutation route with exact target binding and duplicate submission protection, platform capability brokers, an adapter registry contract, client conformance harnesses, Homebrew formula generation, threat model, privacy notes, contribution guidance, and research notes.
 
 The browser route now opens foreground tabs through an explicit native Chrome launcher when enabled and opens exact visible or background tabs through the configured local Chrome endpoint. On macOS, an explicit Accessibility route can reopen one exact closed saved group in the visible Chrome window and verifies that the closed group control disappeared. It reads bounded accessibility trees, moves exact live targets through history, and closes exact live targets. The result reports the exact target identity where CDP is available and explicitly records that mouse and clipboard were untouched. Account state is preserved by using the existing browser profile. No credential or cookie transfer into a separate headless profile is attempted.
 
@@ -36,7 +36,7 @@ The live MCP harness passed initialize, tool discovery, readiness operation, rea
 
 The README forbidden punctuation check passed.
 
-The npm package dry run passed.
+The npm package dry run and launcher restart conformance passed. The browser fixture conformance passed.
 
 The optimized Rust build passed before the latest semantic Chrome group route. The current rebuild is blocked by the same local Xcode license gate.
 
