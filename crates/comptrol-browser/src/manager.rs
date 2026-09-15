@@ -32,6 +32,7 @@ impl BrowserManager {
         }
         let connection = Arc::new(BrowserConnection::connect(endpoint).await?);
         connection.bootstrap().await?;
+        connection.bootstrap_attached_targets().await?;
         let mut connections = self.connections.write().await;
         if let Some(existing) = connections.get(endpoint).cloned()
             && !existing.is_closed()

@@ -201,6 +201,25 @@ impl BrowserConnection {
         Ok(())
     }
 
+    /// Enable the required domains for all targets attached during browser
+    /// bootstrap. The graph is copied before dispatch so no graph lock is held
+    /// across WebSocket I/O.
+    pub async fn bootstrap_attached_targets(&self) -> Result<usize, BrowserError> {
+        let sessions = {
+            let graph = self.targets.read().await;
+            graph
+                .targets
+                .values()
+                .filter(|target| target.attached)
+                .filter_map(|target| target.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+        for session_id in &sessions {
+            self.bootstrap_target(session_id.clone()).await?;
+        }
+        Ok(sessions.len())
+    }
+
     /// Send a command to an already-attached target from the live graph.
     ///
     /// The caller must provide the target generation and revision it observed.
