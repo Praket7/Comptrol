@@ -41,6 +41,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - OBS uses a persistent authenticated WebSocket client.
 - LibreOffice uses a persistent UNO connection and exact document identity.
 - Adapter hosts enforce bounded request deadlines, reap timed-out children, and retain a bounded stderr diagnostic tail.
+- Mutual-TLS transport has a checked-in interoperability conformance test covering a valid client certificate and rejection of an unauthenticated client.
 - VS Code bridge calls require a configured token, nonce, and authenticated response.
 - Adapter host response reads have bounded I/O deadlines and terminate unresponsive children.
 - Doctor reports current capability and live-verification boundaries.

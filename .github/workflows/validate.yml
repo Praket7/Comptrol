@@ -50,6 +50,9 @@ jobs:
         env:
           COMPTROL_BIN: target/release/comptrol
       - run: python3 scripts/mcp_http_current_conformance.py
+      - run: python3 scripts/mtls_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
       - run: python3 scripts/benchmark_v4.py --binary target/release/comptrol --iterations 25 --output benchmark-results/v4-transport.json
       - uses: actions/upload-artifact@v4
         with:
