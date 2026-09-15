@@ -12,6 +12,10 @@ pub mod trace;
 
 use comptrol_adapter_host::{AdapterHost, AdapterHostConfig};
 use comptrol_adapter_sdk::{AdapterManifest, HealthState};
+pub use comptrol_verification::{
+    VerificationCriterion, VerificationEvidence, VerificationLevel, VerificationReport,
+    VerificationSource, VerificationState as StructuredVerificationState,
+};
 use comptrol_workflow::{Workflow, WorkflowExecutor, WorkflowNode};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -33,7 +37,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.38";
+pub const SERVER_VERSION: &str = "0.1.39";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
