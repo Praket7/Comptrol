@@ -135,7 +135,7 @@ impl AdapterRegistry {
                         "project.save".to_owned(),
                         "render".to_owned(),
                     ],
-                    route: "isolated_blender_typed_script".to_owned(),
+                    route: "isolated_blender_offline_typed_script".to_owned(),
                     risk: Risk::R2,
                     isolation: "out_of_process_loopback".to_owned(),
                 },

@@ -37,29 +37,32 @@ def script_for(payload):
 def handler(request):
     method = request.get("method")
     if method == "handshake":
-        return response(request, True, "available", {"adapter": "comptrol.blender", "route": "typed_background_script"})
+        return response(request, True, "available", {"adapter": "comptrol.blender", "modes": ["offline"], "route": "typed_background_script"})
     if method == "capabilities":
-        return response(request, True, "available", {"backend": "blender_background_python"})
+        return response(request, True, "available", {"backend": "blender_background_python", "mode": "offline", "live": False})
     if method == "shutdown":
         return response(request, True, "available", {"stopped": True})
     executable = os.environ.get("COMPTROL_BLENDER_BIN") or shutil.which("blender") or shutil.which("blender.exe")
     if not executable:
         return response(request, False, "unsupported", error={"code": "blender_not_found", "message": "Blender executable is not available"})
     try:
-        script = script_for(request.get("payload", {}))
+        payload = request.get("payload", {})
+        input_path = Path(str(payload.get("input_path", ""))).resolve()
+        if not input_path.is_file() or input_path.suffix.lower() != ".blend":
+            return response(request, False, "unsupported", error={"code": "blender_input_required", "message": "Offline Blender operations require an exact existing input_path .blend file"})
+        script = script_for(payload)
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as handle:
             handle.write(script)
             script_path = handle.name
         try:
-            completed = subprocess.run([executable, "--background", "--python", script_path], capture_output=True, text=True, timeout=30, check=False)
+            completed = subprocess.run([executable, "--background", str(input_path), "--python", script_path], capture_output=True, text=True, timeout=30, check=False)
         finally:
             os.unlink(script_path)
         if completed.returncode != 0:
             return response(request, False, "degraded", error={"code": "blender_failed", "message": completed.stderr[-2000:]})
-        return response(request, True, "available", {"stdout": completed.stdout[-4000:], "verified_process_exit": True})
+        return response(request, True, "available", {"mode": "offline", "input_path": str(input_path), "stdout": completed.stdout[-4000:], "verified_process_exit": True, "live_project_modified": False})
     except Exception as exc:
         return response(request, False, "unhealthy", error={"code": "blender_request_failed", "message": str(exc)})
 
 
 serve(handler)
-
