@@ -143,6 +143,7 @@ jobs:
           test -f packages/mcp/native/linux-arm64/comptrol
           test -f packages/mcp/native/linux-x64/comptrol
           test -f packages/mcp/native/win32-x64/comptrol.exe
+          python3 scripts/validate_npm_package.py
       - name: Publish package with trusted provenance
         run: |
           set -o pipefail
