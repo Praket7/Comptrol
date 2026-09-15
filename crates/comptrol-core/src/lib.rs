@@ -1993,7 +1993,7 @@ fn browser_cdp_workflow(
         Ok(targets) => targets,
         Err(error) => return browser_failure(request, operation_id, error),
     };
-    let target = match browser::bind_browser_target(
+    let target = match crate::bind_browser_target(
         &targets,
         target_id,
         Some(browser_context_id),
@@ -2069,7 +2069,7 @@ fn browser_cdp_workflow(
         completed.push(json!({"index": index, "result": data}));
         if let Ok(current) = browser::discover(&endpoint)
             && let Ok(bound) =
-                browser::bind_browser_target(&current, target_id, Some(browser_context_id), None)
+                crate::bind_browser_target(&current, target_id, Some(browser_context_id), None)
         {
             revision = bound.revision;
         }
@@ -2102,7 +2102,7 @@ fn browser_wait_for_url(
     loop {
         if let Ok(targets) = browser::discover(endpoint)
             && let Ok(target) =
-                browser::bind_browser_target(&targets, target_id, Some(browser_context_id), None)
+                crate::bind_browser_target(&targets, target_id, Some(browser_context_id), None)
             && target
                 .url
                 .as_deref()
