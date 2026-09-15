@@ -28,6 +28,9 @@ try {
   assert.equal(stale.error, "stale_reference")
   const binary = process.env.COMPTROL_BIN || "target/debug/comptrol"
   if (existsSync(binary)) {
+    if (process.platform === "win32" && !binary.toLowerCase().endsWith(".exe")) {
+      throw new Error(`COMPTROL_BIN points to a non-Windows binary (${binary}). Run this conformance test from WSL, or build a Windows executable and set COMPTROL_BIN to its .exe path.`)
+    }
     const comptrol = spawn(binary, ["mcp"], { env: { ...process.env, COMPTROL_CDP_ENDPOINT: `http://127.0.0.1:${port}`, COMPTROL_ALLOW_BROWSER_FIXTURE: "1", COMPTROL_ALLOW_BROWSER_CDP: "1", COMPTROL_STATE_DIR: `/tmp/comptrol-browser-${process.pid}` }, stdio: ["pipe", "pipe", "inherit"] })
     let buffer = ""
     const response = (id, message) => new Promise((resolve, reject) => {

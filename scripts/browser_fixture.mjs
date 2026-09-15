@@ -12,6 +12,7 @@ const openedTabs = new Map()
 let websocketConnections = 0
 let browserWebsocketConnections = 0
 let pageWebsocketConnections = 0
+let targetListRequests = 0
 let fixtureHistoryIndex = 1
 const fixtureHistory = [
   { id: 1, url: "http://127.0.0.1:17417/previous" },
@@ -63,6 +64,7 @@ const server = createServer(async (request, response) => {
     return
   }
   if (request.method === "GET" && request.url === "/json/list") {
+    targetListRequests += 1
     json(response, 200, [{ id: targetId, type: "page", title: "Comptrol browser fixture", url: `http://127.0.0.1:${port}/`, browserContextId, revision, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${targetId}` }, ...openedTabs.values()])
     return
   }
@@ -71,7 +73,7 @@ const server = createServer(async (request, response) => {
     return
   }
   if (request.method === "GET" && request.url === "/metrics") {
-    json(response, 200, { websocketConnections, browserWebsocketConnections, pageWebsocketConnections })
+    json(response, 200, { websocketConnections, browserWebsocketConnections, pageWebsocketConnections, targetListRequests })
     return
   }
   if (request.method === "GET" && request.url === "/download/fixture.txt") {
