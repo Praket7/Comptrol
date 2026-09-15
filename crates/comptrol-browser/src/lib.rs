@@ -311,6 +311,35 @@ impl TargetGraph {
                     self.apply_destroyed(id);
                 }
             }
+            Some("Target.attachedToTarget") => {
+                if let Some(params) = event.get("params") {
+                    let target_id = params
+                        .get("targetInfo")
+                        .and_then(|info| info.get("targetId"))
+                        .and_then(Value::as_str);
+                    let target_id =
+                        target_id.or_else(|| params.get("targetId").and_then(Value::as_str));
+                    if let (Some(target_id), Some(session_id)) =
+                        (target_id, params.get("sessionId").and_then(Value::as_str))
+                        && let Some(target) = self.targets.get_mut(target_id)
+                    {
+                        target.session_id = Some(session_id.to_owned());
+                        target.attached = true;
+                        target.generation = self.generation;
+                        target.revision =
+                            format!("generation:{}:target:{}", self.generation, target_id);
+                    }
+                }
+            }
+            Some("Target.detachedFromTarget") => {
+                if let Some(params) = event.get("params") {
+                    let target_id = params.get("targetId").and_then(Value::as_str);
+                    if let Some(target) = target_id.and_then(|id| self.targets.get_mut(id)) {
+                        target.session_id = None;
+                        target.attached = false;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -577,6 +606,15 @@ mod tests {
             targets.targets["tab-1"].url.as_deref(),
             Some("https://example.test/next")
         );
+        targets.apply_event(&serde_json::json!({"method":"Target.attachedToTarget","params":{"sessionId":"session-1","targetInfo":{"targetId":"tab-1"}}}));
+        assert_eq!(
+            targets.targets["tab-1"].session_id.as_deref(),
+            Some("session-1")
+        );
+        assert!(targets.targets["tab-1"].attached);
+        targets.apply_event(&serde_json::json!({"method":"Target.detachedFromTarget","params":{"targetId":"tab-1","sessionId":"session-1"}}));
+        assert!(!targets.targets["tab-1"].attached);
+        assert!(targets.targets["tab-1"].session_id.is_none());
 
         let mut frames = FrameGraph::default();
         frames.apply_event(&serde_json::json!({"method":"Page.frameAttached","params":{"frameId":"frame-1","parentFrameId":"root","targetId":"tab-1"}}));
