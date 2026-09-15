@@ -24,6 +24,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Workflow candidates can now be promoted only after clean-fixture replay, independent verification, minimum repeated success, and fingerprint equality; promotion creates a new version without mutating the candidate.
 - Durable MCP Tasks are available across stdio, stateless HTTP, and mutual-TLS HTTP with SQLite persistence and cancellation reconciliation.
 - Task cancellation requests are persisted as task events and rechecked after execution, so cancellation state is not only an in-memory transport flag.
+- Durable Tasks now persist a progress snapshot alongside status and result, with migration support for existing SQLite stores; reconnecting clients can inspect progress without relying on transient notifications.
 - Cancellation events are accepted only for queued or running tasks; completed, failed, cancelled, and unknown tasks are not mutated by a late cancel request.
 - EventBus now provides non-blocking subscriptions, bounded replay via `snapshot_since`, and sequence inspection for reconnecting consumers.
 - Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.

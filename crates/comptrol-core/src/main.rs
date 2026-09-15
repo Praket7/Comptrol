@@ -56,6 +56,8 @@ struct StoredTask {
     ttl_ms: u64,
     poll_interval_ms: u64,
     created_at_ms: u128,
+    #[serde(default)]
+    progress: Value,
     result: Value,
 }
 
@@ -283,6 +285,7 @@ impl TaskStore {
                    ttl_ms INTEGER NOT NULL,
                    poll_interval_ms INTEGER NOT NULL,
                    created_at_ms INTEGER NOT NULL,
+                   progress_json TEXT NOT NULL DEFAULT 'null',
                    result_json TEXT NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS task_events (
@@ -310,6 +313,13 @@ impl TaskStore {
                    VALUES (1, strftime('%s','now') * 1000);",
             )
             .map_err(sqlite_io_error)?;
+        if let Err(error) = connection.execute(
+            "ALTER TABLE tasks ADD COLUMN progress_json TEXT NOT NULL DEFAULT 'null'",
+            [],
+        ) && !error.to_string().contains("duplicate column name")
+        {
+            return Err(sqlite_io_error(error));
+        }
         migrate_legacy_tasks(&mut connection, &state_dir.join("tasks.jsonl"))?;
         let mut store = Self {
             connection,
@@ -340,6 +350,7 @@ impl TaskStore {
             ttl_ms,
             poll_interval_ms: TASK_POLL_INTERVAL_MS,
             created_at_ms: now_ms(),
+            progress: Value::Null,
             result: Value::Null,
         };
         self.write(task.clone())?;
@@ -412,7 +423,7 @@ impl TaskStore {
 
     fn list(&self) -> Value {
         let mut statement = match self.connection.prepare(
-            "SELECT task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json
+            "SELECT task_id, status, ttl_ms, poll_interval_ms, created_at_ms, progress_json, result_json
              FROM tasks ORDER BY created_at_ms, task_id",
         ) {
             Ok(statement) => statement,
@@ -442,13 +453,14 @@ impl TaskStore {
             .map_err(sqlite_io_error)?;
         transaction
             .execute(
-                "INSERT INTO tasks(task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO tasks(task_id, status, ttl_ms, poll_interval_ms, created_at_ms, progress_json, result_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(task_id) DO UPDATE SET
                    status = excluded.status,
                    ttl_ms = excluded.ttl_ms,
                    poll_interval_ms = excluded.poll_interval_ms,
                    created_at_ms = excluded.created_at_ms,
+                   progress_json = excluded.progress_json,
                    result_json = excluded.result_json",
                 params![
                     &task.task_id,
@@ -456,6 +468,7 @@ impl TaskStore {
                     task.ttl_ms as i64,
                     task.poll_interval_ms as i64,
                     task.created_at_ms as i64,
+                    serde_json::to_string(&task.progress).map_err(io::Error::other)?,
                     result_json,
                 ],
             )
@@ -480,7 +493,7 @@ impl TaskStore {
     fn get_record(&self, task_id: &str) -> rusqlite::Result<Option<StoredTask>> {
         self.connection
             .query_row(
-                "SELECT task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json
+                "SELECT task_id, status, ttl_ms, poll_interval_ms, created_at_ms, progress_json, result_json
                  FROM tasks WHERE task_id = ?1",
                 params![task_id],
                 task_from_row,
@@ -533,13 +546,15 @@ impl TaskStore {
 }
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
-    let result_json: String = row.get(5)?;
+    let progress_json: String = row.get(5)?;
+    let result_json: String = row.get(6)?;
     Ok(StoredTask {
         task_id: row.get(0)?,
         status: row.get(1)?,
         ttl_ms: row.get::<_, i64>(2)?.max(0) as u64,
         poll_interval_ms: row.get::<_, i64>(3)?.max(0) as u64,
         created_at_ms: row.get::<_, i64>(4)?.max(0) as u128,
+        progress: serde_json::from_str(&progress_json).unwrap_or(Value::Null),
         result: serde_json::from_str(&result_json).unwrap_or(Value::Null),
     })
 }
@@ -558,14 +573,15 @@ fn migrate_legacy_tasks(connection: &mut Connection, path: &Path) -> io::Result<
     for task in legacy {
         transaction
             .execute(
-                "INSERT OR IGNORE INTO tasks(task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR IGNORE INTO tasks(task_id, status, ttl_ms, poll_interval_ms, created_at_ms, progress_json, result_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     task.task_id,
                     task.status,
                     task.ttl_ms as i64,
                     task.poll_interval_ms as i64,
                     task.created_at_ms as i64,
+                    serde_json::to_string(&task.progress).map_err(io::Error::other)?,
                     serde_json::to_string(&task.result).map_err(io::Error::other)?,
                 ],
             )
@@ -740,6 +756,13 @@ fn update_task(
     };
     let task = StoredTask {
         status: status.to_owned(),
+        progress: match status {
+            "running" => json!({ "value": 0.0, "message": "Task execution started" }),
+            "completed" => json!({ "value": 1.0, "message": "Task completed" }),
+            "cancelled" => json!({ "value": 1.0, "message": "Task cancelled before execution" }),
+            "unknown" => json!({ "message": "Task requires reconciliation" }),
+            _ => Value::Null,
+        },
         result,
         ..previous
     };
@@ -752,6 +775,7 @@ fn task_view(task: &StoredTask) -> Value {
         "status": task.status,
         "ttlMs": task.ttl_ms,
         "pollIntervalMs": task.poll_interval_ms,
+        "progress": task.progress,
         "result": task.result
     })
 }
