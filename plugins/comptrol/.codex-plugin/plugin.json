@@ -1,6 +1,6 @@
 {
   "name": "comptrol",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "description": "Local first, policy bound computer control with verified browser and desktop routes.",
   "author": {
     "name": "Local developer"
