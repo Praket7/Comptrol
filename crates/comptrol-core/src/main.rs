@@ -1,7 +1,8 @@
 use comptrol::{
-    MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime, SERVER_VERSION, TraceMode,
-    capabilities, default_state_dir, integration, pairing::PairingStore, privacy_network_endpoints,
-    privacy_status, read_trace,
+    CompiledWorkflow, MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime,
+    SERVER_VERSION, TraceMode, capabilities, compile_verified_trace, default_state_dir,
+    integration, pairing::PairingStore, privacy_network_endpoints, privacy_status, read_trace,
+    validate_compiled_workflow,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -643,6 +644,7 @@ fn main() {
         Some("daemon-health") => run_daemon_health(),
         Some("record") => run_record(env::args().skip(2).collect()),
         Some("replay") => run_replay(env::args().skip(2).collect()),
+        Some("workflow") => run_workflow(env::args().skip(2).collect()),
         Some("integrate") => run_integrate(env::args().skip(2).collect()),
         Some("pair") => run_pair(env::args().skip(2).collect()),
         Some("privacy") => run_privacy(env::args().skip(2).collect()),
@@ -653,7 +655,7 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor status capabilities stop resume serve-http daemon daemon-health record replay integrate pair privacy version"
+                "commands are mcp doctor status capabilities stop resume serve-http daemon daemon-health record replay workflow integrate pair privacy version"
             );
             2
         }
@@ -1233,7 +1235,7 @@ fn task_error(message: &str) -> Value {
 fn tools() -> Value {
     json!([
         { "name": "operate", "description": "Execute one bounded local intent with policy, idempotency, background posture, and verification state", "inputSchema": { "type": "object", "required": ["intent"], "properties": { "intent": {"type":"string"}, "target": {"type":"object"}, "params": {"type":"object"}, "postcondition": {"type":"object"}, "risk": {"type":"string"}, "idempotency_key": {"type":"string"}, "dry_run": {"type":"boolean"}, "background": {"type":"string", "enum":["strict_background","prefer_background","foreground_allowed","foreground_required"]} } } },
-        { "name": "inspect", "description": "Inspect doctor, status, capabilities, platform state, events, checkpoints, adapters, or current desktop observation", "inputSchema": { "type": "object", "properties": { "kind": {"type":"string", "enum":["doctor","status","capabilities","platform","desktop","events","checkpoints","adapters"]} } } },
+        { "name": "inspect", "description": "Inspect doctor, status, capabilities, deterministic route plans, platform state, events, checkpoints, adapters, or current desktop observation", "inputSchema": { "type": "object", "properties": { "kind": {"type":"string", "enum":["doctor","status","capabilities","routes","platform","desktop","events","checkpoints","adapters"]} } } },
         { "name": "watch", "description": "Return the known state of an operation without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
         { "name": "reconcile", "description": "Reconcile a durable unknown operation from observed local state without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
         { "name": "restore_checkpoint", "description": "Restore a local sandbox checkpoint under explicit local write policy", "inputSchema": { "type": "object", "required":["checkpoint"], "properties": { "checkpoint": {"type":"string"}, "idempotency_key": {"type":"string"} } } },
@@ -2186,4 +2188,78 @@ fn run_replay(args: Vec<String>) -> i32 {
         }
     }
     0
+}
+
+fn run_workflow(args: Vec<String>) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("compile") => {
+            let Some(trace_path) = args.get(1) else {
+                eprintln!("workflow compile needs a trace JSONL path and workflow id");
+                return 2;
+            };
+            let Some(workflow_id) = args.get(2) else {
+                eprintln!("workflow compile needs a workflow id");
+                return 2;
+            };
+            let entries = match read_trace(Path::new(trace_path)) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    eprintln!("trace read failed: {error}");
+                    return 1;
+                }
+            };
+            match compile_verified_trace(&entries, workflow_id) {
+                Ok(workflow) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&workflow).unwrap_or_else(|_| "{}".to_owned())
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("workflow compilation failed: {}", error.message);
+                    1
+                }
+            }
+        }
+        Some("validate") => {
+            let Some(workflow_path) = args.get(1) else {
+                eprintln!("workflow validate needs a compiled workflow JSON path");
+                return 2;
+            };
+            let workflow: CompiledWorkflow = match std::fs::read_to_string(workflow_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str(&contents).ok())
+            {
+                Some(workflow) => workflow,
+                None => {
+                    eprintln!("compiled workflow JSON is invalid or unreadable");
+                    return 2;
+                }
+            };
+            let observed = args
+                .get(2)
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or(Value::Null);
+            match validate_compiled_workflow(&workflow, &observed) {
+                Ok(()) => {
+                    println!(
+                        "{}",
+                        json!({"valid": true, "workflow_id": workflow.workflow_id, "workflow_version": workflow.workflow_version})
+                    );
+                    0
+                }
+                Err(error) => {
+                    println!("{}", json!({"valid": false, "error": error}));
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "workflow commands: compile <trace.jsonl> <workflow-id> | validate <workflow.json> [observed-json]"
+            );
+            2
+        }
+    }
 }

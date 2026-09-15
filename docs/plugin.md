@@ -7,3 +7,12 @@ The repo marketplace is `.agents/plugins/marketplace.json`. Validate the package
 Start the local endpoint with `comptrol-http` after installing the npm package, or with `comptrol serve-http` from a native checkout. The endpoint remains loopback-only. A ChatGPT desktop user must enable developer mode, register the local MCP connection, approve the connection, and then install the local marketplace plugin. The repository does not invent or embed a `plugin_asdk_app` registration id, and the local package is not claimed to be publicly submitted or live-tested in ChatGPT.
 
 The portable MCP schema supports remote HTTPS servers for public submission. This package intentionally keeps the local endpoint explicit so it cannot silently turn local computer control into an unauthenticated remote listener.
+
+Verified workflows can be compiled from a privacy-aware trace and validated before replay:
+
+```text
+comptrol workflow compile trace.jsonl bills-article > workflow.json
+comptrol workflow validate workflow.json '{"target_id":"page-1","revision":"r1"}'
+```
+
+Validation rejects a changed workflow fingerprint or stale target precondition. The compiler emits closed JSON IR only; it does not embed arbitrary code or private typed content.

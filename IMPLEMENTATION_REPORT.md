@@ -30,7 +30,7 @@ Rust format check passed.
 
 Clippy with warnings denied passed.
 
-The current source passes 37 workspace tests, including a concurrent delayed-event regression proving EventBus waiters block on notification rather than polling every 5 ms. Browser fixture conformance also covers semantic locators in an open shadow root and a same-origin iframe, while retaining strict ambiguity refusal.
+The current source passes 42 workspace tests, including deterministic route-plan rationale, verified-trace compilation with redaction and preconditions, stale workflow rejection, and a concurrent delayed-event regression proving EventBus waiters block on notification rather than polling every 5 ms. Browser fixture conformance also covers semantic locators in an open shadow root and a same-origin iframe, while retaining strict ambiguity refusal.
 
 The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, real dedicated headless Chrome CDP navigation, background target creation, same profile state continuity, verified history navigation, exact target close, explicit closed group refusal, DOM verification, sandbox upload, filename postcondition verification, allowlisted argv command execution, native Chrome launcher policy and strict background refusal, stdio progress notification ordering, durable MCP Tasks across restart, process level restart reconciliation without duplicate mutation, trace record and fixture replay, platform capability conformance, and the repository owned Codex, Claude Code, and Cursor profiles. A headed Chrome profile acceptance run also passed in an isolated visible profile. An opt in live macOS application launch acceptance run passed for Finder. The native Chrome acceptance harness is present and skips before launch when Chrome Automation access cannot respond.
 
@@ -46,7 +46,7 @@ The npm launcher now has an opt in daemon mode on Unix and Windows. It preserves
 
 The optimized Rust build, format check, Clippy with warnings denied, workspace tests, README lint, and browser fixture conformance pass in WSL. Native headed Chrome acceptance remains host-dependent and is not claimed here.
 
-The GitHub Actions workflows are present, but the latest remote jobs were rejected before checkout because the repository account reported failed recent payments or an exceeded spending limit. This is an external runner availability failure rather than a test result.
+The `v0.1.18` GitHub release workflow completed successfully across all five native targets, published 16 release assets and the npm package, and the package became visible on the public registry after npm processing. The `v0.1.20` workflow is the current release target and includes bounded post-publish registry visibility verification.
 
 ## Platform matrix
 
@@ -74,7 +74,7 @@ The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.049 ms
 
 ## Distribution status
 
-The `comptrolling@0.1.19` npm package is the release for asynchronous task execution, SQLite WAL state, event-driven browser lifecycle verification, the local HTTP launcher, and post-publish npm visibility verification. The `v0.1.19` GitHub release is pending workflow completion. The prior `v0.1.18` release was published with 16 verified archives, checksums, SBOMs, the generated Homebrew formula, and the npm package. The portable local plugin package and repo marketplace are fixture-validated, but ChatGPT developer-mode registration and live ChatGPT installation remain user-side acceptance steps. Detached signing remains opt-in because no operator signing identity was supplied. The fast verified work is pushed to `feat/fast-verified-execution-v3`; the release tag points to its release commit. GitHub Dependency Graph is disabled for this repository, so dependency review reports a warning while RustSec `cargo-audit` remains enforced by the security workflow.
+The `comptrolling@0.1.18` npm package is publicly visible and was verified after registry propagation. The `v0.1.20` package adds deterministic route planning, verified-trace workflow compilation, and post-publish npm visibility verification. The portable local plugin package and repo marketplace are fixture-validated, but ChatGPT developer-mode registration and live ChatGPT installation remain user-side acceptance steps. Detached signing remains opt-in because no operator signing identity was supplied. The fast verified work is pushed to `feat/fast-verified-execution-v3`; the release tag points to the latest released commit. GitHub Dependency Graph is disabled for this repository, so dependency review reports a warning while RustSec `cargo-audit` remains enforced by the security workflow.
 
 ## Remaining issues ordered by impact
 

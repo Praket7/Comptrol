@@ -23,10 +23,13 @@ pub use adapters::{AdapterDescriptor, AdapterRegistry};
 pub use checkpoints::{Checkpoint, CheckpointStore};
 pub use events::{Event, EventBus};
 pub use geometry::{DisplayGeometry, Point, VirtualDesktop};
-pub use trace::{TraceEntry, TraceMode, TraceRecorder, read_trace};
+pub use trace::{
+    CompiledStep, CompiledWorkflow, TraceEntry, TraceMode, TraceRecorder, WorkflowPrecondition,
+    compile_verified_trace, read_trace, validate_compiled_workflow,
+};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.19";
+pub const SERVER_VERSION: &str = "0.1.20";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 pub fn privacy_status() -> Value {
@@ -204,6 +207,21 @@ pub struct Capability {
     pub risk: Risk,
     pub route: String,
     pub note: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RouteCandidate {
+    pub route: String,
+    pub feasible: bool,
+    pub rationale: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RoutePlan {
+    pub intent: String,
+    pub selected: Option<String>,
+    pub candidates: Vec<RouteCandidate>,
+    pub rationale: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -824,11 +842,28 @@ impl Runtime {
             self.remember(&request, result.clone());
             return result;
         }
+        let plan = route_plan(&request);
+        if plan.selected.is_none() {
+            let result = ActionResult::refused(
+                &request,
+                operation_id,
+                ComptrolError {
+                    code: "route_unavailable".to_owned(),
+                    message: plan.rationale.clone(),
+                    recovery: Some(
+                        "Inspect routes and satisfy the selected route's feasibility gates"
+                            .to_owned(),
+                    ),
+                },
+            );
+            self.remember(&request, result.clone());
+            return result;
+        }
         if request.dry_run {
             let result = ActionResult {
                 operation_id,
                 intent: request.intent.clone(),
-                route: route_for(&request.intent),
+                route: plan.selected.clone().unwrap_or_else(|| "none".to_owned()),
                 target: request.target.clone(),
                 preflight: "passed".to_owned(),
                 delivery: DeliveryState::NotDispatched,
@@ -836,7 +871,7 @@ impl Runtime {
                 verification: VerificationState::NotAttempted,
                 disturbance: json!({ "foreground_changed": false }),
                 recovery: RecoveryState::None,
-                data: json!({ "dry_run": true, "risk": risk }),
+                data: json!({ "dry_run": true, "risk": risk, "route_plan": plan }),
                 error: None,
             };
             self.remember(&request, result.clone());
@@ -932,6 +967,7 @@ impl Runtime {
         match kind {
             "doctor" => doctor(self),
             "capabilities" => json!(capabilities()),
+            "routes" => json!(route_catalog()),
             "platform" => platform_diagnostics(),
             "browser" => match std::env::var("COMPTROL_CDP_ENDPOINT") {
                 Ok(endpoint) => match browser::discover(&endpoint) {
@@ -1364,43 +1400,189 @@ fn stable_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn route_for(intent: &str) -> String {
-    match intent {
-        "system.ping" => "native",
-        "desktop.observe" => "platform_observe",
-        "platform.broker.observe" => "platform_broker",
-        "workflow.execute" => "workflow",
-        "filesystem.write" => "sandbox_filesystem",
-        "filesystem.copy" => "sandbox_filesystem",
-        "filesystem.restore_checkpoint" => "sandbox_checkpoint",
-        "desktop.notify" => "platform_notification",
-        "desktop.open_app" => "platform_launch",
-        "browser.chrome.open_tab" => "browser_launcher",
-        "browser.chrome.reopen_closed_group" => "chrome_ax",
-        "command.run" => "process_argv",
-        "windows.uia.press" | "windows.uia.set_value" => "windows_uia",
-        "linux.atspi.press" | "linux.atspi.set_value" => "linux_atspi",
-        "macos.ax.press" | "macos.ax.set_value" => "macos_ax",
-        "browser.fixture.submit" => "browser_fixture",
-        "browser.cdp.evaluate"
-        | "browser.cdp.navigate"
-        | "browser.cdp.upload"
-        | "browser.cdp.download"
-        | "browser.cdp.fill"
-        | "browser.cdp.click"
-        | "browser.cdp.focus"
-        | "browser.cdp.open_tab"
-        | "browser.cdp.close_tab"
-        | "browser.cdp.history_back"
-        | "browser.cdp.history_forward"
-        | "browser.cdp.semantic_click"
-        | "browser.cdp.workflow"
-        | "browser.cdp.accessibility_snapshot"
-        | "browser.cdp.reopen_closed_group"
-        | "browser.cdp.wait_for" => "browser_protocol",
-        _ => "none",
+fn route_plan(request: &OperationRequest) -> RoutePlan {
+    route_plan_for_intent(
+        &request.intent,
+        request.params.clone(),
+        request.background.as_deref(),
+    )
+}
+
+fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) -> RoutePlan {
+    let primary = match intent {
+        "system.ping" => Some(("native", true, "Built-in local readiness route")),
+        "desktop.observe" => Some((
+            "platform_observe",
+            true,
+            "Read-only host observation is available locally",
+        )),
+        "platform.broker.observe" => Some((
+            "platform_broker",
+            true,
+            "Read-only broker diagnostics do not require actuation",
+        )),
+        "workflow.execute" => Some(("workflow", true, "Bounded workflow VM route")),
+        "filesystem.write" | "filesystem.copy" => Some((
+            "sandbox_filesystem",
+            env_enabled("COMPTROL_ALLOW_SANDBOX_WRITES"),
+            "Sandbox write policy must be explicitly enabled",
+        )),
+        "filesystem.restore_checkpoint" => Some((
+            "sandbox_checkpoint",
+            env_enabled("COMPTROL_ALLOW_SANDBOX_WRITES"),
+            "Checkpoint restore is gated by sandbox write policy",
+        )),
+        "desktop.notify" => Some((
+            "platform_notification",
+            cfg!(target_os = "macos") && env_enabled("COMPTROL_ALLOW_DESKTOP_NOTIFY"),
+            "macOS notification route and explicit policy are required",
+        )),
+        "desktop.open_app" => Some((
+            "platform_launch",
+            cfg!(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "linux"
+            )) && env_enabled("COMPTROL_ALLOW_APP_LAUNCH"),
+            "Native app launch requires an explicit local policy",
+        )),
+        "browser.chrome.open_tab" => Some((
+            "browser_launcher",
+            cfg!(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "linux"
+            )) && env_enabled("COMPTROL_ALLOW_BROWSER_LAUNCH"),
+            "Default-profile browser launch requires an explicit local policy",
+        )),
+        "browser.chrome.reopen_closed_group" => Some((
+            "chrome_ax",
+            cfg!(target_os = "macos") && env_enabled("COMPTROL_ALLOW_MACOS_AX"),
+            "Chrome closed-group control requires macOS Accessibility and policy",
+        )),
+        "command.run" => Some((
+            "process_argv",
+            env_enabled("COMPTROL_ALLOW_COMMANDS")
+                && std::env::var_os("COMPTROL_COMMAND_ROOT").is_some(),
+            "Command execution requires an allowlist policy and command root",
+        )),
+        "windows.uia.press" | "windows.uia.set_value" => Some((
+            "windows_uia",
+            cfg!(target_os = "windows") && env_enabled("COMPTROL_ALLOW_WINDOWS_UIA"),
+            "Windows UI Automation requires Windows and explicit policy",
+        )),
+        "linux.atspi.press" | "linux.atspi.set_value" => Some((
+            "linux_atspi",
+            cfg!(target_os = "linux")
+                && env_enabled("COMPTROL_ALLOW_LINUX_ATSPI")
+                && std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
+            "AT-SPI requires Linux, a session bus, and explicit policy",
+        )),
+        "macos.ax.press" | "macos.ax.set_value" => Some((
+            "macos_ax",
+            cfg!(target_os = "macos") && env_enabled("COMPTROL_ALLOW_MACOS_AX"),
+            "macOS Accessibility requires explicit policy and a reachable provider",
+        )),
+        "browser.fixture.submit" => Some((
+            "browser_fixture",
+            true,
+            "Deterministic local browser fixture route",
+        )),
+        value if value.starts_with("browser.cdp.") => Some((
+            "browser_protocol",
+            std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
+            "Persistent local CDP requires an endpoint and explicit policy",
+        )),
+        _ => None,
+    };
+
+    let Some((route, available, base_reason)) = primary else {
+        return RoutePlan {
+            intent: intent.to_owned(),
+            selected: None,
+            candidates: vec![RouteCandidate {
+                route: "none".to_owned(),
+                feasible: false,
+                rationale: "No registered route exists for this intent".to_owned(),
+            }],
+            rationale: format!("No registered route exists for {intent}"),
+        };
+    };
+
+    let mut candidates = vec![RouteCandidate {
+        route: route.to_owned(),
+        feasible: available,
+        rationale: if available {
+            base_reason.to_owned()
+        } else {
+            format!("Rejected: {base_reason}")
+        },
+    }];
+
+    if intent == "browser.cdp.open_tab" {
+        let requested_background = params
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if background == Some("strict_background") && !requested_background {
+            candidates[0].feasible = false;
+            candidates[0].rationale =
+                "Rejected: strict_background requires params.background=true".to_owned();
+        } else if background == Some("foreground_required") && requested_background {
+            candidates[0].feasible = false;
+            candidates[0].rationale =
+                "Rejected: foreground_required conflicts with params.background=true".to_owned();
+        }
     }
-    .to_owned()
+
+    let selected = candidates
+        .iter()
+        .find(|candidate| candidate.feasible)
+        .map(|candidate| candidate.route.clone());
+    let rationale = match selected.as_deref() {
+        Some(route) => format!("Selected deterministic primary route {route}"),
+        None => candidates
+            .first()
+            .map(|candidate| candidate.rationale.clone())
+            .unwrap_or_else(|| "No feasible route".to_owned()),
+    };
+    RoutePlan {
+        intent: intent.to_owned(),
+        selected,
+        candidates,
+        rationale,
+    }
+}
+
+fn route_catalog() -> Vec<RoutePlan> {
+    [
+        "system.ping",
+        "desktop.observe",
+        "platform.broker.observe",
+        "workflow.execute",
+        "filesystem.write",
+        "filesystem.copy",
+        "filesystem.restore_checkpoint",
+        "desktop.notify",
+        "desktop.open_app",
+        "browser.chrome.open_tab",
+        "browser.chrome.reopen_closed_group",
+        "command.run",
+        "windows.uia.press",
+        "linux.atspi.press",
+        "macos.ax.press",
+        "browser.fixture.submit",
+        "browser.cdp.open_tab",
+        "browser.cdp.semantic_click",
+    ]
+    .into_iter()
+    .map(|intent| route_plan_for_intent(intent, Value::Null, None))
+    .collect()
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
 }
 
 fn restore_checkpoint(
@@ -1441,6 +1623,38 @@ fn restore_checkpoint(
 }
 
 fn execute_workflow_request(request: &OperationRequest, operation_id: String) -> ActionResult {
+    if let Some(compiled) = request.params.get("compiled_workflow") {
+        let Ok(compiled) = serde_json::from_value::<CompiledWorkflow>(compiled.clone()) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "workflow_validation_failed".to_owned(),
+                    message: "Compiled workflow did not match the closed schema".to_owned(),
+                    recovery: Some("Recompile the workflow from a verified trace".to_owned()),
+                },
+            );
+        };
+        if let Err(error) = validate_compiled_workflow(
+            &compiled,
+            request.params.get("observed").unwrap_or(&Value::Null),
+        ) {
+            return ActionResult {
+                operation_id,
+                intent: request.intent.clone(),
+                route: "workflow".to_owned(),
+                target: request.target.clone(),
+                preflight: "failed".to_owned(),
+                delivery: DeliveryState::NotDispatched,
+                effect: EffectState::NotAttempted,
+                verification: VerificationState::NotAttempted,
+                disturbance: json!({ "foreground_changed": false }),
+                recovery: RecoveryState::RequiresReconciliation,
+                data: json!({ "workflow_id": compiled.workflow_id, "workflow_version": compiled.workflow_version }),
+                error: Some(error),
+            };
+        }
+    }
     let Some(ops) = request.params.get("ops") else {
         return ActionResult::refused(
             request,
@@ -4757,6 +4971,52 @@ mod tests {
         assert_eq!(
             result.error.as_ref().map(|error| error.code.as_str()),
             Some("invalid_input")
+        );
+    }
+
+    #[test]
+    fn dry_run_returns_deterministic_route_plan_and_rationale() {
+        let mut runtime = runtime();
+        let result = runtime.operate(OperationRequest {
+            intent: "system.ping".to_owned(),
+            target: None,
+            params: Value::Null,
+            postcondition: None,
+            risk: None,
+            idempotency_key: Some("route-plan-ping".to_owned()),
+            dry_run: true,
+            background: None,
+        });
+        assert_eq!(result.route, "native");
+        assert_eq!(result.data["route_plan"]["selected"], "native");
+        assert!(
+            result.data["route_plan"]["rationale"]
+                .as_str()
+                .is_some_and(|value| value.contains("deterministic"))
+        );
+        assert_eq!(result.data["route_plan"]["candidates"][0]["feasible"], true);
+    }
+
+    #[test]
+    fn route_planner_rejects_unknown_intents_explicitly() {
+        let plan = route_plan_for_intent("unknown.intent", Value::Null, None);
+        assert!(plan.selected.is_none());
+        assert_eq!(plan.candidates[0].route, "none");
+        assert!(plan.rationale.contains("No registered route"));
+    }
+
+    #[test]
+    fn strict_background_rejects_foreground_only_browser_opening() {
+        let plan = route_plan_for_intent(
+            "browser.cdp.open_tab",
+            json!({"background": false}),
+            Some("strict_background"),
+        );
+        assert!(plan.selected.is_none());
+        assert!(
+            plan.candidates[0]
+                .rationale
+                .contains("strict_background requires")
         );
     }
 
