@@ -20,6 +20,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Typed workflow IR validation is enforced during trace compilation.
 - Typed workflow executor runs compiled actions through the normal runtime, resolves lifted parameters, enforces a step budget, and supports bounded branches, loops, waits, verification, and parallel reads.
 - Durable MCP Tasks are available across stdio, stateless HTTP, and mutual-TLS HTTP with SQLite persistence and cancellation reconciliation.
+- Task cancellation requests are persisted as task events and rechecked after execution, so cancellation state is not only an in-memory transport flag.
 - Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.
 - Browser multiplexer exposes generation- and revision-checked target commands so warm operations can fail with `stale_reference` before dispatch instead of rediscovering or cross-targeting.
 - Runtime route history is persisted in SQLite and feeds conservative deterministic route scoring after safety gates.

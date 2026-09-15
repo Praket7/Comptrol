@@ -367,6 +367,50 @@ impl TaskStore {
         })
     }
 
+    fn request_cancel(&mut self, task_id: &str) -> io::Result<bool> {
+        let transaction = self.connection.transaction().map_err(sqlite_io_error)?;
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(sqlite_io_error)?
+            .unwrap_or(false);
+        if !exists {
+            return Ok(false);
+        }
+        transaction
+            .execute(
+                "INSERT INTO task_events(task_id, kind, payload_json, at_ms)
+                 VALUES (?1, 'cancel_requested', ?2, ?3)",
+                params![
+                    task_id,
+                    serde_json::to_string(&json!({
+                        "code": "operation_cancelled",
+                        "message": "Cancellation was requested"
+                    }))
+                    .map_err(io::Error::other)?,
+                    now_ms() as i64,
+                ],
+            )
+            .map_err(sqlite_io_error)?;
+        transaction.commit().map_err(sqlite_io_error)?;
+        Ok(true)
+    }
+
+    fn cancel_requested(&self, task_id: &str) -> bool {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_events WHERE task_id = ?1 AND kind = 'cancel_requested')",
+                params![task_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .unwrap_or(false)
+    }
+
     fn list(&self) -> Value {
         let mut statement = match self.connection.prepare(
             "SELECT task_id, status, ttl_ms, poll_interval_ms, created_at_ms, result_json
@@ -579,7 +623,11 @@ impl TaskManager {
                     let mut runtime = runtime.lock().expect("runtime lock poisoned");
                     call_tool(&mut runtime, params)
                 };
-                let requested = cancelled.load(Ordering::Acquire);
+                let requested = cancelled.load(Ordering::Acquire)
+                    || store
+                        .lock()
+                        .map(|store| store.cancel_requested(&task_id))
+                        .unwrap_or(true);
                 let (status, stored_result) = if requested {
                     (
                         "unknown",
@@ -656,13 +704,25 @@ impl TaskManager {
             .get(task_id)
             .cloned()
         else {
+            let requested = self
+                .store
+                .lock()
+                .ok()
+                .and_then(|mut store| store.request_cancel(task_id).ok())
+                .unwrap_or(false);
             return self
                 .get(task_id)
-                .map(|task| json!({ "task": task, "cancelled": false }))
+                .map(|task| json!({ "task": task, "cancelRequested": requested }))
                 .unwrap_or_else(|| task_error("task not found"));
         };
         flag.store(true, Ordering::Release);
-        json!({ "taskId": task_id, "cancelRequested": true })
+        let persisted = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|mut store| store.request_cancel(task_id).ok())
+            .unwrap_or(false);
+        json!({ "taskId": task_id, "cancelRequested": persisted })
     }
 }
 
