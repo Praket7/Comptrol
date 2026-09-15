@@ -5602,6 +5602,11 @@ fn doctor(runtime: &Runtime) -> Value {
         "architecture": std::env::consts::ARCH,
         "daemon": { "state": "in_process", "available": true },
         "mcp_adapter": { "available": true, "transport": "stdio", "command": "comptrol mcp" },
+        "mcp_protocols": {
+            "current": { "version": mcp::CURRENT_VERSION, "mode": "stateless", "status": "implemented_not_live_verified" },
+            "legacy": { "version": mcp::LEGACY_VERSION, "mode": "compatibility", "status": "implemented" },
+            "tasks": { "status": "implemented_not_live_verified" }
+        },
         "policy": {
             "max_risk": runtime.policy.max_risk,
             "sandbox_writes": runtime.policy.allow_sandbox_writes,
@@ -5620,8 +5625,20 @@ fn doctor(runtime: &Runtime) -> Value {
         "browser": {
             "configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
             "fixture_mutation": runtime.policy.allowed_intents.contains("browser.fixture.submit"),
-            "status": if std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some() { "configured" } else { "not_configured" }
+            "status": if std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some() { "configured" } else { "not_configured" },
+            "persistent_multiplexer": "implemented_not_live_verified",
+            "event_target_frame_graph": "implemented_not_live_verified",
+            "chrome_native_restore": "implemented_not_live_verified",
+            "extension": "experimental_only"
         },
+        "adapters": {
+            "vscode_bridge": if std::env::var_os("COMPTROL_VSCODE_BRIDGE_TOKEN").is_some() { "configured" } else { "requires_consent" },
+            "libreoffice_uno": "implemented_not_live_verified",
+            "obs_websocket": "implemented_not_live_verified",
+            "blender": "offline_only_live_pending"
+        },
+        "workflow": { "typed_ir": "implemented", "parameter_lifting": "implemented", "clean_replay_promotion": "planned" },
+        "route_statistics": { "durable": "implemented", "planner_feedback": "planned" },
         "client_configuration": integration::list(),
         "remote": { "available": false, "binding": "loopback_only" },
         "state_dir": state_dir()
