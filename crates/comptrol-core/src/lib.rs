@@ -1230,6 +1230,19 @@ impl Runtime {
             "doctor" => doctor(self),
             "capabilities" => json!(capabilities()),
             "routes" => json!(route_catalog()),
+            "route_stats" => json!({
+                "routes": self
+                    .route_history
+                    .iter()
+                    .map(|(route, stats)| json!({
+                        "route": route,
+                        "attempts": stats.attempts,
+                        "verified_successes": stats.verified_successes,
+                        "historical_success": stats.success_rate(),
+                        "p95_latency_ms": stats.p95_latency_ms,
+                    }))
+                    .collect::<Vec<_>>()
+            }),
             "platform" => platform_diagnostics(),
             "browser" => match std::env::var("COMPTROL_CDP_ENDPOINT") {
                 Ok(endpoint) => match browser::discover(&endpoint) {
