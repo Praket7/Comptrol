@@ -44,7 +44,10 @@ impl UploadTransaction {
             (self.stage, next),
             (UploadStage::Selected, UploadStage::TransferStarted)
                 | (UploadStage::TransferStarted, UploadStage::TransferCompleted)
-                | (UploadStage::TransferCompleted, UploadStage::ApplicationAccepted)
+                | (
+                    UploadStage::TransferCompleted,
+                    UploadStage::ApplicationAccepted
+                )
                 | (UploadStage::ApplicationAccepted, UploadStage::Persisted)
                 | (_, UploadStage::Failed)
         );
