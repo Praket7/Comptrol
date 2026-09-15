@@ -164,6 +164,7 @@ impl AdapterHost {
             .recv_timeout(Duration::from_millis(self.config.timeout_ms))
             .map_err(|_| {
                 let _ = self.child.kill();
+                let _ = self.child.wait();
                 HostError::Timeout
             })?;
         self.stdout = Some(stdout);
