@@ -1088,7 +1088,20 @@ pub fn semantic_click(
                     element.scrollIntoView({{ block: 'center', inline: 'nearest' }});
                     if (actionable(element) && await stable(element) && actionable(element)) {{
                         element.click();
-                        return {{ clicked: true, matches: 1, role: roleOf(element), name: nameOf(element) }};
+                        return {{
+                            clicked: true,
+                            matches: 1,
+                            role: roleOf(element),
+                            name: nameOf(element),
+                            actionability: {{
+                                attached: true,
+                                visible: true,
+                                stable: true,
+                                enabled: true,
+                                receives_events: true,
+                                unobscured: true
+                            }}
+                        }};
                     }}
                 }} else if (matches.length > 1) {{
                     return {{ clicked: false, reason: 'ambiguous_locator', matches: matches.length }};
@@ -1124,6 +1137,7 @@ pub fn semantic_click(
                         "result": data,
                         "semantic_locator": locator,
                         "attempts": attempt + 1,
+                        "actionability": value.get("actionability").cloned().unwrap_or(Value::Null),
                         "verified": true
                     }));
                 }
