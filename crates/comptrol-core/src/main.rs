@@ -5,7 +5,7 @@ use comptrol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -30,6 +30,30 @@ struct TaskStore {
     file: File,
     records: HashMap<String, StoredTask>,
     sequence: u64,
+}
+
+struct HttpState {
+    sessions: HashSet<String>,
+}
+
+impl HttpState {
+    fn new() -> Self {
+        Self {
+            sessions: HashSet::new(),
+        }
+    }
+
+    fn create_session(&mut self) -> io::Result<String> {
+        let mut bytes = [0_u8; 24];
+        getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+        let session = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.sessions.insert(session.clone());
+        Ok(session)
+    }
+
+    fn contains(&self, session: Option<&str>) -> bool {
+        session.is_some_and(|session| self.sessions.contains(session))
+    }
 }
 
 impl TaskStore {
@@ -676,11 +700,12 @@ fn run_http(port: u16) -> i32 {
             return 1;
         }
     };
+    let mut http_state = HttpState::new();
     // ponytail: one blocking loop, add bounded concurrency when multiple clients need simultaneous long operations
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(error) = handle_http(&mut stream, &mut runtime) {
+                if let Err(error) = handle_http(&mut stream, &mut runtime, &mut http_state) {
                     eprintln!("http request failed: {error}");
                 }
             }
@@ -690,7 +715,11 @@ fn run_http(port: u16) -> i32 {
     0
 }
 
-fn handle_http(stream: &mut TcpStream, runtime: &mut Runtime) -> io::Result<()> {
+fn handle_http(
+    stream: &mut TcpStream,
+    runtime: &mut Runtime,
+    http_state: &mut HttpState,
+) -> io::Result<()> {
     // ponytail: bounded local parser, replace with a full HTTP implementation before public network exposure
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     let mut buffer = Vec::with_capacity(8192);
@@ -731,49 +760,180 @@ fn handle_http(stream: &mut TcpStream, runtime: &mut Runtime) -> io::Result<()> 
         }
         buffer.extend_from_slice(&chunk[..size]);
     }
-    let body_end = (body_start + body_length).min(buffer.len());
+    if buffer.len() < body_start + body_length {
+        return write_http_response(
+            stream,
+            400,
+            "Bad Request",
+            "application/json",
+            serde_json::to_vec(&json!({"error":"incomplete_body"})).unwrap_or_default(),
+            None,
+        );
+    }
+    let body_end = body_start + body_length;
     let body = String::from_utf8_lossy(&buffer[body_start..body_end]);
-    let origin = header
-        .lines()
-        .find_map(|line| line.strip_prefix("Origin:").map(str::trim));
+    let header_value = |name: &str| {
+        header.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    };
+    let origin = header_value("Origin");
+    let session = header_value("MCP-Session-Id");
     let origin_ok = origin.is_none_or(|value| {
         matches!(
             value,
             "http://localhost" | "http://127.0.0.1" | "http://[::1]"
         )
     });
-    let method_ok = header.starts_with("POST /mcp ");
-    let (status, content_type, payload) = if !origin_ok {
-        (
+    let request_line = header.lines().next().unwrap_or_default();
+    if !origin_ok {
+        return write_http_response(
+            stream,
             403,
+            "Forbidden",
             "application/json",
             serde_json::to_vec(&json!({"error":"origin_denied"})).unwrap_or_default(),
-        )
-    } else if header.starts_with("GET /dashboard ") {
-        (
+            None,
+        );
+    }
+    if request_line.starts_with("GET /dashboard ") {
+        return write_http_response(
+            stream,
             200,
+            "OK",
             "text/html; charset=utf-8",
             dashboard(runtime).into_bytes(),
-        )
-    } else if !method_ok {
-        (
+            None,
+        );
+    }
+    if request_line.starts_with("DELETE /mcp ") {
+        let Some(session) = session else {
+            return write_http_response(
+                stream,
+                400,
+                "Bad Request",
+                "application/json",
+                serde_json::to_vec(&json!({"error":"session_required"})).unwrap_or_default(),
+                None,
+            );
+        };
+        if !http_state.sessions.remove(session) {
+            return write_http_response(
+                stream,
+                404,
+                "Not Found",
+                "application/json",
+                serde_json::to_vec(&json!({"error":"session_not_found"})).unwrap_or_default(),
+                None,
+            );
+        }
+        return write_http_response(
+            stream,
+            204,
+            "No Content",
+            "application/json",
+            Vec::new(),
+            None,
+        );
+    }
+    if request_line.starts_with("GET /mcp ") {
+        if !http_state.contains(session) {
+            return write_http_response(
+                stream,
+                if session.is_some() { 404 } else { 400 },
+                if session.is_some() { "Not Found" } else { "Bad Request" },
+                "application/json",
+                serde_json::to_vec(&json!({"error": if session.is_some() { "session_not_found" } else { "session_required" }})).unwrap_or_default(),
+                None,
+            );
+        }
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "text/event-stream",
+            b"event: ready\ndata: {}\n\n".to_vec(),
+            None,
+        );
+    }
+    if !request_line.starts_with("POST /mcp ") {
+        return write_http_response(
+            stream,
             405,
+            "Method Not Allowed",
             "application/json",
             serde_json::to_vec(&json!({"error":"method_not_allowed"})).unwrap_or_default(),
-        )
-    } else {
-        let value = handle_message(runtime, body.as_ref()).unwrap_or_else(|| json!({}));
-        (
-            200,
-            "application/json",
-            serde_json::to_vec(&value).unwrap_or_default(),
-        )
+            None,
+        );
+    }
+    let request: Value = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return write_http_response(
+                stream,
+                400,
+                "Bad Request",
+                "application/json",
+                serde_json::to_vec(&json!({"error":"invalid_json","message":error.to_string()}))
+                    .unwrap_or_default(),
+                None,
+            );
+        }
     };
+    let is_initialize = request.get("method").and_then(Value::as_str) == Some("initialize");
+    if is_initialize {
+        if session.is_some() {
+            return write_http_response(
+                stream,
+                400,
+                "Bad Request",
+                "application/json",
+                serde_json::to_vec(&json!({"error":"initialize_cannot_use_session"}))
+                    .unwrap_or_default(),
+                None,
+            );
+        }
+    } else if !http_state.contains(session) {
+        return write_http_response(
+            stream,
+            if session.is_some() { 404 } else { 400 },
+            if session.is_some() { "Not Found" } else { "Bad Request" },
+            "application/json",
+            serde_json::to_vec(&json!({"error": if session.is_some() { "session_not_found" } else { "session_required" }})).unwrap_or_default(),
+            None,
+        );
+    }
+    let value = handle_message(runtime, body.as_ref()).unwrap_or_else(|| json!({}));
+    let new_session = if is_initialize {
+        Some(http_state.create_session()?)
+    } else {
+        None
+    };
+    write_http_response(
+        stream,
+        200,
+        "OK",
+        "application/json",
+        serde_json::to_vec(&value).unwrap_or_default(),
+        new_session.as_deref(),
+    )
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    payload: Vec<u8>,
+    session: Option<&str>,
+) -> io::Result<()> {
+    let session_header = session
+        .map(|session| format!("MCP-Session-Id: {session}\r\n"))
+        .unwrap_or_default();
     write!(
         stream,
-        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        status,
-        content_type,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{session_header}Connection: close\r\n\r\n",
         payload.len()
     )?;
     stream.write_all(&payload)
@@ -785,12 +945,14 @@ fn write_http_error(stream: &mut TcpStream, status: u16, error: &str) -> io::Res
         "limit": MAX_PROTOCOL_BYTES
     }))
     .unwrap_or_default();
-    write!(
+    write_http_response(
         stream,
-        "HTTP/1.1 {status} Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        payload.len()
-    )?;
-    stream.write_all(&payload)
+        status,
+        "Payload Too Large",
+        "application/json",
+        payload,
+        None,
+    )
 }
 
 fn dashboard(runtime: &mut Runtime) -> String {
