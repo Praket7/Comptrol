@@ -57,6 +57,8 @@ impl BrowserConnection {
         let frames = Arc::new(RwLock::new(FrameGraph::default()));
         let targets_for_reader = Arc::clone(&targets);
         let frames_for_reader = Arc::clone(&frames);
+        let generation_for_reader = Arc::new(AtomicU64::new(0));
+        let generation_for_disconnect = Arc::clone(&generation_for_reader);
         let cancellation = CancellationToken::new();
         let cancellation_for_tasks = cancellation.clone();
         tokio::spawn(async move {
@@ -113,6 +115,9 @@ impl BrowserConnection {
                 }
             }
             cancellation_for_reader.cancel();
+            let _generation = generation_for_disconnect.fetch_add(1, Ordering::AcqRel) + 1;
+            targets_for_reader.write().await.reconnect();
+            frames_for_reader.write().await.frames.clear();
             let mut pending = pending_for_responses.lock().await;
             for (_, sender) in pending.drain() {
                 let _ = sender.send(Err(BrowserError::Closed));
@@ -123,7 +128,7 @@ impl BrowserConnection {
             targets,
             frames,
             next_command_id: Arc::new(AtomicU64::new(1)),
-            generation: Arc::new(AtomicU64::new(0)),
+            generation: generation_for_reader,
             cancellation,
         })
     }
