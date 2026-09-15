@@ -2023,16 +2023,16 @@ fn browser_cdp_workflow(
                     json!({"url": url}),
                 ) {
                     Ok(data) => {
-                        if let Some(expected) = url_contains {
-                            if let Err(error) = browser_wait_for_url(
+                        if let Some(expected) = url_contains
+                            && let Err(error) = browser_wait_for_url(
                                 &endpoint,
                                 target_id,
                                 browser_context_id,
                                 expected,
                                 timeout_ms.unwrap_or(2_000),
-                            ) {
-                                return browser_failure(request, operation_id, error);
-                            }
+                            )
+                        {
+                            return browser_failure(request, operation_id, error);
                         }
                         Ok(json!({"action":"navigate", "url": url, "protocol": data}))
                     }
