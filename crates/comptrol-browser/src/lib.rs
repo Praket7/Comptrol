@@ -2,7 +2,159 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BrowserError {
+    #[error("browser connection failed: {0}")]
+    Connection(String),
+    #[error("browser command channel closed")]
+    Closed,
+    #[error("browser response was invalid: {0}")]
+    InvalidResponse(String),
+    #[error("browser command cancelled")]
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct OutgoingCommand {
+    id: u64,
+    session_id: Option<String>,
+    method: String,
+    params: Value,
+    response: oneshot::Sender<Result<Value, BrowserError>>,
+}
+
+type PendingCommands = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, BrowserError>>>>>;
+
+/// One browser-level WebSocket with a dedicated writer and reader.
+/// Commands are correlated by id and never hold a global lock during I/O.
+#[derive(Clone)]
+pub struct BrowserConnection {
+    outgoing: mpsc::Sender<OutgoingCommand>,
+    pub targets: Arc<RwLock<TargetGraph>>,
+    pub frames: Arc<RwLock<FrameGraph>>,
+    next_command_id: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+    cancellation: CancellationToken,
+}
+
+impl BrowserConnection {
+    pub async fn connect(url: &str) -> Result<Self, BrowserError> {
+        use futures_util::{SinkExt, StreamExt};
+        let (socket, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .map_err(|error| BrowserError::Connection(error.to_string()))?;
+        let (mut writer, mut reader) = socket.split();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingCommand>(128);
+        let pending: PendingCommands = Arc::new(Mutex::new(HashMap::new()));
+        let pending_for_reader = Arc::clone(&pending);
+        let cancellation = CancellationToken::new();
+        let cancellation_for_tasks = cancellation.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancellation_for_tasks.cancelled() => break,
+                    outgoing = outgoing_rx.recv() => {
+                        let Some(command) = outgoing else { break };
+                        let mut message = serde_json::json!({
+                            "id": command.id,
+                            "method": command.method,
+                            "params": command.params,
+                        });
+                        if let Some(session_id) = command.session_id {
+                            message["sessionId"] = Value::String(session_id);
+                        }
+                        pending_for_reader.lock().await.insert(command.id, command.response);
+                        if writer.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let pending_for_responses = Arc::clone(&pending);
+        let cancellation_for_reader = cancellation.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(message)) = reader.next().await {
+                let text = match message {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => text,
+                    tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                        match String::from_utf8(bytes.to_vec()) {
+                            Ok(text) => text.into(),
+                            Err(_) => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let Some(id) = value.get("id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if let Some(sender) = pending_for_responses.lock().await.remove(&id) {
+                    let result = if let Some(error) = value.get("error") {
+                        Err(BrowserError::InvalidResponse(error.to_string()))
+                    } else {
+                        Ok(value.get("result").cloned().unwrap_or(Value::Null))
+                    };
+                    let _ = sender.send(result);
+                }
+            }
+            cancellation_for_reader.cancel();
+            let mut pending = pending_for_responses.lock().await;
+            for (_, sender) in pending.drain() {
+                let _ = sender.send(Err(BrowserError::Closed));
+            }
+        });
+        Ok(Self {
+            outgoing: outgoing_tx,
+            targets: Arc::new(RwLock::new(TargetGraph::default())),
+            frames: Arc::new(RwLock::new(FrameGraph::default())),
+            next_command_id: Arc::new(AtomicU64::new(1)),
+            generation: Arc::new(AtomicU64::new(0)),
+            cancellation,
+        })
+    }
+
+    pub async fn command(
+        &self,
+        session_id: Option<String>,
+        method: impl Into<String>,
+        params: Value,
+    ) -> Result<Value, BrowserError> {
+        if self.cancellation.is_cancelled() {
+            return Err(BrowserError::Closed);
+        }
+        let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+        let (response_tx, response_rx) = oneshot::channel();
+        self.outgoing
+            .send(OutgoingCommand {
+                id,
+                session_id,
+                method: method.into(),
+                params,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| BrowserError::Closed)?;
+        response_rx.await.map_err(|_| BrowserError::Cancelled)?
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+    pub async fn reconnect_generation(&self) -> u64 {
+        let next = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.targets.write().await.reconnect();
+        next
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TargetRecord {
@@ -90,6 +242,8 @@ pub struct BrowserCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
 
     fn target() -> TargetRecord {
         TargetRecord {
@@ -116,5 +270,37 @@ mod tests {
         assert_eq!(target.session_id, None);
         assert!(!target.attached);
         assert_eq!(target.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn multiplexes_out_of_order_responses_on_one_socket() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut requests = Vec::new();
+            while requests.len() < 2 {
+                if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                    socket.next().await
+                {
+                    requests.push(serde_json::from_str::<Value>(&text).unwrap());
+                }
+            }
+            for request in requests.into_iter().rev() {
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"id": request["id"], "result": {"method": request["method"]}}).to_string().into()
+                )).await.unwrap();
+            }
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let first = connection.command(Some("session-a".to_owned()), "Runtime.enable", Value::Null);
+        let second = connection.command(Some("session-b".to_owned()), "Page.enable", Value::Null);
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap()["method"], "Runtime.enable");
+        assert_eq!(second.unwrap()["method"], "Page.enable");
+        server.await.unwrap();
     }
 }
