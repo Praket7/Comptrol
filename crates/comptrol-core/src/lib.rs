@@ -369,7 +369,12 @@ pub struct RoutePlan {
 struct RouteHistory {
     attempts: u64,
     verified_successes: u64,
+    verification_failures: u64,
+    dispatch_failures: u64,
+    disturbance_events: u64,
+    ewma_latency_ms: Option<f64>,
     p95_latency_ms: Option<f64>,
+    last_success_at_ms: Option<u128>,
 }
 
 impl RouteHistory {
@@ -944,14 +949,29 @@ impl Runtime {
                    route_key TEXT PRIMARY KEY,
                    attempts INTEGER NOT NULL,
                    verified_successes INTEGER NOT NULL,
-                   p95_latency_ms REAL
+                   verification_failures INTEGER NOT NULL DEFAULT 0,
+                   dispatch_failures INTEGER NOT NULL DEFAULT 0,
+                   disturbance_events INTEGER NOT NULL DEFAULT 0,
+                   ewma_latency_ms REAL,
+                   p95_latency_ms REAL,
+                   last_success_at_ms INTEGER
                  );",
             )
             .map_err(|error| io::Error::other(format!("route stats schema: {error}")))?;
+        for column in [
+            "verification_failures INTEGER NOT NULL DEFAULT 0",
+            "dispatch_failures INTEGER NOT NULL DEFAULT 0",
+            "disturbance_events INTEGER NOT NULL DEFAULT 0",
+            "ewma_latency_ms REAL",
+            "last_success_at_ms INTEGER",
+        ] {
+            let _ =
+                route_stats_db.execute(&format!("ALTER TABLE route_stats ADD COLUMN {column}"), []);
+        }
         let mut route_history = HashMap::new();
         {
             let mut statement = route_stats_db
-                .prepare("SELECT route_key, attempts, verified_successes, p95_latency_ms FROM route_stats")
+                .prepare("SELECT route_key, attempts, verified_successes, verification_failures, dispatch_failures, disturbance_events, ewma_latency_ms, p95_latency_ms, last_success_at_ms FROM route_stats")
                 .map_err(|error| io::Error::other(format!("route stats read: {error}")))?;
             let rows = statement
                 .query_map([], |row| {
@@ -960,7 +980,14 @@ impl Runtime {
                         RouteHistory {
                             attempts: row.get::<_, i64>(1)?.max(0) as u64,
                             verified_successes: row.get::<_, i64>(2)?.max(0) as u64,
-                            p95_latency_ms: row.get(3)?,
+                            verification_failures: row.get::<_, i64>(3)?.max(0) as u64,
+                            dispatch_failures: row.get::<_, i64>(4)?.max(0) as u64,
+                            disturbance_events: row.get::<_, i64>(5)?.max(0) as u64,
+                            ewma_latency_ms: row.get(6)?,
+                            p95_latency_ms: row.get(7)?,
+                            last_success_at_ms: row
+                                .get::<_, Option<i64>>(8)?
+                                .map(|v| v.max(0) as u128),
                         },
                     ))
                 })
@@ -1206,25 +1233,57 @@ impl Runtime {
     fn record_route_outcome(&mut self, result: &ActionResult, latency_ms: f64) {
         let entry = self.route_history.entry(result.route.clone()).or_default();
         entry.attempts = entry.attempts.saturating_add(1);
-        if result.verification == VerificationState::Verified && result.error.is_none() {
+        let verified = result.verification == VerificationState::Verified && result.error.is_none();
+        let dispatch_failed = matches!(
+            result.delivery,
+            DeliveryState::Refused | DeliveryState::NotDispatched
+        );
+        if verified {
             entry.verified_successes = entry.verified_successes.saturating_add(1);
+            entry.last_success_at_ms = Some(now_ms());
+        } else if dispatch_failed {
+            entry.dispatch_failures = entry.dispatch_failures.saturating_add(1);
+        } else {
+            entry.verification_failures = entry.verification_failures.saturating_add(1);
         }
+        if result
+            .disturbance
+            .get("foreground_changed")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            entry.disturbance_events = entry.disturbance_events.saturating_add(1);
+        }
+        entry.ewma_latency_ms = Some(match entry.ewma_latency_ms {
+            Some(previous) => (previous * 0.8) + (latency_ms * 0.2),
+            None => latency_ms,
+        });
         entry.p95_latency_ms = Some(match entry.p95_latency_ms {
             Some(previous) => previous.max(latency_ms),
             None => latency_ms,
         });
         let _ = self.route_stats_db.execute(
-            "INSERT INTO route_stats(route_key, attempts, verified_successes, p95_latency_ms)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO route_stats(route_key, attempts, verified_successes, verification_failures, dispatch_failures, disturbance_events, ewma_latency_ms, p95_latency_ms, last_success_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(route_key) DO UPDATE SET
                attempts = excluded.attempts,
                verified_successes = excluded.verified_successes,
-               p95_latency_ms = excluded.p95_latency_ms",
+               verification_failures = excluded.verification_failures,
+               dispatch_failures = excluded.dispatch_failures,
+               disturbance_events = excluded.disturbance_events,
+               ewma_latency_ms = excluded.ewma_latency_ms,
+               p95_latency_ms = excluded.p95_latency_ms,
+               last_success_at_ms = excluded.last_success_at_ms",
             params![
                 result.route,
                 entry.attempts as i64,
                 entry.verified_successes as i64,
+                entry.verification_failures as i64,
+                entry.dispatch_failures as i64,
+                entry.disturbance_events as i64,
+                entry.ewma_latency_ms,
                 entry.p95_latency_ms,
+                entry.last_success_at_ms.map(|v| v as i64),
             ],
         );
     }
@@ -1242,8 +1301,13 @@ impl Runtime {
                         "route": route,
                         "attempts": stats.attempts,
                         "verified_successes": stats.verified_successes,
+                        "verification_failures": stats.verification_failures,
+                        "dispatch_failures": stats.dispatch_failures,
+                        "disturbance_events": stats.disturbance_events,
                         "historical_success": stats.success_rate(),
+                        "ewma_latency_ms": stats.ewma_latency_ms,
                         "p95_latency_ms": stats.p95_latency_ms,
+                        "last_success_at_ms": stats.last_success_at_ms,
                     }))
                     .collect::<Vec<_>>()
             }),
@@ -6118,6 +6182,9 @@ mod tests {
             .expect("native route stats");
         assert!(native["attempts"].as_u64().unwrap_or_default() >= 1);
         assert!(native["verified_successes"].as_u64().unwrap_or_default() >= 1);
+        assert!(native["verification_failures"].is_number());
+        assert!(native["dispatch_failures"].is_number());
+        assert!(native["ewma_latency_ms"].is_number());
         assert!(native["p95_latency_ms"].is_number());
     }
 
