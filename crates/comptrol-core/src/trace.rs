@@ -1,9 +1,7 @@
 use crate::{ActionResult, OperationRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
-use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -29,6 +27,8 @@ pub struct CompiledWorkflow {
     pub intent: String,
     pub steps: Vec<CompiledStep>,
     pub preconditions: Vec<WorkflowPrecondition>,
+    #[serde(default)]
+    pub parameters: Vec<comptrol_workflow::WorkflowParameter>,
     pub fingerprint: String,
 }
 
@@ -72,12 +72,32 @@ pub fn compile_verified_trace(
             recovery: Some("Capture a clean verified trace before compiling".to_owned()),
         });
     }
+    let mut parameters = Vec::new();
     let steps = entries
         .iter()
-        .map(|entry| CompiledStep {
-            intent: entry.request.intent.clone(),
-            params: public_params(&entry.request.params),
-            postcondition: entry.request.postcondition.clone(),
+        .enumerate()
+        .map(|(index, entry)| {
+            let mut params = entry
+                .request
+                .params
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            for field in ["content", "value", "text", "body"] {
+                if let Some(parameter) = comptrol_workflow::lift_parameter(
+                    &mut params,
+                    field,
+                    &format!("step_{index}_{field}"),
+                    "string",
+                ) {
+                    parameters.push(parameter);
+                }
+            }
+            CompiledStep {
+                intent: entry.request.intent.clone(),
+                params: Value::Object(params),
+                postcondition: entry.request.postcondition.clone(),
+            }
         })
         .collect::<Vec<_>>();
     let mut preconditions = Vec::new();
@@ -121,10 +141,11 @@ pub fn compile_verified_trace(
     let fingerprint = workflow_fingerprint(&intent, &steps, &preconditions);
     Ok(CompiledWorkflow {
         workflow_id: workflow_id.to_owned(),
-        workflow_version: 1,
+        workflow_version: 2,
         intent,
         steps,
         preconditions,
+        parameters,
         fingerprint,
     })
 }
@@ -133,7 +154,7 @@ pub fn validate_compiled_workflow(
     workflow: &CompiledWorkflow,
     observed: &Value,
 ) -> Result<(), crate::ComptrolError> {
-    if workflow.workflow_version != 1
+    if workflow.workflow_version != 2
         || workflow.fingerprint
             != workflow_fingerprint(&workflow.intent, &workflow.steps, &workflow.preconditions)
     {
@@ -161,10 +182,13 @@ fn workflow_fingerprint(
     steps: &[CompiledStep],
     preconditions: &[WorkflowPrecondition],
 ) -> String {
-    let payload = serde_json::to_vec(&(intent, steps, preconditions)).unwrap_or_default();
-    let mut hasher = DefaultHasher::new();
-    payload.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let payload = json!({
+        "version": 2,
+        "intent": intent,
+        "steps": steps,
+        "preconditions": preconditions,
+    });
+    comptrol_workflow::structural_fingerprint(&payload)
 }
 
 fn observed_value<'a>(observed: &'a Value, key: &str) -> Option<&'a Value> {
@@ -173,26 +197,6 @@ fn observed_value<'a>(observed: &'a Value, key: &str) -> Option<&'a Value> {
     }
     key.split('.')
         .try_fold(observed, |value, part| value.get(part))
-}
-
-fn public_params(params: &Value) -> Value {
-    let mut copy = params.clone();
-    if let Value::Object(values) = &mut copy {
-        for key in [
-            "content",
-            "value",
-            "text",
-            "body",
-            "credential",
-            "password",
-            "token",
-        ] {
-            if values.contains_key(key) {
-                values.insert(key.to_owned(), json!({"redacted": true}));
-            }
-        }
-    }
-    copy
 }
 
 #[derive(Clone, Debug)]
@@ -299,8 +303,9 @@ mod tests {
     fn compiler_redacts_private_values_and_emits_preconditions() {
         let workflow =
             compile_verified_trace(&[verified_entry()], "bills-article").expect("compile");
-        assert_eq!(workflow.workflow_version, 1);
-        assert_eq!(workflow.steps[0].params["value"]["redacted"], true);
+        assert_eq!(workflow.workflow_version, 2);
+        assert_eq!(workflow.steps[0].params["value"]["param"], "step_0_value");
+        assert_eq!(workflow.parameters[0].name, "step_0_value");
         assert!(
             workflow
                 .preconditions

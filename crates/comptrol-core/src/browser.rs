@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
@@ -24,7 +24,7 @@ struct TargetCacheEntry {
     targets: Vec<BrowserTarget>,
 }
 
-type CdpSessions = HashMap<String, CdpSession>;
+type CdpSessions = HashMap<String, Arc<Mutex<CdpSession>>>;
 type TargetCaches = HashMap<String, TargetCacheEntry>;
 
 fn cdp_sessions() -> &'static Mutex<CdpSessions> {
@@ -736,25 +736,30 @@ fn persistent_call(
             recovery: Some("Use a local browser endpoint".to_owned()),
         });
     }
-    let mut sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
-        code: "browser_session_unavailable".to_owned(),
-        message: "The browser session cache is unavailable".to_owned(),
-        recovery: Some("Retry after the browser session recovers".to_owned()),
-    })?;
-    if !sessions.contains_key(web_socket_url) {
-        let (socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
-        sessions.insert(
-            web_socket_url.to_owned(),
-            CdpSession {
+    let session = {
+        let mut sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
+            code: "browser_session_unavailable".to_owned(),
+            message: "The browser session cache is unavailable".to_owned(),
+            recovery: Some("Retry after the browser session recovers".to_owned()),
+        })?;
+        if let Some(session) = sessions.get(web_socket_url) {
+            Arc::clone(session)
+        } else {
+            let (socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
+            let session = Arc::new(Mutex::new(CdpSession {
                 socket,
                 next_id: 0,
                 events: VecDeque::new(),
-            },
-        );
-    }
-    let session = sessions
-        .get_mut(web_socket_url)
-        .expect("browser session inserted or present");
+            }));
+            sessions.insert(web_socket_url.to_owned(), Arc::clone(&session));
+            session
+        }
+    };
+    let mut session = session.lock().map_err(|_| ComptrolError {
+        code: "browser_session_unavailable".to_owned(),
+        message: "The browser protocol session is unavailable".to_owned(),
+        recovery: Some("Retry after the browser session recovers".to_owned()),
+    })?;
     session.next_id += 1;
     let id = session.next_id;
     let result = (|| {
@@ -804,7 +809,9 @@ fn persistent_call(
             return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
     })();
-    if result.is_err() {
+    if result.is_err()
+        && let Ok(mut sessions) = cdp_sessions().lock()
+    {
         sessions.remove(web_socket_url);
     }
     result
@@ -819,18 +826,26 @@ where
     F: Fn(&Value) -> bool,
 {
     let deadline = Instant::now() + timeout;
-    let mut sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
+    let session = {
+        let sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
+            code: "browser_session_unavailable".to_owned(),
+            message: "The browser session cache is unavailable".to_owned(),
+            recovery: Some("Retry after the browser session recovers".to_owned()),
+        })?;
+        let Some(session) = sessions.get(web_socket_url) else {
+            return Err(ComptrolError {
+                code: "browser_session_changed".to_owned(),
+                message: "The browser protocol session is no longer cached".to_owned(),
+                recovery: Some("Rebind the exact browser target before retrying".to_owned()),
+            });
+        };
+        Arc::clone(session)
+    };
+    let mut session = session.lock().map_err(|_| ComptrolError {
         code: "browser_session_unavailable".to_owned(),
-        message: "The browser session cache is unavailable".to_owned(),
+        message: "The browser protocol session is unavailable".to_owned(),
         recovery: Some("Retry after the browser session recovers".to_owned()),
     })?;
-    let Some(session) = sessions.get_mut(web_socket_url) else {
-        return Err(ComptrolError {
-            code: "browser_session_changed".to_owned(),
-            message: "The browser protocol session is no longer cached".to_owned(),
-            recovery: Some("Rebind the exact browser target before retrying".to_owned()),
-        });
-    };
     let result = (|| {
         if let Some(position) = session.events.iter().position(&predicate) {
             return Ok(session
@@ -900,7 +915,9 @@ where
         }
     })();
     let _ = set_socket_read_timeout(&mut session.socket, None);
-    if result.is_err() {
+    if result.is_err()
+        && let Ok(mut sessions) = cdp_sessions().lock()
+    {
         sessions.remove(web_socket_url);
     }
     result

@@ -1,7 +1,7 @@
 use comptrol::{
     CompiledWorkflow, MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime,
     SERVER_VERSION, TraceMode, capabilities, compile_verified_trace, default_state_dir,
-    integration, pairing::PairingStore, privacy_network_endpoints, privacy_status, read_trace,
+    integration, mcp, pairing::PairingStore, privacy_network_endpoints, privacy_status, read_trace,
     validate_compiled_workflow,
 };
 use comptrol_adapter_sdk::AdapterManifest;
@@ -1113,8 +1113,28 @@ where
             }
         }));
     }
+    if method == "initialize" {
+        let requested = request
+            .get("params")
+            .and_then(|params| params.get("protocolVersion"))
+            .and_then(Value::as_str);
+        if let Err(error) = mcp::negotiate(requested) {
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": "protocol_version_unsupported", "message": error }
+            }));
+        }
+    }
     let result = match method {
         "initialize" => {
+            let (protocol_version, protocol_mode) = mcp::negotiate(
+                request
+                    .get("params")
+                    .and_then(|params| params.get("protocolVersion"))
+                    .and_then(Value::as_str),
+            )
+            .expect("initialize version was validated");
             *tasks_enabled = task_transport
                 && request
                     .get("params")
@@ -1146,7 +1166,7 @@ where
             } else {
                 json!({})
             };
-            json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": { "tools": { "listChanged": false }, "tasks": task_capabilities, "extensions": extensions }, "serverInfo": { "name": "comptrol", "version": SERVER_VERSION }, "instructions": "Use operate for one bounded intent. Use inspect for current state. Results distinguish delivery, effect, and verification. Unsupported capabilities refuse safely." })
+            json!({ "protocolVersion": protocol_version, "capabilities": { "tools": { "listChanged": false }, "tasks": task_capabilities, "extensions": extensions }, "serverInfo": { "name": "comptrol", "version": SERVER_VERSION }, "instructions": "Use operate for one bounded intent. Use inspect for current state. Results distinguish delivery, effect, and verification. Unsupported capabilities refuse safely.", "comptrol": { "protocol_mode": if protocol_mode == mcp::ProtocolMode::Current { "stateless" } else { "legacy_compatibility" } } })
         }
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tools() }),
@@ -1930,6 +1950,23 @@ fn handle_http<S: HttpStream>(
             key.eq_ignore_ascii_case(name).then(|| value.trim())
         })
     };
+    let protocol_mode = match mcp::from_header(header_value("MCP-Protocol-Version")) {
+        Ok(mode) => mode,
+        Err(error) => {
+            return write_http_response(
+                stream,
+                400,
+                "Bad Request",
+                "application/json",
+                serde_json::to_vec(
+                    &json!({"error":"protocol_version_unsupported","message":error}),
+                )
+                .unwrap_or_default(),
+                None,
+            );
+        }
+    };
+    let current_protocol = protocol_mode == mcp::ProtocolMode::Current;
     let origin = header_value("Origin");
     let session = header_value("MCP-Session-Id");
     let last_event_id = match header_value("Last-Event-ID") {
@@ -1978,6 +2015,17 @@ fn handle_http<S: HttpStream>(
         );
     }
     if request_line.starts_with("DELETE /mcp ") {
+        if current_protocol {
+            return write_http_response(
+                stream,
+                405,
+                "Method Not Allowed",
+                "application/json",
+                serde_json::to_vec(&json!({"error":"stateless_protocol_has_no_session"}))
+                    .unwrap_or_default(),
+                None,
+            );
+        }
         let Some(session) = session else {
             return write_http_response(
                 stream,
@@ -2008,6 +2056,17 @@ fn handle_http<S: HttpStream>(
         );
     }
     if request_line.starts_with("GET /mcp ") {
+        if current_protocol {
+            return write_http_response(
+                stream,
+                405,
+                "Method Not Allowed",
+                "application/json",
+                serde_json::to_vec(&json!({"error":"stateless_protocol_has_no_get_stream"}))
+                    .unwrap_or_default(),
+                None,
+            );
+        }
         let Some(session) = session else {
             return write_http_response(
                 stream,
@@ -2094,7 +2153,7 @@ fn handle_http<S: HttpStream>(
                 None,
             );
         }
-    } else if !http_state.contains(session) {
+    } else if !current_protocol && !http_state.contains(session) {
         return write_http_response(
             stream,
             if session.is_some() { 404 } else { 400 },
@@ -2114,12 +2173,16 @@ fn handle_http<S: HttpStream>(
         |notification| notifications.push(notification),
     )
     .unwrap_or_else(|| json!({}));
-    let new_session = if is_initialize {
+    let new_session = if is_initialize && !current_protocol {
         Some(http_state.create_session()?)
     } else {
         None
     };
-    let event_session = new_session.as_deref().or(session);
+    let event_session = if current_protocol {
+        None
+    } else {
+        new_session.as_deref().or(session)
+    };
     let mut messages = notifications;
     messages.push(value);
     if let Some(event_session) = event_session {
@@ -2127,7 +2190,12 @@ fn handle_http<S: HttpStream>(
             http_state.append(event_session, message.clone())?;
         }
     }
-    let (content_type, payload) = if messages.len() == 1 {
+    let (content_type, payload) = if current_protocol {
+        (
+            "application/json",
+            serde_json::to_vec(messages.last().unwrap_or(&json!({}))).unwrap_or_default(),
+        )
+    } else if messages.len() == 1 {
         (
             "application/json",
             serde_json::to_vec(&messages[0]).unwrap_or_default(),

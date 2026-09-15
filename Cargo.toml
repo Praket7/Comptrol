@@ -6,6 +6,9 @@ members = [
     "crates/comptrol-platform-windows",
     "crates/comptrol-platform-linux",
     "crates/comptrol-platform-macos",
+    "crates/comptrol-verification",
+    "crates/comptrol-browser",
+    "crates/comptrol-workflow",
 ]
 resolver = "2"
 
