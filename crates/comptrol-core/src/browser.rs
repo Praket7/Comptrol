@@ -1,6 +1,6 @@
 use crate::{BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_target};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -10,7 +10,14 @@ use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
 type CdpSocket = WebSocket<MaybeTlsStream<TcpStream>>;
-type CdpSessions = HashMap<String, (CdpSocket, u64)>;
+
+struct CdpSession {
+    socket: CdpSocket,
+    next_id: u64,
+    events: VecDeque<Value>,
+}
+
+type CdpSessions = HashMap<String, CdpSession>;
 
 fn cdp_sessions() -> &'static Mutex<CdpSessions> {
     static SESSIONS: OnceLock<Mutex<CdpSessions>> = OnceLock::new();
@@ -169,32 +176,35 @@ pub fn open_tab(
             message: "The browser did not return the opened tab identity".to_owned(),
             recovery: Some("Inspect the browser target list".to_owned()),
         })?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if let Ok(targets) = discover(endpoint)
-            && let Some(target) = targets.into_iter().find(|target| target.id == target_id)
+    wait_for_event(web_socket_url, Duration::from_secs(2), |event| {
+        event.get("method").and_then(Value::as_str) == Some("Target.targetCreated")
+            && event
+                .get("params")
+                .and_then(|params| params.get("targetInfo"))
+                .and_then(|target| target.get("targetId"))
+                .and_then(Value::as_str)
+                == Some(target_id)
+    })?;
+    let targets = discover(endpoint)?;
+    if let Some(target) = targets.into_iter().find(|target| target.id == target_id) {
+        if browser_context_id
+            .is_some_and(|expected| target.browser_context_id.as_deref() != Some(expected))
         {
-            if browser_context_id
-                .is_some_and(|expected| target.browser_context_id.as_deref() != Some(expected))
-            {
-                return Err(ComptrolError {
-                    code: "stale_reference".to_owned(),
-                    message: "The browser created the tab in a different browser context"
-                        .to_owned(),
-                    recovery: Some("Inspect browser contexts and open the tab again".to_owned()),
-                });
-            }
-            return Ok(json!({
-                "target": target,
-                "visibility": if background { "background" } else { "foreground" },
-                "profile": "attached_existing_browser",
-                "account_state": "same_browser_profile",
-                "mouse": "untouched",
-                "clipboard": "untouched",
-                "verified": true
-            }));
+            return Err(ComptrolError {
+                code: "stale_reference".to_owned(),
+                message: "The browser created the tab in a different browser context".to_owned(),
+                recovery: Some("Inspect browser contexts and open the tab again".to_owned()),
+            });
         }
-        std::thread::sleep(Duration::from_millis(25));
+        return Ok(json!({
+            "target": target,
+            "visibility": if background { "background" } else { "foreground" },
+            "profile": "attached_existing_browser",
+            "account_state": "same_browser_profile",
+            "mouse": "untouched",
+            "clipboard": "untouched",
+            "verified": true
+        }));
     }
     Err(ComptrolError {
         code: "verification_failed".to_owned(),
@@ -299,22 +309,26 @@ pub fn close_tab(
         "Target.closeTarget",
         json!({ "targetId": target_id }),
     )?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if discover(endpoint)
-            .map(|remaining| remaining.iter().all(|item| item.id != target_id))
-            .unwrap_or(false)
-        {
-            return Ok(json!({
-                "target": target,
-                "closed": true,
-                "response": value,
-                "mouse": "untouched",
-                "clipboard": "untouched",
-                "verified": true
-            }));
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    wait_for_event(web_socket_url, Duration::from_secs(2), |event| {
+        event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed")
+            && event
+                .get("params")
+                .and_then(|params| params.get("targetId"))
+                .and_then(Value::as_str)
+                == Some(target_id)
+    })?;
+    if discover(endpoint)
+        .map(|remaining| remaining.iter().all(|item| item.id != target_id))
+        .unwrap_or(false)
+    {
+        return Ok(json!({
+            "target": target,
+            "closed": true,
+            "response": value,
+            "mouse": "untouched",
+            "clipboard": "untouched",
+            "verified": true
+        }));
     }
     Err(ComptrolError {
         code: "verification_failed".to_owned(),
@@ -446,15 +460,23 @@ fn persistent_call(
     })?;
     if !sessions.contains_key(web_socket_url) {
         let (socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
-        sessions.insert(web_socket_url.to_owned(), (socket, 0));
+        sessions.insert(
+            web_socket_url.to_owned(),
+            CdpSession {
+                socket,
+                next_id: 0,
+                events: VecDeque::new(),
+            },
+        );
     }
-    let (socket, next_id) = sessions
+    let session = sessions
         .get_mut(web_socket_url)
         .expect("browser session inserted or present");
-    *next_id += 1;
-    let id = *next_id;
+    session.next_id += 1;
+    let id = session.next_id;
     let result = (|| {
-        socket
+        session
+            .socket
             .send(Message::Text(
                 json!({ "id": id, "method": method, "params": params })
                     .to_string()
@@ -462,7 +484,7 @@ fn persistent_call(
             ))
             .map_err(browser_dispatch_error)?;
         loop {
-            let message = socket.read().map_err(browser_response_error)?;
+            let message = session.socket.read().map_err(browser_response_error)?;
             let Message::Text(text) = message else {
                 continue;
             };
@@ -483,6 +505,10 @@ fn persistent_call(
                 recovery: Some("Inspect the browser protocol version".to_owned()),
             })?;
             if value.get("id").and_then(Value::as_u64) != Some(id) {
+                if session.events.len() == 256 {
+                    session.events.pop_front();
+                }
+                session.events.push_back(value);
                 continue;
             }
             if let Some(error) = value.get("error") {
@@ -499,6 +525,90 @@ fn persistent_call(
         sessions.remove(web_socket_url);
     }
     result
+}
+
+fn wait_for_event<F>(
+    web_socket_url: &str,
+    timeout: Duration,
+    predicate: F,
+) -> Result<Value, ComptrolError>
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    let mut sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
+        code: "browser_session_unavailable".to_owned(),
+        message: "The browser session cache is unavailable".to_owned(),
+        recovery: Some("Retry after the browser session recovers".to_owned()),
+    })?;
+    let Some(session) = sessions.get_mut(web_socket_url) else {
+        return Err(ComptrolError {
+            code: "browser_session_changed".to_owned(),
+            message: "The browser protocol session is no longer cached".to_owned(),
+            recovery: Some("Rebind the exact browser target before retrying".to_owned()),
+        });
+    };
+    let result = (|| {
+        if let Some(position) = session.events.iter().position(&predicate) {
+            return Ok(session
+                .events
+                .remove(position)
+                .expect("event position exists"));
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ComptrolError {
+                    code: "verification_failed".to_owned(),
+                    message: "The browser did not emit the expected protocol event in time"
+                        .to_owned(),
+                    recovery: Some("Inspect the exact browser target before retrying".to_owned()),
+                });
+            }
+            set_socket_read_timeout(&mut session.socket, Some(remaining))
+                .map_err(browser_io_error)?;
+            let message = session.socket.read().map_err(browser_response_error)?;
+            let Message::Text(text) = message else {
+                continue;
+            };
+            if text.len() > MAX_PROTOCOL_BYTES {
+                return Err(ComptrolError {
+                    code: "browser_message_too_large".to_owned(),
+                    message: format!(
+                        "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
+                    ),
+                    recovery: Some("Inspect the browser protocol response size".to_owned()),
+                });
+            }
+            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
+                code: "browser_protocol_invalid".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect the browser protocol version".to_owned()),
+            })?;
+            if predicate(&value) {
+                return Ok(value);
+            }
+            if session.events.len() == 256 {
+                session.events.pop_front();
+            }
+            session.events.push_back(value);
+        }
+    })();
+    let _ = set_socket_read_timeout(&mut session.socket, None);
+    if result.is_err() {
+        sessions.remove(web_socket_url);
+    }
+    result
+}
+
+fn set_socket_read_timeout(socket: &mut CdpSocket, timeout: Option<Duration>) -> io::Result<()> {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TLS browser sessions do not expose a bounded socket timeout",
+        )),
+    }
 }
 
 fn encode_new_tab_url(url: &str) -> String {
@@ -1019,6 +1129,14 @@ fn browser_response_error(error: tungstenite::Error) -> ComptrolError {
         code: "browser_response_failed".to_owned(),
         message: error.to_string(),
         recovery: Some("Inspect the browser target before retrying".to_owned()),
+    }
+}
+
+fn browser_io_error(error: io::Error) -> ComptrolError {
+    ComptrolError {
+        code: "browser_response_failed".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Reconnect to the exact browser target".to_owned()),
     }
 }
 

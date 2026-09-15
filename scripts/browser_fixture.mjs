@@ -192,6 +192,12 @@ server.on("upgrade", (request, socket) => {
         : message.method === "Page.navigate"
           ? { frameId: "fixture-frame" }
           : {}
+    const event = browserSocket && message.method === "Target.createTarget"
+      ? { method: "Target.targetCreated", params: { targetInfo: { targetId: result.targetId } } }
+      : browserSocket && message.method === "Target.closeTarget"
+        ? { method: "Target.targetDestroyed", params: { targetId: message.params.targetId } }
+        : null
+    if (event) socket.write(websocketFrame(JSON.stringify(event)))
     socket.write(websocketFrame(JSON.stringify({ id: message.id, result })))
   })
 })
