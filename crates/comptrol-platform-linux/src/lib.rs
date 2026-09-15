@@ -185,12 +185,15 @@ async fn verify(node: &AccessibleProxy<'_>, request: &Request<'_>) -> Result<boo
                 .proxies()
                 .await
                 .map_err(|error| format!("AT-SPI verification interfaces unavailable: {error}"))?;
-            let editable = proxies.editable_text().await.map_err(|error| {
+            let text_proxy = proxies.text().await.map_err(|error| {
                 format!("AT-SPI verification text interface unavailable: {error}")
             })?;
-            let text = editable
-                .inner()
-                .get_property::<String>("text")
+            let count = text_proxy
+                .character_count()
+                .await
+                .map_err(|error| format!("AT-SPI value length verification failed: {error}"))?;
+            let text = text_proxy
+                .get_text(0, count)
                 .await
                 .map_err(|error| format!("AT-SPI value verification failed: {error}"))?;
             Ok(text == request.expected_value.unwrap_or_default())

@@ -31,7 +31,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.29";
+pub const SERVER_VERSION: &str = "0.1.30";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -4411,7 +4411,7 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
             expected_attribute,
             expected_value,
         });
-        match result {
+        return match result {
             Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
                 request,
                 operation_id,
@@ -4449,7 +4449,7 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
                     ),
                 },
             ),
-        }
+        };
     }
     let mut command = Command::new("powershell.exe");
     command
