@@ -178,7 +178,7 @@ jobs:
         run: |
           set -o pipefail
           for attempt in 1 2 3; do
-            if npm publish --workspace packages/mcp --access public 2>&1 | tee "npm-publish-${attempt}.log"; then
+            if npm publish --workspace packages/mcp --access public --provenance=false 2>&1 | tee "npm-publish-${attempt}.log"; then
               exit 0
             fi
             if grep -Eqi 'E403|ENEEDAUTH|forbidden|not authorized|trusted publisher' "npm-publish-${attempt}.log"; then
@@ -195,9 +195,10 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           for attempt in $(seq 1 20); do
-            published="$(npm view "comptrolling@${version}" version --json 2>/dev/null || true)"
-            if [ "$published" = "\"${version}\"" ]; then
-              npm view "comptrolling@${version}" bin --json
+            metadata="$(curl --fail --silent --show-error --retry 3 --retry-all-errors "https://registry.npmjs.org/comptrolling/${version}" 2>/dev/null || true)"
+            published="$(printf '%s' "$metadata" | node -e 'let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).version||"")}catch{}})')"
+            if [ "$published" = "$version" ]; then
+              printf '%s' "$metadata" | node -e 'let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s); console.log(JSON.stringify(p.bin||{}))})'
               exit 0
             fi
             echo "npm version ${version} is still processing (attempt ${attempt}/20)"
