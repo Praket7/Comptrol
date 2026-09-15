@@ -1,0 +1,20 @@
+{
+  "name": "comptrol",
+  "version": "0.1.18",
+  "description": "Local first, policy bound computer control with verified browser and desktop routes.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Comptrol",
+    "shortDescription": "Use Comptrol in Codex.",
+    "longDescription": "Comptrol adds a local Codex plugin scaffold.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Help me use Comptrol."
+  },
+  "mcpServers": "./.mcp.json",
+  "apps": "./.app.json"
+}
