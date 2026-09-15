@@ -58,7 +58,7 @@ pub fn privacy_network_endpoints() -> Value {
                 "name": "remote_host",
                 "configured": false,
                 "address": Value::Null,
-                "reason": "Remote pairing is not implemented"
+                "reason": "Remote transport is disabled until mutual TLS is configured"
             },
             {
                 "name": "update_service",
@@ -4044,6 +4044,13 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R3,
             route: "process_argv".to_owned(),
             note: "Runs an explicitly allowlisted executable with argv inside an explicit local root and no shell".to_owned(),
+        },
+        Capability {
+            name: "daemon.ipc".to_owned(),
+            available: cfg!(unix),
+            risk: Risk::R0,
+            route: "local_unix_socket".to_owned(),
+            note: "Provides bounded versioned local daemon IPC on macOS and Linux".to_owned(),
         },
         Capability {
             name: "windows.uia.semantic".to_owned(),
