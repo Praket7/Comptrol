@@ -4,6 +4,7 @@ use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{AccessibilityConnection, zbus};
 use serde_json::{Value, json};
+use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,15 +25,91 @@ pub struct Request<'a> {
     pub timeout: Duration,
 }
 
+#[derive(Clone, Debug)]
+struct OwnedRequest {
+    process_id: u32,
+    name: String,
+    role: Option<String>,
+    action: Action,
+    value: Option<String>,
+    expected_attribute: Option<String>,
+    expected_value: Option<String>,
+    timeout: Duration,
+}
+
+impl<'a> From<Request<'a>> for OwnedRequest {
+    fn from(request: Request<'a>) -> Self {
+        Self {
+            process_id: request.process_id,
+            name: request.name.to_owned(),
+            role: request.role.map(str::to_owned),
+            action: request.action,
+            value: request.value.map(str::to_owned),
+            expected_attribute: request.expected_attribute.map(str::to_owned),
+            expected_value: request.expected_value.map(str::to_owned),
+            timeout: request.timeout,
+        }
+    }
+}
+
+impl OwnedRequest {
+    fn as_request(&self) -> Request<'_> {
+        Request {
+            process_id: self.process_id,
+            name: &self.name,
+            role: self.role.as_deref(),
+            action: self.action,
+            value: self.value.as_deref(),
+            expected_attribute: self.expected_attribute.as_deref(),
+            expected_value: self.expected_value.as_deref(),
+            timeout: self.timeout,
+        }
+    }
+}
+
+type WorkItem = (OwnedRequest, mpsc::Sender<Result<Value, String>>);
+type WorkerSender = mpsc::Sender<WorkItem>;
+
+static WORKER: OnceLock<WorkerSender> = OnceLock::new();
+
+fn worker() -> &'static WorkerSender {
+    WORKER.get_or_init(|| {
+        let (requests, receiver) =
+            mpsc::channel::<(OwnedRequest, mpsc::Sender<Result<Value, String>>)>();
+        std::thread::Builder::new()
+            .name("comptrol-linux-atspi".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                while let Ok((request, response)) = receiver.recv() {
+                    let result = match &runtime {
+                        Ok(runtime) => runtime.block_on(async {
+                            tokio::time::timeout(
+                                request.timeout,
+                                execute_async(request.as_request()),
+                            )
+                            .await
+                            .map_err(|_| "AT-SPI operation timed out".to_owned())?
+                        }),
+                        Err(error) => Err(format!("AT-SPI runtime unavailable: {error}")),
+                    };
+                    let _ = response.send(result);
+                }
+            })
+            .expect("failed to start persistent Linux AT-SPI worker");
+        requests
+    })
+}
+
 pub fn execute(request: Request<'_>) -> Result<Value, String> {
-    let timeout = request.timeout;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("AT-SPI runtime unavailable: {error}"))?;
-    runtime
-        .block_on(async move { tokio::time::timeout(timeout, execute_async(request)).await })
-        .map_err(|_| "AT-SPI operation timed out".to_owned())?
+    let (response, receiver) = mpsc::channel();
+    worker()
+        .send((request.into(), response))
+        .map_err(|_| "Linux AT-SPI worker stopped".to_owned())?;
+    receiver
+        .recv()
+        .map_err(|_| "Linux AT-SPI worker stopped before responding".to_owned())?
 }
 
 async fn execute_async(request: Request<'_>) -> Result<Value, String> {

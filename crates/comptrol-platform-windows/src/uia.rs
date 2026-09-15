@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::sync::{OnceLock, mpsc};
 use std::time::Instant;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -27,10 +28,96 @@ pub struct Request<'a> {
     pub expected_value: Option<&'a str>,
 }
 
+#[derive(Clone, Debug)]
+struct OwnedRequest {
+    process_id: u32,
+    name: Option<String>,
+    automation_id: Option<String>,
+    role: Option<String>,
+    action: Action,
+    value: Option<String>,
+    expected_attribute: Option<String>,
+    expected_value: Option<String>,
+}
+
+impl<'a> From<Request<'a>> for OwnedRequest {
+    fn from(request: Request<'a>) -> Self {
+        Self {
+            process_id: request.process_id,
+            name: request.name.map(str::to_owned),
+            automation_id: request.automation_id.map(str::to_owned),
+            role: request.role.map(str::to_owned),
+            action: request.action,
+            value: request.value.map(str::to_owned),
+            expected_attribute: request.expected_attribute.map(str::to_owned),
+            expected_value: request.expected_value.map(str::to_owned),
+        }
+    }
+}
+
+impl OwnedRequest {
+    fn as_request(&self) -> Request<'_> {
+        Request {
+            process_id: self.process_id,
+            name: self.name.as_deref(),
+            automation_id: self.automation_id.as_deref(),
+            role: self.role.as_deref(),
+            action: self.action,
+            value: self.value.as_deref(),
+            expected_attribute: self.expected_attribute.as_deref(),
+            expected_value: self.expected_value.as_deref(),
+        }
+    }
+}
+
+struct UiaWorker {
+    requests: WorkerSender,
+}
+
+type WorkItem = (OwnedRequest, mpsc::Sender<Result<Value, String>>);
+type WorkerSender = mpsc::Sender<WorkItem>;
+
+static WORKER: OnceLock<UiaWorker> = OnceLock::new();
+
+fn worker() -> &'static UiaWorker {
+    WORKER.get_or_init(|| {
+        let (requests, receiver) =
+            mpsc::channel::<(OwnedRequest, mpsc::Sender<Result<Value, String>>)>();
+        std::thread::Builder::new()
+            .name("comptrol-windows-uia".to_owned())
+            .spawn(move || {
+                let com = ComGuard::initialize()
+                    .map_err(|error| format!("COM initialization failed in UIA worker: {error}"));
+                while let Ok((request, response)) = receiver.recv() {
+                    let result = match &com {
+                        Ok(_) => execute_once(request.as_request()),
+                        Err(error) => Err(error.clone()),
+                    };
+                    let _ = response.send(result);
+                }
+            })
+            .expect("failed to start persistent Windows UIA worker");
+        UiaWorker { requests }
+    })
+}
+
+/// Execute through one long-lived COM/UIA worker. This keeps COM initialized
+/// once, serializes UIA calls on the required apartment thread, and gives the
+/// runtime a stable place to add cache/event invalidation without traversing
+/// the desktop for every request.
 pub fn execute(request: Request<'_>) -> Result<Value, String> {
+    let (response, receiver) = mpsc::channel();
+    worker()
+        .requests
+        .send((request.into(), response))
+        .map_err(|_| "Windows UIA worker stopped".to_owned())?;
+    receiver
+        .recv()
+        .map_err(|_| "Windows UIA worker stopped before responding".to_owned())?
+}
+
+fn execute_once(request: Request<'_>) -> Result<Value, String> {
     let started = Instant::now();
-    let com =
-        ComGuard::initialize().map_err(|error| format!("COM initialization failed: {error}"))?;
     let automation: IUIAutomation =
         unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
             .map_err(|error| format!("UI Automation activation failed: {error}"))?;
@@ -82,7 +169,6 @@ pub fn execute(request: Request<'_>) -> Result<Value, String> {
         }
     }
     let verified = verify(&element, &request)?;
-    drop(com);
     Ok(json!({
         "verified": verified,
         "route": "windows_uia_direct",

@@ -1,6 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use serde_json::Value;
+#[cfg(target_os = "macos")]
+use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,6 +318,80 @@ mod native {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+struct OwnedRequest {
+    process_id: u32,
+    name: String,
+    role: Option<String>,
+    action: Action,
+    value: Option<String>,
+    expected_attribute: Option<String>,
+    expected_value: Option<String>,
+    timeout: Duration,
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> From<Request<'a>> for OwnedRequest {
+    fn from(request: Request<'a>) -> Self {
+        Self {
+            process_id: request.process_id,
+            name: request.name.to_owned(),
+            role: request.role.map(str::to_owned),
+            action: request.action,
+            value: request.value.map(str::to_owned),
+            expected_attribute: request.expected_attribute.map(str::to_owned),
+            expected_value: request.expected_value.map(str::to_owned),
+            timeout: request.timeout,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl OwnedRequest {
+    fn as_request(&self) -> Request<'_> {
+        Request {
+            process_id: self.process_id,
+            name: &self.name,
+            role: self.role.as_deref(),
+            action: self.action,
+            value: self.value.as_deref(),
+            expected_attribute: self.expected_attribute.as_deref(),
+            expected_value: self.expected_value.as_deref(),
+            timeout: self.timeout,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
+type WorkItem = (OwnedRequest, mpsc::Sender<Result<Value, String>>);
+#[cfg(target_os = "macos")]
+type WorkerSender = mpsc::Sender<WorkItem>;
+
+#[cfg(target_os = "macos")]
+static WORKER: OnceLock<WorkerSender> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
 pub fn execute(request: Request<'_>) -> Result<Value, String> {
-    native::execute(request)
+    let sender = WORKER.get_or_init(|| {
+        let (requests, receiver) =
+            mpsc::channel::<(OwnedRequest, mpsc::Sender<Result<Value, String>>)>();
+        std::thread::Builder::new()
+            .name("comptrol-macos-ax".to_owned())
+            .spawn(move || {
+                while let Ok((request, response)) = receiver.recv() {
+                    let result = native::execute(request.as_request());
+                    let _ = response.send(result);
+                }
+            })
+            .expect("failed to start persistent macOS AX worker");
+        requests
+    });
+    let (response, receiver) = mpsc::channel();
+    sender
+        .send((request.into(), response))
+        .map_err(|_| "macOS AX worker stopped".to_owned())?;
+    receiver
+        .recv()
+        .map_err(|_| "macOS AX worker stopped before responding".to_owned())?
 }
