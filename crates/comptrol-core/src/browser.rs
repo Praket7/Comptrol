@@ -1324,28 +1324,53 @@ pub fn cdp_download(
             "awaitPromise": true
         }),
     )?;
+    let download = wait_for_event(browser_web_socket_url, Duration::from_secs(10), |event| {
+        event.get("method").and_then(Value::as_str) == Some("Browser.downloadWillBegin")
+    })?;
+    let guid = download
+        .get("params")
+        .and_then(|params| params.get("guid"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "Browser download event did not contain a GUID".to_owned(),
+            recovery: Some("Inspect the browser download protocol events".to_owned()),
+        })?
+        .to_owned();
+    let progress = wait_for_event(browser_web_socket_url, Duration::from_secs(30), |event| {
+        event.get("method").and_then(Value::as_str) == Some("Browser.downloadProgress")
+            && event
+                .get("params")
+                .and_then(|params| params.get("guid"))
+                .and_then(Value::as_str)
+                == Some(guid.as_str())
+            && event
+                .get("params")
+                .and_then(|params| params.get("state"))
+                .and_then(Value::as_str)
+                == Some("completed")
+    })?;
     let expected_path = download_dir.join(expected_name);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if expected_path.is_file()
-            && !download_dir
-                .join(format!("{expected_name}.crdownload"))
-                .exists()
-        {
-            let bytes = std::fs::metadata(&expected_path)
-                .map_err(browser_file_error)?
-                .len();
-            return Ok(
-                json!({ "path": expected_path, "file_name": expected_name, "bytes": bytes, "verified": true }),
-            );
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    if !expected_path.is_file() {
+        return Err(ComptrolError {
+            code: "verification_failed".to_owned(),
+            message: "Browser reported download completion but the expected file is missing"
+                .to_owned(),
+            recovery: Some("Reconcile the completed download GUID before retrying".to_owned()),
+        });
     }
-    Err(ComptrolError {
-        code: "verification_failed".to_owned(),
-        message: "The browser did not produce the expected download".to_owned(),
-        recovery: Some("Inspect the download target and reconcile before retrying".to_owned()),
-    })
+    let bytes = std::fs::metadata(&expected_path)
+        .map_err(browser_file_error)?
+        .len();
+    Ok(json!({
+        "path": expected_path,
+        "file_name": expected_name,
+        "bytes": bytes,
+        "guid": guid,
+        "state": progress["params"]["state"],
+        "wait_strategy": "browser_download_events",
+        "verified": true
+    }))
 }
 
 fn fs_create_dir(path: &Path) -> Result<(), ComptrolError> {
