@@ -2,7 +2,7 @@
   "suite": "browser_fixture_verified_task",
   "verified_success": true,
   "verification": "verified",
-  "latency_ms": 277.301,
+  "latency_ms": 288.485,
   "mcp_calls": 17,
   "steps": 3,
   "bytes_in": 5021,
@@ -26,6 +26,6 @@
     "binary": "target/release/comptrol",
     "fixture": "scripts/browser_fixture.mjs",
     "host": "WSL2 Linux",
-    "release_line": "0.1.28"
+    "release_line": "0.1.30"
   }
 }

@@ -6,7 +6,7 @@ The server speaks newline delimited JSON on standard input and standard output. 
 
 The npm launcher keeps the client pipe open across a bounded number of unexpected native process exits. Durable operation state remains in the configured Comptrol state directory, so a client can retry an idempotent request after reconnect. The launcher stops after three restarts and reports the loss on standard error.
 
-Set `COMPTROL_DAEMON=1` on macOS or Linux to route the launcher through the local versioned daemon socket. The launcher starts the daemon, keeps the MCP stdio contract for the client, reconnects within the same bounded restart budget, and does not replay a request that was already sent without a response. Windows uses the direct stdio path until named pipe support is complete.
+Set `COMPTROL_DAEMON=1` to route the launcher through the local versioned daemon transport. macOS and Linux use the Unix socket; Windows uses the local named pipe. The launcher starts the daemon, keeps the MCP stdio contract for the client, reconnects within the same bounded restart budget, and does not replay a request that was already sent without a response.
 
 Do not add a client configuration that grants shell access or points the preview HTTP server at a non loopback address.
 
