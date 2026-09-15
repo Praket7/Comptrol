@@ -12,6 +12,53 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+/// Evidence stages for a browser upload. Generic CDP can normally establish
+/// selection and transfer only; application acceptance and persistence require
+/// an independent adapter or postcondition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum UploadStage {
+    Selected,
+    TransferStarted,
+    TransferCompleted,
+    ApplicationAccepted,
+    Persisted,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UploadTransaction {
+    pub operation_id: String,
+    pub stage: UploadStage,
+}
+
+impl UploadTransaction {
+    pub fn new(operation_id: impl Into<String>) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            stage: UploadStage::Selected,
+        }
+    }
+
+    pub fn advance(&mut self, next: UploadStage) -> Result<(), BrowserError> {
+        let allowed = matches!(
+            (self.stage, next),
+            (UploadStage::Selected, UploadStage::TransferStarted)
+                | (UploadStage::TransferStarted, UploadStage::TransferCompleted)
+                | (UploadStage::TransferCompleted, UploadStage::ApplicationAccepted)
+                | (UploadStage::ApplicationAccepted, UploadStage::Persisted)
+                | (_, UploadStage::Failed)
+        );
+        if !allowed {
+            return Err(BrowserError::InvalidResponse(format!(
+                "invalid upload transition {:?} -> {:?}",
+                self.stage, next
+            )));
+        }
+        self.stage = next;
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
     #[error("browser connection failed: {0}")]
@@ -534,6 +581,28 @@ mod tests {
             generation: 0,
             revision: "generation:0:target:tab".to_owned(),
         }
+    }
+
+    #[test]
+    fn upload_transaction_requires_ordered_evidence() {
+        let mut transaction = UploadTransaction::new("upload-1");
+        assert_eq!(transaction.stage, UploadStage::Selected);
+        assert!(transaction.advance(UploadStage::TransferCompleted).is_err());
+        transaction.advance(UploadStage::TransferStarted).unwrap();
+        transaction.advance(UploadStage::TransferCompleted).unwrap();
+        transaction
+            .advance(UploadStage::ApplicationAccepted)
+            .unwrap();
+        transaction.advance(UploadStage::Persisted).unwrap();
+        assert_eq!(transaction.stage, UploadStage::Persisted);
+    }
+
+    #[test]
+    fn upload_failure_is_terminal_and_cannot_be_overclaimed() {
+        let mut transaction = UploadTransaction::new("upload-2");
+        transaction.advance(UploadStage::Failed).unwrap();
+        assert!(transaction.advance(UploadStage::Persisted).is_err());
+        assert_eq!(transaction.stage, UploadStage::Failed);
     }
 
     #[test]
