@@ -360,6 +360,23 @@ pub struct RoutePlan {
     pub rationale: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RouteHistory {
+    attempts: u64,
+    verified_successes: u64,
+    p95_latency_ms: Option<f64>,
+}
+
+impl RouteHistory {
+    fn success_rate(&self) -> f64 {
+        if self.attempts == 0 {
+            0.5
+        } else {
+            (self.verified_successes as f64 / self.attempts as f64).clamp(0.0, 1.0)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BrowserTarget {
     pub id: String,
@@ -881,6 +898,7 @@ pub struct Runtime {
     pub stop: StopLatch,
     adapter_hosts: HashMap<String, AdapterHost>,
     idempotent: HashMap<String, ActionResult>,
+    route_history: HashMap<String, RouteHistory>,
     sequence: u64,
 }
 
@@ -927,6 +945,7 @@ impl Runtime {
             stop: StopLatch::new(&state_dir),
             adapter_hosts: HashMap::new(),
             idempotent,
+            route_history: HashMap::new(),
             sequence: 0,
         })
     }
@@ -999,7 +1018,7 @@ impl Runtime {
             self.remember(&request, result.clone());
             return result;
         }
-        let plan = route_plan(&request);
+        let plan = route_plan_with_history(&request, &self.route_history);
         if request.dry_run {
             let route_error = plan.selected.is_none().then(|| ComptrolError {
                 code: "route_unavailable".to_owned(),
@@ -1133,8 +1152,17 @@ impl Runtime {
                 },
             ),
         };
+        self.record_route_outcome(&result);
         self.remember(&request, result.clone());
         result
+    }
+
+    fn record_route_outcome(&mut self, result: &ActionResult) {
+        let entry = self.route_history.entry(result.route.clone()).or_default();
+        entry.attempts = entry.attempts.saturating_add(1);
+        if result.verification == VerificationState::Verified && result.error.is_none() {
+            entry.verified_successes = entry.verified_successes.saturating_add(1);
+        }
     }
 
     pub fn inspect(&mut self, kind: &str) -> Value {
@@ -1797,6 +1825,60 @@ fn route_plan(request: &OperationRequest) -> RoutePlan {
         request.params.clone(),
         request.background.as_deref(),
     )
+}
+
+fn route_plan_with_history(
+    request: &OperationRequest,
+    history: &HashMap<String, RouteHistory>,
+) -> RoutePlan {
+    let mut plan = route_plan(request);
+    for candidate in &mut plan.candidates {
+        if !candidate.feasible {
+            candidate.utility = None;
+            continue;
+        }
+        if let Some(stats) = history.get(&candidate.route) {
+            candidate.historical_success = stats.success_rate();
+            if let Some(latency) = stats.p95_latency_ms {
+                candidate.expected_p95_ms = Some(latency);
+            }
+            let verification = match candidate.verification_strength.as_str() {
+                "independent_outcome" => 1.0,
+                "persisted_artifact" => 0.95,
+                "application_state" => 0.85,
+                "surface_state" => 0.65,
+                _ => 0.35,
+            };
+            let latency = candidate.expected_p95_ms.unwrap_or(1_000.0);
+            candidate.utility = Some(
+                (0.45 * candidate.historical_success)
+                    + (0.35 * verification)
+                    + (0.20 * (1.0 - (latency / 1_000.0).min(1.0))),
+            );
+        }
+    }
+    plan.candidates.sort_by(|left, right| {
+        right
+            .utility
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(&left.utility.unwrap_or(f64::NEG_INFINITY))
+            .then_with(|| left.route.cmp(&right.route))
+    });
+    plan.selected = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.feasible)
+        .map(|candidate| candidate.route.clone());
+    plan.rationale = plan
+        .selected
+        .as_deref()
+        .map(|route| {
+            format!(
+                "Selected deterministic safest feasible route with historical feedback: {route}"
+            )
+        })
+        .unwrap_or_else(|| "No feasible route".to_owned());
+    plan
 }
 
 fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) -> RoutePlan {
