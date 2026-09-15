@@ -16,6 +16,8 @@ For a user visible validation, start Chrome with a loopback DevTools endpoint an
 
 On Windows, the repository launcher creates a separate profile and exposes the endpoint automatically. It does not touch the normal Chrome profile.
 
+The native `comptrol mcp` startup path also performs this setup automatically when no `COMPTROL_CDP_ENDPOINT` is already configured. This applies to source builds, GitHub release binaries, and the `comptrolling` npm launcher. Set `COMPTROL_AUTO_START_CHROME_CDP=0` to opt out. Set `COMPTROL_CHROME_START_URL` to choose the first page, or `COMPTROL_CHROME_PROFILE` to choose the isolated profile directory.
+
 ```powershell
 python scripts/start_windows_chrome_cdp.py --url https://www.espn.com
 ```
