@@ -58,6 +58,12 @@ struct TaskStore {
     sequence: u64,
 }
 
+struct TaskManager {
+    store: Arc<Mutex<TaskStore>>,
+    runtime: Arc<Mutex<Runtime>>,
+    cancellation: Arc<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct HttpEvent {
     id: u64,
@@ -254,27 +260,45 @@ impl TaskStore {
                 }
             }
         }
+        let interrupted = records
+            .values()
+            .filter(|task| matches!(task.status.as_str(), "queued" | "running"))
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self {
+        let mut store = Self {
             file,
             records,
             sequence: 0,
-        })
+        };
+        for task_id in interrupted {
+            if let Some(previous) = store.records.get(&task_id).cloned() {
+                store.write(StoredTask {
+                    status: "unknown".to_owned(),
+                    result: json!({
+                        "code": "operation_unknown",
+                        "message": "Task was interrupted by daemon restart; reconcile before retrying"
+                    }),
+                    ..previous
+                })?;
+            }
+        }
+        Ok(store)
     }
 
-    fn create(&mut self, result: Value, ttl_ms: u64) -> io::Result<Value> {
+    fn create_pending(&mut self, ttl_ms: u64) -> io::Result<StoredTask> {
         self.sequence = self.sequence.saturating_add(1);
         let task_id = format!("task-{}-{}", now_ms(), self.sequence);
         let task = StoredTask {
             task_id: task_id.clone(),
-            status: "completed".to_owned(),
+            status: "queued".to_owned(),
             ttl_ms,
             poll_interval_ms: TASK_POLL_INTERVAL_MS,
             created_at_ms: now_ms(),
-            result,
+            result: Value::Null,
         };
         self.write(task.clone())?;
-        Ok(task_view(&task))
+        Ok(task)
     }
 
     fn get(&self, task_id: &str) -> Option<Value> {
@@ -282,7 +306,17 @@ impl TaskStore {
     }
 
     fn result(&self, task_id: &str) -> Option<Value> {
-        self.records.get(task_id).map(|task| task.result.clone())
+        self.records.get(task_id).map(|task| {
+            if task.status == "completed" {
+                task.result.clone()
+            } else {
+                json!({
+                    "taskId": task.task_id,
+                    "status": task.status,
+                    "result": task.result
+                })
+            }
+        })
     }
 
     fn list(&self) -> Value {
@@ -296,6 +330,129 @@ impl TaskStore {
         self.records.insert(task.task_id.clone(), task);
         Ok(())
     }
+}
+
+impl TaskManager {
+    fn new(runtime: Arc<Mutex<Runtime>>, store: TaskStore) -> Self {
+        Self {
+            store: Arc::new(Mutex::new(store)),
+            runtime,
+            cancellation: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn spawn(&self, params: Value, ttl_ms: u64) -> io::Result<Value> {
+        let task = self
+            .store
+            .lock()
+            .expect("task store lock poisoned")
+            .create_pending(ttl_ms)?;
+        let task_id = task.task_id.clone();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancellation
+            .lock()
+            .expect("task cancellation lock poisoned")
+            .insert(task_id.clone(), Arc::clone(&cancelled));
+        let store = Arc::clone(&self.store);
+        let runtime = Arc::clone(&self.runtime);
+        let cancellation = Arc::clone(&self.cancellation);
+        thread::Builder::new()
+            .name(format!("comptrol-task-{task_id}"))
+            .spawn(move || {
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = update_task(&store, &task_id, "cancelled", json!({
+                        "code": "operation_cancelled",
+                        "message": "Task was cancelled before execution started"
+                    }));
+                    cancellation
+                        .lock()
+                        .expect("task cancellation lock poisoned")
+                        .remove(&task_id);
+                    return;
+                }
+                let _ = update_task(&store, &task_id, "running", Value::Null);
+                let result = {
+                    let mut runtime = runtime.lock().expect("runtime lock poisoned");
+                    call_tool(&mut runtime, params)
+                };
+                let requested = cancelled.load(Ordering::Acquire);
+                let (status, stored_result) = if requested {
+                    (
+                        "unknown",
+                        json!({
+                            "code": "operation_unknown",
+                            "message": "Cancellation arrived after execution began; reconcile the operation before retrying",
+                            "result": result
+                        }),
+                    )
+                } else {
+                    ("completed", result)
+                };
+                let _ = update_task(&store, &task_id, status, stored_result);
+                cancellation
+                    .lock()
+                    .expect("task cancellation lock poisoned")
+                    .remove(&task_id);
+            })
+            .map_err(io::Error::other)?;
+        Ok(task_view(&task))
+    }
+
+    fn get(&self, task_id: &str) -> Option<Value> {
+        self.store
+            .lock()
+            .expect("task store lock poisoned")
+            .get(task_id)
+    }
+
+    fn result(&self, task_id: &str) -> Option<Value> {
+        self.store
+            .lock()
+            .expect("task store lock poisoned")
+            .result(task_id)
+    }
+
+    fn list(&self) -> Value {
+        self.store.lock().expect("task store lock poisoned").list()
+    }
+
+    fn cancel(&self, task_id: &str) -> Value {
+        let Some(flag) = self
+            .cancellation
+            .lock()
+            .expect("task cancellation lock poisoned")
+            .get(task_id)
+            .cloned()
+        else {
+            return self
+                .get(task_id)
+                .map(|task| json!({ "task": task, "cancelled": false }))
+                .unwrap_or_else(|| task_error("task not found"));
+        };
+        flag.store(true, Ordering::Release);
+        json!({ "taskId": task_id, "cancelRequested": true })
+    }
+}
+
+fn update_task(
+    store: &Arc<Mutex<TaskStore>>,
+    task_id: &str,
+    status: &str,
+    result: Value,
+) -> io::Result<()> {
+    let mut store = store.lock().expect("task store lock poisoned");
+    let Some(previous) = store.records.get(task_id).cloned() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "task record disappeared",
+        ));
+    };
+    let task = StoredTask {
+        status: status.to_owned(),
+        result,
+        ..previous
+    };
+    store.write(task)
 }
 
 fn task_view(task: &StoredTask) -> Value {
@@ -680,20 +837,22 @@ fn run_integrate(args: Vec<String>) -> i32 {
 }
 
 fn run_stdio() -> i32 {
-    let mut runtime = match Runtime::new(default_state_dir()) {
+    let runtime = match Runtime::new(default_state_dir()) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("startup failed: {error}");
             return 1;
         }
     };
-    let mut tasks = match TaskStore::open(&default_state_dir()) {
+    let tasks = match TaskStore::open(&default_state_dir()) {
         Ok(tasks) => tasks,
         Err(error) => {
             eprintln!("task store startup failed: {error}");
             return 1;
         }
     };
+    let runtime = Arc::new(Mutex::new(runtime));
+    let tasks = TaskManager::new(Arc::clone(&runtime), tasks);
     let mut tasks_enabled = false;
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -718,8 +877,8 @@ fn run_stdio() -> i32 {
                 };
                 if !line.trim().is_empty() {
                     let response = handle_message_with_state(
-                        &mut runtime,
-                        Some(&mut tasks),
+                        &runtime,
+                        Some(&tasks),
                         &mut tasks_enabled,
                         line,
                         |notification| {
@@ -743,8 +902,8 @@ fn run_stdio() -> i32 {
 }
 
 fn handle_message_with_state<F>(
-    runtime: &mut Runtime,
-    mut tasks: Option<&mut TaskStore>,
+    runtime: &Arc<Mutex<Runtime>>,
+    tasks: Option<&TaskManager>,
     tasks_enabled: &mut bool,
     line: &str,
     mut emit: F,
@@ -836,30 +995,28 @@ where
                     .and_then(Value::as_u64)
                     .unwrap_or(DEFAULT_TASK_TTL_MS)
                     .clamp(1_000, 86_400_000);
-                let result = call_tool(runtime, params.clone());
-                match tasks.as_deref_mut() {
-                    Some(store) => match store.create(result, ttl_ms) {
+                match tasks {
+                    Some(manager) => match manager.spawn(params.clone(), ttl_ms) {
                         Ok(task) => json!({ "resultType": "task", "task": task }),
                         Err(error) => {
                             json!({ "error": { "code": "task_store_failed", "message": error.to_string() } })
                         }
                     },
                     None => call_tool(
-                        runtime,
+                        &mut runtime.lock().expect("runtime lock poisoned"),
                         request.get("params").cloned().unwrap_or(Value::Null),
                     ),
                 }
             } else {
-                call_tool(runtime, params)
+                call_tool(&mut runtime.lock().expect("runtime lock poisoned"), params)
             }
         }
-        "tasks/get" => task_get(tasks.as_deref(), &request),
-        "tasks/result" => task_result(tasks.as_deref(), &request),
+        "tasks/get" => task_get(tasks, &request),
+        "tasks/result" => task_result(tasks, &request),
         "tasks/list" => tasks
-            .as_deref()
-            .map(TaskStore::list)
+            .map(TaskManager::list)
             .unwrap_or_else(|| task_error("Tasks are available only on the stdio transport")),
-        "tasks/cancel" => task_error("Completed Comptrol tasks cannot be cancelled"),
+        "tasks/cancel" => task_cancel(tasks, &request),
         "tasks/update" => task_error("Comptrol tasks do not accept input updates"),
         _ => {
             json!({ "error": { "code": "method_not_found", "message": format!("Unknown MCP method {method}") } })
@@ -880,7 +1037,7 @@ where
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-fn task_get(tasks: Option<&TaskStore>, request: &Value) -> Value {
+fn task_get(tasks: Option<&TaskManager>, request: &Value) -> Value {
     let Some(task_id) = request
         .get("params")
         .and_then(|params| params.get("taskId"))
@@ -889,11 +1046,11 @@ fn task_get(tasks: Option<&TaskStore>, request: &Value) -> Value {
         return task_error("tasks/get needs taskId");
     };
     tasks
-        .and_then(|store| store.get(task_id))
+        .and_then(|manager| manager.get(task_id))
         .unwrap_or_else(|| task_error("task not found"))
 }
 
-fn task_result(tasks: Option<&TaskStore>, request: &Value) -> Value {
+fn task_result(tasks: Option<&TaskManager>, request: &Value) -> Value {
     let Some(task_id) = request
         .get("params")
         .and_then(|params| params.get("taskId"))
@@ -902,8 +1059,21 @@ fn task_result(tasks: Option<&TaskStore>, request: &Value) -> Value {
         return task_error("tasks/result needs taskId");
     };
     tasks
-        .and_then(|store| store.result(task_id))
+        .and_then(|manager| manager.result(task_id))
         .unwrap_or_else(|| task_error("task not found"))
+}
+
+fn task_cancel(tasks: Option<&TaskManager>, request: &Value) -> Value {
+    let Some(task_id) = request
+        .get("params")
+        .and_then(|params| params.get("taskId"))
+        .and_then(Value::as_str)
+    else {
+        return task_error("tasks/cancel needs taskId");
+    };
+    tasks
+        .map(|manager| manager.cancel(task_id))
+        .unwrap_or_else(|| task_error("Tasks are available only on the stdio transport"))
 }
 
 fn task_error(message: &str) -> Value {
@@ -1095,25 +1265,27 @@ fn run_daemon() -> i32 {
         eprintln!("daemon socket permissions failed: {error}");
         return 1;
     }
-    let mut runtime = match Runtime::new(default_state_dir()) {
+    let runtime = match Runtime::new(default_state_dir()) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("startup failed: {error}");
             return 1;
         }
     };
-    let mut tasks = match TaskStore::open(&default_state_dir()) {
+    let tasks = match TaskStore::open(&default_state_dir()) {
         Ok(tasks) => tasks,
         Err(error) => {
             eprintln!("task store startup failed: {error}");
             return 1;
         }
     };
+    let runtime = Arc::new(Mutex::new(runtime));
+    let tasks = TaskManager::new(Arc::clone(&runtime), tasks);
     eprintln!("comptrol daemon listening on {}", path.display());
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(error) = handle_ipc_connection(&mut stream, &mut runtime, &mut tasks) {
+                if let Err(error) = handle_ipc_connection(&mut stream, &runtime, &tasks) {
                     eprintln!("daemon connection failed: {error}");
                 }
             }
@@ -1128,20 +1300,22 @@ fn run_daemon() -> i32 {
     #[cfg(windows)]
     {
         let pipe_name = wide_pipe_name(&daemon_pipe_name());
-        let mut runtime = match Runtime::new(default_state_dir()) {
+        let runtime = match Runtime::new(default_state_dir()) {
             Ok(runtime) => runtime,
             Err(error) => {
                 eprintln!("startup failed: {error}");
                 return 1;
             }
         };
-        let mut tasks = match TaskStore::open(&default_state_dir()) {
+        let tasks = match TaskStore::open(&default_state_dir()) {
             Ok(tasks) => tasks,
             Err(error) => {
                 eprintln!("task store startup failed: {error}");
                 return 1;
             }
         };
+        let runtime = Arc::new(Mutex::new(runtime));
+        let tasks = TaskManager::new(Arc::clone(&runtime), tasks);
         eprintln!("comptrol daemon listening on {}", daemon_pipe_name());
         loop {
             let handle = unsafe {
@@ -1168,9 +1342,7 @@ fn run_daemon() -> i32 {
                     || GetLastError() == ERROR_PIPE_CONNECTED
             };
             let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
-            if connected
-                && let Err(error) = handle_ipc_connection(&mut stream, &mut runtime, &mut tasks)
-            {
+            if connected && let Err(error) = handle_ipc_connection(&mut stream, &runtime, &tasks) {
                 eprintln!("daemon connection failed: {error}");
             }
         }
@@ -1271,8 +1443,8 @@ fn run_daemon_health() -> i32 {
 
 fn handle_ipc_connection<S: Read + Write>(
     stream: &mut S,
-    runtime: &mut Runtime,
-    tasks: &mut TaskStore,
+    runtime: &Arc<Mutex<Runtime>>,
+    tasks: &TaskManager,
 ) -> io::Result<()> {
     let mut tasks_enabled = false;
     while let Some(frame) = read_ipc_frame(stream)? {
@@ -1623,7 +1795,7 @@ fn handle_http(
     let mut notifications = Vec::new();
     let mut tasks_enabled = false;
     let value = handle_message_with_state(
-        &mut runtime.lock().expect("runtime lock poisoned"),
+        runtime,
         None,
         &mut tasks_enabled,
         body.as_ref(),
