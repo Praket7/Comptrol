@@ -13,6 +13,16 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Protocol negotiation for legacy MCP and the 2026-07-28 current mode.
 - Current stdio and HTTP behavior refuses legacy session operations instead of silently treating them as current protocol state.
 - Chrome closed-groups extension moved to experiments and excluded from normal setup.
+- Browser multiplexer primitives provide one WebSocket, flattened-session command correlation, and out-of-order response routing.
+- Target and frame graphs consume CDP lifecycle events and execution-context changes.
+- Download verification uses browser download lifecycle events and exact GUID binding.
+- Upload responses expose honest selected/transfer/accepted/persisted stages.
+- Typed workflow IR validation is enforced during trace compilation.
+- OBS uses a persistent authenticated WebSocket client.
+- LibreOffice uses a persistent UNO connection and exact document identity.
+- VS Code bridge calls require a configured token, nonce, and authenticated response.
+- Adapter host response reads have bounded I/O deadlines and terminate unresponsive children.
+- Doctor reports current capability and live-verification boundaries.
 
 ## Implemented but not live-verified here
 
@@ -26,6 +36,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 
 - Replace the remaining synchronous CDP session implementation with the full single-reader/single-writer flattened-session multiplexer.
 - Complete universal verification wiring across every adapter and high-level operation.
+- Wire the extracted async browser connection into the remaining synchronous compatibility facade and enable full target attachment/domain bootstrap.
 - Persist route statistics and add the V2 route planner score and hard gates.
 - Complete MCP Tasks persistence, cancellation propagation, and protocol conformance coverage.
 - Complete workflow state-machine execution, clean replay promotion, branches, loops, parallel reads, and repair fallback.
