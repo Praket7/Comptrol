@@ -12,6 +12,7 @@ pub mod trace;
 
 use comptrol_adapter_host::{AdapterHost, AdapterHostConfig};
 use comptrol_adapter_sdk::{AdapterManifest, HealthState};
+use comptrol_workflow::{Workflow, WorkflowExecutor, WorkflowNode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
@@ -1075,7 +1076,7 @@ impl Runtime {
                 VerificationState::Verified,
                 json!({ "ready": true, "protocol": PROTOCOL_VERSION }),
             ),
-            "workflow.execute" => execute_workflow_request(&request, operation_id),
+            "workflow.execute" => execute_workflow_request(self, &request, operation_id),
             "desktop.observe" => desktop_observe(&request, operation_id),
             "platform.broker.observe" => platform_broker_observe(&request, operation_id),
             "filesystem.write" => sandbox_write(&request, operation_id, &self.checkpoints),
@@ -2026,7 +2027,11 @@ fn restore_checkpoint(
     }
 }
 
-fn execute_workflow_request(request: &OperationRequest, operation_id: String) -> ActionResult {
+fn execute_workflow_request(
+    runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
     if let Some(compiled) = request.params.get("compiled_workflow") {
         let Ok(compiled) = serde_json::from_value::<CompiledWorkflow>(compiled.clone()) else {
             return ActionResult::refused(
@@ -2058,6 +2063,86 @@ fn execute_workflow_request(request: &OperationRequest, operation_id: String) ->
                 error: Some(error),
             };
         }
+        let mut nodes = std::collections::BTreeMap::new();
+        for (index, step) in compiled.steps.iter().enumerate() {
+            let id = format!("act_{index}");
+            let next = if index + 1 < compiled.steps.len() {
+                Some(format!("act_{}", index + 1))
+            } else {
+                Some("return".to_owned())
+            };
+            nodes.insert(
+                id,
+                WorkflowNode::Act {
+                    intent: step.intent.clone(),
+                    params: resolve_workflow_parameters(
+                        &step.params,
+                        request.params.get("parameters").unwrap_or(&Value::Null),
+                    ),
+                    next,
+                },
+            );
+        }
+        nodes.insert(
+            "return".to_owned(),
+            WorkflowNode::Return { value: Value::Null },
+        );
+        let workflow = Workflow {
+            id: compiled.workflow_id.clone(),
+            version: compiled.workflow_version,
+            intent: compiled.intent.clone(),
+            parameters: compiled.parameters.clone(),
+            fingerprint: compiled.fingerprint.clone(),
+            start: "act_0".to_owned(),
+            nodes,
+        };
+        let target = request.target.clone();
+        let background = request.background.clone();
+        let mut executor = WorkflowExecutor {
+            action: |intent: &str, params: &Value| {
+                let result = runtime.operate(OperationRequest {
+                    intent: intent.to_owned(),
+                    target: target.clone(),
+                    params: params.clone(),
+                    postcondition: None,
+                    risk: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                    background: background.clone(),
+                });
+                serde_json::to_value(result).map_err(|error| error.to_string())
+            },
+            verify: |criterion: &Value, observed: &Value| {
+                criterion
+                    .get("equals")
+                    .is_some_and(|expected| observed.get("data") == Some(expected))
+                    || criterion == observed
+            },
+            wait: |_event: &str, timeout_ms: u64| {
+                std::thread::sleep(Duration::from_millis(timeout_ms.min(60_000)));
+                Ok(())
+            },
+            max_steps: compiled.steps.len().saturating_mul(4).saturating_add(4),
+        };
+        return match executor.run(&workflow) {
+            Ok(value) => success(
+                request,
+                operation_id,
+                "workflow",
+                EffectState::Changed,
+                VerificationState::Verified,
+                json!({ "workflow_id": compiled.workflow_id, "workflow_version": compiled.workflow_version, "result": value }),
+            ),
+            Err(error) => ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "workflow_execution_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Observe the current state and use a cold route".to_owned()),
+                },
+            ),
+        };
     }
     let Some(ops) = request.params.get("ops") else {
         return ActionResult::refused(
@@ -2104,6 +2189,31 @@ fn execute_workflow_request(request: &OperationRequest, operation_id: String) ->
             data: Value::Null,
             error: Some(error),
         },
+    }
+}
+
+fn resolve_workflow_parameters(template: &Value, parameters: &Value) -> Value {
+    match template {
+        Value::Object(object) => {
+            if let Some(name) = object.get("param").and_then(Value::as_str) {
+                return parameters.get(name).cloned().unwrap_or(Value::Null);
+            }
+            Value::Object(
+                object
+                    .iter()
+                    .map(|(key, value)| {
+                        (key.clone(), resolve_workflow_parameters(value, parameters))
+                    })
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| resolve_workflow_parameters(value, parameters))
+                .collect(),
+        ),
+        _ => template.clone(),
     }
 }
 

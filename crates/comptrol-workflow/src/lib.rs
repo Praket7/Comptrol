@@ -124,7 +124,7 @@ pub enum ExecutionError {
 /// Application-specific work remains behind callbacks owned by the host. The
 /// executor only controls the closed state-machine transitions and enforces a
 /// finite step budget, so a repaired or malformed workflow cannot run forever.
-pub struct WorkflowExecutor<'a, A, V, W>
+pub struct WorkflowExecutor<A, V, W>
 where
     A: FnMut(&str, &Value) -> Result<Value, String>,
     V: FnMut(&Value, &Value) -> bool,
@@ -134,10 +134,9 @@ where
     pub verify: V,
     pub wait: W,
     pub max_steps: usize,
-    marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a, A, V, W> WorkflowExecutor<'a, A, V, W>
+impl<A, V, W> WorkflowExecutor<A, V, W>
 where
     A: FnMut(&str, &Value) -> Result<Value, String>,
     V: FnMut(&Value, &Value) -> bool,
@@ -484,7 +483,6 @@ mod tests {
             verify: |criterion: &Value, observed: &Value| criterion == observed,
             wait: |_event: &str, _timeout: u64| Ok(()),
             max_steps: 10,
-            marker: std::marker::PhantomData,
         };
         assert_eq!(
             executor.run(&workflow).unwrap(),
