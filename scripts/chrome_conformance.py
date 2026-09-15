@@ -147,7 +147,8 @@ try:
     assert snapshot_data["verification"] == "verified"
     assert snapshot_data["data"]["snapshot"]["nodes"]
     upload = call(runtime, 5, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.upload", "idempotency_key": "chrome-upload", "params": {**identity, "selector": "#upload", "path": str(upload_path)}}})
-    assert upload["result"]["structuredContent"]["verification"] == "verified"
+    assert upload["result"]["structuredContent"]["verification"] == "unverified"
+    assert upload["result"]["structuredContent"]["data"]["stage"] == "selected"
     assert upload["result"]["structuredContent"]["data"]["verified"] is True
     fill = call(runtime, 6, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.fill", "idempotency_key": "chrome-fill", "params": {**identity, "selector": "#message", "value": "verified form"}}})
     assert fill["result"]["structuredContent"]["verification"] == "verified"

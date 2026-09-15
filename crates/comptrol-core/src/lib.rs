@@ -31,7 +31,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.25";
+pub const SERVER_VERSION: &str = "0.1.26";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -3036,8 +3036,13 @@ fn browser_cdp_upload(
             operation_id,
             "browser_protocol",
             EffectState::Changed,
-            VerificationState::Verified,
-            data,
+            VerificationState::Unverified,
+            json!({
+                "selection": data,
+                "stage": "selected",
+                "verification": "unverified",
+                "next": "A site or application adapter must verify transfer or application acceptance"
+            }),
         ),
         Err(error) => browser_failure(request, operation_id, error),
     }
@@ -4377,6 +4382,73 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
                 recovery: None,
             },
         );
+    }
+    #[cfg(windows)]
+    if std::env::var("COMPTROL_WINDOWS_UIA_LEGACY").as_deref() != Ok("1") {
+        let action = if request.intent.ends_with("press") {
+            comptrol_platform_windows::Action::Press
+        } else {
+            comptrol_platform_windows::Action::SetValue
+        };
+        let (expected_attribute, expected_value) = request
+            .postcondition
+            .as_ref()
+            .and_then(|postcondition| {
+                Some((
+                    postcondition.get("attribute")?.as_str()?,
+                    postcondition.get("equals")?.as_str()?,
+                ))
+            })
+            .unzip();
+        let result = comptrol_platform_windows::execute(comptrol_platform_windows::Request {
+            process_id: process_id as u32,
+            name,
+            automation_id,
+            role: request.params.get("role").and_then(Value::as_str),
+            action,
+            value: request.params.get("value").and_then(Value::as_str),
+            expected_attribute,
+            expected_value,
+        });
+        return match result {
+            Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
+                request,
+                operation_id,
+                "windows_uia_direct",
+                EffectState::Changed,
+                VerificationState::Verified,
+                data,
+            ),
+            Ok(data) => success(
+                request,
+                operation_id,
+                "windows_uia_direct",
+                EffectState::Changed,
+                VerificationState::Unverified,
+                data,
+            ),
+            Err(message) => ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: if message.contains("ambiguous") {
+                        "target_ambiguous"
+                    } else if message.contains("missing") {
+                        "target_gone"
+                    } else if message.contains("disabled") {
+                        "not_actionable"
+                    } else {
+                        "adapter_unavailable"
+                    }
+                    .to_owned(),
+                    message,
+                    recovery: Some(
+                        "Refresh the exact UI Automation target and inspect Windows permissions"
+                            .to_owned(),
+                    ),
+                },
+            ),
+        };
     }
     let mut command = Command::new("powershell.exe");
     command

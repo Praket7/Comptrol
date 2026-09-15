@@ -3,11 +3,12 @@ members = [
     "crates/comptrol-core",
     "crates/comptrol-adapter-sdk",
     "crates/comptrol-adapter-host",
+    "crates/comptrol-platform-windows",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.25"
+version = "0.1.26"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Praket7/Comptrol"

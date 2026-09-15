@@ -6,7 +6,7 @@ On macOS it checks the public System Events accessibility surface. On Windows it
 
 Detection is not actuation. A detected display or bus does not make semantic mutation available. `platform.broker.observe` returns the broker descriptor and the explicit read only boundary. The action capability stays unavailable until its adapter and verification suite pass.
 
-Windows semantic routes use UI Automation control patterns. `windows.uia.press` requires an exact process id plus a name or automation id and uses InvokePattern. `windows.uia.set_value` uses ValuePattern and reads the value back before reporting verified. The route is bounded and does not synthesize mouse or keyboard input.
+Windows semantic routes use the direct Rust COM UI Automation adapter in `comptrol-platform-windows`. `windows.uia.press` requires an exact process id plus a name or automation id and uses InvokePattern. `windows.uia.set_value` uses ValuePattern and reads the value back before reporting verified. The route uses one bounded COM worker call and does not spawn PowerShell in the hot path, synthesize mouse or keyboard input, or silently foreground the target. `COMPTROL_WINDOWS_UIA_LEGACY=1` is an explicit compatibility escape hatch for older hosts only.
 
 Linux semantic routes use AT SPI when the session exposes the bus. `linux.atspi.press` resolves one accessible by process id and name and invokes its action interface. `linux.atspi.set_value` uses the editable text interface when available and verifies the resulting text. Wayland input injection remains separate and unsupported until a portal and libei consent path is validated.
 
