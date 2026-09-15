@@ -1,6 +1,7 @@
 use crate::{ActionResult, OperationRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -139,6 +140,41 @@ pub fn compile_verified_trace(
     preconditions.dedup();
     let intent = entries[0].request.intent.clone();
     let fingerprint = workflow_fingerprint(&intent, &steps, &preconditions);
+    let mut nodes = BTreeMap::new();
+    for (index, step) in steps.iter().enumerate() {
+        let act_id = format!("act_{index}");
+        let next = if index + 1 < steps.len() {
+            Some(format!("act_{}", index + 1))
+        } else {
+            Some("return".to_owned())
+        };
+        nodes.insert(
+            act_id,
+            comptrol_workflow::WorkflowNode::Act {
+                intent: step.intent.clone(),
+                params: step.params.clone(),
+                next,
+            },
+        );
+    }
+    nodes.insert(
+        "return".to_owned(),
+        comptrol_workflow::WorkflowNode::Return { value: Value::Null },
+    );
+    let typed = comptrol_workflow::Workflow {
+        id: workflow_id.to_owned(),
+        version: 2,
+        intent: intent.clone(),
+        parameters: parameters.clone(),
+        fingerprint: fingerprint.clone(),
+        start: "act_0".to_owned(),
+        nodes,
+    };
+    comptrol_workflow::validate_workflow(&typed).map_err(|message| crate::ComptrolError {
+        code: "workflow_validation_failed".to_owned(),
+        message,
+        recovery: Some("Compile a closed typed workflow from a verified trace".to_owned()),
+    })?;
     Ok(CompiledWorkflow {
         workflow_id: workflow_id.to_owned(),
         workflow_version: 2,
