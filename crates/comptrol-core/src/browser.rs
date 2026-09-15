@@ -1,4 +1,11 @@
 use crate::{BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_target};
+// Compatibility facade: new browser callers should use the async persistent
+// multiplexer. The legacy synchronous helpers below remain available for
+// protocol compatibility while their call sites migrate.
+pub use comptrol_browser::{
+    BrowserCommand, BrowserConnection, BrowserError, BrowserManager, FrameGraph, FrameRecord,
+    TargetGraph, TargetRecord,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};

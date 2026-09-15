@@ -8,6 +8,7 @@ description = "Local first computer control runtime and MCP server"
 [dependencies]
 comptrol-adapter-host = { path = "../comptrol-adapter-host" }
 comptrol-adapter-sdk = { path = "../comptrol-adapter-sdk" }
+comptrol-browser = { path = "../comptrol-browser" }
 comptrol-platform-windows = { path = "../comptrol-platform-windows" }
 comptrol-workflow = { path = "../comptrol-workflow" }
 serde = { version = "1", features = ["derive"] }
