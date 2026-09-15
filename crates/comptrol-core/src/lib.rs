@@ -3893,12 +3893,11 @@ fn ax_script(request: &OperationRequest, action: &str) -> Option<String> {
             Some(script) => format!("perform action \"AXPress\" of targetElement\nreturn {script}"),
             None => "perform action \"AXPress\" of targetElement\nreturn \"pressed\"".to_owned(),
         }
-    } else if let Some(value) = action.strip_prefix("set_value:") {
+    } else {
+        let value = action.strip_prefix("set_value:")?;
         format!(
             "set value of targetElement to {value}\nreturn ((value of targetElement as text) is {value})"
         )
-    } else {
-        return None;
     };
     Some(format!(
         "tell application \"System Events\"\ntell application process {app}\nset targetWindow to {window}\nset matches to (every {element} of targetWindow whose name is {control})\nif (count of matches) is not 1 then error \"target_ambiguous\"\nset targetElement to item 1 of matches\n{action_line}\nend tell\nend tell"
