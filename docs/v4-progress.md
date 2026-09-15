@@ -32,6 +32,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Runtime route history is persisted in SQLite and feeds conservative deterministic route scoring after safety gates.
 - OBS uses a persistent authenticated WebSocket client.
 - LibreOffice uses a persistent UNO connection and exact document identity.
+- Adapter hosts enforce bounded request deadlines, reap timed-out children, and retain a bounded stderr diagnostic tail.
 - VS Code bridge calls require a configured token, nonce, and authenticated response.
 - Adapter host response reads have bounded I/O deadlines and terminate unresponsive children.
 - Doctor reports current capability and live-verification boundaries.
@@ -53,7 +54,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Extend MCP cancellation propagation into every adapter/browser operation and add task progress replay coverage.
 - Add workflow repair fallback and host persistence for promoted candidates; the clean replay promotion gate is implemented.
 - Implement persistent native accessibility workers and event-driven caches for all three desktop platforms.
-- Upgrade VS Code authentication, exact LibreOffice document identity, persistent OBS, Blender live IPC, adapter deadlines, and truthful kernel-isolation reporting.
+- Upgrade VS Code authentication, exact LibreOffice document identity, persistent OBS, Blender live IPC, and truthful kernel-isolation reporting.
 - Add the complete benchmark matrix and collect stable performance history before hard regression thresholds.
 - Build and publish platform-specific npm/Homebrew release artifacts after release CI produces fresh binaries.
 - Wire the typed locator/actionability and upload/download transaction primitives into every remaining legacy browser helper.
