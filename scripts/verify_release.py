@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import zipfile
 
 
 parser = argparse.ArgumentParser()
@@ -23,6 +24,15 @@ for checksum_path in checksums:
     actual = hashlib.sha256(archive.read_bytes()).hexdigest()
     if actual != digest:
         raise SystemExit(f"checksum mismatch for {archive}")
+    with zipfile.ZipFile(archive) as package:
+        members = package.namelist()
+        if any(path.startswith("/") or ".." in pathlib.PurePosixPath(path).parts for path in members):
+            raise SystemExit(f"unsafe archive path in {archive}")
+        binaries = [path for path in members if path in ("comptrol/comptrol", "comptrol/comptrol.exe")]
+        if len(binaries) != 1:
+            raise SystemExit(f"release archive must contain exactly one Comptrol binary: {archive}")
+        if package.getinfo(binaries[0]).file_size == 0:
+            raise SystemExit(f"empty release binary in {archive}")
 
 sboms = sorted(args.directory.glob("*.sbom.json"))
 if len(sboms) != len(checksums):
