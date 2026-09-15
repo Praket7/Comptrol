@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--binary", default=str(ROOT / "target" / "debug" / "comptrol"))
     parser.add_argument("--task", default="v4.transport.smoke")
     parser.add_argument("--iterations", type=int, default=25)
+    parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
     task_path = ROOT / "bench" / "tasks" / f"{args.task.replace('.', '_')}.json"
     if not task_path.is_file():
@@ -42,7 +43,11 @@ def main():
     if missing:
         raise SystemExit(f"benchmark result is missing required metrics: {', '.join(missing)}")
     result.update({"task_id": args.task, "final_verifier": task["final_verifier"], "verified_success": result["iterations"] == args.iterations and not missing})
-    print(json.dumps(result, sort_keys=True))
+    encoded = json.dumps(result, sort_keys=True, indent=2) + "\n"
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(encoded, encoding="utf-8")
+    print(encoded, end="")
 
 
 if __name__ == "__main__":
