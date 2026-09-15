@@ -2903,8 +2903,16 @@ fn browser_cdp_semantic_click(
             operation_id,
             "browser_protocol",
             EffectState::Changed,
-            VerificationState::Verified,
-            data,
+            VerificationState::Unverified,
+            json!({
+                "dispatch": data,
+                "postcondition": if request.postcondition.is_some() {
+                    "requested_but_not_checked"
+                } else {
+                    "none"
+                },
+                "verification": "unverified"
+            }),
         ),
         Err(error) => browser_failure(request, operation_id, error),
     }
