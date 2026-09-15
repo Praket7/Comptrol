@@ -3123,7 +3123,11 @@ fn browser_cdp_dom_action(
                 } else {
                     VerificationState::Unverified
                 },
-                json!({ "result": data, "postcondition": if verified { "verified" } else if postcondition_requested { "failed" } else { "unverified" } }),
+                json!({
+                    "result": data,
+                    "postcondition": if verified { "verified" } else if postcondition_requested { "failed" } else { "unverified" },
+                    "wait_strategy": if request.intent == "browser.cdp.wait_for" { "bounded_poll" } else { "none" }
+                }),
             );
         }
         if request.intent != "browser.cdp.wait_for" || Instant::now() >= deadline {
