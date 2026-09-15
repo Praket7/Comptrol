@@ -12,7 +12,7 @@ The current host observer is real. On macOS it calls the public System Events ac
 
 The loopback HTTP preview validates the origin and binds only to localhost. It also serves a read only diagnostics dashboard. The standard compatibility path is MCP stdio.
 
-The repository also includes an npm launcher package with bounded native process supervision, CI validation, a release workflow, browser target discovery, a narrow CDP websocket route for evaluation navigation and sandbox uploads, a fixture mutation route with exact target binding and duplicate submission protection, platform capability brokers, an adapter registry contract, client conformance harnesses, Homebrew formula generation, threat model, privacy notes, contribution guidance, and research notes.
+The repository also includes an npm launcher package with bounded native process supervision, CI validation, a release workflow, browser target discovery, a narrow CDP route with exact target binding and duplicate submission protection, platform capability brokers, an adapter registry contract, client conformance harnesses, Homebrew formula generation, threat model, privacy notes, contribution guidance, and research notes. In the fast verified execution milestone, normal target-bound CDP and browser protocol calls reuse one mutex-protected local websocket per exact DevTools URL, with monotonic command ids and eviction on protocol failure.
 
 The browser route now opens foreground tabs through an explicit native Chrome launcher when enabled and opens exact visible or background tabs through the configured local Chrome endpoint. On macOS, an explicit Accessibility route can reopen one exact closed saved group in the visible Chrome window and verifies that the closed group control disappeared. It reads bounded accessibility trees, moves exact live targets through history, focuses exact page elements, and closes exact live targets. The result reports the exact target identity where CDP is available and explicitly records that mouse and clipboard were untouched. Account state is preserved by using the existing browser profile. No credential or cookie transfer into a separate headless profile is attempted.
 
@@ -30,13 +30,13 @@ Rust format check passed.
 
 Clippy with warnings denied passed.
 
-The previous verified run passed thirty three unit tests. The current source adds two unit tests for exact Chrome group binding and restart metadata, but they cannot run on this host until the Xcode license gate is resolved.
+The current source passes 37 workspace tests, including a concurrent delayed-event regression proving EventBus waiters block on notification rather than polling every 5 ms.
 
 The live MCP harness passed initialize, tool discovery, readiness operation, real macOS desktop observation, unauthorized mutation refusal, idempotent replay, a permitted macOS notification with an explicitly unverified effect, stop and resume latch behavior, loopback HTTP origin rejection plus acceptance, durable completed replay, browser target discovery, verified fixture submission, browser duplicate protection, fixture CDP evaluation over websocket, real dedicated headless Chrome CDP navigation, background target creation, same profile state continuity, verified history navigation, exact target close, explicit closed group refusal, DOM verification, sandbox upload, filename postcondition verification, allowlisted argv command execution, native Chrome launcher policy and strict background refusal, stdio progress notification ordering, durable MCP Tasks across restart, process level restart reconciliation without duplicate mutation, trace record and fixture replay, platform capability conformance, and the repository owned Codex, Claude Code, and Cursor profiles. A headed Chrome profile acceptance run also passed in an isolated visible profile. An opt in live macOS application launch acceptance run passed for Finder. The native Chrome acceptance harness is present and skips before launch when Chrome Automation access cannot respond.
 
 The README forbidden punctuation check passed.
 
-The npm package dry run and launcher restart conformance passed. The browser fixture conformance passed.
+The npm package dry run and launcher restart conformance passed. Browser fixture conformance passed with an explicit transport assertion of one page websocket and one browser websocket across repeated target-bound CDP operations.
 
 The loopback HTTP conformance source now covers random session assignment, required session reuse, session deletion, finite server sent event responses, ordered progress events, invalid JSON, incomplete bodies, origin rejection, method rejection, and oversized requests. The current host cannot execute this updated harness because rebuilding the native binary is blocked by the local Xcode license gate.
 
@@ -44,7 +44,7 @@ The native daemon mode now has a bounded versioned Unix socket protocol on macOS
 
 The npm launcher now has an opt in daemon mode on Unix and Windows. It preserves the external MCP stdio contract, supervises daemon startup, reconnects after transport loss, bounds restart attempts, and does not replay a request that was already sent without a response. The dedicated daemon launcher conformance test passes on this host.
 
-The optimized Rust build passed before the latest semantic Chrome group route. The current rebuild is blocked by the same local Xcode license gate.
+The optimized Rust build, format check, Clippy with warnings denied, workspace tests, README lint, and browser fixture conformance pass in WSL. Native headed Chrome acceptance remains host-dependent and is not claimed here.
 
 The GitHub Actions workflows are present, but the latest remote jobs were rejected before checkout because the repository account reported failed recent payments or an exceeded spending limit. This is an external runner availability failure rather than a test result.
 
@@ -60,7 +60,7 @@ Linux has an opt in AT SPI route for exact process and accessible name binding t
 
 ## Not built yet
 
-Remote mutual TLS transport, application specific adapters, portable CDP closed group restoration, screenshots and visual recovery, full asynchronous MCP task execution and cancellation, native Windows and Linux live fixture validation on their operating systems, signed release publication, npm publication, Homebrew publication, GitHub artifact attestation, and real user profile acceptance without an explicitly supplied DevTools endpoint remain open work. Streamable HTTP now has concurrent long lived GET streams, bounded event history, `Last-Event-ID` replay, persistent session state, safe restart loading, session deletion, and a connection ceiling. Basic HTTP session lifecycle, bounded event responses, ordered progress events, the macOS and Linux Unix socket daemon boundary, the Windows named pipe source path, and opt in daemon backed MCP reconnect are implemented but await native runtime verification where the current host cannot build or run the target. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, target bound fill, focus, and wait operations, accessibility snapshots, history navigation, exact live tab close, sandbox upload and download verification, sandbox restricted copy with checkpoint and hash verification, client integration proposals with atomic JSON apply and undo, cross platform build validation, reproducible native archive and checksum preparation, and dedicated headless Chrome validation were implemented and previously tested. The new macOS semantic closed group reopening route has unit coverage but no live acceptance on this host. GitHub workflow security checks include Rust dependency audit and pull request dependency review.
+Remote mutual TLS transport, four production application adapters, portable CDP closed group restoration, screenshots and visual recovery, full asynchronous MCP task execution and cancellation, and native Windows and Linux live fixture validation remain open work. Streamable HTTP has concurrent long lived GET streams, bounded event history, `Last-Event-ID` replay, persistent session state, safe restart loading, session deletion, and a connection ceiling. The browser session cache is implemented for normal CDP calls; upload and download still use bounded transaction-local channels pending migration. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, target-bound fill, focus, and wait operations, accessibility snapshots, history navigation, exact live tab close, sandbox upload and download verification, sandbox restricted copy with checkpoint and hash verification, client integration proposals with atomic JSON apply and undo, cross platform build validation, release packaging, and dedicated headless Chrome validation are implemented. Native real-Chrome profile acceptance remains pending on this host.
 
 ## Security decisions
 
@@ -70,11 +70,11 @@ The implementation preserves the difference between delivery, effect, and verifi
 
 ## Benchmark result
 
-The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.011 ms and p95 0.014 ms in this environment. This is a local transport measurement only. It is not a cross platform, browser, semantic action, or daemon latency claim.
+The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.049 ms and p95 0.061 ms in WSL. This is a local transport measurement only. The browser fixture additionally verified one page websocket and one browser websocket for repeated target-bound calls; no cross-platform browser latency advantage is claimed.
 
 ## Distribution status
 
-The current source build and local release checks are verified. The `comptrolling@0.1.0` npm launcher is published, while version `0.1.1` is prepared to bundle the native runtime for each supported platform so users do not need `COMPTROL_BIN`. Verified Apple Silicon and Intel Homebrew archives plus a multi macOS formula are published as assets on the `v0.1.0` private GitHub release. Linux formula branches and release matrix entries are prepared but await native Linux runners. The release workflow publishes npm after native CI and attaches a formula with the correct architecture guard for each runner. Detached signing and verification are implemented, but no signed release exists because no operator signing identity was supplied. A private GitHub repository exists at `Praket7/Comptrol` with main synchronized through the latest implementation commit, seven open implementation issues, and one completed browser issue.
+The `comptrolling@0.1.12` npm package is published with native binaries for Linux x64 and ARM64, macOS x64 and ARM64, and Windows x64. The `v0.1.12` GitHub release is published with 16 verified archives, checksums, SBOMs, and the generated Homebrew formula. The release and validate workflows both passed for tag `v0.1.12`. Detached signing remains opt-in because no operator signing identity was supplied. The fast verified work is pushed to `feat/fast-verified-execution-v3`; the release tag points to its release commit.
 
 ## Remaining issues ordered by impact
 
