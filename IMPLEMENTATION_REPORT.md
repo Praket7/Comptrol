@@ -46,7 +46,7 @@ The npm launcher now has an opt in daemon mode on Unix and Windows. It preserves
 
 The optimized Rust build, format check, Clippy with warnings denied, workspace tests, README lint, and browser fixture conformance pass in WSL. Native headed Chrome acceptance remains host-dependent and is not claimed here.
 
-The `v0.1.18` GitHub release workflow completed successfully across all five native targets, published 16 release assets and the npm package, and the package became visible on the public registry after npm processing. The `v0.1.20` workflow is the current release target and includes bounded post-publish registry visibility verification.
+The `v0.1.18` GitHub release workflow completed successfully across all five native targets, published 16 release assets and the npm package, and the package became visible on the public registry after npm processing. The `v0.1.21` workflow is the current release target and includes bounded post-publish registry visibility verification plus event-driven history verification.
 
 ## Platform matrix
 
@@ -74,7 +74,7 @@ The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.049 ms
 
 ## Distribution status
 
-The `comptrolling@0.1.18` npm package is publicly visible and was verified after registry propagation. The `v0.1.20` package adds deterministic route planning, verified-trace workflow compilation, and post-publish npm visibility verification. The portable local plugin package and repo marketplace are fixture-validated, but ChatGPT developer-mode registration and live ChatGPT installation remain user-side acceptance steps. Detached signing remains opt-in because no operator signing identity was supplied. The fast verified work is pushed to `feat/fast-verified-execution-v3`; the release tag points to the latest released commit. GitHub Dependency Graph is disabled for this repository, so dependency review reports a warning while RustSec `cargo-audit` remains enforced by the security workflow.
+The `comptrolling@0.1.18` npm package is publicly visible and was verified after registry propagation. The `v0.1.21` package adds deterministic route planning, verified-trace workflow compilation, event-driven browser history verification, and post-publish npm visibility verification. The portable local plugin package and repo marketplace are fixture-validated, but ChatGPT developer-mode registration and live ChatGPT installation remain user-side acceptance steps. Detached signing remains opt-in because no operator signing identity was supplied. The fast verified work is pushed to `feat/fast-verified-execution-v3`; the release tag points to the latest released commit. GitHub Dependency Graph is disabled for this repository, so dependency review reports a warning while RustSec `cargo-audit` remains enforced by the security workflow.
 
 ## Remaining issues ordered by impact
 

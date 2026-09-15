@@ -344,14 +344,19 @@ pub fn history(
     revision: &str,
     forward: bool,
 ) -> Result<Value, ComptrolError> {
-    let current = cdp_call(
-        endpoint,
+    let targets = discover(endpoint)?;
+    let target = crate::bind_browser_target(
+        &targets,
         target_id,
         Some(browser_context_id),
         Some(revision),
-        "Page.getNavigationHistory",
-        json!({}),
     )?;
+    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
+        code: "browser_protocol_invalid".to_owned(),
+        message: "The target did not provide a websocket debugger URL".to_owned(),
+        recovery: Some("Inspect browser targets again".to_owned()),
+    })?;
+    let current = persistent_call(&web_socket_url, "Page.getNavigationHistory", json!({}))?;
     let current_index = current
         .get("currentIndex")
         .and_then(Value::as_i64)
@@ -394,35 +399,28 @@ pub fn history(
             message: "The browser history entry has no numeric id".to_owned(),
             recovery: Some("Inspect the exact browser target again".to_owned()),
         })?;
-    cdp_call(
-        endpoint,
-        target_id,
-        Some(browser_context_id),
-        Some(revision),
+    persistent_call(
+        &web_socket_url,
         "Page.navigateToHistoryEntry",
         json!({ "entryId": entry_id }),
     )?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if let Ok(observed) = cdp_call(
-            endpoint,
-            target_id,
-            Some(browser_context_id),
-            Some(revision),
-            "Page.getNavigationHistory",
-            json!({}),
-        ) && observed.get("currentIndex").and_then(Value::as_i64) == Some(destination_index)
-        {
-            return Ok(json!({
-                "direction": if forward { "forward" } else { "back" },
-                "entry": destination,
-                "current_index": destination_index,
-                "verified": true,
-                "mouse": "untouched",
-                "clipboard": "untouched"
-            }));
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    wait_for_event(&web_socket_url, Duration::from_secs(2), |event| {
+        matches!(
+            event.get("method").and_then(Value::as_str),
+            Some("Page.frameNavigated") | Some("Page.navigatedWithinDocument")
+        )
+    })?;
+    let observed = persistent_call(&web_socket_url, "Page.getNavigationHistory", json!({}))?;
+    if observed.get("currentIndex").and_then(Value::as_i64) == Some(destination_index) {
+        return Ok(json!({
+            "direction": if forward { "forward" } else { "back" },
+            "entry": destination,
+            "current_index": destination_index,
+            "verified": true,
+            "wait": "protocol_event",
+            "mouse": "untouched",
+            "clipboard": "untouched"
+        }));
     }
     Err(ComptrolError {
         code: "verification_failed".to_owned(),

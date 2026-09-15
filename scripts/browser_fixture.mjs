@@ -196,6 +196,8 @@ server.on("upgrade", (request, socket) => {
       ? { method: "Target.targetCreated", params: { targetInfo: { targetId: result.targetId } } }
       : browserSocket && message.method === "Target.closeTarget"
         ? { method: "Target.targetDestroyed", params: { targetId: message.params.targetId } }
+        : message.method === "Page.navigateToHistoryEntry"
+          ? { method: "Page.frameNavigated", params: { frame: { id: "fixture-frame", url: fixtureHistory[fixtureHistoryIndex]?.url || "about:blank" } } }
         : null
     if (event) socket.write(websocketFrame(JSON.stringify(event)))
     socket.write(websocketFrame(JSON.stringify({ id: message.id, result })))
