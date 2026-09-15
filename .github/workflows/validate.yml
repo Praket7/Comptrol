@@ -24,6 +24,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release
+      - name: Windows real Chrome CDP conformance
+        if: runner.os == 'Windows'
+        run: python scripts/windows_chrome_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol.exe
 
   rust:
     runs-on: ubuntu-latest
