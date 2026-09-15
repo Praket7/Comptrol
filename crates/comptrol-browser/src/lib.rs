@@ -172,6 +172,24 @@ impl BrowserConnection {
         Ok(())
     }
 
+    pub async fn bootstrap_target(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<(), BrowserError> {
+        let session_id = session_id.into();
+        for method in [
+            "Page.enable",
+            "Runtime.enable",
+            "DOM.enable",
+            "Network.enable",
+            "Accessibility.enable",
+        ] {
+            self.command(Some(session_id.clone()), method, Value::Null)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -503,6 +521,49 @@ mod tests {
         assert_eq!(
             server.await.unwrap(),
             vec!["Target.setDiscoverTargets", "Target.setAutoAttach"]
+        );
+    }
+
+    #[tokio::test]
+    async fn target_bootstrap_enables_required_domains_on_flattened_session() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut methods = Vec::new();
+            while methods.len() < 5 {
+                if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                    socket.next().await
+                {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(request["sessionId"], "session-1");
+                    methods.push(request["method"].as_str().unwrap().to_owned());
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!({"id":request["id"],"result":{}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            methods
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        connection.bootstrap_target("session-1").await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "Page.enable",
+                "Runtime.enable",
+                "DOM.enable",
+                "Network.enable",
+                "Accessibility.enable"
+            ]
         );
     }
 
