@@ -74,11 +74,11 @@ The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.011 ms
 
 ## Distribution status
 
-An earlier source build is verified. The current source build is blocked by the local Xcode license gate. The npm launcher package dry run passes and npm authentication is valid for the current account, but the `comptrol` npm scope is not owned by that account and the package is not published. The release workflow now publishes the npm package after native CI and attaches a Homebrew formula built from the verified macOS archive. Detached signing and verification are implemented, but no signed release exists because no operator signing identity was supplied. A private GitHub repository exists at `Praket7/Comptrol` with main synchronized through the latest implementation commit, seven open implementation issues, and one completed browser issue.
+The current source build and local release checks are verified. The npm launcher package is now named `comptrolling`; its dry run passes and npm authentication is valid, but publication is waiting for the account one time password. A verified Apple Silicon Homebrew formula is published as an asset on the `v0.1.0` private GitHub release. The release workflow publishes npm after native CI and attaches a formula with the correct architecture guard for its runner. Detached signing and verification are implemented, but no signed release exists because no operator signing identity was supplied. A private GitHub repository exists at `Praket7/Comptrol` with main synchronized through the latest implementation commit, seven open implementation issues, and one completed browser issue.
 
 ## Remaining issues ordered by impact
 
 1. Finish native Windows and Linux validation on their operating systems.
 2. Validate the CDP websocket route against an explicitly selected real user Chrome profile and add browser state delta coverage.
 3. Add remote mutual TLS transport and application adapters.
-4. Publish signed release artifacts and packages only after independent release verification and npm scope access is available.
+4. Publish signed release artifacts only after independent release verification and an operator signing identity is available.

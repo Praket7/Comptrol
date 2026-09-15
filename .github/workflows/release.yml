@@ -60,12 +60,16 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           archive="release-assets/comptrol-macos/comptrol-${version}-comptrol-macos.zip"
           sha256="$(sha256sum "$archive" | awk '{print $1}')"
+          architecture_args=()
+          if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+            architecture_args+=(--arm64-only)
+          fi
           python3 scripts/generate_homebrew_formula.py \
             --version "$version" \
             --url "https://github.com/Praket7/Comptrol/releases/download/${GITHUB_REF_NAME}/comptrol-${version}-comptrol-macos.zip" \
             --sha256 "$sha256" \
             --formula-name Comptrolling \
-            --arm64-only \
+            "${architecture_args[@]}" \
             --output release-assets/comptrolling.rb
       - name: Publish checksummed release assets
         env:
