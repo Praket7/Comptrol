@@ -64,7 +64,9 @@ jobs:
             --version "$version" \
             --url "https://github.com/Praket7/Comptrol/releases/download/${GITHUB_REF_NAME}/comptrol-${version}-comptrol-macos.zip" \
             --sha256 "$sha256" \
-            --output release-assets/comptrol.rb
+            --formula-name Comptrolling \
+            --arm64-only \
+            --output release-assets/comptrolling.rb
       - name: Publish checksummed release assets
         env:
           GH_TOKEN: ${{ github.token }}

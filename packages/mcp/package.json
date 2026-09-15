@@ -1,5 +1,5 @@
 {
-  "name": "@comptrol/mcp",
+  "name": "comptrolling",
   "version": "0.1.0",
   "description": "Supervised MCP launcher for a Comptrol binary installed on the host",
   "bin": { "comptrol-mcp": "bin/comptrol-mcp.js" },

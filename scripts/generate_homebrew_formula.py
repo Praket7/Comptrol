@@ -11,14 +11,18 @@ def main() -> int:
     parser.add_argument("--url", required=True)
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--formula-name", default="Comptrolling")
+    parser.add_argument("--arm64-only", action="store_true")
     args = parser.parse_args()
-    formula = f'''class Comptrol < Formula
+    architecture = '  depends_on arch: :arm64\n' if args.arm64_only else ''
+    formula = f'''class {args.formula_name} < Formula
   desc "Local first computer control runtime"
   homepage "https://github.com/Praket7/Comptrol"
   url "{args.url}"
   sha256 "{args.sha256}"
   version "{args.version}"
   license "Apache-2.0"
+{architecture}
 
   def install
     bin.install "comptrol/comptrol"
