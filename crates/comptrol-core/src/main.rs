@@ -1428,6 +1428,13 @@ fn run_http(port: u16) -> i32 {
         }
     };
     let runtime = Arc::new(Mutex::new(runtime));
+    let tasks = match TaskStore::open(&default_state_dir()) {
+        Ok(store) => Arc::new(TaskManager::new(Arc::clone(&runtime), store)),
+        Err(error) => {
+            eprintln!("task store startup failed: {error}");
+            return 1;
+        }
+    };
     let http_state = Arc::new(http_state);
     let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
@@ -1448,10 +1455,11 @@ fn run_http(port: u16) -> i32 {
                     continue;
                 }
                 let runtime = Arc::clone(&runtime);
+                let tasks = Arc::clone(&tasks);
                 let http_state = Arc::clone(&http_state);
                 let active_connections = Arc::clone(&active_connections);
                 thread::spawn(move || {
-                    if let Err(error) = handle_http(&mut stream, &runtime, &http_state) {
+                    if let Err(error) = handle_http(&mut stream, &runtime, &tasks, &http_state) {
                         eprintln!("http request failed: {error}");
                     }
                     active_connections.fetch_sub(1, Ordering::AcqRel);
@@ -1538,6 +1546,13 @@ fn run_mtls(port: u16) -> i32 {
             return 1;
         }
     };
+    let tasks = match TaskStore::open(&default_state_dir()) {
+        Ok(store) => Arc::new(TaskManager::new(Arc::clone(&runtime), store)),
+        Err(error) => {
+            eprintln!("task store startup failed: {error}");
+            return 1;
+        }
+    };
     let http_state = match HttpStore::open(&default_state_dir()) {
         Ok(state) => Arc::new(state),
         Err(error) => {
@@ -1557,6 +1572,7 @@ fn run_mtls(port: u16) -> i32 {
         }
         let config = Arc::clone(&config);
         let runtime = Arc::clone(&runtime);
+        let tasks = Arc::clone(&tasks);
         let http_state = Arc::clone(&http_state);
         let active_connections = Arc::clone(&active_connections);
         thread::spawn(move || {
@@ -1570,7 +1586,7 @@ fn run_mtls(port: u16) -> i32 {
                     connection.complete_io(&mut stream)?;
                 }
                 let mut tls = rustls::StreamOwned::new(connection, stream);
-                handle_http(&mut tls, &runtime, &http_state)
+                handle_http(&mut tls, &runtime, &tasks, &http_state)
             })();
             if let Err(error) = result {
                 eprintln!("mTLS request failed: {error}");
@@ -1966,6 +1982,7 @@ impl HttpStream for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
 fn handle_http<S: HttpStream>(
     stream: &mut S,
     runtime: &Arc<Mutex<Runtime>>,
+    tasks: &Arc<TaskManager>,
     http_state: &Arc<HttpStore>,
 ) -> io::Result<()> {
     // ponytail: bounded local parser, replace with a full HTTP implementation before public network exposure
@@ -2243,7 +2260,7 @@ fn handle_http<S: HttpStream>(
     let mut tasks_enabled = false;
     let value = handle_message_with_state(
         runtime,
-        None,
+        Some(tasks),
         &mut tasks_enabled,
         body.as_ref(),
         |notification| notifications.push(notification),
