@@ -1160,7 +1160,13 @@ pub fn cdp_upload(
             recovery: Some("Inspect the upload control and retry once".to_owned()),
         });
     }
-    Ok(json!({ "path": path, "file_name": file_name_text, "verified": true }))
+    Ok(json!({
+        "path": path,
+        "file_name": file_name_text,
+        "verified": false,
+        "stage": "selected",
+        "evidence": "DOM file input readback"
+    }))
 }
 
 pub fn cdp_download(
