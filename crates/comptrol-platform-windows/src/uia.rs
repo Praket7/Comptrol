@@ -104,14 +104,14 @@ fn matches_element(element: &IUIAutomationElement, request: &Request<'_>) -> Res
     if let Some(name) = request.name {
         let current = unsafe { element.CurrentName() }
             .map_err(|error| format!("UI Automation name read failed: {error}"))?;
-        if current.to_string() != name {
+        if current != name {
             return Ok(false);
         }
     }
     if let Some(automation_id) = request.automation_id {
         let current = unsafe { element.CurrentAutomationId() }
             .map_err(|error| format!("UI Automation id read failed: {error}"))?;
-        if current.to_string() != automation_id {
+        if current != automation_id {
             return Ok(false);
         }
     }
@@ -137,7 +137,6 @@ fn verify(element: &IUIAutomationElement, request: &Request<'_>) -> Result<bool,
         None => Ok(false),
         Some("name") => Ok(unsafe { element.CurrentName() }
             .map_err(|error| format!("UI Automation verification failed: {error}"))?
-            .to_string()
             == request.expected_value.unwrap_or_default()),
         Some("value") => {
             let pattern: IUIAutomationValuePattern = unsafe {
@@ -146,7 +145,6 @@ fn verify(element: &IUIAutomationElement, request: &Request<'_>) -> Result<bool,
             .map_err(|error| format!("Value verification pattern unavailable: {error}"))?;
             Ok(unsafe { pattern.CurrentValue() }
                 .map_err(|error| format!("Value verification failed: {error}"))?
-                .to_string()
                 == request.expected_value.unwrap_or_default())
         }
         Some("enabled") => Ok(unsafe { element.CurrentIsEnabled() }
