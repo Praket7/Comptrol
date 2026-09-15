@@ -40,6 +40,8 @@ The npm package dry run passed.
 
 The optimized Rust build passed.
 
+The GitHub Actions workflows are present, but the latest remote runs were not started because the repository account reported failed recent payments or an exceeded spending limit. This is an external runner availability failure rather than a test result.
+
 ## Platform matrix
 
 macOS has real basic process observation through System Events, exact LaunchServices application launch with process verification, and a semantic AX press and value route with exact application, window, role, and control matching. The controlled Cocoa fixture and conformance harness are present. The live host correctly reported missing Accessibility permission, so the fixture action was not falsely marked verified.
