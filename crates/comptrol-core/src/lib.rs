@@ -26,6 +26,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use adapters::{AdapterDescriptor, AdapterRegistry};
@@ -38,7 +42,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.58";
+pub const SERVER_VERSION: &str = "0.1.59";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -908,6 +912,7 @@ pub struct Runtime {
     pub durable_events: DurableEventHub,
     pub trace: Option<TraceRecorder>,
     pub stop: StopLatch,
+    operation_cancel: Option<Arc<AtomicBool>>,
     adapter_hosts: HashMap<String, AdapterHost>,
     idempotent: HashMap<String, ActionResult>,
     route_history: HashMap<String, RouteHistory>,
@@ -1018,6 +1023,7 @@ impl Runtime {
                 .map_err(io::Error::other)?,
             trace,
             stop: StopLatch::new(&state_dir),
+            operation_cancel: None,
             adapter_hosts: HashMap::new(),
             idempotent,
             route_history,
@@ -1291,6 +1297,20 @@ impl Runtime {
                 entry.last_success_at_ms.map(|v| v as i64),
             ],
         );
+    }
+
+    /// Execute an operation while exposing the task cancellation latch to
+    /// lower-level routes. The previous latch is restored so nested workflow
+    /// operations inherit cancellation without leaking it into later calls.
+    pub fn operate_with_cancel(
+        &mut self,
+        request: OperationRequest,
+        cancellation: Arc<AtomicBool>,
+    ) -> ActionResult {
+        let previous = self.operation_cancel.replace(cancellation);
+        let result = self.operate(request);
+        self.operation_cancel = previous;
+        result
     }
 
     pub fn inspect(&mut self, kind: &str) -> Value {
@@ -1753,7 +1773,14 @@ fn execute_adapter_request(
         payload = json!({});
     }
     payload["intent"] = json!(request.intent);
-    match host.request("execute", &resource, payload, Some(token)) {
+    let response = if let Some(cancellation) = runtime.operation_cancel.as_ref() {
+        host.request_with_cancel("execute", &resource, payload, Some(token), || {
+            cancellation.load(Ordering::Acquire)
+        })
+    } else {
+        host.request("execute", &resource, payload, Some(token))
+    };
+    match response {
         Ok(response) if response.ok && response.health == HealthState::Available => {
             let verified = response
                 .payload

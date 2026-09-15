@@ -36,6 +36,7 @@ pub enum HostError {
     Protocol(String),
     Json(serde_json::Error),
     Timeout,
+    Cancelled,
 }
 
 impl std::fmt::Display for HostError {
@@ -45,6 +46,7 @@ impl std::fmt::Display for HostError {
             Self::Protocol(error) => write!(formatter, "adapter protocol failed: {error}"),
             Self::Json(error) => write!(formatter, "adapter JSON failed: {error}"),
             Self::Timeout => write!(formatter, "adapter I/O deadline exceeded"),
+            Self::Cancelled => write!(formatter, "adapter I/O cancelled before completion"),
         }
     }
 }
@@ -164,6 +166,27 @@ impl AdapterHost {
         payload: Value,
         token: Option<CapabilityToken>,
     ) -> Result<RpcResponse, HostError> {
+        self.request_with_cancel(method, resource, payload, token, || false)
+    }
+
+    /// Send one request while observing the caller's cancellation state.
+    ///
+    /// Adapter stdout is read on a bounded helper thread so cancellation and
+    /// deadlines can be observed without blocking the Comptrol worker. A
+    /// cancellation after dispatch terminates the adapter process and returns
+    /// `Cancelled`; callers must therefore reconcile the external operation
+    /// before retrying it.
+    pub fn request_with_cancel<C>(
+        &mut self,
+        method: &str,
+        resource: &str,
+        payload: Value,
+        token: Option<CapabilityToken>,
+        cancelled: C,
+    ) -> Result<RpcResponse, HostError>
+    where
+        C: Fn() -> bool,
+    {
         self.request_sequence = self.request_sequence.saturating_add(1);
         let request = RpcRequest {
             protocol_version: ADAPTER_PROTOCOL_VERSION,
@@ -197,13 +220,31 @@ impl AdapterHost {
             let result = read_frame(&mut stdout, max_frame_bytes);
             let _ = sender.send((stdout, result));
         });
-        let (stdout, response) = receiver
-            .recv_timeout(Duration::from_millis(self.config.timeout_ms))
-            .map_err(|_| {
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_millis(self.config.timeout_ms))
+            .unwrap_or_else(std::time::Instant::now);
+        let (stdout, response) = loop {
+            if cancelled() {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                HostError::Timeout
-            })?;
+                return Err(HostError::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err(HostError::Timeout);
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(HostError::Protocol(
+                        "adapter response reader stopped".to_owned(),
+                    ));
+                }
+            }
+        };
         self.stdout = Some(stdout);
         let response = response?;
         if response.protocol_version != ADAPTER_PROTOCOL_VERSION

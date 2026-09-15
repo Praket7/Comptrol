@@ -636,7 +636,7 @@ impl TaskManager {
                 let started_at_ms = now_ms();
                 let result = {
                     let mut runtime = runtime.lock().expect("runtime lock poisoned");
-                    call_tool(&mut runtime, params)
+                    call_tool_with_cancel(&mut runtime, params, Some(Arc::clone(&cancelled)))
                 };
                 let requested = cancelled.load(Ordering::Acquire)
                     || store
@@ -1345,13 +1345,18 @@ where
                             json!({ "error": { "code": "task_store_failed", "message": error.to_string() } })
                         }
                     },
-                    None => call_tool(
+                    None => call_tool_with_cancel(
                         &mut runtime.lock().expect("runtime lock poisoned"),
                         request.get("params").cloned().unwrap_or(Value::Null),
+                        None,
                     ),
                 }
             } else {
-                call_tool(&mut runtime.lock().expect("runtime lock poisoned"), params)
+                call_tool_with_cancel(
+                    &mut runtime.lock().expect("runtime lock poisoned"),
+                    params,
+                    None,
+                )
             }
         }
         "tasks/get" => task_get(tasks, &request),
@@ -1436,7 +1441,11 @@ fn tools() -> Value {
     ])
 }
 
-fn call_tool(runtime: &mut Runtime, params: Value) -> Value {
+fn call_tool_with_cancel(
+    runtime: &mut Runtime,
+    params: Value,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Value {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -1446,7 +1455,12 @@ fn call_tool(runtime: &mut Runtime, params: Value) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
     let value = match name {
-        "operate" => serde_json::from_value::<OperationRequest>(arguments).map(|request| json!(runtime.operate(request))).unwrap_or_else(|error| json!({ "error": { "code": "invalid_input", "message": error.to_string() } })),
+        "operate" => serde_json::from_value::<OperationRequest>(arguments).map(|request| {
+            json!(match cancellation {
+                Some(cancellation) => runtime.operate_with_cancel(request, cancellation),
+                None => runtime.operate(request),
+            })
+        }).unwrap_or_else(|error| json!({ "error": { "code": "invalid_input", "message": error.to_string() } })),
         "inspect" => json!(runtime.inspect(arguments.get("kind").and_then(Value::as_str).unwrap_or("status"))),
         "watch" => json!(runtime.watch(arguments.get("operation_id").and_then(Value::as_str).unwrap_or_default())),
         "reconcile" => json!(runtime.reconcile(arguments.get("operation_id").and_then(Value::as_str).unwrap_or_default())),
