@@ -6,6 +6,10 @@ use comptrol::{
 };
 use comptrol_adapter_sdk::AdapterManifest;
 use rusqlite::{Connection, OptionalExtension, params};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls_pemfile::{certs, private_key};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -641,6 +645,12 @@ fn main() {
                 .and_then(|port| port.parse().ok())
                 .unwrap_or(7317),
         ),
+        Some("serve-mtls") => run_mtls(
+            env::args()
+                .nth(2)
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(7443),
+        ),
         Some("daemon") => run_daemon(),
         Some("daemon-health") => run_daemon_health(),
         Some("record") => run_record(env::args().skip(2).collect()),
@@ -657,7 +667,7 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor status capabilities stop resume serve-http daemon daemon-health record replay workflow adapter integrate pair privacy version"
+                "commands are mcp doctor status capabilities stop resume serve-http serve-mtls daemon daemon-health record replay workflow adapter integrate pair privacy version"
             );
             2
         }
@@ -1357,6 +1367,124 @@ fn run_http(port: u16) -> i32 {
     0
 }
 
+fn load_certificates(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
+    let file = File::open(path)?;
+    certs(&mut BufReader::new(file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
+    let file = File::open(path)?;
+    private_key(&mut BufReader::new(file))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no private key found"))
+}
+
+fn mtls_config() -> io::Result<Arc<ServerConfig>> {
+    let cert_path = env::var_os("COMPTROL_MTLS_CERT")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "COMPTROL_MTLS_CERT is required",
+            )
+        })?;
+    let key_path = env::var_os("COMPTROL_MTLS_KEY")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "COMPTROL_MTLS_KEY is required")
+        })?;
+    let client_ca_path = env::var_os("COMPTROL_MTLS_CLIENT_CA")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "COMPTROL_MTLS_CLIENT_CA is required",
+            )
+        })?;
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in load_certificates(&client_ca_path)? {
+        roots
+            .add(certificate)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    }
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(load_certificates(&cert_path)?, load_private_key(&key_path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok(Arc::new(config))
+}
+
+fn run_mtls(port: u16) -> i32 {
+    let bind = env::var("COMPTROL_MTLS_BIND").unwrap_or_else(|_| "0.0.0.0".to_owned());
+    let listener = match TcpListener::bind((bind.as_str(), port)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("mTLS bind failed: {error}");
+            return 1;
+        }
+    };
+    let config = match mtls_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("mTLS configuration failed: {error}");
+            return 1;
+        }
+    };
+    let runtime = match Runtime::new(default_state_dir()) {
+        Ok(runtime) => Arc::new(Mutex::new(runtime)),
+        Err(error) => {
+            eprintln!("startup failed: {error}");
+            return 1;
+        }
+    };
+    let http_state = match HttpStore::open(&default_state_dir()) {
+        Ok(state) => Arc::new(state),
+        Err(error) => {
+            eprintln!("HTTP state startup failed: {error}");
+            return 1;
+        }
+    };
+    eprintln!("comptrol mutual-TLS HTTP listening on {bind}:{port}/mcp");
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else {
+            continue;
+        };
+        if active_connections.fetch_add(1, Ordering::AcqRel) + 1 > HTTP_MAX_CONNECTIONS {
+            active_connections.fetch_sub(1, Ordering::AcqRel);
+            continue;
+        }
+        let config = Arc::clone(&config);
+        let runtime = Arc::clone(&runtime);
+        let http_state = Arc::clone(&http_state);
+        let active_connections = Arc::clone(&active_connections);
+        thread::spawn(move || {
+            let result = (|| -> io::Result<()> {
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                let mut connection = rustls::ServerConnection::new(config).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                })?;
+                while connection.is_handshaking() {
+                    connection.complete_io(&mut stream)?;
+                }
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                handle_http(&mut tls, &runtime, &http_state)
+            })();
+            if let Err(error) = result {
+                eprintln!("mTLS request failed: {error}");
+            }
+            active_connections.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+    0
+}
+
 #[cfg(windows)]
 fn daemon_pipe_name() -> String {
     env::var("COMPTROL_PIPE_NAME").unwrap_or_else(|_| r"\\.\pipe\comptrol".to_owned())
@@ -1709,8 +1837,38 @@ fn restrict_socket(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-fn handle_http(
-    stream: &mut TcpStream,
+trait HttpStream: Read + Write {
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl HttpStream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+impl HttpStream for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.get_ref().set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.get_ref().set_write_timeout(timeout)
+    }
+}
+
+fn handle_http<S: HttpStream>(
+    stream: &mut S,
     runtime: &Arc<Mutex<Runtime>>,
     http_state: &Arc<HttpStore>,
 ) -> io::Result<()> {
@@ -1999,7 +2157,7 @@ fn handle_http(
     )
 }
 
-fn write_sse_headers(stream: &mut TcpStream) -> io::Result<()> {
+fn write_sse_headers<S: Write>(stream: &mut S) -> io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -2007,8 +2165,8 @@ fn write_sse_headers(stream: &mut TcpStream) -> io::Result<()> {
     stream.flush()
 }
 
-fn write_sse_event(
-    stream: &mut TcpStream,
+fn write_sse_event<S: Write>(
+    stream: &mut S,
     id: Option<u64>,
     event: &str,
     data: &Value,
@@ -2022,13 +2180,13 @@ fn write_sse_event(
     stream.flush()
 }
 
-fn write_sse_end(stream: &mut TcpStream) -> io::Result<()> {
+fn write_sse_end<S: Write>(stream: &mut S) -> io::Result<()> {
     stream.write_all(b"0\r\n\r\n")?;
     stream.flush()
 }
 
-fn write_http_response(
-    stream: &mut TcpStream,
+fn write_http_response<S: Write>(
+    stream: &mut S,
     status: u16,
     reason: &str,
     content_type: &str,
@@ -2046,7 +2204,7 @@ fn write_http_response(
     stream.write_all(&payload)
 }
 
-fn write_http_error(stream: &mut TcpStream, status: u16, error: &str) -> io::Result<()> {
+fn write_http_error<S: Write>(stream: &mut S, status: u16, error: &str) -> io::Result<()> {
     let payload = serde_json::to_vec(&json!({
         "error": error,
         "limit": MAX_PROTOCOL_BYTES

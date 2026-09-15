@@ -547,6 +547,7 @@ pub fn wait_for_url(
 /// intentionally not returned through MCP by default: callers get a stable
 /// digest and encoded size that can be compared during target-scoped recovery
 /// without flooding the control channel with pixels.
+#[allow(clippy::too_many_arguments)]
 pub fn capture_screenshot(
     endpoint: &str,
     target_id: &str,
@@ -555,7 +556,24 @@ pub fn capture_screenshot(
     format: &str,
     quality: Option<u64>,
     clip: Value,
+    include_pixels: bool,
 ) -> Result<Value, ComptrolError> {
+    let viewport = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+        "Runtime.evaluate",
+        json!({
+            "expression": "(() => ({ width: Math.max(1, Math.floor(window.innerWidth)), height: Math.max(1, Math.floor(window.innerHeight)), device_pixel_ratio: window.devicePixelRatio }))()",
+            "returnByValue": true
+        }),
+    )?;
+    let viewport = viewport
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .cloned()
+        .unwrap_or_else(|| json!({"width": 0, "height": 0}));
     let params = json!({
         "format": format,
         "captureBeyondViewport": false,
@@ -589,16 +607,112 @@ pub fn capture_screenshot(
     let mut digest = Sha256::new();
     digest.update(data.as_bytes());
     let digest = digest.finalize();
-    Ok(json!({
+    let digest_hex = format!("{digest:x}");
+    let width = viewport.get("width").and_then(Value::as_u64).unwrap_or(0);
+    let height = viewport.get("height").and_then(Value::as_u64).unwrap_or(0);
+    let capture_id = format!(
+        "{target_id}:{browser_context_id}:{revision}:{format}:{width}x{height}:{digest_hex}"
+    );
+    let mut result = json!({
         "target_id": target_id,
         "browser_context_id": browser_context_id,
         "revision": revision,
         "format": format,
         "encoded_bytes": data.len(),
-        "sha256_base64_payload": format!("{digest:x}"),
+        "sha256_base64_payload": digest_hex,
+        "capture_id": capture_id,
+        "viewport": viewport,
         "clip": clip,
         "verified": true,
-        "evidence": "target_scoped_visual_digest"
+        "evidence": if include_pixels { "target_scoped_pixels" } else { "target_scoped_visual_digest" }
+    });
+    if include_pixels {
+        result["data_base64"] = json!(data);
+    }
+    Ok(result)
+}
+
+/// Click one coordinate only when it is bound to an immediately verifiable
+/// screenshot capture. A changed pixel digest or viewport refuses the action
+/// as stale instead of guessing against moved page geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn coordinate_click(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+    capture_id: &str,
+    x: f64,
+    y: f64,
+    button: &str,
+) -> Result<Value, ComptrolError> {
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Coordinate clicks require finite non-negative viewport coordinates"
+                .to_owned(),
+            recovery: None,
+        });
+    }
+    if !matches!(button, "none" | "left" | "middle" | "right") {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Coordinate clicks support none, left, middle, or right buttons".to_owned(),
+            recovery: None,
+        });
+    }
+    let current = capture_screenshot(
+        endpoint,
+        target_id,
+        browser_context_id,
+        revision,
+        "png",
+        None,
+        Value::Null,
+        false,
+    )?;
+    let width = current["viewport"]["width"].as_u64().unwrap_or(0) as f64;
+    let height = current["viewport"]["height"].as_u64().unwrap_or(0) as f64;
+    if x >= width || y >= height || current["capture_id"].as_str() != Some(capture_id) {
+        return Err(ComptrolError {
+            code: "stale_geometry".to_owned(),
+            message: "The screenshot geometry no longer matches the requested coordinate"
+                .to_owned(),
+            recovery: Some("Capture a fresh screenshot and retry with its capture_id".to_owned()),
+        });
+    }
+    let targets = discover_cached(endpoint)?;
+    let target = crate::bind_browser_target(
+        &targets,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+    )?;
+    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
+        code: "browser_protocol_invalid".to_owned(),
+        message: "The target did not provide a websocket debugger URL".to_owned(),
+        recovery: Some("Inspect browser targets again".to_owned()),
+    })?;
+    persistent_call(
+        &web_socket_url,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mousePressed","x":x,"y":y,"button":button,"clickCount":1}),
+    )?;
+    persistent_call(
+        &web_socket_url,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mouseReleased","x":x,"y":y,"button":button,"clickCount":1}),
+    )?;
+    Ok(json!({
+        "clicked": true,
+        "x": x,
+        "y": y,
+        "button": button,
+        "capture_id": capture_id,
+        "viewport": current["viewport"],
+        "verified": false,
+        "verification": "dispatch_only",
+        "evidence": "fresh_pixel_capture_geometry"
     }))
 }
 
@@ -1050,65 +1164,7 @@ pub fn cdp_upload(
             ),
         });
     }
-    let (mut socket, _) = connect(web_socket_url).map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Start the browser target and retry".to_owned()),
-    })?;
-    let mut command_id = 0_u64;
-    let mut call = |method: &str, params: Value| -> Result<Value, ComptrolError> {
-        command_id += 1;
-        let id = command_id;
-        socket
-            .send(Message::Text(
-                json!({ "id": id, "method": method, "params": params })
-                    .to_string()
-                    .into(),
-            ))
-            .map_err(|error| ComptrolError {
-                code: "browser_dispatch_failed".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Reconnect to the exact browser target".to_owned()),
-            })?;
-        loop {
-            let message = socket.read().map_err(|error| ComptrolError {
-                code: "browser_response_failed".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Inspect the browser target before retrying".to_owned()),
-            })?;
-            let Message::Text(text) = message else {
-                continue;
-            };
-            if text.len() > MAX_PROTOCOL_BYTES {
-                return Err(ComptrolError {
-                    code: "browser_message_too_large".to_owned(),
-                    message: format!(
-                        "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
-                    ),
-                    recovery: Some(
-                        "Inspect the target and retry with a bounded response".to_owned(),
-                    ),
-                });
-            }
-            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-                code: "browser_protocol_invalid".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Inspect the browser protocol version".to_owned()),
-            })?;
-            if value.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = value.get("error") {
-                return Err(ComptrolError {
-                    code: "browser_command_failed".to_owned(),
-                    message: error.to_string(),
-                    recovery: Some("Refresh the target and retry once".to_owned()),
-                });
-            }
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-        }
-    };
-    let document = call("DOM.getDocument", json!({ "depth": -1 }))?;
+    let document = persistent_call(&web_socket_url, "DOM.getDocument", json!({ "depth": -1 }))?;
     let root_id = document
         .get("root")
         .and_then(|root| root.get("nodeId"))
@@ -1118,7 +1174,8 @@ pub fn cdp_upload(
             message: "The browser did not return a document root".to_owned(),
             recovery: Some("Refresh the browser target".to_owned()),
         })?;
-    let node = call(
+    let node = persistent_call(
+        &web_socket_url,
         "DOM.querySelector",
         json!({ "nodeId": root_id, "selector": selector }),
     )?;
@@ -1131,7 +1188,8 @@ pub fn cdp_upload(
             message: "The browser upload control was not found".to_owned(),
             recovery: Some("Refresh the page and inspect the exact upload selector".to_owned()),
         })?;
-    call(
+    persistent_call(
+        &web_socket_url,
         "DOM.setFileInputFiles",
         json!({ "nodeId": node_id, "files": [path] }),
     )?;
@@ -1145,7 +1203,8 @@ pub fn cdp_upload(
         message: error.to_string(),
         recovery: None,
     })?;
-    let verification = call(
+    let verification = persistent_call(
+        &web_socket_url,
         "Runtime.evaluate",
         json!({
             "expression": format!("(() => {{ const files = document.querySelector({selector}).files; return files.length === 1 && files[0].name === {file_name}; }})()"),
@@ -1234,47 +1293,13 @@ pub fn cdp_download(
             "browserContextId": browser_context_id.unwrap_or("default")
         }),
     )?;
-    let (mut socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
-    let mut command_id = 0_u64;
-    let mut call = |method: &str, params: Value| -> Result<Value, ComptrolError> {
-        command_id += 1;
-        let id = command_id;
-        socket
-            .send(Message::Text(
-                json!({ "id": id, "method": method, "params": params })
-                    .to_string()
-                    .into(),
-            ))
-            .map_err(browser_dispatch_error)?;
-        loop {
-            let message = socket.read().map_err(browser_response_error)?;
-            let Message::Text(text) = message else {
-                continue;
-            };
-            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-                code: "browser_protocol_invalid".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Inspect the browser protocol version".to_owned()),
-            })?;
-            if value.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = value.get("error") {
-                return Err(ComptrolError {
-                    code: "browser_command_failed".to_owned(),
-                    message: error.to_string(),
-                    recovery: Some("Refresh the target and retry once".to_owned()),
-                });
-            }
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-        }
-    };
     let selector = serde_json::to_string(selector).map_err(|error| ComptrolError {
         code: "invalid_input".to_owned(),
         message: error.to_string(),
         recovery: None,
     })?;
-    call(
+    persistent_call(
+        &web_socket_url,
         "Runtime.evaluate",
         json!({
             "expression": format!("(() => {{ const link = document.querySelector({selector}); if (!link) throw new Error('download target missing'); link.click(); return true; }})()"),

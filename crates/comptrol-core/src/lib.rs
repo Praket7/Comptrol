@@ -470,6 +470,7 @@ impl Policy {
                 "browser.cdp.semantic_click".to_owned(),
                 "browser.cdp.workflow".to_owned(),
                 "browser.cdp.screenshot".to_owned(),
+                "browser.cdp.coordinate_click".to_owned(),
             ]);
         }
         if std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1") {
@@ -1020,6 +1021,7 @@ impl Runtime {
             | "browser.cdp.semantic_click"
             | "browser.cdp.workflow"
             | "browser.cdp.screenshot"
+            | "browser.cdp.coordinate_click"
             | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             intent if is_first_party_adapter_intent(intent) => {
@@ -1306,7 +1308,8 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.close_tab"
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward"
-        | "browser.cdp.semantic_click" => Risk::R2,
+        | "browser.cdp.semantic_click"
+        | "browser.cdp.coordinate_click" => Risk::R2,
         "browser.cdp.screenshot" => Risk::R0,
         "browser.cdp.workflow" => Risk::R2,
         "obs.recording.start" | "obs.recording.stop" => Risk::R3,
@@ -1871,6 +1874,7 @@ fn route_catalog() -> Vec<RoutePlan> {
         "browser.cdp.open_tab",
         "browser.cdp.semantic_click",
         "browser.cdp.screenshot",
+        "browser.cdp.coordinate_click",
     ]
     .into_iter()
     .map(|intent| route_plan_for_intent(intent, Value::Null, None))
@@ -2291,6 +2295,11 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             format,
             quality,
             clip,
+            request
+                .params
+                .get("include_pixels")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         ) {
             Ok(data) => success(
                 request,
@@ -2298,6 +2307,69 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
                 "browser_protocol",
                 EffectState::None,
                 VerificationState::Verified,
+                data,
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
+    if request.intent == "browser.cdp.coordinate_click" {
+        let Some(capture_id) = request.params.get("capture_id").and_then(Value::as_str) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Coordinate clicks require a capture_id from browser.cdp.screenshot"
+                        .to_owned(),
+                    recovery: Some(
+                        "Capture fresh pixels before requesting a coordinate click".to_owned(),
+                    ),
+                },
+            );
+        };
+        let Some(x) = request.params.get("x").and_then(Value::as_f64) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Coordinate clicks require x".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        let Some(y) = request.params.get("y").and_then(Value::as_f64) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Coordinate clicks require y".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        let button = request
+            .params
+            .get("button")
+            .and_then(Value::as_str)
+            .unwrap_or("left");
+        return match browser::coordinate_click(
+            &endpoint.to_string_lossy(),
+            target_id,
+            browser_context_id,
+            revision,
+            capture_id,
+            x,
+            y,
+            button,
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                VerificationState::Unverified,
                 data,
             ),
             Err(error) => browser_failure(request, operation_id, error),
@@ -5236,6 +5308,14 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
             note: "Captures a bounded target-scoped visual digest without returning pixels through MCP".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.coordinate_click".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "browser_protocol".to_owned(),
+            note: "Dispatches one coordinate click only when a fresh screenshot capture_id proves the viewport geometry is current".to_owned(),
         },
         Capability {
             name: "browser.cdp.focus".to_owned(),
