@@ -11,7 +11,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 
 const DEFAULT_TASK_TTL_MS: u64 = 300_000;
 const TASK_POLL_INTERVAL_MS: u64 = 50;
@@ -143,6 +148,8 @@ fn main() {
                 .and_then(|port| port.parse().ok())
                 .unwrap_or(7317),
         ),
+        Some("daemon") => run_daemon(),
+        Some("daemon-health") => run_daemon_health(),
         Some("record") => run_record(env::args().skip(2).collect()),
         Some("replay") => run_replay(env::args().skip(2).collect()),
         Some("integrate") => run_integrate(env::args().skip(2).collect()),
@@ -155,7 +162,7 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor status capabilities stop resume serve-http record replay integrate pair privacy version"
+                "commands are mcp doctor status capabilities stop resume serve-http daemon daemon-health record replay integrate pair privacy version"
             );
             2
         }
@@ -708,6 +715,240 @@ fn run_http(port: u16) -> i32 {
         }
     }
     0
+}
+
+#[cfg(unix)]
+fn daemon_socket_path() -> PathBuf {
+    env::var_os("COMPTROL_SOCKET_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_state_dir().join("comptrol.sock"))
+}
+
+#[cfg(unix)]
+fn run_daemon() -> i32 {
+    use std::os::unix::fs::FileTypeExt;
+
+    let path = daemon_socket_path();
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("daemon state directory failed: {error}");
+        return 1;
+    }
+    if path.exists() {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_socket() => {}
+            Ok(_) => {
+                eprintln!("daemon socket path is not a socket");
+                return 1;
+            }
+            Err(error) => {
+                eprintln!("daemon socket path cannot be inspected: {error}");
+                return 1;
+            }
+        }
+        if UnixStream::connect(&path).is_ok() {
+            eprintln!("daemon is already running");
+            return 1;
+        }
+        if let Err(error) = std::fs::remove_file(&path) {
+            eprintln!("stale daemon socket cannot be removed: {error}");
+            return 1;
+        }
+    }
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("daemon socket bind failed: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = restrict_socket(&path) {
+        eprintln!("daemon socket permissions failed: {error}");
+        return 1;
+    }
+    let mut runtime = match Runtime::new(default_state_dir()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("startup failed: {error}");
+            return 1;
+        }
+    };
+    let mut tasks = match TaskStore::open(&default_state_dir()) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            eprintln!("task store startup failed: {error}");
+            return 1;
+        }
+    };
+    let mut tasks_enabled = false;
+    eprintln!("comptrol daemon listening on {}", path.display());
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                if let Err(error) =
+                    handle_ipc_connection(&mut stream, &mut runtime, &mut tasks, &mut tasks_enabled)
+                {
+                    eprintln!("daemon connection failed: {error}");
+                }
+            }
+            Err(error) => eprintln!("daemon accept failed: {error}"),
+        }
+    }
+    0
+}
+
+#[cfg(not(unix))]
+fn run_daemon() -> i32 {
+    eprintln!("daemon named pipe transport is not implemented on this platform");
+    2
+}
+
+#[cfg(unix)]
+fn run_daemon_health() -> i32 {
+    let path = daemon_socket_path();
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("daemon unavailable: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = write_ipc_frame(
+        &mut stream,
+        &json!({ "version": 1, "id": "health", "method": "health" }),
+    ) {
+        eprintln!("daemon health request failed: {error}");
+        return 1;
+    }
+    match read_ipc_frame(&mut stream).and_then(|frame| {
+        serde_json::from_slice::<Value>(&frame)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }) {
+        Ok(value) => print_json(value),
+        Err(error) => {
+            eprintln!("daemon health response failed: {error}");
+            1
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_daemon_health() -> i32 {
+    eprintln!("daemon named pipe transport is not implemented on this platform");
+    2
+}
+
+#[cfg(unix)]
+fn handle_ipc_connection(
+    stream: &mut UnixStream,
+    runtime: &mut Runtime,
+    tasks: &mut TaskStore,
+    tasks_enabled: &mut bool,
+) -> io::Result<()> {
+    while let Some(frame) = read_ipc_frame(stream)? {
+        let request: Value = match serde_json::from_slice(&frame) {
+            Ok(value) => value,
+            Err(error) => {
+                write_ipc_frame(
+                    stream,
+                    &json!({ "version": 1, "id": Value::Null, "error": { "code": "invalid_json", "message": error.to_string() } }),
+                )?;
+                continue;
+            }
+        };
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        if request.get("version").and_then(Value::as_u64) != Some(1) {
+            write_ipc_frame(
+                stream,
+                &json!({ "version": 1, "id": id, "error": { "code": "protocol_version_unsupported", "message": "IPC version 1 is required" } }),
+            )?;
+            continue;
+        }
+        match request.get("method").and_then(Value::as_str) {
+            Some("health") => write_ipc_frame(
+                stream,
+                &json!({ "version": 1, "id": id, "result": { "ready": true, "server": SERVER_VERSION, "protocol": PROTOCOL_VERSION } }),
+            )?,
+            Some("mcp") => {
+                let Some(message) = request.get("message") else {
+                    write_ipc_frame(
+                        stream,
+                        &json!({ "version": 1, "id": id, "error": { "code": "message_required", "message": "IPC mcp requests need a message" } }),
+                    )?;
+                    continue;
+                };
+                let line = serde_json::to_string(message).map_err(io::Error::other)?;
+                let mut notifications = Vec::new();
+                let response = handle_message_with_state(
+                    runtime,
+                    Some(tasks),
+                    tasks_enabled,
+                    &line,
+                    |notification| notifications.push(notification),
+                )
+                .unwrap_or_else(|| json!({}));
+                for notification in notifications {
+                    write_ipc_frame(
+                        stream,
+                        &json!({ "version": 1, "id": id, "event": notification }),
+                    )?;
+                }
+                write_ipc_frame(
+                    stream,
+                    &json!({ "version": 1, "id": id, "result": response }),
+                )?;
+            }
+            Some(method) => write_ipc_frame(
+                stream,
+                &json!({ "version": 1, "id": id, "error": { "code": "method_not_found", "message": format!("Unknown IPC method {method}") } }),
+            )?,
+            None => write_ipc_frame(
+                stream,
+                &json!({ "version": 1, "id": id, "error": { "code": "method_required", "message": "IPC requests need a method" } }),
+            )?,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_ipc_frame(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
+    let mut header = [0_u8; 4];
+    match stream.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let length = u32::from_be_bytes(header) as usize;
+    if length > MAX_PROTOCOL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPC frame exceeds the protocol limit",
+        ));
+    }
+    let mut frame = vec![0_u8; length];
+    stream.read_exact(&mut frame)?;
+    Ok(Some(frame))
+}
+
+#[cfg(unix)]
+fn write_ipc_frame(stream: &mut UnixStream, value: &Value) -> io::Result<()> {
+    let frame = serde_json::to_vec(value).map_err(io::Error::other)?;
+    if frame.len() > MAX_PROTOCOL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPC response exceeds the protocol limit",
+        ));
+    }
+    stream.write_all(&(frame.len() as u32).to_be_bytes())?;
+    stream.write_all(&frame)
+}
+
+#[cfg(unix)]
+fn restrict_socket(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 fn handle_http(

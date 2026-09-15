@@ -14,4 +14,6 @@ The stdio server also supports a durable completed task subset when the client a
 
 The loopback HTTP preview binds only to localhost. It assigns a random session id after initialization and requires that id for later MCP requests. It supports origin validation, session deletion, and a finite server sent event readiness response. It remains a local preview because it does not yet provide concurrent long lived event streams or remote authentication.
 
+The native daemon mode uses a versioned length framed Unix socket on macOS and Linux. It provides health checks and forwards MCP messages through the same runtime while preserving ordered progress events. The socket is restricted to the local user and rejects oversized frames. Windows named pipe support and automatic adapter reconnect remain unavailable until their native implementation is validated.
+
 `command.run` is an optional R3 intent. It requires `COMPTROL_ALLOW_COMMANDS=1`, an explicit `COMPTROL_COMMAND_ROOT`, and an exact executable in `COMPTROL_COMMAND_ALLOWLIST`. It accepts a structured program and argv, never invokes a shell, limits output to 64 KiB per stream, bounds execution to 60 seconds, and verifies an optional `exit_code` postcondition. A timeout is durable unknown and must be observed before retrying.
