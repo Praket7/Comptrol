@@ -31,7 +31,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.28";
+pub const SERVER_VERSION: &str = "0.1.29";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -2553,7 +2553,7 @@ fn browser_cdp_workflow(
     }
     let endpoint = endpoint.to_string_lossy();
     let initial_revision = request.params.get("revision").and_then(Value::as_str);
-    let targets = match browser::discover(&endpoint) {
+    let targets = match browser::discover_cached_targets(&endpoint) {
         Ok(targets) => targets,
         Err(error) => return browser_failure(request, operation_id, error),
     };
@@ -2631,7 +2631,7 @@ fn browser_cdp_workflow(
             Err(error) => return browser_failure(request, operation_id, error),
         };
         completed.push(json!({"index": index, "result": data}));
-        if let Ok(current) = browser::discover(&endpoint)
+        if let Ok(current) = browser::discover_cached_targets(&endpoint)
             && let Ok(bound) =
                 crate::bind_browser_target(&current, target_id, Some(browser_context_id), None)
         {
@@ -4195,6 +4195,7 @@ if ($env:COMPTROL_UIA_VERIFY_ATTRIBUTE -eq 'value') {
 ([pscustomobject]@{ verified = $verified; action = $env:COMPTROL_UIA_ACTION } | ConvertTo-Json -Compress)
 "#;
 
+#[cfg(not(target_os = "linux"))]
 const LINUX_ATSPI_SCRIPT: &str = r#"
 import json
 import os
@@ -4410,7 +4411,7 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
             expected_attribute,
             expected_value,
         });
-        return match result {
+        match result {
             Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
                 request,
                 operation_id,
@@ -4448,7 +4449,7 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
                     ),
                 },
             ),
-        };
+        }
     }
     let mut command = Command::new("powershell.exe");
     command
@@ -4536,7 +4537,74 @@ fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    #[cfg(target_os = "linux")]
+    {
+        let action = if request.intent.ends_with("press") {
+            comptrol_platform_linux::Action::Press
+        } else {
+            comptrol_platform_linux::Action::SetValue
+        };
+        let (expected_attribute, expected_value) = request
+            .postcondition
+            .as_ref()
+            .and_then(|postcondition| {
+                Some((
+                    postcondition.get("attribute")?.as_str()?,
+                    postcondition.get("equals")?.as_str()?,
+                ))
+            })
+            .unzip();
+        let result = comptrol_platform_linux::execute(comptrol_platform_linux::Request {
+            process_id: process_id as u32,
+            name,
+            role: request.params.get("role").and_then(Value::as_str),
+            action,
+            value: request.params.get("value").and_then(Value::as_str),
+            expected_attribute,
+            expected_value,
+            timeout: Duration::from_millis(1500),
+        });
+        match result {
+            Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
+                request,
+                operation_id,
+                "linux_atspi_direct",
+                EffectState::Changed,
+                VerificationState::Verified,
+                data,
+            ),
+            Ok(data) => success(
+                request,
+                operation_id,
+                "linux_atspi_direct",
+                EffectState::Changed,
+                VerificationState::Unverified,
+                data,
+            ),
+            Err(message) => ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: if message.contains("ambiguous") {
+                        "target_ambiguous"
+                    } else if message.contains("missing") {
+                        "target_gone"
+                    } else {
+                        "adapter_unavailable"
+                    }
+                    .to_owned(),
+                    message,
+                    recovery: Some(
+                        "Refresh the exact AT-SPI target and inspect the Linux accessibility bus"
+                            .to_owned(),
+                    ),
+                },
+            ),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     let mut command = Command::new("python3");
+    #[cfg(not(target_os = "linux"))]
     command
         .args(["-c", LINUX_ATSPI_SCRIPT])
         .env("COMPTROL_ATSPI_PROCESS_ID", process_id.to_string())
@@ -4549,15 +4617,19 @@ fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> Actio
                 "set_value"
             },
         );
+    #[cfg(not(target_os = "linux"))]
     if let Some(role) = request.params.get("role").and_then(Value::as_str) {
         command.env("COMPTROL_ATSPI_ROLE", role);
     }
+    #[cfg(not(target_os = "linux"))]
     if let Some(action) = request.params.get("action").and_then(Value::as_str) {
         command.env("COMPTROL_ATSPI_ACTION", action);
     }
+    #[cfg(not(target_os = "linux"))]
     if let Some(value) = request.params.get("value").and_then(Value::as_str) {
         command.env("COMPTROL_ATSPI_VALUE", value);
     }
+    #[cfg(not(target_os = "linux"))]
     if let Some(postcondition) = request.postcondition.as_ref()
         && let (Some(attribute), Some(expected)) = (
             postcondition.get("attribute").and_then(Value::as_str),
@@ -4573,17 +4645,32 @@ fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> Actio
                 .unwrap_or_else(|| expected.to_string()),
         );
     }
-    semantic_provider_result(
+    #[cfg(not(target_os = "linux"))]
+    return semantic_provider_result(
         request,
         operation_id,
         "linux_atspi",
         run_bounded(command, Duration::from_millis(1500)),
-    )
+    );
 }
 
 fn macos_ax_press(request: &OperationRequest, operation_id: String) -> ActionResult {
     if !cfg!(target_os = "macos") {
         return unsupported_ax(request, operation_id);
+    }
+    #[cfg(target_os = "macos")]
+    if let (Some(process_id), Some(control)) = (
+        request.params.get("process_id").and_then(Value::as_u64),
+        request.params.get("control").and_then(Value::as_str),
+    ) {
+        return macos_ax_direct_result(
+            request,
+            operation_id,
+            comptrol_platform_macos::Action::Press,
+            process_id,
+            control,
+            None,
+        );
     }
     let Some(script) = ax_script(request, "press") else {
         return ActionResult::refused(
@@ -4647,6 +4734,20 @@ fn macos_ax_set_value(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    #[cfg(target_os = "macos")]
+    if let (Some(process_id), Some(control)) = (
+        request.params.get("process_id").and_then(Value::as_u64),
+        request.params.get("control").and_then(Value::as_str),
+    ) {
+        return macos_ax_direct_result(
+            request,
+            operation_id,
+            comptrol_platform_macos::Action::SetValue,
+            process_id,
+            control,
+            Some(value),
+        );
+    }
     let Some(script) = ax_script(request, &format!("set_value:{}", apple_quote(value))) else {
         return ActionResult::refused(
             request,
@@ -4680,6 +4781,75 @@ fn macos_ax_set_value(request: &OperationRequest, operation_id: String) -> Actio
                 code: "adapter_unavailable".to_owned(),
                 message: error.to_string(),
                 recovery: Some("Check macOS Accessibility permission".to_owned()),
+            },
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ax_direct_result(
+    request: &OperationRequest,
+    operation_id: String,
+    action: comptrol_platform_macos::Action,
+    process_id: u64,
+    control: &str,
+    value: Option<&str>,
+) -> ActionResult {
+    let (expected_attribute, expected_value) = request
+        .postcondition
+        .as_ref()
+        .and_then(|postcondition| {
+            Some((
+                postcondition.get("attribute")?.as_str()?,
+                postcondition.get("equals")?.as_str()?,
+            ))
+        })
+        .unzip();
+    match comptrol_platform_macos::execute(comptrol_platform_macos::Request {
+        process_id: process_id as u32,
+        name: control,
+        role: request.params.get("role").and_then(Value::as_str),
+        action,
+        value,
+        expected_attribute,
+        expected_value,
+        timeout: Duration::from_millis(1500),
+    }) {
+        Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
+            request,
+            operation_id,
+            "macos_ax_direct",
+            EffectState::Changed,
+            VerificationState::Verified,
+            data,
+        ),
+        Ok(data) => success(
+            request,
+            operation_id,
+            "macos_ax_direct",
+            EffectState::Changed,
+            VerificationState::Unverified,
+            data,
+        ),
+        Err(message) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: if message.contains("ambiguous") {
+                    "target_ambiguous"
+                } else if message.contains("missing") {
+                    "target_gone"
+                } else if message.contains("permission") {
+                    "permission_required"
+                } else {
+                    "adapter_unavailable"
+                }
+                .to_owned(),
+                message,
+                recovery: Some(
+                    "Refresh the exact AX target and inspect macOS Accessibility permission"
+                        .to_owned(),
+                ),
             },
         ),
     }

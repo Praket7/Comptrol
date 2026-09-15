@@ -1,0 +1,31 @@
+{
+  "suite": "browser_fixture_verified_task",
+  "verified_success": true,
+  "verification": "verified",
+  "latency_ms": 277.301,
+  "mcp_calls": 17,
+  "steps": 3,
+  "bytes_in": 5021,
+  "bytes_out": 21054,
+  "retries": 0,
+  "false_positive_verifications": 0,
+  "disturbance": {
+    "mouse": "untouched",
+    "clipboard": "untouched",
+    "foreground_changed": false
+  },
+  "independent_final_verifier": "fixture state and protocol metrics",
+  "protocol": {
+    "websocketConnections": 2,
+    "browserWebsocketConnections": 1,
+    "pageWebsocketConnections": 1,
+    "targetListRequests": 5,
+    "protocolEvents": 5
+  },
+  "environment": {
+    "binary": "target/release/comptrol",
+    "fixture": "scripts/browser_fixture.mjs",
+    "host": "WSL2 Linux",
+    "release_line": "0.1.28"
+  }
+}

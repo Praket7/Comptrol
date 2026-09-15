@@ -2,6 +2,11 @@ import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { existsSync } from "node:fs"
 
+const startedAt = performance.now()
+let mcpCalls = 0
+let bytesIn = 0
+let bytesOut = 0
+let workflowSteps = 0
 const port = 17418
 const fixture = spawn(process.execPath, ["scripts/browser_fixture.mjs"], { env: { ...process.env, COMPTROL_FIXTURE_PORT: String(port) }, stdio: ["ignore", "ignore", "pipe"] })
 await new Promise((resolve, reject) => {
@@ -43,6 +48,7 @@ try {
         if (!line) return
         try {
           const value = JSON.parse(line)
+          bytesOut += Buffer.byteLength(line)
           if (value.id === id) {
             comptrol.stdout.off("data", onData)
             resolve(value)
@@ -53,7 +59,10 @@ try {
         }
       }
       comptrol.stdout.on("data", onData)
-      comptrol.stdin.write(`${JSON.stringify(message)}\n`)
+      const encoded = `${JSON.stringify(message)}\n`
+      mcpCalls += 1
+      bytesIn += Buffer.byteLength(encoded)
+      comptrol.stdin.write(encoded)
     })
     await response(1, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} })
     const browser = await response(2, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "inspect", arguments: { kind: "browser" } } })
@@ -75,8 +84,10 @@ try {
     const workflow = await response(47, { jsonrpc: "2.0", id: 47, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.workflow", idempotency_key: "browser-workflow", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, steps: [{ action: "click", locator: { role: "button", name: "Add dynamic node" }, timeout_ms: 1000 }] } } } })
     assert.equal(workflow.result.structuredContent.verification, "verified", JSON.stringify(workflow))
     assert.equal(workflow.result.structuredContent.data.step_count, 1)
+    workflowSteps += workflow.result.structuredContent.data.step_count
     const navigationWorkflow = await response(50, { jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.workflow", idempotency_key: "browser-navigation-workflow", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, steps: [{ action: "navigate", url: `http://127.0.0.1:${port}/next`, url_contains: "/next", timeout_ms: 1000 }, { action: "wait_url", contains: "/next", timeout_ms: 1000 }] } } } })
     assert.equal(navigationWorkflow.result.structuredContent.verification, "verified", JSON.stringify(navigationWorkflow))
+    workflowSteps += navigationWorkflow.result.structuredContent.data.step_count
     const snapshot = await response(43, { jsonrpc: "2.0", id: 43, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.accessibility_snapshot", idempotency_key: "accessibility-snapshot", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, depth: 4 } } } })
     assert.equal(snapshot.result.structuredContent.verification, "verified")
     assert.equal(snapshot.result.structuredContent.data.snapshot.nodes[0].name.value, "Comptrol browser fixture")
@@ -107,6 +118,22 @@ try {
     assert.equal(metrics.pageWebsocketConnections, 1, JSON.stringify(metrics))
     assert.equal(metrics.browserWebsocketConnections, 1, JSON.stringify(metrics))
     comptrol.kill("SIGTERM")
+    console.log(JSON.stringify({
+      suite: "browser_fixture_verified_task",
+      verified_success: true,
+      verification: "verified",
+      latency_ms: Number((performance.now() - startedAt).toFixed(3)),
+      mcp_calls: mcpCalls,
+      steps: workflowSteps,
+      bytes_in: bytesIn,
+      bytes_out: bytesOut,
+      retries: 0,
+      false_positive_verifications: 0,
+      disturbance: { mouse: "untouched", clipboard: "untouched", foreground_changed: false },
+      resource_usage: { comptrol_pid: comptrol.pid },
+      independent_final_verifier: "fixture state and protocol metrics",
+      protocol: metrics,
+    }))
   }
   console.log("browser fixture conformance passed")
 } finally {

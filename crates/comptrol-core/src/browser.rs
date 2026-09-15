@@ -63,11 +63,18 @@ pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
 fn discover_cached(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
     if let Ok(caches) = target_caches().lock()
         && let Some(entry) = caches.get(endpoint)
-        && entry.observed_at.elapsed() <= Duration::from_millis(100)
+        && entry.observed_at.elapsed() <= Duration::from_secs(2)
     {
         return Ok(entry.targets.clone());
     }
     discover(endpoint)
+}
+
+/// Return the current target snapshot, reusing the event-invalidated cache for
+/// normal actions. Explicit inspection still uses [`discover`] when callers
+/// request a fresh browser inventory.
+pub fn discover_cached_targets(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
+    discover_cached(endpoint)
 }
 
 fn invalidate_target_cache(endpoint: &str) {
@@ -88,7 +95,7 @@ pub fn fixture_submit(
     idempotency_key: &str,
     message: &str,
 ) -> Result<Value, ComptrolError> {
-    let targets = discover(endpoint)?;
+    let targets = discover_cached(endpoint)?;
     bind_browser_target(
         &targets,
         target_id,
@@ -224,6 +231,7 @@ pub fn open_tab(
                 .and_then(Value::as_str)
                 == Some(target_id)
     })?;
+    invalidate_target_cache(endpoint);
     let targets = discover(endpoint)?;
     if let Some(target) = targets.into_iter().find(|target| target.id == target_id) {
         if browser_context_id
@@ -323,7 +331,7 @@ pub fn close_tab(
     browser_context_id: &str,
     revision: &str,
 ) -> Result<Value, ComptrolError> {
-    let targets = discover(endpoint)?;
+    let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(
         &targets,
         target_id,
@@ -356,6 +364,7 @@ pub fn close_tab(
                 .and_then(Value::as_str)
                 == Some(target_id)
     })?;
+    invalidate_target_cache(endpoint);
     if discover(endpoint)
         .map(|remaining| remaining.iter().all(|item| item.id != target_id))
         .unwrap_or(false)
@@ -383,7 +392,7 @@ pub fn history(
     revision: &str,
     forward: bool,
 ) -> Result<Value, ComptrolError> {
-    let targets = discover(endpoint)?;
+    let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(
         &targets,
         target_id,
@@ -832,13 +841,7 @@ pub fn cdp_call(
         });
     };
     let result = persistent_call(&web_socket_url, method, params);
-    if matches!(
-        method,
-        "Page.navigate"
-            | "Page.navigateToHistoryEntry"
-            | "Runtime.evaluate"
-            | "DOM.setFileInputFiles"
-    ) {
+    if matches!(method, "Page.navigate" | "Page.navigateToHistoryEntry") {
         invalidate_target_cache(endpoint);
     }
     result
@@ -1029,7 +1032,7 @@ pub fn cdp_upload(
             message: "Upload path needs a valid file name".to_owned(),
             recovery: None,
         })?;
-    let targets = discover(endpoint)?;
+    let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
     let Some(web_socket_url) = target.web_socket_url else {
         return Err(ComptrolError {
@@ -1191,7 +1194,7 @@ pub fn cdp_download(
         });
     }
     fs_create_dir(download_dir)?;
-    let targets = discover(endpoint)?;
+    let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
     let Some(web_socket_url) = target.web_socket_url else {
         return Err(ComptrolError {

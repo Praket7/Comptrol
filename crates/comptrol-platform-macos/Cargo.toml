@@ -1,0 +1,9 @@
+[package]
+name = "comptrol-platform-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Direct Rust Application Services accessibility adapter for Comptrol"
+
+[dependencies]
+serde_json = "1"
