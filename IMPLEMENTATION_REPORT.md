@@ -38,9 +38,11 @@ The README forbidden punctuation check passed.
 
 The npm package dry run and launcher restart conformance passed. The browser fixture conformance passed.
 
+The loopback HTTP conformance source now covers random session assignment, required session reuse, session deletion, finite server sent event responses, ordered progress events, invalid JSON, incomplete bodies, origin rejection, method rejection, and oversized requests. The current host cannot execute this updated harness because rebuilding the native binary is blocked by the local Xcode license gate.
+
 The optimized Rust build passed before the latest semantic Chrome group route. The current rebuild is blocked by the same local Xcode license gate.
 
-The GitHub Actions workflows are present, but the latest remote runs were not started because the repository account reported failed recent payments or an exceeded spending limit. This is an external runner availability failure rather than a test result.
+The GitHub Actions workflows are present, but the latest remote jobs were rejected before checkout because the repository account reported failed recent payments or an exceeded spending limit. This is an external runner availability failure rather than a test result.
 
 ## Platform matrix
 
@@ -54,7 +56,7 @@ Linux has an opt in AT SPI route for exact process and accessible name binding t
 
 ## Not built yet
 
-Full Streamable HTTP session and event conformance, daemon supervision, persistent hot sessions, remote mutual TLS transport, application specific adapters, portable CDP closed group restoration, screenshots and visual recovery, full asynchronous MCP task execution and cancellation, native Windows and Linux live fixture validation on their operating systems, signed release publication, npm publication, Homebrew publication, GitHub artifact attestation, and real user profile acceptance without an explicitly supplied DevTools endpoint remain open work. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, target bound fill and wait operations, accessibility snapshots, history navigation, exact live tab close, sandbox upload and download verification, sandbox restricted copy with checkpoint and hash verification, client integration proposals with atomic JSON apply and undo, cross platform build validation, reproducible native archive and checksum preparation, and dedicated headless Chrome validation were implemented and previously tested. The new macOS semantic closed group reopening route has unit coverage but no live acceptance on this host. GitHub workflow security checks include Rust dependency audit and pull request dependency review.
+Long lived Streamable HTTP event streams, daemon supervision, persistent hot sessions, remote mutual TLS transport, application specific adapters, portable CDP closed group restoration, screenshots and visual recovery, full asynchronous MCP task execution and cancellation, native Windows and Linux live fixture validation on their operating systems, signed release publication, npm publication, Homebrew publication, GitHub artifact attestation, and real user profile acceptance without an explicitly supplied DevTools endpoint remain open work. Basic HTTP session lifecycle, bounded event responses, and ordered progress events are implemented but await native runtime verification. Event sequencing, bounded waits, checkpoints, record and replay, dashboard diagnostics, browser discovery, fixture CDP mutation, target bound fill and wait operations, accessibility snapshots, history navigation, exact live tab close, sandbox upload and download verification, sandbox restricted copy with checkpoint and hash verification, client integration proposals with atomic JSON apply and undo, cross platform build validation, reproducible native archive and checksum preparation, and dedicated headless Chrome validation were implemented and previously tested. The new macOS semantic closed group reopening route has unit coverage but no live acceptance on this host. GitHub workflow security checks include Rust dependency audit and pull request dependency review.
 
 ## Security decisions
 
@@ -68,7 +70,7 @@ The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.011 ms
 
 ## Distribution status
 
-Source build is verified. The npm launcher package is prepared but not published. Homebrew formula generation is prepared but no formula is published. Detached signing and verification are implemented, but no signed release exists because no operator signing identity was supplied. A private GitHub repository exists at `Praket7/Comptrol` with the verified main branch, six open implementation issues, and one completed browser issue.
+An earlier source build is verified. The current source build is blocked by the local Xcode license gate. The npm launcher package is prepared but not published. Homebrew formula generation is prepared but no formula is published. Detached signing and verification are implemented, but no signed release exists because no operator signing identity was supplied. A private GitHub repository exists at `Praket7/Comptrol` with main synchronized through the latest implementation commit, six open implementation issues, and one completed browser issue.
 
 ## Remaining issues ordered by impact
 
