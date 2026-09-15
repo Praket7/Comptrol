@@ -170,11 +170,11 @@ jobs:
           test -f packages/mcp/native/linux-x64/comptrol
           test -f packages/mcp/native/win32-x64/comptrol.exe
           python3 scripts/validate_npm_package.py
-      - name: Publish package with trusted provenance
+      - name: Publish package with npm token
         run: |
           set -o pipefail
           for attempt in 1 2 3; do
-            if npm publish --workspace packages/mcp --access public --provenance 2>&1 | tee "npm-publish-${attempt}.log"; then
+            if npm publish --workspace packages/mcp --access public 2>&1 | tee "npm-publish-${attempt}.log"; then
               exit 0
             fi
             if grep -Eqi 'E403|ENEEDAUTH|forbidden|not authorized|trusted publisher' "npm-publish-${attempt}.log"; then
