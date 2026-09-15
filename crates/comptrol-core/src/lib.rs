@@ -5911,7 +5911,7 @@ fn doctor(runtime: &Runtime) -> Value {
             "obs_websocket": "implemented_not_live_verified",
             "blender": "offline_only_live_pending"
         },
-        "workflow": { "typed_ir": "implemented", "parameter_lifting": "implemented", "clean_replay_promotion": "planned" },
+        "workflow": { "typed_ir": "implemented", "parameter_lifting": "implemented", "clean_replay_promotion": "implemented_not_live_verified" },
         "route_statistics": { "durable": "implemented", "planner_feedback": "implemented", "latency": "implemented" },
         "client_configuration": integration::list(),
         "remote": { "available": false, "binding": "loopback_only" },
