@@ -18,6 +18,9 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Download verification uses browser download lifecycle events and exact GUID binding.
 - Upload responses expose honest selected/transfer/accepted/persisted stages.
 - Typed workflow IR validation is enforced during trace compilation.
+- Typed workflow executor runs compiled actions through the normal runtime, resolves lifted parameters, enforces a step budget, and supports bounded branches, loops, waits, verification, and parallel reads.
+- Durable MCP Tasks are available across stdio, stateless HTTP, and mutual-TLS HTTP with SQLite persistence and cancellation reconciliation.
+- Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.
 - OBS uses a persistent authenticated WebSocket client.
 - LibreOffice uses a persistent UNO connection and exact document identity.
 - VS Code bridge calls require a configured token, nonce, and authenticated response.
@@ -38,8 +41,8 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Complete universal verification wiring across every adapter and high-level operation.
 - Wire the extracted async browser connection into the remaining synchronous compatibility facade and enable full target attachment/domain bootstrap.
 - Persist route statistics and add the V2 route planner score and hard gates.
-- Complete MCP Tasks persistence, cancellation propagation, and protocol conformance coverage.
-- Complete workflow state-machine execution, clean replay promotion, branches, loops, parallel reads, and repair fallback.
+- Extend MCP cancellation propagation into every adapter/browser operation and add task progress replay coverage.
+- Add clean workflow replay promotion and repair fallback; the typed state-machine executor and bounded branches/loops/parallel reads are implemented.
 - Implement persistent native accessibility workers and event-driven caches for all three desktop platforms.
 - Upgrade VS Code authentication, exact LibreOffice document identity, persistent OBS, Blender live IPC, adapter deadlines, and truthful kernel-isolation reporting.
 - Add the complete benchmark matrix and collect stable performance history before hard regression thresholds.
