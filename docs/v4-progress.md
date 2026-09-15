@@ -33,7 +33,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Browser-level synchronous compatibility calls now use `BlockingBrowserManager`, whose dedicated long-lived Tokio runtime owns `BrowserManager` and reuses one browser-level WebSocket per debugger endpoint. Target-specific legacy helpers still need migration to generation-bound `target_command`.
 - The blocking bridge now also exposes generation- and revision-bound target commands, so migrated synchronous callers can use the live target graph without creating a per-target socket.
 - Frame commands now bind an execution context to a generation- and revision-checked frame record, including OOPIF target/session routing; navigation and execution-context lifecycle events invalidate frame references.
-- History, coordinate input, upload, accessibility, and download-trigger target commands now dispatch through the flattened browser multiplexer. Event-only compatibility waits still use the temporary legacy event buffer and remain to be moved onto the shared EventHub.
+- History, coordinate input, upload, accessibility, and download-trigger target commands now dispatch through the flattened browser multiplexer. Event-only waits now consume the shared browser connection's bounded broadcast stream; the old synchronous per-page session map has been removed.
 - Runtime route history is persisted in SQLite and feeds conservative deterministic route scoring after safety gates.
 - OBS uses a persistent authenticated WebSocket client.
 - LibreOffice uses a persistent UNO connection and exact document identity.
@@ -52,7 +52,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 
 ## Still required for the full V4 specification
 
-- Migrate the remaining event-only target waits from the compatibility event buffer to the shared EventHub and remove the temporary synchronous per-page session implementation.
+- Add event replay/cursor semantics for late subscribers and wire the shared browser event stream into the durable MCP EventHub.
 - Complete universal verification wiring across every adapter and high-level operation.
 - Complete target attachment/domain bootstrap coverage for all migrated compatibility helpers and remove the remaining legacy per-session socket path.
 - Extend persisted route statistics with latency samples and planner feedback across adapter/application versions.

@@ -11,7 +11,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 /// Evidence stages for a browser upload. Generic CDP can normally establish
@@ -221,6 +223,8 @@ pub enum BrowserError {
     InvalidResponse(String),
     #[error("browser command cancelled")]
     Cancelled,
+    #[error("browser event wait timed out")]
+    Timeout,
     #[error("target reference is stale or unavailable: {0}")]
     StaleReference(String),
 }
@@ -246,6 +250,7 @@ pub struct BrowserConnection {
     next_command_id: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
     cancellation: CancellationToken,
+    events: broadcast::Sender<Value>,
 }
 
 impl BrowserConnection {
@@ -264,6 +269,8 @@ impl BrowserConnection {
         let frames_for_reader = Arc::clone(&frames);
         let generation_for_reader = Arc::new(AtomicU64::new(0));
         let generation_for_disconnect = Arc::clone(&generation_for_reader);
+        let (events, _) = broadcast::channel(512);
+        let events_for_reader = events.clone();
         let cancellation = CancellationToken::new();
         let cancellation_for_tasks = cancellation.clone();
         tokio::spawn(async move {
@@ -306,6 +313,7 @@ impl BrowserConnection {
                     continue;
                 };
                 let Some(id) = value.get("id").and_then(Value::as_u64) else {
+                    let _ = events_for_reader.send(value.clone());
                     targets_for_reader.write().await.apply_event(&value);
                     let generation = generation_for_disconnect.load(Ordering::Acquire);
                     frames_for_reader
@@ -339,6 +347,7 @@ impl BrowserConnection {
             next_command_id: Arc::new(AtomicU64::new(1)),
             generation: generation_for_reader,
             cancellation,
+            events,
         })
     }
 
@@ -364,6 +373,17 @@ impl BrowserConnection {
             .await
             .map_err(|_| BrowserError::Closed)?;
         response_rx.await.map_err(|_| BrowserError::Cancelled)?
+    }
+
+    /// Receive the next protocol event from the shared browser reader. This
+    /// is intentionally separate from command correlation so event waits never
+    /// need to open or lock a target WebSocket.
+    pub async fn next_event(&self, duration: Duration) -> Result<Value, BrowserError> {
+        let mut receiver = self.events.subscribe();
+        timeout(duration, receiver.recv())
+            .await
+            .map_err(|_| BrowserError::Timeout)?
+            .map_err(|error| BrowserError::InvalidResponse(error.to_string()))
     }
 
     pub async fn bootstrap(&self) -> Result<(), BrowserError> {
@@ -922,6 +942,7 @@ mod tests {
             next_command_id: Arc::new(AtomicU64::new(1)),
             generation: Arc::new(AtomicU64::new(0)),
             cancellation: CancellationToken::new(),
+            events: broadcast::channel(8).0,
         };
         connection.targets.write().await.apply_created(target());
         let result = connection

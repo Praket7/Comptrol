@@ -8,37 +8,20 @@ pub use comptrol_browser::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
-
-type CdpSocket = WebSocket<MaybeTlsStream<TcpStream>>;
-
-#[allow(dead_code)]
-struct CdpSession {
-    socket: CdpSocket,
-    next_id: u64,
-    events: VecDeque<Value>,
-}
 
 struct TargetCacheEntry {
     observed_at: Instant,
     targets: Vec<BrowserTarget>,
 }
 
-type CdpSessions = HashMap<String, Arc<Mutex<CdpSession>>>;
 type TargetCaches = HashMap<String, TargetCacheEntry>;
-
-fn cdp_sessions() -> &'static Mutex<CdpSessions> {
-    static SESSIONS: OnceLock<Mutex<CdpSessions>> = OnceLock::new();
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 fn target_caches() -> &'static Mutex<TargetCaches> {
     static CACHES: OnceLock<Mutex<TargetCaches>> = OnceLock::new();
@@ -759,100 +742,6 @@ fn protocol_call(
         })
 }
 
-#[allow(dead_code)]
-fn persistent_call(
-    web_socket_url: &str,
-    method: &str,
-    params: Value,
-) -> Result<Value, ComptrolError> {
-    if !web_socket_url.starts_with("ws://") {
-        return Err(ComptrolError {
-            code: "browser_transport_unsupported".to_owned(),
-            message: "Only local unencrypted DevTools websocket endpoints are enabled".to_owned(),
-            recovery: Some("Use a local browser endpoint".to_owned()),
-        });
-    }
-    let session = {
-        let mut sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
-            code: "browser_session_unavailable".to_owned(),
-            message: "The browser session cache is unavailable".to_owned(),
-            recovery: Some("Retry after the browser session recovers".to_owned()),
-        })?;
-        if let Some(session) = sessions.get(web_socket_url) {
-            Arc::clone(session)
-        } else {
-            let (socket, _) = connect(web_socket_url).map_err(browser_connect_error)?;
-            let session = Arc::new(Mutex::new(CdpSession {
-                socket,
-                next_id: 0,
-                events: VecDeque::new(),
-            }));
-            sessions.insert(web_socket_url.to_owned(), Arc::clone(&session));
-            session
-        }
-    };
-    let mut session = session.lock().map_err(|_| ComptrolError {
-        code: "browser_session_unavailable".to_owned(),
-        message: "The browser protocol session is unavailable".to_owned(),
-        recovery: Some("Retry after the browser session recovers".to_owned()),
-    })?;
-    session.next_id += 1;
-    let id = session.next_id;
-    let result = (|| {
-        session
-            .socket
-            .send(Message::Text(
-                json!({ "id": id, "method": method, "params": params })
-                    .to_string()
-                    .into(),
-            ))
-            .map_err(browser_dispatch_error)?;
-        loop {
-            let message = session.socket.read().map_err(browser_response_error)?;
-            let Message::Text(text) = message else {
-                continue;
-            };
-            if text.len() > MAX_PROTOCOL_BYTES {
-                return Err(ComptrolError {
-                    code: "browser_message_too_large".to_owned(),
-                    message: format!(
-                        "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
-                    ),
-                    recovery: Some(
-                        "Inspect the target and retry with a bounded response".to_owned(),
-                    ),
-                });
-            }
-            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-                code: "browser_protocol_invalid".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Inspect the browser protocol version".to_owned()),
-            })?;
-            if value.get("id").and_then(Value::as_u64) != Some(id) {
-                if session.events.len() == 256 {
-                    session.events.pop_front();
-                }
-                session.events.push_back(value);
-                continue;
-            }
-            if let Some(error) = value.get("error") {
-                return Err(ComptrolError {
-                    code: "browser_command_failed".to_owned(),
-                    message: error.to_string(),
-                    recovery: Some("Inspect the browser target and retry once".to_owned()),
-                });
-            }
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-        }
-    })();
-    if result.is_err()
-        && let Ok(mut sessions) = cdp_sessions().lock()
-    {
-        sessions.remove(web_socket_url);
-    }
-    result
-}
-
 fn wait_for_event<F>(
     web_socket_url: &str,
     timeout: Duration,
@@ -861,111 +750,36 @@ fn wait_for_event<F>(
 where
     F: Fn(&Value) -> bool,
 {
+    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
+    let bridge = BRIDGE.get_or_init(BlockingBrowserManager::new);
     let deadline = Instant::now() + timeout;
-    let session = {
-        let sessions = cdp_sessions().lock().map_err(|_| ComptrolError {
-            code: "browser_session_unavailable".to_owned(),
-            message: "The browser session cache is unavailable".to_owned(),
-            recovery: Some("Retry after the browser session recovers".to_owned()),
-        })?;
-        let Some(session) = sessions.get(web_socket_url) else {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(ComptrolError {
-                code: "browser_session_changed".to_owned(),
-                message: "The browser protocol session is no longer cached".to_owned(),
-                recovery: Some("Rebind the exact browser target before retrying".to_owned()),
+                code: "verification_failed".to_owned(),
+                message: "The browser did not emit the expected protocol event in time".to_owned(),
+                recovery: Some("Inspect the exact browser target before retrying".to_owned()),
             });
-        };
-        Arc::clone(session)
-    };
-    let mut session = session.lock().map_err(|_| ComptrolError {
-        code: "browser_session_unavailable".to_owned(),
-        message: "The browser protocol session is unavailable".to_owned(),
-        recovery: Some("Retry after the browser session recovers".to_owned()),
-    })?;
-    let result = (|| {
-        if let Some(position) = session.events.iter().position(&predicate) {
-            return Ok(session
-                .events
-                .remove(position)
-                .expect("event position exists"));
         }
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(ComptrolError {
-                    code: "verification_failed".to_owned(),
-                    message: "The browser did not emit the expected protocol event in time"
-                        .to_owned(),
-                    recovery: Some("Inspect the exact browser target before retrying".to_owned()),
-                });
-            }
-            set_socket_read_timeout(&mut session.socket, Some(remaining))
-                .map_err(browser_io_error)?;
-            let message = match session.socket.read() {
-                Ok(message) => message,
-                Err(tungstenite::Error::Io(error))
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    if Instant::now() >= deadline {
-                        return Err(ComptrolError {
-                            code: "verification_failed".to_owned(),
-                            message: "The browser did not emit the expected protocol event in time"
-                                .to_owned(),
-                            recovery: Some(
-                                "Inspect the exact browser target before retrying".to_owned(),
-                            ),
-                        });
-                    }
-                    thread::yield_now();
-                    continue;
+        let value = bridge
+            .next_event(
+                web_socket_url,
+                remaining.as_millis().min(u64::MAX as u128) as u64,
+            )
+            .map_err(|error| ComptrolError {
+                code: if matches!(error, BrowserError::Timeout) {
+                    "verification_failed"
+                } else {
+                    "browser_protocol_error"
                 }
-                Err(error) => return Err(browser_response_error(error)),
-            };
-            let Message::Text(text) = message else {
-                continue;
-            };
-            if text.len() > MAX_PROTOCOL_BYTES {
-                return Err(ComptrolError {
-                    code: "browser_message_too_large".to_owned(),
-                    message: format!(
-                        "Browser protocol messages are limited to {MAX_PROTOCOL_BYTES} bytes"
-                    ),
-                    recovery: Some("Inspect the browser protocol response size".to_owned()),
-                });
-            }
-            let value: Value = serde_json::from_str(&text).map_err(|error| ComptrolError {
-                code: "browser_protocol_invalid".to_owned(),
+                .to_owned(),
                 message: error.to_string(),
-                recovery: Some("Inspect the browser protocol version".to_owned()),
+                recovery: Some("Inspect the browser connection and retry".to_owned()),
             })?;
-            if predicate(&value) {
-                return Ok(value);
-            }
-            if session.events.len() == 256 {
-                session.events.pop_front();
-            }
-            session.events.push_back(value);
+        if predicate(&value) {
+            return Ok(value);
         }
-    })();
-    let _ = set_socket_read_timeout(&mut session.socket, None);
-    if result.is_err()
-        && let Ok(mut sessions) = cdp_sessions().lock()
-    {
-        sessions.remove(web_socket_url);
-    }
-    result
-}
-
-fn set_socket_read_timeout(socket: &mut CdpSocket, timeout: Option<Duration>) -> io::Result<()> {
-    match socket.get_mut() {
-        MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "TLS browser sessions do not expose a bounded socket timeout",
-        )),
     }
 }
 
@@ -1468,40 +1282,6 @@ fn browser_file_error(error: io::Error) -> ComptrolError {
         code: "browser_filesystem_failed".to_owned(),
         message: error.to_string(),
         recovery: Some("Inspect the Comptrol sandbox and retry".to_owned()),
-    }
-}
-
-#[allow(dead_code)]
-fn browser_connect_error(error: tungstenite::Error) -> ComptrolError {
-    ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Start the browser target and retry".to_owned()),
-    }
-}
-
-#[allow(dead_code)]
-fn browser_dispatch_error(error: tungstenite::Error) -> ComptrolError {
-    ComptrolError {
-        code: "browser_dispatch_failed".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Reconnect to the exact browser target".to_owned()),
-    }
-}
-
-fn browser_response_error(error: tungstenite::Error) -> ComptrolError {
-    ComptrolError {
-        code: "browser_response_failed".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Inspect the browser target before retrying".to_owned()),
-    }
-}
-
-fn browser_io_error(error: io::Error) -> ComptrolError {
-    ComptrolError {
-        code: "browser_response_failed".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Reconnect to the exact browser target".to_owned()),
     }
 }
 

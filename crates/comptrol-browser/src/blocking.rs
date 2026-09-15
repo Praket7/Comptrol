@@ -19,6 +19,11 @@ enum Request {
         params: Value,
         response: mpsc::Sender<Result<Value, BrowserError>>,
     },
+    NextEvent {
+        endpoint: String,
+        timeout_ms: u64,
+        response: mpsc::Sender<Result<Value, BrowserError>>,
+    },
 }
 
 /// Synchronous compatibility bridge for callers that cannot yet be async.
@@ -111,6 +116,20 @@ impl BlockingBrowserManager {
                                 let _ = response.send(result);
                                 continue;
                             }
+                            Request::NextEvent {
+                                endpoint,
+                                timeout_ms,
+                                response,
+                            } => {
+                                let result = async {
+                                    let connection = manager.connect(&endpoint).await?;
+                                    connection
+                                        .next_event(std::time::Duration::from_millis(timeout_ms))
+                                        .await
+                                }
+                                .await;
+                                let _ = response.send(result);
+                            }
                         }
                     }
                 });
@@ -182,6 +201,18 @@ impl BlockingBrowserManager {
                 revision: legacy_revision.unwrap_or_default().to_owned(),
                 method: method.to_owned(),
                 params,
+                response,
+            })
+            .map_err(|_| BrowserError::Closed)?;
+        receiver.recv().map_err(|_| BrowserError::Closed)?
+    }
+
+    pub fn next_event(&self, endpoint: &str, timeout_ms: u64) -> Result<Value, BrowserError> {
+        let (response, receiver) = mpsc::channel();
+        self.requests
+            .send(Request::NextEvent {
+                endpoint: endpoint.to_owned(),
+                timeout_ms,
                 response,
             })
             .map_err(|_| BrowserError::Closed)?;
