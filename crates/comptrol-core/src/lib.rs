@@ -29,7 +29,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.21";
+pub const SERVER_VERSION: &str = "0.1.22";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 pub fn privacy_status() -> Value {
@@ -843,6 +843,36 @@ impl Runtime {
             return result;
         }
         let plan = route_plan(&request);
+        if request.dry_run {
+            let route_error = plan.selected.is_none().then(|| ComptrolError {
+                code: "route_unavailable".to_owned(),
+                message: plan.rationale.clone(),
+                recovery: Some(
+                    "Inspect routes and satisfy the selected route's feasibility gates".to_owned(),
+                ),
+            });
+            let result = ActionResult {
+                operation_id,
+                intent: request.intent.clone(),
+                route: plan.selected.clone().unwrap_or_else(|| "none".to_owned()),
+                target: request.target.clone(),
+                preflight: if plan.selected.is_some() {
+                    "passed"
+                } else {
+                    "failed"
+                }
+                .to_owned(),
+                delivery: DeliveryState::NotDispatched,
+                effect: EffectState::NotAttempted,
+                verification: VerificationState::NotAttempted,
+                disturbance: json!({ "foreground_changed": false }),
+                recovery: RecoveryState::None,
+                data: json!({ "dry_run": true, "risk": risk, "route_plan": plan }),
+                error: route_error,
+            };
+            self.remember(&request, result.clone());
+            return result;
+        }
         if plan.selected.is_none() {
             let result = ActionResult::refused(
                 &request,
@@ -856,24 +886,6 @@ impl Runtime {
                     ),
                 },
             );
-            self.remember(&request, result.clone());
-            return result;
-        }
-        if request.dry_run {
-            let result = ActionResult {
-                operation_id,
-                intent: request.intent.clone(),
-                route: plan.selected.clone().unwrap_or_else(|| "none".to_owned()),
-                target: request.target.clone(),
-                preflight: "passed".to_owned(),
-                delivery: DeliveryState::NotDispatched,
-                effect: EffectState::NotAttempted,
-                verification: VerificationState::NotAttempted,
-                disturbance: json!({ "foreground_changed": false }),
-                recovery: RecoveryState::None,
-                data: json!({ "dry_run": true, "risk": risk, "route_plan": plan }),
-                error: None,
-            };
             self.remember(&request, result.clone());
             return result;
         }
@@ -5018,6 +5030,33 @@ mod tests {
                 .rationale
                 .contains("strict_background requires")
         );
+    }
+
+    #[test]
+    fn unavailable_dry_run_preserves_route_rejection_rationale() {
+        let mut runtime = runtime();
+        runtime
+            .policy
+            .allowed_intents
+            .insert("browser.cdp.open_tab".to_owned());
+        runtime.policy.max_risk = Risk::R2;
+        let result = runtime.operate(OperationRequest {
+            intent: "browser.cdp.open_tab".to_owned(),
+            target: None,
+            params: json!({"url":"https://example.test", "background":false}),
+            postcondition: None,
+            risk: None,
+            idempotency_key: Some("route-plan-unavailable".to_owned()),
+            dry_run: true,
+            background: Some("strict_background".to_owned()),
+        });
+        assert_eq!(result.route, "none");
+        assert_eq!(result.preflight, "failed");
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("route_unavailable")
+        );
+        assert!(result.data["route_plan"]["rationale"].as_str().is_some());
     }
 
     #[test]

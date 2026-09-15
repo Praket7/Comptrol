@@ -17,11 +17,22 @@ struct CdpSession {
     events: VecDeque<Value>,
 }
 
+struct TargetCacheEntry {
+    observed_at: Instant,
+    targets: Vec<BrowserTarget>,
+}
+
 type CdpSessions = HashMap<String, CdpSession>;
+type TargetCaches = HashMap<String, TargetCacheEntry>;
 
 fn cdp_sessions() -> &'static Mutex<CdpSessions> {
     static SESSIONS: OnceLock<Mutex<CdpSessions>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn target_caches() -> &'static Mutex<TargetCaches> {
+    static CACHES: OnceLock<Mutex<TargetCaches>> = OnceLock::new();
+    CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
@@ -30,11 +41,37 @@ pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
         message: error.to_string(),
         recovery: Some("Start a supported browser with remote debugging enabled".to_owned()),
     })?;
-    parse_targets(&value).ok_or_else(|| ComptrolError {
+    let targets = parse_targets(&value).ok_or_else(|| ComptrolError {
         code: "browser_protocol_invalid".to_owned(),
         message: "The browser returned an invalid target list".to_owned(),
         recovery: Some("Inspect the configured DevTools endpoint".to_owned()),
-    })
+    })?;
+    if let Ok(mut caches) = target_caches().lock() {
+        caches.insert(
+            endpoint.to_owned(),
+            TargetCacheEntry {
+                observed_at: Instant::now(),
+                targets: targets.clone(),
+            },
+        );
+    }
+    Ok(targets)
+}
+
+fn discover_cached(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
+    if let Ok(caches) = target_caches().lock()
+        && let Some(entry) = caches.get(endpoint)
+        && entry.observed_at.elapsed() <= Duration::from_millis(100)
+    {
+        return Ok(entry.targets.clone());
+    }
+    discover(endpoint)
+}
+
+fn invalidate_target_cache(endpoint: &str) {
+    if let Ok(mut caches) = target_caches().lock() {
+        caches.remove(endpoint);
+    }
 }
 
 pub fn parse_targets(value: &Value) -> Option<Vec<BrowserTarget>> {
@@ -629,8 +666,17 @@ pub fn cdp_call(
     method: &str,
     params: Value,
 ) -> Result<Value, ComptrolError> {
-    let targets = discover(endpoint)?;
-    let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
+    let targets = discover_cached(endpoint)?;
+    let target = match crate::bind_browser_target(&targets, target_id, browser_context_id, revision)
+    {
+        Ok(target) => target,
+        Err(error) if matches!(error.code.as_str(), "stale_reference" | "target_gone") => {
+            invalidate_target_cache(endpoint);
+            let refreshed = discover(endpoint)?;
+            crate::bind_browser_target(&refreshed, target_id, browser_context_id, revision)?
+        }
+        Err(error) => return Err(error),
+    };
     let Some(web_socket_url) = target.web_socket_url else {
         return Err(ComptrolError {
             code: "browser_protocol_invalid".to_owned(),
@@ -638,7 +684,17 @@ pub fn cdp_call(
             recovery: Some("Inspect browser targets again".to_owned()),
         });
     };
-    persistent_call(&web_socket_url, method, params)
+    let result = persistent_call(&web_socket_url, method, params);
+    if matches!(
+        method,
+        "Page.navigate"
+            | "Page.navigateToHistoryEntry"
+            | "Runtime.evaluate"
+            | "DOM.setFileInputFiles"
+    ) {
+        invalidate_target_cache(endpoint);
+    }
+    result
 }
 
 /// Resolve and click a semantic locator in one bounded browser transaction.
