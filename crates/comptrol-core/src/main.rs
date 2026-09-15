@@ -293,6 +293,19 @@ impl TaskStore {
                    at_ms INTEGER NOT NULL,
                    FOREIGN KEY(task_id) REFERENCES tasks(task_id)
                  );
+                 CREATE TABLE IF NOT EXISTS route_stats (
+                   route_key TEXT PRIMARY KEY,
+                   attempts INTEGER NOT NULL DEFAULT 0,
+                   verified_successes INTEGER NOT NULL DEFAULT 0,
+                   verification_failures INTEGER NOT NULL DEFAULT 0,
+                   dispatch_failures INTEGER NOT NULL DEFAULT 0,
+                   disturbance_events INTEGER NOT NULL DEFAULT 0,
+                   ewma_latency_ms REAL,
+                   p95_latency_ms REAL,
+                   last_success_at_ms INTEGER,
+                   app_version TEXT,
+                   adapter_version TEXT
+                 );
                  INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms)
                    VALUES (1, strftime('%s','now') * 1000);",
             )
@@ -440,6 +453,40 @@ impl TaskStore {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect()
     }
+
+    fn record_route_outcome(
+        &mut self,
+        route: &str,
+        verified: bool,
+        dispatch_failed: bool,
+        disturbance: bool,
+        latency_ms: u128,
+    ) -> rusqlite::Result<()> {
+        let latency = latency_ms as f64;
+        self.connection.execute(
+            "INSERT INTO route_stats(route_key, attempts, verified_successes, verification_failures, dispatch_failures, disturbance_events, ewma_latency_ms, p95_latency_ms, last_success_at_ms)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?6, CASE WHEN ?2 = 1 THEN ?7 ELSE NULL END)
+             ON CONFLICT(route_key) DO UPDATE SET
+               attempts = attempts + 1,
+               verified_successes = verified_successes + excluded.verified_successes,
+               verification_failures = verification_failures + excluded.verification_failures,
+               dispatch_failures = dispatch_failures + excluded.dispatch_failures,
+               disturbance_events = disturbance_events + excluded.disturbance_events,
+               ewma_latency_ms = (COALESCE(route_stats.ewma_latency_ms, excluded.ewma_latency_ms) * 0.8) + (excluded.ewma_latency_ms * 0.2),
+               p95_latency_ms = MAX(COALESCE(route_stats.p95_latency_ms, 0), excluded.p95_latency_ms),
+               last_success_at_ms = CASE WHEN excluded.last_success_at_ms IS NOT NULL THEN excluded.last_success_at_ms ELSE route_stats.last_success_at_ms END",
+            params![
+                route,
+                i64::from(verified),
+                i64::from(!verified && !dispatch_failed),
+                i64::from(dispatch_failed),
+                i64::from(disturbance),
+                latency,
+                now_ms() as i64,
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
@@ -527,6 +574,7 @@ impl TaskManager {
                     return;
                 }
                 let _ = update_task(&store, &task_id, "running", Value::Null);
+                let started_at_ms = now_ms();
                 let result = {
                     let mut runtime = runtime.lock().expect("runtime lock poisoned");
                     call_tool(&mut runtime, params)
@@ -544,6 +592,34 @@ impl TaskManager {
                 } else {
                     ("completed", result)
                 };
+                if status == "completed" {
+                    let route = stored_result
+                        .get("route")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let verified = stored_result
+                        .get("verification")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == "verified");
+                    let dispatch_failed = stored_result
+                        .get("delivery")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == "failed" || value == "refused");
+                    let disturbance = stored_result
+                        .get("disturbance")
+                        .and_then(|value| value.get("foreground_changed"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Ok(mut store) = store.lock() {
+                        let _ = store.record_route_outcome(
+                            route,
+                            verified,
+                            dispatch_failed,
+                            disturbance,
+                            now_ms().saturating_sub(started_at_ms),
+                        );
+                    }
+                }
                 let _ = update_task(&store, &task_id, status, stored_result);
                 cancellation
                     .lock()
