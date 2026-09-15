@@ -140,7 +140,7 @@ impl HttpStore {
     fn create_session(&self) -> io::Result<String> {
         let mut bytes = [0_u8; 24];
         getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
-        let session = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let session: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         let mut state = self.state.lock().expect("HTTP state lock poisoned");
         state.sessions.insert(
             session.clone(),
@@ -1091,6 +1091,12 @@ fn run_daemon_health() -> i32 {
         return 1;
     }
     match read_ipc_frame(&mut stream).and_then(|frame| {
+        let frame = frame.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing daemon health response",
+            )
+        })?;
         serde_json::from_slice::<Value>(&frame)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }) {
@@ -1196,7 +1202,7 @@ fn handle_ipc_connection<S: Read + Write>(
                 let response = handle_message_with_state(
                     runtime,
                     Some(tasks),
-                    tasks_enabled,
+                    &mut tasks_enabled,
                     &line,
                     |notification| notifications.push(notification),
                 )
@@ -1287,7 +1293,7 @@ fn handle_http(
     let Some(header_end) = header_end else {
         return write_http_error(stream, 413, "message_too_large");
     };
-    let header = String::from_utf8_lossy(&buffer[..header_end]);
+    let header = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
     let declared_length = header.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("content-length")
@@ -1368,7 +1374,7 @@ fn handle_http(
             200,
             "OK",
             "text/html; charset=utf-8",
-            dashboard(runtime).into_bytes(),
+            dashboard(&mut runtime).into_bytes(),
             None,
         );
     }
@@ -1403,13 +1409,23 @@ fn handle_http(
         );
     }
     if request_line.starts_with("GET /mcp ") {
-        if !http_state.contains(session) {
+        let Some(session) = session else {
             return write_http_response(
                 stream,
-                if session.is_some() { 404 } else { 400 },
-                if session.is_some() { "Not Found" } else { "Bad Request" },
+                400,
+                "Bad Request",
                 "application/json",
-                serde_json::to_vec(&json!({"error": if session.is_some() { "session_not_found" } else { "session_required" }})).unwrap_or_default(),
+                serde_json::to_vec(&json!({"error":"session_required"})).unwrap_or_default(),
+                None,
+            );
+        };
+        if !http_state.contains(Some(session)) {
+            return write_http_response(
+                stream,
+                404,
+                "Not Found",
+                "application/json",
+                serde_json::to_vec(&json!({"error":"session_not_found"})).unwrap_or_default(),
                 None,
             );
         }
