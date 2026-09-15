@@ -33,6 +33,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release
       - run: python3 scripts/lint_readme.py
+      - run: python3 scripts/test_release_verification.py
       - run: python3 scripts/adapter_conformance.py
       - run: python3 scripts/adapter_runtime_conformance.py
         env:
