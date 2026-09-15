@@ -553,6 +553,153 @@ pub fn cdp_call(
     }
 }
 
+/// Resolve and click a semantic locator in one bounded browser transaction.
+///
+/// The locator is intentionally data-only. The page receives no caller-supplied
+/// JavaScript, and the element is resolved again inside the action transaction so
+/// React-style rerenders cannot leave us holding a stale DOM node.
+pub fn semantic_click(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: Option<&str>,
+    locator: &Value,
+    timeout_ms: u64,
+) -> Result<Value, ComptrolError> {
+    if !locator.is_object() {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Semantic browser locators must be an object".to_owned(),
+            recovery: Some("Use role/name, text, test_id, href_contains, or selector".to_owned()),
+        });
+    }
+    let locator_json = serde_json::to_string(locator).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: None,
+    })?;
+    let timeout_ms = timeout_ms.clamp(100, 30_000);
+    let expression = format!(
+        r#"(async () => {{
+            const locator = {locator_json};
+            const deadline = performance.now() + {timeout_ms};
+            const normalize = value => String(value || '').replace(/\\s+/g, ' ').trim();
+            const nameOf = element => normalize(
+                element.getAttribute('aria-label') ||
+                element.getAttribute('title') ||
+                element.innerText ||
+                element.textContent
+            );
+            const roleOf = element => element.getAttribute('role') ||
+                (element.tagName === 'A' ? 'link' :
+                 element.tagName === 'BUTTON' ? 'button' :
+                 element.tagName === 'INPUT' ? 'textbox' : '');
+            const candidates = () => {{
+                let elements;
+                if (locator.selector) {{
+                    elements = [...document.querySelectorAll(locator.selector)];
+                }} else if (locator.test_id) {{
+                    elements = [...document.querySelectorAll('[data-testid], [data-test-id]')];
+                }} else {{
+                    elements = [...document.querySelectorAll('button, a, input, select, textarea, [role], [tabindex]')];
+                }}
+                return elements.filter(element => {{
+                    if (locator.test_id &&
+                        element.getAttribute('data-testid') !== locator.test_id &&
+                        element.getAttribute('data-test-id') !== locator.test_id) return false;
+                    if (locator.role && roleOf(element) !== locator.role) return false;
+                    if (locator.name && nameOf(element) !== normalize(locator.name)) return false;
+                    if (locator.text && !normalize(element.innerText || element.textContent).includes(normalize(locator.text))) return false;
+                    if (locator.href_contains && !(element.href || '').includes(locator.href_contains)) return false;
+                    return true;
+                }});
+            }};
+            const actionable = element => {{
+                if (!element.isConnected || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || !rect.width || !rect.height) return false;
+                const x = Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2));
+                const y = Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2));
+                const hit = document.elementFromPoint(x, y);
+                return hit === element || Boolean(hit && element.contains(hit));
+            }};
+            const stable = async element => {{
+                const first = element.getBoundingClientRect();
+                await new Promise(requestAnimationFrame);
+                const second = element.getBoundingClientRect();
+                return first.left === second.left && first.top === second.top &&
+                    first.width === second.width && first.height === second.height;
+            }};
+            while (performance.now() < deadline) {{
+                const matches = candidates();
+                if (matches.length === 1) {{
+                    const element = matches[0];
+                    element.scrollIntoView({{ block: 'center', inline: 'nearest' }});
+                    if (actionable(element) && await stable(element) && actionable(element)) {{
+                        element.click();
+                        return {{ clicked: true, matches: 1, role: roleOf(element), name: nameOf(element) }};
+                    }}
+                }} else if (matches.length > 1) {{
+                    return {{ clicked: false, reason: 'ambiguous_locator', matches: matches.length }};
+                }}
+                await new Promise(resolve => setTimeout(resolve, 25));
+            }}
+            return {{ clicked: false, reason: 'not_actionable', matches: candidates().length }};
+        }})()"#
+    );
+    let mut last_error = None;
+    for attempt in 0..=1 {
+        let current_revision = if attempt == 0 { revision } else { None };
+        match cdp_call(
+            endpoint,
+            target_id,
+            Some(browser_context_id),
+            current_revision,
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+        ) {
+            Ok(data) => {
+                let value = data
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if value.get("clicked").and_then(Value::as_bool) == Some(true) {
+                    return Ok(json!({
+                        "result": data,
+                        "semantic_locator": locator,
+                        "attempts": attempt + 1,
+                        "verified": true
+                    }));
+                }
+                return Err(ComptrolError {
+                    code: value
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("verification_failed")
+                        .to_owned(),
+                    message: format!("Semantic locator did not resolve to one actionable element: {value}"),
+                    recovery: Some("Inspect the current accessibility tree and refine the locator".to_owned()),
+                });
+            }
+            Err(error) if error.code == "stale_reference" && attempt == 0 => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| ComptrolError {
+        code: "stale_reference".to_owned(),
+        message: "The browser target changed during semantic click".to_owned(),
+        recovery: Some("Inspect browser targets and retry once".to_owned()),
+    }))
+}
+
 pub fn cdp_upload(
     endpoint: &str,
     target_id: &str,

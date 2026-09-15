@@ -26,7 +26,7 @@ pub use geometry::{DisplayGeometry, Point, VirtualDesktop};
 pub use trace::{TraceEntry, TraceMode, TraceRecorder, read_trace};
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.8";
+pub const SERVER_VERSION: &str = "0.1.9";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 pub fn privacy_status() -> Value {
@@ -409,6 +409,7 @@ impl Policy {
                 "browser.cdp.close_tab".to_owned(),
                 "browser.cdp.history_back".to_owned(),
                 "browser.cdp.history_forward".to_owned(),
+                "browser.cdp.semantic_click".to_owned(),
             ]);
         }
         if std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1") {
@@ -908,6 +909,7 @@ impl Runtime {
             | "browser.cdp.close_tab"
             | "browser.cdp.history_back"
             | "browser.cdp.history_forward"
+            | "browser.cdp.semantic_click"
             | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             _ => ActionResult::refused(
@@ -1189,7 +1191,8 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.open_tab"
         | "browser.cdp.close_tab"
         | "browser.cdp.history_back"
-        | "browser.cdp.history_forward" => Risk::R2,
+        | "browser.cdp.history_forward"
+        | "browser.cdp.semantic_click" => Risk::R2,
         "browser.cdp.wait_for"
         | "browser.cdp.accessibility_snapshot"
         | "browser.cdp.reopen_closed_group" => Risk::R0,
@@ -1387,6 +1390,7 @@ fn route_for(intent: &str) -> String {
         | "browser.cdp.close_tab"
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward"
+        | "browser.cdp.semantic_click"
         | "browser.cdp.accessibility_snapshot"
         | "browser.cdp.reopen_closed_group"
         | "browser.cdp.wait_for" => "browser_protocol",
@@ -1622,6 +1626,9 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             Err(error) => browser_failure(request, operation_id, error),
         };
     }
+    if request.intent == "browser.cdp.semantic_click" {
+        return browser_cdp_semantic_click(request, operation_id, &endpoint);
+    }
     let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) else {
         return ActionResult::refused(
             request,
@@ -1818,6 +1825,65 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             } else {
                 VerificationState::Unverified
             },
+            data,
+        ),
+        Err(error) => browser_failure(request, operation_id, error),
+    }
+}
+
+fn browser_cdp_semantic_click(
+    request: &OperationRequest,
+    operation_id: String,
+    endpoint: &std::ffi::OsStr,
+) -> ActionResult {
+    let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Semantic browser clicks need a target id".to_owned(),
+                recovery: Some("Inspect browser targets before the semantic action".to_owned()),
+            },
+        );
+    };
+    let browser_context_id = request
+        .params
+        .get("browser_context_id")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let Some(locator) = request.params.get("locator") else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Semantic browser clicks need a locator object".to_owned(),
+                recovery: Some("Provide role/name, text, test_id, href_contains, or selector".to_owned()),
+            },
+        );
+    };
+    let revision = request.params.get("revision").and_then(Value::as_str);
+    let timeout = request
+        .params
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(3_000)
+        .min(30_000);
+    match browser::semantic_click(
+        &endpoint.to_string_lossy(),
+        target_id,
+        browser_context_id,
+        revision,
+        locator,
+        timeout,
+    ) {
+        Ok(data) => success(
+            request,
+            operation_id,
+            "browser_protocol",
+            EffectState::Changed,
+            VerificationState::Verified,
             data,
         ),
         Err(error) => browser_failure(request, operation_id, error),
@@ -4154,6 +4220,14 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R1,
             route: "browser_protocol".to_owned(),
             note: "Focuses one exact live page element without mouse or clipboard input".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.semantic_click".to_owned(),
+            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "browser_protocol".to_owned(),
+            note: "Resolves a fresh semantic locator, checks visibility and overlay coverage, then retries once after a stale target revision".to_owned(),
         },
         Capability {
             name: "browser.cdp.reopen_closed_group".to_owned(),

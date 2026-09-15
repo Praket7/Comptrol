@@ -32,4 +32,6 @@ Uploads are restricted to the Comptrol sandbox and verify the selected filename.
 
 The CDP operation surface also provides target bound fill, click, and wait for condition routes. Fill verifies the resulting value. Click reports unverified unless a caller supplies a postcondition expression. Wait uses an allowlisted DOM property with an equals or contains condition, a bounded timeout, and no caller supplied JavaScript.
 
+`browser.cdp.semantic_click` is the dynamic-site fast path. It accepts a data-only locator such as `{ "role": "button", "name": "Submit" }`, `{ "text": "Buffalo Bills" }`, `{ "test_id": "checkout" }`, `{ "href_contains": "/team/" }`, or `{ "selector": "#known-control" }`. The runtime resolves the locator at action time, requires exactly one attached and visible match, checks that it is enabled and receives events rather than being covered by an overlay, waits for two stable animation frames, and then clicks it. If the supplied revision is stale, it refreshes the exact target once and retries; it never performs an unbounded retry or guesses another tab. The result is verified when the semantic click itself completed, while a caller can still provide a separate follow-up `browser.cdp.wait_for` postcondition for navigation or SPA state.
+
 Run `node scripts/browser_conformance.mjs` from the repository root.
