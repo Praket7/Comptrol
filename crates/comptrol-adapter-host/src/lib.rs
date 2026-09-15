@@ -6,7 +6,8 @@ use serde_json::Value;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct AdapterHostConfig {
@@ -15,6 +16,7 @@ pub struct AdapterHostConfig {
     pub arguments: Vec<String>,
     pub instance_id: String,
     pub max_frame_bytes: usize,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug)]
@@ -22,7 +24,7 @@ pub struct AdapterHost {
     config: AdapterHostConfig,
     child: Child,
     stdin: ChildStdin,
-    stdout: ChildStdout,
+    stdout: Option<ChildStdout>,
     request_sequence: u64,
 }
 
@@ -31,6 +33,7 @@ pub enum HostError {
     Io(io::Error),
     Protocol(String),
     Json(serde_json::Error),
+    Timeout,
 }
 
 impl std::fmt::Display for HostError {
@@ -39,6 +42,7 @@ impl std::fmt::Display for HostError {
             Self::Io(error) => write!(formatter, "adapter host I/O failed: {error}"),
             Self::Protocol(error) => write!(formatter, "adapter protocol failed: {error}"),
             Self::Json(error) => write!(formatter, "adapter JSON failed: {error}"),
+            Self::Timeout => write!(formatter, "adapter I/O deadline exceeded"),
         }
     }
 }
@@ -82,7 +86,7 @@ impl AdapterHost {
             config,
             child,
             stdin,
-            stdout,
+            stdout: Some(stdout),
             request_sequence: 0,
         })
     }
@@ -128,7 +132,7 @@ impl AdapterHost {
             protocol_version: ADAPTER_PROTOCOL_VERSION,
             adapter_instance_id: self.config.instance_id.clone(),
             request_id: format!("adapter-request-{}", self.request_sequence),
-            deadline_ms: now_ms().saturating_add(5_000),
+            deadline_ms: now_ms().saturating_add(self.config.timeout_ms),
             capability_token: token,
             resource_scope: resource.to_owned(),
             method: method.to_owned(),
@@ -145,7 +149,25 @@ impl AdapterHost {
         }
         self.stdin.write_all(&encoded)?;
         self.stdin.flush()?;
-        let response: RpcResponse = read_frame(&mut self.stdout, self.config.max_frame_bytes)?;
+        let stdout = self
+            .stdout
+            .take()
+            .ok_or_else(|| HostError::Protocol("adapter stdout is unavailable".to_owned()))?;
+        let max_frame_bytes = self.config.max_frame_bytes;
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stdout = stdout;
+            let result = read_frame(&mut stdout, max_frame_bytes);
+            let _ = sender.send((stdout, result));
+        });
+        let (stdout, response) = receiver
+            .recv_timeout(Duration::from_millis(self.config.timeout_ms))
+            .map_err(|_| {
+                let _ = self.child.kill();
+                HostError::Timeout
+            })?;
+        self.stdout = Some(stdout);
+        let response = response?;
         if response.protocol_version != ADAPTER_PROTOCOL_VERSION
             || response.adapter_instance_id != self.config.instance_id
             || response.request_id != request.request_id
@@ -224,6 +246,7 @@ mod tests {
             arguments: Vec::new(),
             instance_id: "instance".to_owned(),
             max_frame_bytes: MAX_FRAME_BYTES,
+            timeout_ms: 1_000,
         };
         assert!(config.manifest.validate().is_ok());
     }

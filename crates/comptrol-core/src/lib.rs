@@ -1496,6 +1496,12 @@ fn execute_adapter_request(
             arguments: vec![script.to_string_lossy().into_owned()],
             instance_id: format!("{adapter_name}-{operation_id}"),
             max_frame_bytes: comptrol_adapter_sdk::MAX_FRAME_BYTES,
+            timeout_ms: request
+                .params
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(5_000)
+                .clamp(100, 120_000),
         };
         let mut host = match AdapterHost::spawn(config) {
             Ok(host) => host,
