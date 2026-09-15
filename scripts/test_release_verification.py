@@ -49,4 +49,12 @@ with tempfile.TemporaryDirectory(prefix="comptrol-release-test-") as temporary:
     (root / "invalid.sbom.json").write_text('{"packages": []}\n', encoding="utf-8")
     run(root, False)
 
+    empty = root / "empty.zip"
+    with zipfile.ZipFile(empty, "w") as package:
+        package.writestr("comptrol/comptrol", b"")
+    digest = hashlib.sha256(empty.read_bytes()).hexdigest()
+    (root / "empty.zip.sha256").write_text(f"{digest}  empty.zip\n", encoding="utf-8")
+    (root / "empty.sbom.json").write_text('{"packages": []}\n', encoding="utf-8")
+    run(root, False)
+
 print("release verification regression tests passed")
