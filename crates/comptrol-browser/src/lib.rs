@@ -152,6 +152,26 @@ impl BrowserConnection {
         response_rx.await.map_err(|_| BrowserError::Cancelled)?
     }
 
+    pub async fn bootstrap(&self) -> Result<(), BrowserError> {
+        self.command(
+            None,
+            "Target.setDiscoverTargets",
+            serde_json::json!({"discover": true}),
+        )
+        .await?;
+        self.command(
+            None,
+            "Target.setAutoAttach",
+            serde_json::json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": false,
+                "flatten": true
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -448,6 +468,42 @@ mod tests {
             Some("Event tab")
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_enables_discovery_and_flattened_auto_attach() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut methods = Vec::new();
+            while methods.len() < 2 {
+                if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                    socket.next().await
+                {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    methods.push(request["method"].as_str().unwrap().to_owned());
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!({"id":request["id"],"result":{}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            methods
+        });
+        let connection = BrowserConnection::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        connection.bootstrap().await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            vec!["Target.setDiscoverTargets", "Target.setAutoAttach"]
+        );
     }
 
     #[test]
