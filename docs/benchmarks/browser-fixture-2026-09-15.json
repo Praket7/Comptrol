@@ -26,6 +26,6 @@
     "binary": "target/release/comptrol",
     "fixture": "scripts/browser_fixture.mjs",
     "host": "WSL2 Linux",
-    "release_line": "0.1.30"
+    "release_line": "0.1.32"
   }
 }

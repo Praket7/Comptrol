@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 
 
 def send(process, message):
@@ -65,8 +66,16 @@ with tempfile.TemporaryDirectory(prefix="comptrol-tasks-") as state:
         assert progress_end["params"]["progress"] == 1
         task = created["result"]["task"]
         assert created["result"]["resultType"] == "task"
-        assert task["status"] == "completed"
         task_id = task["taskId"]
+        deadline = time.time() + 10
+        while task["status"] not in {"completed", "failed", "cancelled", "unknown"}:
+            assert time.time() < deadline, task
+            send(process, {"jsonrpc": "2.0", "id": 10, "method": "tasks/get", "params": {"taskId": task_id}})
+            task_response = read(process)
+            task = task_response["result"]
+            if task["status"] not in {"completed", "failed", "cancelled", "unknown"}:
+                time.sleep(task.get("pollIntervalMs", 50) / 1000)
+        assert task["status"] == "completed", task
     finally:
         process.terminate()
         process.wait(timeout=3)

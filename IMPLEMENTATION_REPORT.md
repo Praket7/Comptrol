@@ -46,7 +46,7 @@ The npm launcher now has an opt in daemon mode on Unix and Windows. It preserves
 
 The optimized Rust build, format check, Clippy with warnings denied, workspace tests, README lint, and browser fixture conformance pass in WSL. Native headed Chrome acceptance remains host-dependent and is not claimed here.
 
-The `v0.1.30` GitHub release workflow completed successfully across all five native targets, with validation and security workflows green. It includes target-scoped visual evidence for dynamic-site recovery, direct Windows UIA, Linux AT-SPI, and macOS AX source adapters, honest staged upload verification, browser target-cache reuse, WSL-versus-Windows binary diagnostics, isolated adapter runtime validation, and the measured browser fixture benchmark. npm registry verification confirmed `comptrolling@0.1.30` and its published launcher bins.
+The `v0.1.32` source release includes the completed validation-helper fixes on top of the v0.1.30 native release. The v0.1.30 GitHub release workflow completed successfully across all five native targets, with validation and security workflows green. It includes target-scoped visual evidence for dynamic-site recovery, direct Windows UIA, Linux AT-SPI, and macOS AX source adapters, honest staged upload verification, browser target-cache reuse, WSL-versus-Windows binary diagnostics, isolated adapter runtime validation, and the measured browser fixture benchmark. npm registry verification confirmed `comptrolling@0.1.30` and its published launcher bins; v0.1.32 publication remains pending its release workflow.
 
 ## Platform matrix
 
