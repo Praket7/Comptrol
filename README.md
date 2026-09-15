@@ -38,7 +38,7 @@ The standard input and output transport is the compatibility path for Codex, Cla
 
 ## Install the launcher
 
-The published npm launcher is named `comptrolling`.
+The published npm package is named `comptrolling`. Starting with version 0.1.1 it bundles the native runtime for macOS, Linux, and Windows.
 
 ```text
 npm install comptrolling

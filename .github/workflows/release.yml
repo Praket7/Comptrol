@@ -94,4 +94,33 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Bundle native binaries for npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p packages/mcp/native
+          for spec in \
+            "comptrol-linux-intel linux-x64" \
+            "comptrol-linux-arm64 linux-arm64" \
+            "comptrol-macos-arm64 darwin-arm64" \
+            "comptrol-macos-intel darwin-x64" \
+            "comptrol-windows win32-x64"; do
+            artifact="${spec%% *}"
+            platform="${spec##* }"
+            archive="$(find "release-assets/${artifact}" -name '*.zip' -type f | head -n1)"
+            test -n "$archive"
+            mkdir -p "packages/mcp/native/${platform}"
+            unzip -q "$archive" -d "packages/mcp/native/${platform}"
+            mv "packages/mcp/native/${platform}/comptrol/"* "packages/mcp/native/${platform}/"
+            rmdir "packages/mcp/native/${platform}/comptrol"
+          done
+          chmod +x packages/mcp/native/*/comptrol 2>/dev/null || true
+          test -f packages/mcp/native/darwin-arm64/comptrol
+          test -f packages/mcp/native/darwin-x64/comptrol
+          test -f packages/mcp/native/linux-arm64/comptrol
+          test -f packages/mcp/native/linux-x64/comptrol
+          test -f packages/mcp/native/win32-x64/comptrol.exe
       - run: npm publish --workspace packages/mcp --access public

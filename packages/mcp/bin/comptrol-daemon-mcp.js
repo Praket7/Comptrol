@@ -1,9 +1,15 @@
 const { spawn } = require("node:child_process");
+const fs = require("node:fs");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 
-const binary = process.env.COMPTROL_BIN || "comptrol";
+function bundledBinary() {
+  const platform = `${process.platform}-${process.arch}`;
+  return path.join(__dirname, "..", "native", platform, process.platform === "win32" ? "comptrol.exe" : "comptrol");
+}
+
+const binary = process.env.COMPTROL_BIN || (fs.existsSync(bundledBinary()) ? bundledBinary() : "comptrol");
 const maxRestarts = 3;
 const maxFrameBytes = 1024 * 1024;
 const pending = [];
