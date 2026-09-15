@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_TASK_TTL_MS: u64 = 300_000;
 const TASK_POLL_INTERVAL_MS: u64 = 50;
@@ -692,39 +692,47 @@ fn run_http(port: u16) -> i32 {
 
 fn handle_http(stream: &mut TcpStream, runtime: &mut Runtime) -> io::Result<()> {
     // ponytail: bounded local parser, replace with a full HTTP implementation before public network exposure
-    let mut buffer = vec![0_u8; 2 * 1024 * 1024];
-    let size = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..size]);
-    let declared_length = request
-        .split("\r\n\r\n")
-        .next()
-        .unwrap_or_default()
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        });
-    if declared_length.is_some_and(|length| length > MAX_PROTOCOL_BYTES)
-        || (size == buffer.len() && !request.contains("\r\n\r\n"))
-    {
-        let payload = serde_json::to_vec(&json!({
-            "error": "message_too_large",
-            "limit": MAX_PROTOCOL_BYTES
-        }))
-        .unwrap_or_default();
-        write!(
-            stream,
-            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            payload.len()
-        )?;
-        stream.write_all(&payload)?;
-        return Ok(());
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    let mut buffer = Vec::with_capacity(8192);
+    let header_end = loop {
+        let mut chunk = [0_u8; 8192];
+        let size = stream.read(&mut chunk)?;
+        if size == 0 {
+            break None;
+        }
+        buffer.extend_from_slice(&chunk[..size]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break Some(position);
+        }
+        if buffer.len() > MAX_PROTOCOL_BYTES {
+            break None;
+        }
+    };
+    let Some(header_end) = header_end else {
+        return write_http_error(stream, 413, "message_too_large");
+    };
+    let header = String::from_utf8_lossy(&buffer[..header_end]);
+    let declared_length = header.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+    if declared_length.is_some_and(|length| length > MAX_PROTOCOL_BYTES) {
+        return write_http_error(stream, 413, "message_too_large");
     }
-    let mut sections = request.split("\r\n\r\n");
-    let header = sections.next().unwrap_or_default();
-    let body = sections.next().unwrap_or_default();
+    let body_start = header_end + 4;
+    let body_length = declared_length.unwrap_or(0);
+    while buffer.len() < body_start + body_length {
+        let mut chunk = [0_u8; 8192];
+        let size = stream.read(&mut chunk)?;
+        if size == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..size]);
+    }
+    let body_end = (body_start + body_length).min(buffer.len());
+    let body = String::from_utf8_lossy(&buffer[body_start..body_end]);
     let origin = header
         .lines()
         .find_map(|line| line.strip_prefix("Origin:").map(str::trim));
@@ -754,7 +762,7 @@ fn handle_http(stream: &mut TcpStream, runtime: &mut Runtime) -> io::Result<()> 
             serde_json::to_vec(&json!({"error":"method_not_allowed"})).unwrap_or_default(),
         )
     } else {
-        let value = handle_message(runtime, body).unwrap_or_else(|| json!({}));
+        let value = handle_message(runtime, body.as_ref()).unwrap_or_else(|| json!({}));
         (
             200,
             "application/json",
@@ -766,6 +774,20 @@ fn handle_http(stream: &mut TcpStream, runtime: &mut Runtime) -> io::Result<()> 
         "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         content_type,
+        payload.len()
+    )?;
+    stream.write_all(&payload)
+}
+
+fn write_http_error(stream: &mut TcpStream, status: u16, error: &str) -> io::Result<()> {
+    let payload = serde_json::to_vec(&json!({
+        "error": error,
+        "limit": MAX_PROTOCOL_BYTES
+    }))
+    .unwrap_or_default();
+    write!(
+        stream,
+        "HTTP/1.1 {status} Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     )?;
     stream.write_all(&payload)
