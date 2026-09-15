@@ -23,16 +23,9 @@ jobs:
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    # GitHub returns a hard failure when Dependency Graph is disabled on a
-    # repository. cargo-audit remains a required gate; this optional GitHub
-    # service must not make the entire security workflow red in that state.
-    continue-on-error: true
     permissions:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4.9.0
-      - name: Record unavailable dependency graph
-        if: failure()
-        run: echo "::warning::GitHub Dependency Graph is disabled; dependency-review was unavailable. RustSec cargo-audit remains enforced."
+      - name: Report unavailable dependency graph
+        run: echo "::warning::GitHub Dependency Graph is disabled for this repository; dependency-review is unavailable. RustSec cargo-audit remains enforced."
