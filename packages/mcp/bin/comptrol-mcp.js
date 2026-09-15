@@ -46,6 +46,12 @@ function start() {
     if (child === current) child = undefined;
     scheduleRestart(`because ${error.message}`);
   });
+  current.stdin.on("error", (error) => {
+    if (handled || stopping) return;
+    handled = true;
+    if (child === current) child = undefined;
+    scheduleRestart(`because the child input closed ${error.message}`);
+  });
   current.on("exit", (code, signal) => {
     if (handled) return;
     handled = true;

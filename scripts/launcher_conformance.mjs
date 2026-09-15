@@ -60,6 +60,12 @@ if (!output.includes('"ok":true')) {
   await rm(directory, { recursive: true, force: true });
   throw new Error(`launcher did not reconnect ${output} ${errors}`);
 }
+if (!errors.includes("reconnecting")) {
+  launcher.kill("SIGKILL");
+  await exited;
+  await rm(directory, { recursive: true, force: true });
+  throw new Error(`launcher did not report reconnect ${errors}`);
+}
 launcher.kill("SIGTERM");
 await exited;
 await rm(directory, { recursive: true, force: true });
