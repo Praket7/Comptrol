@@ -8,7 +8,12 @@ function bundledBinary() {
   return path.join(__dirname, "..", "native", platform, process.platform === "win32" ? "comptrol.exe" : "comptrol");
 }
 
-const binary = process.env.COMPTROL_BIN || (fs.existsSync(bundledBinary()) ? bundledBinary() : "comptrol");
+const binary = process.env.COMPTROL_BIN || (fs.existsSync(bundledBinary()) ? bundledBinary() : undefined);
+if (!binary) {
+  console.error(`Comptrol native binary is missing for ${process.platform}-${process.arch}; reinstall the package or set COMPTROL_BIN`);
+  process.exitCode = 1;
+  return;
+}
 const child = spawn(binary, ["serve-http", ...process.argv.slice(2)], {
   stdio: "inherit",
   env: process.env,
