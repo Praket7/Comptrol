@@ -364,6 +364,32 @@ impl TaskStore {
             .map(|task| task_view(&task))
     }
 
+    fn events_since(
+        &self,
+        task_id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<Value>> {
+        let mut statement = self.connection.prepare(
+            "SELECT seq, kind, payload_json, at_ms
+             FROM task_events
+             WHERE task_id = ?1 AND seq > ?2
+             ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let rows =
+            statement.query_map(params![task_id, after_seq as i64, limit as i64], |row| {
+                let payload: String = row.get(2)?;
+                Ok(json!({
+                    "eventId": row.get::<_, i64>(0)? as u64,
+                    "taskId": task_id,
+                    "kind": row.get::<_, String>(1)?,
+                    "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null),
+                    "at": row.get::<_, i64>(3)? as u128
+                }))
+            })?;
+        rows.collect()
+    }
+
     fn result(&self, task_id: &str) -> Option<Value> {
         self.get_record(task_id).ok().flatten().map(|task| {
             if task.status == "completed" {
@@ -698,6 +724,20 @@ impl TaskManager {
             .lock()
             .expect("task store lock poisoned")
             .get(task_id)
+    }
+
+    fn get_with_events(&self, task_id: &str, after_seq: u64) -> Option<Value> {
+        let store = self.store.lock().ok()?;
+        let mut task = store.get(task_id)?;
+        let events = store.events_since(task_id, after_seq, 256).ok()?;
+        let cursor = events
+            .last()
+            .and_then(|event| event.get("eventId"))
+            .and_then(Value::as_u64)
+            .unwrap_or(after_seq);
+        task["events"] = Value::Array(events);
+        task["eventCursor"] = json!(cursor);
+        Some(task)
     }
 
     fn result(&self, task_id: &str) -> Option<Value> {
@@ -1386,15 +1426,19 @@ where
 }
 
 fn task_get(tasks: Option<&TaskManager>, request: &Value) -> Value {
-    let Some(task_id) = request
-        .get("params")
-        .and_then(|params| params.get("taskId"))
-        .and_then(Value::as_str)
-    else {
+    let Some(params) = request.get("params") else {
         return task_error("tasks/get needs taskId");
     };
+    let Some(task_id) = params.get("taskId").and_then(Value::as_str) else {
+        return task_error("tasks/get needs taskId");
+    };
+    let after_seq = params
+        .get("afterEventId")
+        .or_else(|| params.get("lastEventId"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     tasks
-        .and_then(|manager| manager.get(task_id))
+        .and_then(|manager| manager.get_with_events(task_id, after_seq))
         .unwrap_or_else(|| task_error("task not found"))
 }
 
