@@ -574,14 +574,30 @@ pub fn semantic_click(
                 (element.tagName === 'A' ? 'link' :
                  element.tagName === 'BUTTON' ? 'button' :
                  element.tagName === 'INPUT' ? 'textbox' : '');
+            const roots = () => {{
+                const pending = [document];
+                const seen = [];
+                while (pending.length) {{
+                    const root = pending.shift();
+                    seen.push(root);
+                    for (const element of root.querySelectorAll('*')) {{
+                        if (element.shadowRoot) pending.push(element.shadowRoot);
+                        if (element.tagName === 'IFRAME') {{
+                            try {{ if (element.contentDocument) pending.push(element.contentDocument); }} catch (_) {{}}
+                        }}
+                    }}
+                }}
+                return seen;
+            }};
+            const all = selector => roots().flatMap(root => [...root.querySelectorAll(selector)]);
             const candidates = () => {{
                 let elements;
                 if (locator.selector) {{
-                    elements = [...document.querySelectorAll(locator.selector)];
+                    elements = all(locator.selector);
                 }} else if (locator.test_id) {{
-                    elements = [...document.querySelectorAll('[data-testid], [data-test-id]')];
+                    elements = all('[data-testid], [data-test-id]');
                 }} else {{
-                    elements = [...document.querySelectorAll('button, a, input, select, textarea, [role], [tabindex]')];
+                    elements = all('button, a, input, select, textarea, [role], [tabindex]');
                 }}
                 return elements.filter(element => {{
                     if (locator.test_id &&
@@ -602,7 +618,9 @@ pub fn semantic_click(
                 const x = Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2));
                 const y = Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2));
                 const hit = document.elementFromPoint(x, y);
-                return hit === element || Boolean(hit && element.contains(hit));
+                const host = element.getRootNode() && element.getRootNode().host;
+                return hit === element || Boolean(hit && element.contains(hit)) ||
+                    Boolean(host && (hit === host || host.contains(hit)));
             }};
             const stable = async element => {{
                 const first = element.getBoundingClientRect();

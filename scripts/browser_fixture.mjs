@@ -38,7 +38,7 @@ const server = createServer(async (request, response) => {
   }
   if (request.method === "GET" && request.url === "/frame.html") {
     response.writeHead(200, { "content-type": "text/html; charset=utf8", "cache-control": "no-store" })
-    response.end("<!doctype html><title>Nested fixture frame</title><p id=frame-state>frame ready</p>")
+    response.end("<!doctype html><title>Nested fixture frame</title><p id=frame-state>frame ready</p><button id=frame-button>Frame action</button>")
     return
   }
   if (request.method === "GET" && request.url === "/json/version") {
@@ -176,6 +176,10 @@ server.on("upgrade", (request, socket) => {
           ? { result: { type: "string", value: "Comptrol browser fixture" } }
           : message.params.expression.includes("Add dynamic node")
             ? { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Add dynamic node" } } }
+          : message.params.expression.includes("Shadow action")
+            ? { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Shadow action" } } }
+          : message.params.expression.includes("Frame action")
+            ? { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Frame action" } } }
           : message.params.expression.includes("dynamic ready")
             ? { result: { type: "boolean", value: true } }
           : message.params.expression.includes("element.focus()")
