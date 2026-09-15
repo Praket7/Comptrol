@@ -1244,6 +1244,14 @@ pub fn cdp_upload(
         "file_name": file_name_text,
         "verified": false,
         "stage": "selected",
+        "stages": {
+            "selected": true,
+            "transfer_started": false,
+            "transfer_completed": false,
+            "application_accepted": false,
+            "persisted": false
+        },
+        "verification_level": "surface_state",
         "evidence": "DOM file input readback"
     }))
 }
