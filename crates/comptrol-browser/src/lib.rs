@@ -1,5 +1,9 @@
 #![deny(unsafe_code)]
 
+mod manager;
+
+pub use manager::BrowserManager;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -197,6 +201,10 @@ impl BrowserConnection {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
     pub async fn reconnect_generation(&self) -> u64 {
         let next = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -480,6 +488,17 @@ mod tests {
         assert_eq!(target.session_id, None);
         assert!(!target.attached);
         assert_eq!(target.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_empty_endpoint_without_creating_state() {
+        let manager = BrowserManager::new();
+        let result = manager.connect("").await;
+        assert!(matches!(
+            result,
+            Err(BrowserError::Connection(message)) if message == "empty debugger endpoint"
+        ));
+        assert_eq!(manager.len().await, 0);
     }
 
     #[tokio::test]
