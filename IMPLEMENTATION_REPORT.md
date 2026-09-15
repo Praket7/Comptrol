@@ -74,7 +74,7 @@ The local benchmark measured 25 warm MCP ping calls over stdio with p50 0.011 ms
 
 ## Distribution status
 
-An earlier source build is verified. The current source build is blocked by the local Xcode license gate. The npm launcher package is prepared but not published. The registry check returned unauthorized and the package name is not currently visible. Homebrew formula generation is prepared but no formula is published. Detached signing and verification are implemented, but no signed release exists because no operator signing identity was supplied. A private GitHub repository exists at `Praket7/Comptrol` with main synchronized through the latest implementation commit, seven open implementation issues, and one completed browser issue.
+An earlier source build is verified. The current source build is blocked by the local Xcode license gate. The npm launcher package dry run passes but the package is not published. The registry check returned unauthorized and the package name is not currently visible. Homebrew formula generation is prepared but no formula is published. Detached signing and verification are implemented, but no signed release exists because no operator signing identity was supplied. A private GitHub repository exists at `Praket7/Comptrol` with main synchronized through the latest implementation commit, seven open implementation issues, and one completed browser issue.
 
 ## Remaining issues ordered by impact
 
