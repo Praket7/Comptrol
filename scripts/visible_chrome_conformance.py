@@ -7,6 +7,7 @@ import tempfile
 import urllib.parse
 import urllib.request
 import subprocess
+import pathlib
 
 
 endpoint = os.environ.get("COMPTROL_CDP_ENDPOINT")
@@ -35,7 +36,7 @@ def close_target(target_id):
         pass
 
 
-binary = os.environ.get("COMPTROL_BIN", "target/debug/comptrol")
+binary = os.environ.get("COMPTROL_BIN", str(pathlib.Path(__file__).resolve().parents[1] / "target" / ("debug/comptrol.exe" if os.name == "nt" else "debug/comptrol")))
 opened = []
 with tempfile.TemporaryDirectory(prefix="comptrol-visible-chrome-") as state:
     runtime = subprocess.Popen(

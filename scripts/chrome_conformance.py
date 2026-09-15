@@ -38,8 +38,16 @@ def call(process, identifier, method, params):
     return response
 
 
-chrome = os.environ.get("COMPTROL_CHROME_BIN", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-binary = os.environ.get("COMPTROL_BIN", "target/debug/comptrol")
+if os.name == "nt":
+    chrome_defaults = [
+        pathlib.Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Google/Chrome/Application/chrome.exe",
+        pathlib.Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
+        pathlib.Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+    ]
+    chrome = os.environ.get("COMPTROL_CHROME_BIN", next((str(path) for path in chrome_defaults if path.exists()), "chrome.exe"))
+else:
+    chrome = os.environ.get("COMPTROL_CHROME_BIN", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+binary = os.environ.get("COMPTROL_BIN", str(pathlib.Path(__file__).resolve().parents[1] / "target" / ("debug/comptrol.exe" if os.name == "nt" else "debug/comptrol")))
 if not pathlib.Path(chrome).exists():
     if os.environ.get("COMPTROL_REQUIRE_CHROME") == "1":
         raise SystemExit("Chrome binary is required but unavailable")

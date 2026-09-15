@@ -2,6 +2,11 @@ import json
 import os
 import subprocess
 import tempfile
+from pathlib import Path
+
+
+root = Path(__file__).resolve().parents[1]
+binary = os.environ.get("COMPTROL_BIN", str(root / "target" / "debug" / ("comptrol.exe" if os.name == "nt" else "comptrol")))
 
 
 def call(process, message):
@@ -20,7 +25,7 @@ for client in ("codex", "claude-code", "cursor"):
     with tempfile.TemporaryDirectory(prefix="comptrol-client-") as state:
         environment = dict(os.environ, COMPTROL_STATE_DIR=state)
         process = subprocess.Popen(
-            ["target/debug/comptrol", "mcp"],
+            [binary, "mcp"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,

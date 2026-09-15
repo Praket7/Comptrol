@@ -33,7 +33,7 @@ def call(process, identifier, method, params):
 
 root = pathlib.Path(__file__).resolve().parents[1]
 binary = os.environ.get("COMPTROL_BIN", str(root / "target" / "debug" / "comptrol.exe"))
-fixture = subprocess.Popen([powershell, "-NoProfile", "-File", str(root / "fixtures" / "windows" / "UIAutomationFixture.ps1")])
+fixture = subprocess.Popen([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(root / "fixtures" / "windows" / "UIAutomationFixture.ps1")])
 runtime = None
 try:
     time.sleep(1)
