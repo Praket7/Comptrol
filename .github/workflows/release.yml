@@ -4,12 +4,23 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to release, for example v0.1.33"
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   source-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: cargo test --workspace
@@ -17,6 +28,7 @@ jobs:
       - run: npm pack --workspace packages/mcp --dry-run
 
   native:
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     strategy:
       matrix:
         include:
@@ -38,10 +50,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: cargo test --workspace
-      - run: python scripts/package_release.py --binary "${{ matrix.binary }}" --platform "${{ matrix.artifact }}" --version "${{ github.ref_name }}" --output release-dist
+      - run: python scripts/package_release.py --binary "${{ matrix.binary }}" --platform "${{ matrix.artifact }}" --version "${{ env.RELEASE_TAG }}" --output release-dist
       - run: python scripts/verify_release.py --directory release-dist
       - uses: actions/upload-artifact@v4
         with:
@@ -49,7 +63,7 @@ jobs:
           path: release-dist
 
   github-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     runs-on: ubuntu-latest
     needs: [native, source-check]
     permissions:
@@ -64,8 +78,8 @@ jobs:
           find release-assets -name '*.zip.sha256' -print0 | xargs -0 -n1 sh -c 'cd "$(dirname "$0")" && sha256sum -c "$(basename "$0")"'
       - name: Generate Homebrew formula from verified macOS archive
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          release_url="https://github.com/Praket7/Comptrol/releases/download/${GITHUB_REF_NAME}"
+          version="${RELEASE_TAG#v}"
+          release_url="https://github.com/Praket7/Comptrol/releases/download/${RELEASE_TAG}"
           python3 scripts/generate_homebrew_formula.py \
             --version "$version" \
             --macos-arm64-url "$release_url/comptrol-${version}-comptrol-macos-arm64.zip" \
@@ -84,20 +98,22 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t assets < <(find release-assets -type f -print)
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" --generate-notes --verify-tag
+            gh release create "${RELEASE_TAG}" "${assets[@]}" --generate-notes --verify-tag
           fi
 
   npm-publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     runs-on: ubuntu-latest
     needs: [source-check, native]
     permissions:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -113,7 +129,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           package_version="$(node -p "require('./packages/mcp/package.json').version")"
           if [ "$tag_version" != "$package_version" ]; then
             echo "release tag $tag_version does not match npm package version $package_version" >&2
@@ -173,7 +189,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           for attempt in $(seq 1 20); do
             published="$(npm view "comptrolling@${version}" version --json 2>/dev/null || true)"
             if [ "$published" = "\"${version}\"" ]; then
