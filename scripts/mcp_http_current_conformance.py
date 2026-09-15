@@ -36,7 +36,10 @@ port = free_port()
 with tempfile.TemporaryDirectory(prefix="comptrol-mcp-http-current-") as state:
     process = subprocess.Popen([BIN, "serve-http", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "COMPTROL_STATE_DIR": state})
     try:
-        deadline = time.time() + 10
+        # Release builds on shared macOS/Windows runners can take longer to
+        # bind their listener while the runtime initializes SQLite state.
+        # This is a bounded startup allowance, not a request poll loop.
+        deadline = time.time() + 30
         while time.time() < deadline:
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=1):
