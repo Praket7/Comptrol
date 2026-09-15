@@ -14,6 +14,23 @@ The normal repository check uses the deterministic fixture websocket. Real Chrom
 
 For a user visible validation, start Chrome with a loopback DevTools endpoint and set `COMPTROL_CDP_ENDPOINT` plus `COMPTROL_ALLOW_BROWSER_CDP`. The validation must use the user chosen profile intentionally. Comptrol will reuse that profile but will not copy cookies or credentials into another profile.
 
+On Windows, the repository launcher creates a separate profile and exposes the endpoint automatically. It does not touch the normal Chrome profile.
+
+```powershell
+python scripts/start_windows_chrome_cdp.py --url https://www.espn.com
+```
+
+Copy the printed endpoint into the validation environment.
+
+```powershell
+$env:COMPTROL_CDP_ENDPOINT = "http://127.0.0.1:<printed-port>"
+$env:COMPTROL_ALLOW_BROWSER_CDP = "1"
+$env:COMPTROL_REQUIRE_VISIBLE_CHROME = "1"
+python scripts/visible_chrome_conformance.py
+```
+
+The Chrome process remains open until its dedicated window is closed. The endpoint binds only to loopback.
+
 Run `python3 scripts/visible_chrome_conformance.py` for an opt in acceptance check. It opens one visible and one background `about:blank` tab in that profile, checks the profile and input invariants, and closes only those exact test tabs. Set `COMPTROL_REQUIRE_VISIBLE_CHROME=1` when the endpoint must be present.
 
 Run `COMPTROL_RUN_LIVE_NATIVE_BROWSER_CONFORMANCE=1 python3 scripts/native_browser_conformance.py` for the native launcher acceptance check. It first requires responsive Chrome Automation access so it can close the exact unique test URL after verification. Without that permission it skips before opening a tab. The route itself remains foreground only and reports launcher acceptance rather than exact target verification.
