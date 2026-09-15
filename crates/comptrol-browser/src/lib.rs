@@ -53,6 +53,10 @@ impl BrowserConnection {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingCommand>(128);
         let pending: PendingCommands = Arc::new(Mutex::new(HashMap::new()));
         let pending_for_reader = Arc::clone(&pending);
+        let targets = Arc::new(RwLock::new(TargetGraph::default()));
+        let frames = Arc::new(RwLock::new(FrameGraph::default()));
+        let targets_for_reader = Arc::clone(&targets);
+        let frames_for_reader = Arc::clone(&frames);
         let cancellation = CancellationToken::new();
         let cancellation_for_tasks = cancellation.clone();
         tokio::spawn(async move {
@@ -95,6 +99,8 @@ impl BrowserConnection {
                     continue;
                 };
                 let Some(id) = value.get("id").and_then(Value::as_u64) else {
+                    targets_for_reader.write().await.apply_event(&value);
+                    frames_for_reader.write().await.apply_event(&value);
                     continue;
                 };
                 if let Some(sender) = pending_for_responses.lock().await.remove(&id) {
@@ -114,8 +120,8 @@ impl BrowserConnection {
         });
         Ok(Self {
             outgoing: outgoing_tx,
-            targets: Arc::new(RwLock::new(TargetGraph::default())),
-            frames: Arc::new(RwLock::new(FrameGraph::default())),
+            targets,
+            frames,
             next_command_id: Arc::new(AtomicU64::new(1)),
             generation: Arc::new(AtomicU64::new(0)),
             cancellation,
@@ -419,6 +425,9 @@ mod tests {
                     requests.push(serde_json::from_str::<Value>(&text).unwrap());
                 }
             }
+            socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({"method":"Target.targetCreated","params":{"targetInfo":{"targetId":"event-tab","type":"page","url":"https://event.test","title":"Event tab"}}}).to_string().into()
+            )).await.unwrap();
             for request in requests.into_iter().rev() {
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(
                     serde_json::json!({"id": request["id"], "result": {"method": request["method"]}}).to_string().into()
@@ -433,6 +442,11 @@ mod tests {
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.unwrap()["method"], "Runtime.enable");
         assert_eq!(second.unwrap()["method"], "Page.enable");
+        let targets = connection.targets.read().await;
+        assert_eq!(
+            targets.targets["event-tab"].title.as_deref(),
+            Some("Event tab")
+        );
         server.await.unwrap();
     }
 
