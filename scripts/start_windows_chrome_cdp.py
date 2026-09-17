@@ -59,7 +59,7 @@ process = subprocess.Popen([
     "--no-first-run",
     "--no-default-browser-check",
     args.url,
-])
+], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 version = wait_for_endpoint(endpoint)
 print(json.dumps({
     "pid": process.pid,
@@ -68,4 +68,4 @@ print(json.dumps({
     "endpoint": endpoint,
     "browser": version.get("Browser"),
     "webSocketDebuggerUrl": version.get("webSocketDebuggerUrl"),
-}, indent=2))
+}, separators=(",", ":")), flush=True)

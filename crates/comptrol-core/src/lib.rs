@@ -3044,22 +3044,35 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
                         data,
                     );
                 }
-                let observed = browser::cdp_call(
+                let observed = match browser::cdp_call(
                     &endpoint.to_string_lossy(),
                     target_id,
                     Some(browser_context_id),
                     None,
                     "Runtime.evaluate",
                     json!({"expression":"location.href", "returnByValue":true}),
-                )
-                .ok()
-                .and_then(|value| {
-                    value
+                ) {
+                    Ok(value) => value
                         .get("result")
+                        .and_then(|result| result.get("result").or(Some(result)))
                         .and_then(|result| result.get("value"))
                         .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
+                        .map(str::to_owned),
+                    Err(_error) => {
+                        let mut recovered = None;
+                        for _ in 0..100 {
+                            recovered =
+                                browser::fresh_target_url(&endpoint.to_string_lossy(), target_id)
+                                    .ok()
+                                    .flatten();
+                            if recovered.as_deref().is_some_and(|url| !url.is_empty()) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        recovered
+                    }
+                };
                 let expected = request
                     .params
                     .get("url_contains")

@@ -85,35 +85,68 @@ impl BlockingBrowserManager {
                                 let result = async {
                                     let connection = manager.connect(&endpoint).await?;
                                     if generation == u64::MAX {
-                                        let (current_generation, current_revision, current_url) = {
-                                            let graph = connection.targets.read().await;
-                                            let target =
-                                                graph.targets.get(&target_id).ok_or_else(|| {
-                                                    BrowserError::StaleReference(target_id.clone())
-                                                })?;
-                                            (
-                                                graph.generation,
-                                                target.revision.clone(),
-                                                target.url.clone(),
-                                            )
-                                        };
-                                        if revision.starts_with("url:")
-                                            && current_url.as_deref()
-                                                != Some(revision.trim_start_matches("url:"))
-                                        {
-                                            return Err(BrowserError::StaleReference(
-                                                target_id.clone(),
-                                            ));
-                                        }
-                                        return connection
-                                            .target_command(
-                                                &target_id,
+                                        for attempt in 0..2 {
+                                            let snapshot = {
+                                                let graph = connection.targets.read().await;
+                                                graph.targets.get(&target_id).map(|target| {
+                                                    (
+                                                        graph.generation,
+                                                        target.revision.clone(),
+                                                        target.url.clone(),
+                                                    )
+                                                })
+                                            };
+                                            let Some((
                                                 current_generation,
-                                                &current_revision,
-                                                method,
-                                                params,
-                                            )
-                                            .await;
+                                                current_revision,
+                                                current_url,
+                                            )) = snapshot
+                                            else {
+                                                crate::manager::attach_existing_targets(
+                                                    &connection,
+                                                )
+                                                .await?;
+                                                connection.bootstrap_attached_targets().await?;
+                                                continue;
+                                            };
+                                            if revision.starts_with("url:")
+                                                && current_url.as_deref()
+                                                    != Some(revision.trim_start_matches("url:"))
+                                            {
+                                                return Err(BrowserError::StaleReference(
+                                                    target_id.clone(),
+                                                ));
+                                            }
+                                            match connection
+                                                .target_command(
+                                                    &target_id,
+                                                    current_generation,
+                                                    &current_revision,
+                                                    method.clone(),
+                                                    params.clone(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(value) => return Ok(value),
+                                                Err(error)
+                                                    if attempt == 0
+                                                        && matches!(
+                                                            error,
+                                                            BrowserError::StaleReference(_)
+                                                        ) =>
+                                                {
+                                                    crate::manager::attach_existing_targets(
+                                                        &connection,
+                                                    )
+                                                    .await?;
+                                                    connection.bootstrap_attached_targets().await?;
+                                                }
+                                                Err(error) => return Err(error),
+                                            }
+                                        }
+                                        return Err(BrowserError::StaleReference(
+                                            target_id.clone(),
+                                        ));
                                     }
                                     connection
                                         .target_command(

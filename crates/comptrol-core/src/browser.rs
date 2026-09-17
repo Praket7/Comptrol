@@ -68,6 +68,16 @@ pub fn discover_cached_targets(endpoint: &str) -> Result<Vec<BrowserTarget>, Com
     discover_cached(endpoint)
 }
 
+/// Recovery-only target readback used when a browser navigation invalidates
+/// the compatibility bridge's cached session before its event update arrives.
+/// Ordinary operations remain event-driven and do not call `/json/list`.
+pub fn fresh_target_url(endpoint: &str, target_id: &str) -> Result<Option<String>, ComptrolError> {
+    Ok(discover(endpoint)?
+        .into_iter()
+        .find(|target| target.id == target_id)
+        .and_then(|target| target.url))
+}
+
 fn invalidate_target_cache(endpoint: &str) {
     if let Ok(mut caches) = target_caches().lock() {
         caches.remove(endpoint);

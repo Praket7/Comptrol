@@ -19,7 +19,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -830,8 +830,22 @@ fn now_ms() -> u128 {
 fn main() {
     let result = match env::args().nth(1).as_deref() {
         None | Some("mcp") => {
-            auto_start_chrome_cdp();
-            run_stdio()
+            let auto_started_chrome = auto_start_chrome_cdp();
+            let result = run_stdio();
+            if let Some(mut chrome) = auto_started_chrome {
+                #[cfg(windows)]
+                {
+                    let pid = chrome.id().to_string();
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &pid, "/T", "/F"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+                let _ = chrome.kill();
+                let _ = chrome.wait();
+            }
+            result
         }
         Some("doctor") => run_doctor(env::args().skip(2).collect()),
         Some("status") => print_json(run_inspect("status")),
@@ -876,21 +890,21 @@ fn main() {
     }
 }
 
-fn auto_start_chrome_cdp() {
+fn auto_start_chrome_cdp() -> Option<std::process::Child> {
     if env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
         || env::var("COMPTROL_AUTO_START_CHROME_CDP").as_deref() == Ok("0")
     {
-        return;
+        return None;
     }
 
     #[cfg(not(windows))]
-    return;
+    return None;
 
     #[cfg(windows)]
     {
         let Some(chrome) = windows_chrome_path() else {
             eprintln!("Comptrol Chrome CDP auto-start skipped because Chrome was not found");
-            return;
+            return None;
         };
         let port = match TcpListener::bind(("127.0.0.1", 0))
             .and_then(|listener| listener.local_addr())
@@ -901,7 +915,7 @@ fn auto_start_chrome_cdp() {
                 eprintln!(
                     "Comptrol Chrome CDP auto-start skipped because a local port was unavailable: {error}"
                 );
-                return;
+                return None;
             }
         };
         let profile = env::var_os("COMPTROL_CHROME_PROFILE")
@@ -911,12 +925,12 @@ fn auto_start_chrome_cdp() {
             eprintln!(
                 "Comptrol Chrome CDP auto-start skipped because the profile could not be created: {error}"
             );
-            return;
+            return None;
         }
         let url =
             env::var("COMPTROL_CHROME_START_URL").unwrap_or_else(|_| "about:blank".to_owned());
         let endpoint = format!("http://127.0.0.1:{port}");
-        let spawn = Command::new(&chrome)
+        let mut child = match Command::new(&chrome)
             .args([
                 "--remote-debugging-address=127.0.0.1".to_owned(),
                 format!("--remote-debugging-port={port}"),
@@ -925,13 +939,18 @@ fn auto_start_chrome_cdp() {
                 "--no-default-browser-check".to_owned(),
                 url,
             ])
-            .spawn();
-        if let Err(error) = spawn {
-            eprintln!(
-                "Comptrol Chrome CDP auto-start skipped because Chrome could not launch: {error}"
-            );
-            return;
-        }
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!(
+                    "Comptrol Chrome CDP auto-start skipped because Chrome could not launch: {error}"
+                );
+                return None;
+            }
+        };
         let ready = (0..100).any(|_| {
             if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
@@ -951,7 +970,9 @@ fn auto_start_chrome_cdp() {
             eprintln!(
                 "Comptrol Chrome CDP auto-start skipped because Chrome did not expose /json/version"
             );
-            return;
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
         }
         unsafe {
             env::set_var("COMPTROL_CDP_ENDPOINT", endpoint);
@@ -961,6 +982,7 @@ fn auto_start_chrome_cdp() {
             "Comptrol Chrome CDP auto-started with profile {}",
             profile.display()
         );
+        Some(child)
     }
 }
 

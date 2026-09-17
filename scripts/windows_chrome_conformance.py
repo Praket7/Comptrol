@@ -16,7 +16,9 @@ if platform.system() != "Windows":
 
 root = Path(__file__).resolve().parents[1]
 binary = os.environ.get("COMPTROL_BIN", str(root / "target" / "release" / "comptrol.exe"))
-with tempfile.TemporaryDirectory(prefix="comptrol-live-chrome-") as state:
+with tempfile.TemporaryDirectory(
+    prefix="comptrol-live-chrome-", ignore_cleanup_errors=True
+) as state:
     profile = Path(state) / "chrome-profile"
     chrome = subprocess.Popen(
         [
@@ -54,7 +56,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-live-chrome-") as state:
             env=environment,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=None if os.environ.get("COMPTROL_BROWSER_DEBUG") else subprocess.PIPE,
             text=True,
         )
 

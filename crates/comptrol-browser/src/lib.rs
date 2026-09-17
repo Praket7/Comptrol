@@ -491,7 +491,9 @@ impl BrowserConnection {
             graph
                 .targets
                 .values()
-                .filter(|target| target.attached)
+                .filter(|target| {
+                    target.attached && matches!(target.target_type.as_str(), "page" | "iframe")
+                })
                 .filter_map(|target| target.session_id.clone())
                 .collect::<Vec<_>>()
         };
