@@ -288,7 +288,10 @@ impl AdapterHost {
 #[cfg(windows)]
 #[derive(Debug)]
 struct JobObject {
-    handle: HANDLE,
+    // Store the opaque Windows handle as an integer so the host remains
+    // movable across the worker threads that own the adapter runtime.
+    // The raw HANDLE is reconstructed only for the bounded Win32 calls.
+    handle: usize,
 }
 
 #[cfg(windows)]
@@ -319,14 +322,16 @@ impl JobObject {
             unsafe { CloseHandle(handle) };
             return Err(HostError::Io(io::Error::last_os_error()));
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle: handle as usize,
+        })
     }
 }
 
 #[cfg(windows)]
 impl Drop for JobObject {
     fn drop(&mut self) {
-        unsafe { CloseHandle(self.handle) };
+        unsafe { CloseHandle(self.handle as HANDLE) };
     }
 }
 
