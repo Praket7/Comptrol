@@ -8,6 +8,8 @@ pub mod geometry;
 pub mod integration;
 pub mod mcp;
 pub mod pairing;
+pub mod restore;
+pub mod restore_native;
 pub mod trace;
 
 use comptrol_adapter_host::{AdapterHost, AdapterHostConfig};
@@ -547,6 +549,9 @@ impl Policy {
             policy
                 .allowed_intents
                 .insert("browser.chrome.reopen_closed_group".to_owned());
+            policy
+                .allowed_intents
+                .insert("browser.chrome.restore_recent".to_owned());
         }
         if std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1") {
             policy.max_risk = Risk::R2;
@@ -1189,8 +1194,8 @@ impl Runtime {
             "desktop.notify" => desktop_notify(&request, operation_id),
             "desktop.open_app" => desktop_open_app(&request, operation_id),
             "browser.chrome.open_tab" => browser_chrome_open_tab(&request, operation_id),
-            "browser.chrome.reopen_closed_group" => {
-                browser_chrome_reopen_closed_group(&request, operation_id)
+            "browser.chrome.restore_recent" | "browser.chrome.reopen_closed_group" => {
+                browser_chrome_restore_recent(&request, operation_id)
             }
             "command.run" => command_run(&request, operation_id),
             "windows.uia.press" | "windows.uia.set_value" => {
@@ -1588,6 +1593,7 @@ fn classify(intent: &str) -> Risk {
         | "macos.ax.press"
         | "macos.ax.set_value"
         | "browser.chrome.open_tab"
+        | "browser.chrome.restore_recent"
         | "browser.chrome.reopen_closed_group" => Risk::R2,
         "command.run" => Risk::R3,
         "windows.uia.press" | "windows.uia.set_value" => Risk::R2,
@@ -1976,6 +1982,21 @@ fn operation_metadata(request: &OperationRequest) -> Value {
         metadata["postcondition_attribute"] = json!("closed_group_absent");
         metadata["postcondition_bool"] = json!(true);
     }
+    if request.intent == "browser.chrome.restore_recent" {
+        if let Some(kind) = request.params.get("kind").and_then(Value::as_str) {
+            metadata["restore_kind"] = json!(kind);
+        }
+        if let Some(mode) = request.params.get("mode").and_then(Value::as_str) {
+            metadata["restore_mode"] = json!(mode);
+        }
+        if let Some(urls) = request.params.get("urls").and_then(Value::as_array) {
+            metadata["restore_url_count"] = json!(urls.len());
+            if let Ok(bytes) = serde_json::to_vec(urls) {
+                metadata["restore_urls_hash"] = json!(stable_hash(&bytes));
+            }
+        }
+        metadata["action"] = json!("restore_recent");
+    }
     if request.intent == "command.run" {
         if let Some(program) = request.params.get("program").and_then(Value::as_str) {
             metadata["program"] = json!(program);
@@ -2111,10 +2132,10 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
             )) && env_enabled("COMPTROL_ALLOW_BROWSER_LAUNCH"),
             "Default-profile browser launch requires an explicit local policy",
         )),
-        "browser.chrome.reopen_closed_group" => Some((
-            "chrome_ax",
-            cfg!(target_os = "macos") && env_enabled("COMPTROL_ALLOW_MACOS_AX"),
-            "Chrome closed-group control requires macOS Accessibility and policy",
+        "browser.chrome.restore_recent" | "browser.chrome.reopen_closed_group" => Some((
+            "chrome_restore",
+            true,
+            "Chrome restore uses the native recently-closed surface when reachable and otherwise reconstructs only when explicitly allowed",
         )),
         "command.run" => Some((
             "process_argv",
@@ -2231,6 +2252,7 @@ fn route_catalog() -> Vec<RoutePlan> {
         "desktop.notify",
         "desktop.open_app",
         "browser.chrome.open_tab",
+        "browser.chrome.restore_recent",
         "browser.chrome.reopen_closed_group",
         "command.run",
         "windows.uia.press",
@@ -3917,7 +3939,7 @@ fn foreground_changed(request: &OperationRequest) -> bool {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         "browser.chrome.open_tab" => true,
-        "browser.chrome.reopen_closed_group" => true,
+        "browser.chrome.restore_recent" | "browser.chrome.reopen_closed_group" => true,
         _ => false,
     }
 }
@@ -4446,92 +4468,71 @@ fn browser_chrome_open_tab(request: &OperationRequest, operation_id: String) -> 
     }
 }
 
-fn browser_chrome_reopen_closed_group(
-    request: &OperationRequest,
-    operation_id: String,
-) -> ActionResult {
-    if !cfg!(target_os = "macos") {
-        return unsupported_ax(request, operation_id);
-    }
+/// Execute `browser.chrome.restore_recent` (and the
+/// `browser.chrome.reopen_closed_group` compatibility alias) through Chrome's
+/// own restore subsystem with semantic matching, unique-entry enforcement,/// CDP target-graph verification, and truthful reconstruction labeling.
+fn browser_chrome_restore_recent(request: &OperationRequest, operation_id: String) -> ActionResult {
     if request.background.as_deref() == Some("strict_background") {
         return ActionResult::refused(
             request,
             operation_id,
             ComptrolError {
                 code: "background_unavailable".to_owned(),
-                message: "Reopening a closed Chrome group activates the visible browser".to_owned(),
-                recovery: Some("Use a live CDP target for strict background control".to_owned()),
+                message: "Native restore may activate the visible browser window".to_owned(),
+                recovery: Some("Use browser.cdp.open_tab for strict background control".to_owned()),
             },
         );
     }
-    let Some(group) = request.params.get("group").and_then(Value::as_str) else {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "invalid_input".to_owned(),
-                message: "Reopening a closed Chrome group needs an exact group name".to_owned(),
-                recovery: None,
-            },
-        );
-    };
-    if group.is_empty() || group.chars().any(char::is_control) {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "invalid_input".to_owned(),
-                message: "Chrome group names cannot be empty or contain control characters"
-                    .to_owned(),
-                recovery: None,
-            },
-        );
+    let endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").ok();
+    // Compatibility alias: a legacy caller that passes only a group name gets
+    // tab_group semantics with native restore then explicit reconstruction
+    // permission preserved from its params.
+    let mut params = request.params.clone();
+    if request.intent == "browser.chrome.reopen_closed_group"
+        && params.get("kind").is_none()
+        && params.get("group").and_then(Value::as_str).is_some()
+    {
+        params["kind"] = json!("tab_group");
     }
-    let script = chrome_closed_group_ax_script(request, group);
-    match run_osascript(&script) {
-        Ok(output)
-            if output.status.success()
-                && String::from_utf8_lossy(&output.stdout).trim() == "true" =>
-        {
-            success(
+    match restore::execute(endpoint.as_deref(), &params, None) {
+        Ok(outcome) => success(
+            request,
+            operation_id,
+            "chrome_restore",
+            EffectState::Changed,
+            VerificationState::Verified,
+            json!({
+                "restoration_mode": outcome.restoration_mode,
+                "native_restore_used": outcome.native_restore_used,
+                "kind": outcome.kind.as_str(),
+                "group_title": outcome.group_title,
+                "targets": outcome.restored_targets.iter().map(|target| json!({
+                    "id": target.id,
+                    "url": target.url,
+                    "title": target.title,
+                })).collect::<Vec<_>>(),
+                "not_restored": outcome.not_restored,
+                "verification": outcome.verification,
+                "mouse": "untouched",
+                "clipboard": "untouched"
+            }),
+        ),
+        Err(error) => match error {
+            restore::RestoreError::Refused {
+                code,
+                message,
+                recovery,
+            } => ActionResult::refused(
                 request,
                 operation_id,
-                "chrome_ax",
-                EffectState::Changed,
-                VerificationState::Verified,
-                json!({
-                    "group": group,
-                    "postcondition": "closed_group_button_absent",
-                    "mouse": "untouched",
-                    "clipboard": "untouched"
-                }),
-            )
-        }
-        Ok(output) => ax_failure(request, operation_id, &output),
-        Err(error) => ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "adapter_unavailable".to_owned(),
-                message: error.to_string(),
-                recovery: Some("Check Chrome and macOS Accessibility permission".to_owned()),
-            },
-        ),
+                ComptrolError {
+                    code: code.to_owned(),
+                    message,
+                    recovery,
+                },
+            ),
+        },
     }
-}
-
-fn chrome_closed_group_ax_script(request: &OperationRequest, group: &str) -> String {
-    let control = apple_quote(&format!("{group} group Closed"));
-    let window = request
-        .params
-        .get("window")
-        .and_then(Value::as_str)
-        .map(apple_quote)
-        .map(|name| format!("first window whose name is {name}"))
-        .unwrap_or_else(|| "window 1".to_owned());
-    format!(
-        "tell application \"System Events\"\ntell application process \"Google Chrome\"\nset targetWindow to {window}\nset matches to (every button of targetWindow whose name is {control})\nif (count of matches) is not 1 then error \"target_ambiguous\"\nperform action \"AXPress\" of item 1 of matches\ndelay 0.05\nset remaining to (every button of targetWindow whose name is {control})\nreturn ((count of remaining) is 0)\nend tell\nend tell"
-    )
 }
 
 const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -5765,7 +5766,7 @@ fn unsupported_ax(request: &OperationRequest, operation_id: String) -> ActionRes
     )
 }
 
-fn apple_quote(value: &str) -> String {
+pub(crate) fn apple_quote(value: &str) -> String {
     format!(
         "\"{}\"",
         value
@@ -5775,7 +5776,7 @@ fn apple_quote(value: &str) -> String {
     )
 }
 
-fn run_osascript(script: &str) -> io::Result<Output> {
+pub(crate) fn run_osascript(script: &str) -> io::Result<Output> {
     let mut child = Command::new("osascript")
         .args(["-e", script])
         .stdout(Stdio::piped())
@@ -5866,13 +5867,18 @@ pub fn capabilities() -> Vec<Capability> {
             note: "Opens a foreground Chrome tab in the existing default browser profile and reports launcher acceptance only".to_owned(),
         },
         Capability {
-            name: "browser.chrome.reopen_closed_group".to_owned(),
-            available: cfg!(target_os = "macos")
-                && macos_accessibility_reachable()
-                && std::env::var("COMPTROL_ALLOW_MACOS_AX").as_deref() == Ok("1"),
+            name: "browser.chrome.restore_recent".to_owned(),
+            available: true,
             risk: Risk::R2,
-            route: "chrome_ax".to_owned(),
-            note: "Reopens one exact closed Chrome tab group through semantic Accessibility control with a postcondition".to_owned(),
+            route: "chrome_restore".to_owned(),
+            note: "Restores one exact recently-closed Chrome tab, group, or window through Chrome's own restore surface with unique semantic matching and live CDP verification; reconstructs only when explicitly allowed and labeled".to_owned(),
+        },
+        Capability {
+            name: "browser.chrome.reopen_closed_group".to_owned(),
+            available: true,
+            risk: Risk::R2,
+            route: "chrome_restore".to_owned(),
+            note: "Compatibility alias for browser.chrome.restore_recent with kind tab_group".to_owned(),
         },
         Capability {
             name: "command.run".to_owned(),
@@ -6438,23 +6444,85 @@ mod tests {
     }
 
     #[test]
-    fn chrome_closed_group_script_uses_exact_accessibility_press() {
+    fn restore_recent_metadata_is_reconcilable_without_typed_urls() {
+        let mut runtime = runtime();
+        runtime
+            .policy
+            .allowed_intents
+            .insert("browser.chrome.restore_recent".to_owned());
+        runtime.policy.max_risk = Risk::R2;
+        let request = OperationRequest {
+            intent: "browser.chrome.restore_recent".to_owned(),
+            target: None,
+            params: json!({"kind":"tab_group", "group":"Research", "urls":["https://example.test/one"]}),
+            postcondition: None,
+            risk: Some(Risk::R2),
+            idempotency_key: Some("restore-metadata".to_owned()),
+            dry_run: true,
+            background: None,
+        };
+        let metadata = operation_metadata(&request);
+        assert_eq!(metadata["action"], "restore_recent");
+        assert_eq!(metadata["restore_kind"], "tab_group");
+        assert_eq!(metadata["restore_url_count"], 1);
+        assert!(metadata.get("urls").is_none());
+        assert!(metadata.get("restore_urls_hash").is_some());
+        let result = runtime.operate(request);
+        assert!(result.data["route_plan"]["rationale"].as_str().is_some());
+    }
+
+    #[test]
+    fn restore_recent_refuses_strict_background() {
+        let mut runtime = runtime();
+        runtime
+            .policy
+            .allowed_intents
+            .insert("browser.chrome.restore_recent".to_owned());
+        runtime.policy.max_risk = Risk::R2;
+        let request = OperationRequest {
+            intent: "browser.chrome.restore_recent".to_owned(),
+            target: None,
+            params: json!({"kind":"tab", "url":"https://example.test/one"}),
+            postcondition: None,
+            risk: Some(Risk::R2),
+            idempotency_key: Some("restore-strict-bg".to_owned()),
+            dry_run: false,
+            background: Some("strict_background".to_owned()),
+        };
+        let result = runtime.operate(request);
+        assert_eq!(result.delivery, DeliveryState::Refused);
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("background_unavailable")
+        );
+    }
+
+    #[test]
+    fn restore_recent_alias_shares_route_with_current_intent() {
+        let mut runtime = runtime();
+        runtime
+            .policy
+            .allowed_intents
+            .insert("browser.chrome.reopen_closed_group".to_owned());
+        runtime.policy.max_risk = Risk::R2;
         let request = OperationRequest {
             intent: "browser.chrome.reopen_closed_group".to_owned(),
             target: None,
-            params: json!({"group":"Research", "window":"Chrome Window"}),
+            params: json!({"kind":"tab", "url":"https://example.test/one", "mode":"reconstruct_only"}),
             postcondition: None,
-            risk: None,
-            idempotency_key: Some("closed-group-script".to_owned()),
+            risk: Some(Risk::R2),
+            idempotency_key: Some("restore-alias".to_owned()),
             dry_run: false,
             background: None,
         };
-        let script = chrome_closed_group_ax_script(&request, "Research");
-        assert!(script.contains("Research group Closed"));
-        assert!(script.contains("perform action \"AXPress\""));
-        assert!(script.contains("count of remaining"));
-        assert!(!script.contains("keystroke"));
-        assert!(!script.contains("clipboard"));
+        let result = runtime.operate(request);
+        // Without a CDP endpoint the reconstruct path refuses with a
+        // machine-readable error rather than dispatching anything.
+        assert_eq!(result.delivery, DeliveryState::Refused);
+        assert!(matches!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("browser_unavailable") | Some("invalid_input") | Some("policy_denied")
+        ));
     }
 
     #[test]

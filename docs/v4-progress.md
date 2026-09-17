@@ -32,6 +32,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Runtime operation-completion events are persisted in a bounded SQLite EventHub with explicit consumer cursors and monotonic acknowledgement across process restart.
 - Browser connection manager reuses one bootstrapped flattened-session WebSocket per debugger endpoint and invalidates graph state on disconnect.
 - Browser manager bootstraps required CDP domains for all targets already attached in the live graph without holding graph locks across I/O.
+- `browser.chrome.restore_recent` and the `browser.chrome.reopen_closed_group` compatibility alias now have typed request parsing, unique title/URL matching, ambiguity refusal, explicit native/reconstruct modes, reconstruction labeling, target-graph verification, metadata redaction, and fixture conformance coverage. This is not live native restore acceptance.
 - Direct browser navigation now independently reads back the final URL and records a surface-state verification criterion; dispatch alone remains unverified.
 - Windows CI now has a real Chrome CDP acceptance harness using an isolated loopback debugging profile and the built release executable.
 - High-level frame evaluation is now wired through the persistent flattened-session frame graph with generation and revision validation, including OOPIF session/context routing.
@@ -62,6 +63,7 @@ This branch records the first verified V4 foundation slice. It is not a claim th
 - Wire browser event sequence/cursor metadata into the durable MCP EventHub and add end-to-end replay conformance for reconnecting clients.
 - Complete universal verification wiring across every adapter and high-level operation.
 - Complete target attachment/domain bootstrap coverage for all migrated compatibility helpers and remove the remaining legacy per-session socket path.
+- Implement native Windows UIA and Linux AT-SPI Recently Closed enumeration/invocation; the current restore provider returns `native_restore_unavailable` on those platforms. Complete native macOS restore acceptance separately.
 - Extend persisted route statistics with latency samples and planner feedback across adapter/application versions.
 - Extend MCP cancellation propagation into every adapter/browser operation and add task progress replay coverage.
 - Workflow execution now accepts a host cancellation callback, and promoted candidates can be stored atomically in a durable host registry; repair remains explicit and never silently rewrites an active workflow.
