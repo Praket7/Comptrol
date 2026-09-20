@@ -48,6 +48,11 @@ enum Request {
         min_count: usize,
         response: mpsc::Sender<Result<WaitGraphSnapshot, BrowserError>>,
     },
+    TargetState {
+        endpoint: String,
+        target_id: String,
+        response: mpsc::Sender<Result<Option<TargetRecord>, BrowserError>>,
+    },
 }
 
 /// Synchronous compatibility bridge for callers that cannot yet be async.
@@ -292,6 +297,22 @@ impl BlockingBrowserManager {
                                 .await;
                                 let _ = response.send(result);
                             }
+                            Request::TargetState {
+                                endpoint,
+                                target_id,
+                                response,
+                            } => {
+                                // Read the event-maintained live graph with
+                                // no network round trip: this is the
+                                // TargetStateCache read API.
+                                let result = async {
+                                    let connection = manager.connect(&endpoint).await?;
+                                    let graph = connection.targets.read().await;
+                                    Ok(graph.targets.get(&target_id).cloned())
+                                }
+                                .await;
+                                let _ = response.send(result);
+                            }
                             Request::FrameCommand {
                                 endpoint,
                                 frame_id,
@@ -383,6 +404,25 @@ impl BlockingBrowserManager {
                 revision: legacy_revision.unwrap_or_default().to_owned(),
                 method: method.to_owned(),
                 params,
+                response,
+            })
+            .map_err(|_| BrowserError::Closed)?;
+        receiver.recv().map_err(|_| BrowserError::Closed)?
+    }
+
+    /// Read one target's event-maintained state (URL, title, generation,
+    /// revision, session binding) from the live graph without any network
+    /// round trip. `None` means the target is absent from the graph.
+    pub fn target_state(
+        &self,
+        endpoint: &str,
+        target_id: &str,
+    ) -> Result<Option<TargetRecord>, BrowserError> {
+        let (response, receiver) = mpsc::channel();
+        self.requests
+            .send(Request::TargetState {
+                endpoint: endpoint.to_owned(),
+                target_id: target_id.to_owned(),
                 response,
             })
             .map_err(|_| BrowserError::Closed)?;

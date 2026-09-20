@@ -85,6 +85,23 @@ pub fn fresh_target_url(endpoint: &str, target_id: &str) -> Result<Option<String
 /// The check compares the current URL against the requested URL (exact or
 /// `url_contains`) and optionally evaluates an in-page readiness
 /// expression. Returns the observation needed to answer without mutating.
+/// Read the event-maintained live target state from the persistent graph
+/// (the TargetStateCache read path). Returns None when the target is not
+/// present in the graph; callers fall back to discovery only for recovery.
+pub fn live_target_state(
+    endpoint: &str,
+    target_id: &str,
+) -> Result<Option<comptrol_browser::TargetRecord>, ComptrolError> {
+    let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
+    bridge()
+        .target_state(&browser_web_socket_url, target_id)
+        .map_err(|error| ComptrolError {
+            code: "browser_protocol_error".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Refresh the browser connection and retry".to_owned()),
+        })
+}
+
 pub fn ensure_state(
     endpoint: &str,
     target_id: &str,
@@ -94,9 +111,17 @@ pub fn ensure_state(
     url_contains: Option<&str>,
     ready_expression: Option<&str>,
 ) -> Result<Value, ComptrolError> {
+    // Prefer the event-maintained live graph (no network); only fall back
+    // to discovery when the target is absent or the caller bound it with a
+    // legacy revision that the graph cannot confirm.
+    let graph_state = live_target_state(endpoint, target_id)?;
     let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
-    let current_url = target.url.clone().unwrap_or_default();
+    let current_url = graph_state
+        .as_ref()
+        .and_then(|record| record.url.clone())
+        .or_else(|| target.url.clone())
+        .unwrap_or_default();
 
     // URL identity gate: exact match or containment, mirroring the
     // navigate verification criteria so a skipped navigation proves the

@@ -240,7 +240,17 @@ server.on("upgrade", (request, socket) => {
       : browserSocket && message.method === "Target.closeTarget"
         ? { method: "Target.targetDestroyed", params: { targetId: message.params.targetId } }
         : message.method === "Page.navigateToHistoryEntry" || message.method === "Page.navigate"
-          ? { method: "Page.frameNavigated", params: { frame: { id: "fixture-frame", url: fixtureUrl } } }
+          ? (() => {
+              // Real Chrome emits Target.targetInfoChanged alongside the
+              // navigation lifecycle; the multiplexer's target graph (and
+              // therefore its event-driven state cache) updates from it.
+              const event = { method: "Page.frameNavigated", params: { frame: { id: "fixture-frame", url: fixtureUrl } } }
+              const info = targetInfo(pageTarget || targetId, fixtureUrl)
+              const targetEvent = { method: "Target.targetInfoChanged", params: { targetInfo: info } }
+              protocolEvents += 1
+              socket.write(websocketFrame(JSON.stringify(targetEvent)))
+              return event
+            })()
         : null
     if (event) {
       protocolEvents += 1
