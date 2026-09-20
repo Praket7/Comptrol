@@ -66,7 +66,11 @@ async function execute(intent: string, payload: Record<string, unknown>): Promis
     case "vscode.document.save": {
       const uri = vscode.Uri.parse(String(payload.uri ?? ""));
       const document = await vscode.workspace.openTextDocument(uri);
-      return { uri: document.uri.toString(), saved: await document.save(), isDirty: document.isDirty, verified: !document.isDirty, verification: "vscode_document_persistence_readback" };
+      await document.save();
+      // Persisted-artifact verification: the saved file must exist on disk
+      // with nonzero size, not merely report a clean buffer.
+      const stat = await vscode.workspace.fs.stat(document.uri);
+      return { uri: document.uri.toString(), saved: true, size: stat.size, mtime: stat.mtime, isDirty: document.isDirty, verified: !document.isDirty && stat.size > 0, verification: "vscode_persisted_artifact_stat" };
     }
     default: throw new Error("unsupported intent");
   }

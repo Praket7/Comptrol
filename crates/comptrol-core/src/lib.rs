@@ -3179,22 +3179,38 @@ fn browser_cdp_semantic_click(
         locator,
         timeout,
     ) {
-        Ok(data) => success(
-            request,
-            operation_id,
-            "browser_protocol",
-            EffectState::Changed,
-            VerificationState::Unverified,
-            json!({
-                "dispatch": data,
-                "postcondition": if request.postcondition.is_some() {
-                    "requested_but_not_checked"
+        Ok(data) => {
+            // The dispatch carries an independent in-page readback: a unique
+            // locator match plus full actionability plus a clicked
+            // confirmation from the DOM itself. When that readback reports
+            // verified, the outcome is application-state verified, not merely
+            // delivered.
+            let verified = data.get("verified").and_then(Value::as_bool) == Some(true);
+            success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                if verified {
+                    VerificationState::Verified
                 } else {
-                    "none"
+                    VerificationState::Unverified
                 },
-                "verification": "unverified"
-            }),
-        ),
+                json!({
+                    "dispatch": data,
+                    "postcondition": if request.postcondition.is_some() {
+                        "requested_but_not_checked"
+                    } else {
+                        "none"
+                    },
+                    "verification": if verified {
+                        "in_page_actionability_readback"
+                    } else {
+                        "unverified"
+                    }
+                }),
+            )
+        }
         Err(error) => browser_failure(request, operation_id, error),
     }
 }
@@ -3772,20 +3788,24 @@ fn browser_cdp_upload(
         selector,
         &path,
     ) {
-        Ok(data) => success(
-            request,
-            operation_id,
-            "browser_protocol",
-            EffectState::Changed,
-            VerificationState::Unverified,
-            json!({
-                "selection": data,
-                "stage": "selected",
-                "transaction": transaction,
-                "verification": "unverified",
-                "next": "A site or application adapter must verify transfer or application acceptance"
-            }),
-        ),
+        Ok(data) => {
+            let selection_verified = data.get("verified").and_then(Value::as_bool) == Some(true);
+            success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                VerificationState::Unverified,
+                json!({
+                    "selection": data,
+                    "stage": "selected",
+                    "verified": selection_verified,
+                    "transaction": transaction,
+                    "verification": "unverified",
+                    "next": "A site or application adapter must verify transfer or application acceptance"
+                }),
+            )
+        }
         Err(error) => browser_failure(request, operation_id, error),
     }
 }
@@ -3830,7 +3850,7 @@ fn browser_cdp_download(
             "browser_protocol",
             EffectState::None,
             VerificationState::Verified,
-            json!({ "path": expected_path, "file_name": file_name, "verified": true, "replayed": true, "transaction": transaction }),
+            json!({ "download": { "path": expected_path, "file_name": file_name, "verified": true, "replayed": true }, "transaction": transaction }),
         );
     }
     let selector = request
@@ -4532,6 +4552,11 @@ fn browser_chrome_restore_recent(request: &OperationRequest, operation_id: Strin
         ),
         Err(error) => match error {
             restore::RestoreError::Refused {
+                code,
+                message,
+                recovery,
+            }
+            | restore::RestoreError::Unavailable {
                 code,
                 message,
                 recovery,

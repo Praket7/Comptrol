@@ -32,6 +32,20 @@ def script_for(payload):
         if path.suffix.lower() != ".blend":
             raise ValueError("project save requires a .blend path")
         return f"import bpy, json; bpy.ops.wm.save_as_mainfile(filepath={str(path)!r}); print(json.dumps({{'saved':True,'path':str(bpy.data.filepath)}}))"
+    if intent == "blender.render":
+        output = Path(str(payload.get("output_path", ""))).resolve()
+        if output.suffix.lower() not in {".png", ".jpg", ".jpeg", ".exr", ".mp4", ".avi", ".mkv"}:
+            raise ValueError("render output_path must be an image or video artifact")
+        frame = payload.get("frame", 1)
+        if not isinstance(frame, int) or frame < 0:
+            raise ValueError("frame must be a nonnegative integer")
+        return (
+            "import bpy, json; "
+            f"scene = bpy.context.scene; scene.render.filepath = {str(output)!r}; "
+            f"scene.render.frame_start = {frame}; scene.render.frame_end = {frame}; "
+            "bpy.ops.render.render(write_still=True); "
+            "print(json.dumps({'rendered': True, 'path': bpy.path.abspath(scene.render.filepath)}))"
+        )
     raise ValueError("unsupported intent")
 
 
@@ -85,7 +99,22 @@ def handler(request):
             os.unlink(script_path)
         if completed.returncode != 0:
             return response(request, False, "degraded", error={"code": "blender_failed", "message": completed.stderr[-2000:]})
-        return response(request, True, "available", {"mode": "offline", "input_path": str(input_path), "stdout": completed.stdout[-4000:], "verified_process_exit": True, "live_project_modified": False})
+        data = {"mode": "offline", "input_path": str(input_path), "stdout": completed.stdout[-4000:], "verified_process_exit": True, "live_project_modified": False}
+        # Offline verification is artifact-based: the saved or rendered file
+        # must exist with nonzero size. Process exit alone is never proof.
+        if intent == "blender.project.save":
+            saved = Path(str(payload.get("path", ""))).resolve()
+            data["output_path"] = str(saved)
+            data["output_size"] = saved.stat().st_size if saved.is_file() else 0
+            data["verified"] = saved.is_file() and data["output_size"] > 0
+            data["verification"] = "blend_file_readback"
+        elif intent == "blender.render":
+            artifact = Path(str(payload.get("output_path", ""))).resolve()
+            data["output_path"] = str(artifact)
+            data["output_size"] = artifact.stat().st_size if artifact.is_file() else 0
+            data["verified"] = artifact.is_file() and data["output_size"] > 0
+            data["verification"] = "render_artifact_readback"
+        return response(request, True, "available", data)
     except Exception as exc:
         return response(request, False, "unhealthy", error={"code": "blender_request_failed", "message": str(exc)})
 

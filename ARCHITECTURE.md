@@ -2,7 +2,7 @@
 
 Comptrol has a small canonical protocol and a native Rust runtime. MCP is an adapter at the edge. The runtime owns policy, operation identity, audit, stop state, and route selection.
 
-The preferred path is state first. A future adapter can use an application API, browser protocol, accessibility tree, or a verified workflow before resorting to pixels.
+The preferred path is state first. Adapters use an application API, browser protocol, accessibility tree, or a verified workflow before resorting to pixels; the typed workflow engine and the persistent browser multiplexer described below are implemented today, not planned.
 
 Every operation returns a route, preflight state, delivery state, effect state, verification state, disturbance state, recovery state, and a machine readable error when needed.
 

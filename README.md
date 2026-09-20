@@ -4,7 +4,7 @@ Comptrol is a local first control layer for computer using agents.
 
 It gives an MCP client one bounded operation surface with explicit policy, stable operation identity, audit records, recovery state, and honest verification.
 
-The first release is a small foundation. It runs on macOS, Windows, and Linux. Basic platform observation is available on the current machine. Browser CDP control is available only for an explicitly configured local endpoint. macOS semantic mutation is available only with Accessibility permission and explicit policy. Windows and Linux currently expose read only capability brokers.
+The first release is a small foundation. It runs on macOS, Windows, and Linux. Basic platform observation is available on the current machine. Browser CDP control is available only for an explicitly configured local endpoint. macOS semantic mutation is available only with Accessibility permission and explicit policy. Windows UI Automation and Linux AT SPI semantic mutation routes are implemented behind persistent platform workers and explicit local policy. They are exercised by conformance harnesses but still need live validation on real Windows and Linux hosts, and their traversal paths do not yet use event driven caching.
 
 ## Why it exists
 
@@ -61,7 +61,7 @@ The runtime refuses unsupported routes. It does not pretend that a platform back
 
 Basic observation and the policy core are implemented and tested.
 
-The macOS observer can use the public System Events accessibility surface when permission is available. Exact application launch is available through LaunchServices with process verification on macOS. Windows UI Automation and Linux AT SPI semantic routes are implemented behind explicit local policy but remain unverified on this host. Other platforms use best effort process observation.
+The macOS observer can use the public System Events accessibility surface when permission is available. Exact application launch is available through LaunchServices with process verification on macOS. Windows UI Automation and Linux AT SPI semantic routes are implemented behind persistent platform workers with the same semantic matching contract, while live acceptance on physical Windows and Linux hosts is still pending. Other platforms use best effort process observation.
 
 The runtime includes bounded event history, file checkpoints, fixture trace replay, exact browser target discovery, and a loopback diagnostics dashboard.
 
@@ -71,7 +71,7 @@ With explicit local app launch policy, macOS, Windows, and Linux can open an exa
 
 Supported browser operations can request strict background posture. Routes that cannot prove that posture refuse instead of activating another application or silently taking control of the foreground.
 
-Dedicated user profile Chrome validation, Windows and Linux live matrix validation, remote transport, signed releases, and published packages remain tracked work. The real Chrome harness covers navigation, DOM evaluation, same profile background state, sandbox upload, and sandbox download.
+Dedicated user profile Chrome validation, Windows and Linux live matrix validation, signed releases, and published packages remain tracked work. Remote transport exists as an mTLS server but is not yet a complete paired remote control product. The real Chrome harness covers navigation, DOM evaluation, same profile background state, sandbox upload, and sandbox download. Restore verification waits on the persistent browser target graph instead of polling target discovery, and reconstruction after an unavailable native restore is implemented and unit tested.
 
 ## Contributing
 

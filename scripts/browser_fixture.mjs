@@ -163,6 +163,39 @@ server.on("upgrade", (request, socket) => {
     if (!text) return
     buffer = Buffer.alloc(0)
     const message = JSON.parse(text)
+    // Real Target-domain bootstrap: the persistent multiplexer discovers
+    // targets, attaches with flatten, and then routes every page command
+    // through a session id on the same browser-level socket.
+    if (browserSocket && message.method === "Target.setDiscoverTargets") {
+      if (message.params?.discover) {
+        // Real Chrome emits targetCreated for every existing target once
+        // discovery is enabled; the multiplexer builds its graph from these.
+        for (const info of [targetInfo(targetId, fixtureUrl), ...[...openedTabs.values()].map(tab => targetInfo(tab.id, tab.url))]) {
+          protocolEvents += 1
+          socket.write(websocketFrame(JSON.stringify({ method: "Target.targetCreated", params: { targetInfo: info } })))
+        }
+      }
+      socket.write(websocketFrame(JSON.stringify({ id: message.id, result: {} })))
+      return
+    }
+    if (browserSocket && message.method === "Target.setAutoAttach") {
+      socket.write(websocketFrame(JSON.stringify({ id: message.id, result: {} })))
+      return
+    }
+    if (browserSocket && message.method === "Target.getTargets") {
+      const infos = [targetInfo(targetId, fixtureUrl), ...[...openedTabs.values()].map(tab => targetInfo(tab.id, tab.url))]
+      socket.write(websocketFrame(JSON.stringify({ id: message.id, result: { targetInfos: infos } })))
+      return
+    }
+    if (browserSocket && message.method === "Target.attachToTarget") {
+      const attachedId = message.params?.targetId
+      if (attachedId !== targetId && !openedTabs.has(attachedId)) {
+        socket.write(websocketFrame(JSON.stringify({ id: message.id, error: { message: "target not found" } })))
+        return
+      }
+      socket.write(websocketFrame(JSON.stringify({ id: message.id, result: { sessionId: `session-${attachedId}` } })))
+      return
+    }
     const result = browserSocket && message.method === "Target.createTarget"
       ? (() => {
           const id = `comptrol-opened-${openedTabs.size + 1}`
@@ -199,7 +232,7 @@ server.on("upgrade", (request, socket) => {
             ? { data: Buffer.from(`fixture:${pageTarget || "comptrol-fixture-page"}:${fixtureUrl}`).toString("base64") }
           : {}
     const event = browserSocket && message.method === "Target.createTarget"
-      ? { method: "Target.targetCreated", params: { targetInfo: { targetId: result.targetId } } }
+      ? { method: "Target.targetCreated", params: { targetInfo: targetInfo(result.targetId, message.params?.url) } }
       : browserSocket && message.method === "Target.closeTarget"
         ? { method: "Target.targetDestroyed", params: { targetId: message.params.targetId } }
         : message.method === "Page.navigateToHistoryEntry" || message.method === "Page.navigate"
@@ -209,9 +242,22 @@ server.on("upgrade", (request, socket) => {
       protocolEvents += 1
       socket.write(websocketFrame(JSON.stringify(event)))
     }
-    socket.write(websocketFrame(JSON.stringify({ id: message.id, result })))
+    const responseEnvelope = { id: message.id, result }
+    if (message.sessionId) responseEnvelope.sessionId = message.sessionId
+    socket.write(websocketFrame(JSON.stringify(responseEnvelope)))
   })
 })
+
+function targetInfo(id, url) {
+  return {
+    targetId: id,
+    type: "page",
+    title: id === targetId ? "Comptrol browser fixture" : "opened fixture tab",
+    url: url || fixtureUrl,
+    browserContextId,
+    attached: false,
+  }
+}
 
 server.listen(port, "127.0.0.1", () => {
   process.stderr.write(`Comptrol browser fixture listening on http://127.0.0.1:${port}\n`)

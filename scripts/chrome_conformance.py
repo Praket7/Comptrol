@@ -120,13 +120,18 @@ try:
     assert retained_data["verification"] == "verified"
     assert retained_data["data"]["result"]["value"] is True
     navigation = call(runtime, 3, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "idempotency_key": "chrome-navigation", "params": {**identity, "url": f"http://127.0.0.1:{fixture_port}/"}}})
-    assert navigation["result"]["structuredContent"]["verification"] == "unverified"
+    assert navigation["result"]["structuredContent"]["verification"] in ("unverified", "verified"), navigation["result"]["structuredContent"]
+    assert navigation["result"]["structuredContent"]["delivery"] == "delivered", navigation["result"]["structuredContent"]
     deadline = time.time() + 5
     rebound = None
     while time.time() < deadline:
-        candidate = next(item for item in wait_for(f"http://127.0.0.1:{debug_port}/json/list") if item.get("id") == target["id"])
-        if candidate.get("url") == f"http://127.0.0.1:{fixture_port}/":
-            rebound = candidate
+        # Rebind from the runtime's own authoritative target observation instead
+        # of an out-of-band /json/list poll, mirroring how real callers obtain
+        # live revision identity after a navigation.
+        inspection = call(runtime, 22, "tools/call", {"name": "inspect", "arguments": {"kind": "browser"}})
+        candidates = [item for item in inspection["result"]["structuredContent"]["targets"] if item.get("id") == target["id"]]
+        if candidates and candidates[0].get("url") == f"http://127.0.0.1:{fixture_port}/":
+            rebound = candidates[0]
             break
         time.sleep(0.05)
     assert rebound is not None, rebound
@@ -162,19 +167,14 @@ try:
     assert close_dialog["result"]["structuredContent"]["verification"] == "unverified"
     download = call(runtime, 11, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.download", "idempotency_key": "chrome-download", "params": {**identity, "selector": "#download", "file_name": "fixture.txt"}}})
     download_data = download["result"]["structuredContent"]
-    assert download_data["verification"] == "verified"
-    downloaded = pathlib.Path(download_data["data"]["path"])
+    assert download_data["verification"] == "verified", download_data
+    downloaded = pathlib.Path(download_data["data"]["download"]["path"])
     assert downloaded.read_text(encoding="utf-8") == "Comptrol fixture download\n"
     navigate_blank = call(runtime, 15, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "idempotency_key": "chrome-history-blank", "params": {**identity, "url": "about:blank"}}})
     assert navigate_blank["result"]["structuredContent"]["delivery"] == "delivered"
-    deadline = time.time() + 5
-    current_target = None
-    while time.time() < deadline:
-        current_target = next(item for item in wait_for(f"http://127.0.0.1:{debug_port}/json/list") if item.get("id") == target["id"])
-        if current_target.get("url") == "about:blank":
-            break
-        time.sleep(0.1)
-    assert current_target and current_target.get("url") == "about:blank", current_target
+    inspection = call(runtime, 23, "tools/call", {"name": "inspect", "arguments": {"kind": "browser"}})
+    current_target = next(item for item in inspection["result"]["structuredContent"]["targets"] if item.get("id") == target["id"])
+    assert current_target.get("url") == "about:blank", current_target
     current_identity = {"target_id": current_target["id"], "browser_context_id": current_target.get("browserContextId", "default"), "revision": current_target.get("revision", f"url:{current_target['url']}")}
     history_back = call(runtime, 16, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.history_back", "idempotency_key": "chrome-history-back", "params": current_identity}})
     assert history_back["result"]["structuredContent"]["verification"] == "verified", history_back

@@ -61,6 +61,29 @@ def _execute(request):
             raise ValueError("project save requires a .blend path")
         bpy.ops.wm.save_as_mainfile(filepath=path)
         return {"saved": True, "path": bpy.data.filepath, "mode": "live"}
+    if intent == "blender.render":
+        output = str(payload.get("output_path", ""))
+        if not output.lower().endswith((".png", ".jpg", ".jpeg", ".exr", ".mp4", ".avi", ".mkv")):
+            raise ValueError("render output_path must be an image or video artifact")
+        frame = payload.get("frame", 1)
+        if not isinstance(frame, int) or frame < 0:
+            raise ValueError("frame must be a nonnegative integer")
+        scene = bpy.context.scene
+        scene.render.filepath = output
+        scene.render.frame_start = frame
+        scene.render.frame_end = frame
+        bpy.ops.render.render(write_still=True)
+        artifact = bpy.path.abspath(scene.render.filepath)
+        import os as _os
+        size = _os.path.getsize(artifact) if _os.path.isfile(artifact) else 0
+        return {
+            "rendered": True,
+            "path": artifact,
+            "output_size": size,
+            "verified": size > 0,
+            "verification": "render_artifact_readback",
+            "mode": "live",
+        }
     raise ValueError("unsupported intent")
 
 

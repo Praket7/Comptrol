@@ -1,5 +1,15 @@
 # Implementation report
 
+> Status update (V4 closeout pass): restore verification now waits on the
+> persistent browser target graph instead of polling `/json/list`; reconstruction
+> after an unavailable native restore is implemented and unit tested; adapter
+> manifests are validated against executable handlers and declared verification
+> levels by conformance CI; OBS, Blender, LibreOffice, and VS Code adapters
+> report per-intent verification readbacks instead of blanket `verified: true`;
+> package versions across the workspace, npm package, and plugin manifests are
+> generated from the single `VERSION` source and enforced by CI. Sections below
+> describe the earlier build state and are retained for history.
+
 ## Built
 
 The repository contains a Rust workspace with a native Comptrol runtime and MCP server. The runtime implements a compact MCP surface with operate, inspect, watch, reconcile, checkpoint restore, and capabilities. Deterministic closed workflows execute through one operate call.

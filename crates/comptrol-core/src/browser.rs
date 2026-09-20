@@ -211,7 +211,7 @@ pub fn open_tab(
         "focus": !background,
         "newWindow": false
     });
-    if let Some(browser_context_id) = browser_context_id {
+    if let Some(browser_context_id) = real_context_id(browser_context_id) {
         create_params["browserContextId"] = json!(browser_context_id);
     }
     let created = protocol_call(web_socket_url, "Target.createTarget", create_params)?;
@@ -400,11 +400,6 @@ pub fn history(
         Some(browser_context_id),
         Some(revision),
     )?;
-    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
-        code: "browser_protocol_invalid".to_owned(),
-        message: "The target did not provide a websocket debugger URL".to_owned(),
-        recovery: Some("Inspect browser targets again".to_owned()),
-    })?;
     let current = cdp_call(
         endpoint,
         target_id,
@@ -463,7 +458,11 @@ pub fn history(
         "Page.navigateToHistoryEntry",
         json!({ "entryId": entry_id }),
     )?;
-    wait_for_event(&web_socket_url, Duration::from_secs(2), |event| {
+    // The navigation command rides the persistent browser-level connection,
+    // so its lifecycle event arrives there too. Waiting on a fresh page-level
+    // socket here would miss the event and time out.
+    let browser_event_socket = browser_websocket_endpoint(endpoint)?;
+    wait_for_event(&browser_event_socket, Duration::from_secs(2), |event| {
         matches!(
             event.get("method").and_then(Value::as_str),
             Some("Page.frameNavigated") | Some("Page.navigatedWithinDocument")
@@ -741,15 +740,21 @@ fn protocol_call(
     method: &str,
     params: Value,
 ) -> Result<Value, ComptrolError> {
-    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
-    BRIDGE
-        .get_or_init(BlockingBrowserManager::new)
+    bridge()
         .command(web_socket_url, method, params)
         .map_err(|error| ComptrolError {
             code: "browser_protocol_error".to_owned(),
             message: error.to_string(),
             recovery: Some("Inspect the browser connection and retry".to_owned()),
         })
+}
+
+/// Shared persistent browser bridge accessor. One long-lived multiplexer is
+/// created per process; every browser wait and command routes through it so
+/// warm paths never open a second socket or poll discovery.
+pub fn bridge() -> &'static BlockingBrowserManager {
+    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
+    BRIDGE.get_or_init(BlockingBrowserManager::new)
 }
 
 fn wait_for_event<F>(
@@ -760,8 +765,7 @@ fn wait_for_event<F>(
 where
     F: Fn(&Value) -> bool,
 {
-    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
-    let bridge = BRIDGE.get_or_init(BlockingBrowserManager::new);
+    let bridge = bridge();
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -825,9 +829,7 @@ pub fn cdp_call(
         Err(error) => return Err(error),
     };
     let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
-    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
-    let result = BRIDGE
-        .get_or_init(BlockingBrowserManager::new)
+    let result = bridge()
         .target_command_legacy_revision(
             &browser_web_socket_url,
             target_id,
@@ -860,9 +862,7 @@ pub fn cdp_frame_call(
     params: Value,
 ) -> Result<Value, ComptrolError> {
     let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
-    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
-    BRIDGE
-        .get_or_init(BlockingBrowserManager::new)
+    bridge()
         .frame_command(
             &browser_web_socket_url,
             frame_id,
@@ -1180,7 +1180,9 @@ pub fn cdp_upload(
     Ok(json!({
         "path": path,
         "file_name": file_name_text,
-        "verified": false,
+        // The DOM readback above proved the selection; transfer and persistence
+        // remain unproven and are tracked by the stage map below.
+        "verified": true,
         "stage": "selected",
         "stages": {
             "selected": true,
@@ -1232,17 +1234,24 @@ pub fn cdp_download(
             message: "The browser did not provide a browser websocket".to_owned(),
             recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
         })?;
-    static BRIDGE: OnceLock<BlockingBrowserManager> = OnceLock::new();
-    BRIDGE
-        .get_or_init(BlockingBrowserManager::new)
+    // Real Chrome omits browserContextId for default-context targets and
+    // rejects unknown GUIDs, so the canonical "default" label must never be
+    // sent as if it were a real context GUID.
+    let mut download_behavior = json!({
+        "behavior": "allow",
+        "downloadPath": download_dir,
+        // Chrome only emits Browser.downloadWillBegin/downloadProgress when
+        // events are explicitly enabled on this behavior binding.
+        "eventsEnabled": true
+    });
+    if let Some(context_id) = real_context_id(browser_context_id) {
+        download_behavior["browserContextId"] = json!(context_id);
+    }
+    bridge()
         .command(
             browser_web_socket_url,
             "Browser.setDownloadBehavior",
-            json!({
-            "behavior": "allow",
-            "downloadPath": download_dir,
-            "browserContextId": browser_context_id.unwrap_or("default")
-            }),
+            download_behavior,
         )
         .map_err(|error| ComptrolError {
             code: "browser_protocol_error".to_owned(),
@@ -1324,6 +1333,17 @@ fn browser_file_error(error: io::Error) -> ComptrolError {
         code: "browser_filesystem_failed".to_owned(),
         message: error.to_string(),
         recovery: Some("Inspect the Comptrol sandbox and retry".to_owned()),
+    }
+}
+
+/// Chrome omits `browserContextId` for default-context targets, so Comptrol
+/// normalizes that absence to the canonical label "default". That label is an
+/// identity alias for binding and reporting only. It must never be forwarded
+/// to Chrome as if it were a real context GUID, which Chrome rejects.
+pub fn real_context_id(browser_context_id: Option<&str>) -> Option<&str> {
+    match browser_context_id {
+        Some("default") | Some("") => None,
+        other => other,
     }
 }
 

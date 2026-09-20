@@ -135,9 +135,31 @@ def handler(request):
                 return response(request, True, "available", {"responses": result, "verified": True, "verification": "obs_batch_readback"})
             return response(request, False, "unsupported", error={"code": "unsupported_intent", "message": str(intent)})
         result = obs_request(request, *mapping[intent])
-        if intent.startswith("obs.recording.") and intent != "obs.recording.status":
-            result = {**result, "verified_status": obs_request(request, "GetRecordStatus")}
-        result = {**result, "verified": True, "verification": "obs_event_or_response_readback"}
+        # Verification is per-intent readback, never request success alone.
+        # Each mutation must be confirmed by the corresponding getter state.
+        verified = True
+        if intent == "obs.scene.switch":
+            state = obs_request(request, "GetCurrentProgramScene")
+            expected = request["payload"]["scene"]
+            verified = state.get("currentProgramSceneName") == expected
+            result = {**result, "current_program_scene": state.get("currentProgramSceneName")}
+            verification = "obs_scene_readback"
+        elif intent == "obs.source.visibility.set":
+            items = obs_request(request, "GetSceneItemList", {"sceneName": request["payload"]["scene"]}).get("sceneItems", [])
+            item_id = int(request["payload"]["scene_item_id"])
+            expected = bool(request["payload"]["enabled"])
+            match = next((item for item in items if item.get("sceneItemId") == item_id), None)
+            verified = match is not None and bool(match.get("sceneItemEnabled")) == expected
+            verification = "obs_scene_item_readback"
+        elif intent in ("obs.recording.start", "obs.recording.stop"):
+            state = obs_request(request, "GetRecordStatus")
+            expected_active = intent == "obs.recording.start"
+            verified = bool(state.get("outputActive")) == expected_active
+            result = {**result, "record_status": state}
+            verification = "obs_record_status_readback"
+        else:
+            verification = "obs_state_readback"
+        result = {**result, "verified": verified, "verification": verification}
         return response(request, True, "available", result)
     except Exception as exc:
         return response(request, False, "degraded", error={"code": "obs_request_failed", "message": str(exc)})

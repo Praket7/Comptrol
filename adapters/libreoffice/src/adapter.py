@@ -2,6 +2,7 @@
 import os
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
 from adapter_protocol import response, serve  # noqa: E402
@@ -46,6 +47,16 @@ def select_document(current_desktop, payload):
     return candidates[0]
 
 
+def file_url_to_path(url):
+    """Convert a file:// URL to a local path; return None for remote URLs."""
+    parsed = urlparse(url)
+    if parsed.scheme == "file":
+        return unquote(parsed.path)
+    if not parsed.scheme:
+        return url
+    return None
+
+
 def handler(request):
     method = request.get("method")
     if method == "handshake":
@@ -77,13 +88,78 @@ def handler(request):
             document = select_document(current_desktop, payload)
             document.store()
             return response(request, True, "available", {"saved": True, "document_url": str(document.getURL()), "document_title": str(document.getTitle()), "modified": document.isModified(), "verified": not document.isModified(), "verification": "uno_persistence_readback"})
+        if intent == "libreoffice.document.open":
+            import uno
+            target = str(payload.get("path", "")).strip()
+            url = str(payload.get("document_url", "")).strip()
+            if target:
+                url = uno.systemPathToFileUrl(target)
+            if not url:
+                raise ValueError("path or document_url is required")
+            component = current_desktop.loadComponentFromURL(url, "_blank", 0, ())
+            if component is None:
+                return response(request, False, "available", error={
+                    "code": "document_open_failed",
+                    "message": f"LibreOffice did not open {url}",
+                })
+            opened_url = str(component.getURL())
+            verified = opened_url == url
+            return response(request, True, "available", {
+                "opened": True,
+                "document_url": opened_url,
+                "document_title": str(component.getTitle()),
+                "verified": verified,
+                "verification": "uno_url_readback",
+            })
+        if intent == "libreoffice.writer.text.replace":
+            document = select_document(current_desktop, payload)
+            if not document.supportsService("com.sun.star.text.TextDocument"):
+                raise ValueError("writer.text.replace requires a text document")
+            search = str(payload.get("find", ""))
+            replacement = str(payload.get("replace", ""))
+            if not search:
+                raise ValueError("find is required")
+            descriptor = document.createReplaceDescriptor()
+            descriptor.SearchString = search
+            descriptor.ReplaceString = replacement
+            replaced = int(document.replaceAll(descriptor))
+            # Independent readback: the search string must no longer occur
+            # unless the replacement reintroduced it.
+            probe = document.createSearchDescriptor()
+            probe.SearchString = search
+            remaining = 0
+            while document.findNext(document.Text.Start, probe) is not None:
+                remaining += 1
+                if remaining > 1000:
+                    break
+            verified = remaining == 0 or search in replacement
+            return response(request, True, "available", {
+                "replaced": replaced,
+                "remaining_occurrences": remaining,
+                "verified": verified,
+                "verification": "uno_replace_readback",
+            })
         if intent == "libreoffice.document.export":
             document = select_document(current_desktop, payload)
             output_url = str(payload.get("output_url", "")).strip()
             if not output_url:
                 raise ValueError("output_url is required")
             document.storeToURL(output_url, ())
-            return response(request, True, "available", {"exported": True, "output_url": output_url, "modified": document.isModified(), "verified": True, "verification": "uno_export_readback"})
+            # Persisted-artifact verification: the exported file must exist
+            # with nonzero size on the local filesystem when observable.
+            path = file_url_to_path(output_url)
+            verified = False
+            details = {"exported": True, "output_url": output_url, "modified": document.isModified(), "verification": "uno_export_readback"}
+            if path is not None:
+                exported = Path(path)
+                exists = exported.is_file()
+                size = exported.stat().st_size if exists else 0
+                verified = exists and size > 0
+                details["output_size"] = size
+            else:
+                details["verification"] = "uno_export_dispatch_only"
+            details["verified"] = verified
+            return response(request, True, "available", details)
         return response(request, False, "unsupported", error={"code": "unsupported_intent", "message": str(intent)})
     except ImportError as exc:
         return response(request, False, "unsupported", error={"code": "uno_unavailable", "message": str(exc)})

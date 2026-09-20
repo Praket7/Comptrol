@@ -1,9 +1,10 @@
 {
   "name": "comptrol",
-  "version": "0.1.0",
+  "version": "0.1.63",
   "private": true,
   "description": "Local first computer control runtime",
   "scripts": {
+    "check:versions": "python3 scripts/check_versions.py",
     "test:browser": "node scripts/browser_conformance.mjs",
     "test:launcher": "node scripts/launcher_conformance.mjs",
     "test:daemon-launcher": "node scripts/daemon_launcher_conformance.mjs",

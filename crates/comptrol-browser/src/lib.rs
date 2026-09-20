@@ -482,6 +482,21 @@ impl BrowserConnection {
         Ok(())
     }
 
+    /// Snapshot the current target graph generation and matching page records
+    /// without any network round trip. Restore verification and other waiters
+    /// poll this in-memory view instead of issuing `/json/list` discovery; the
+    /// persistent connection keeps the graph current from target events.
+    pub async fn target_snapshot(&self) -> (u64, Vec<TargetRecord>) {
+        let graph = self.targets.read().await;
+        let records = graph
+            .targets
+            .values()
+            .filter(|target| target.target_type == "page")
+            .cloned()
+            .collect();
+        (graph.generation, records)
+    }
+
     /// Enable the required domains for all targets attached during browser
     /// bootstrap. The graph is copied before dispatch so no graph lock is held
     /// across WebSocket I/O.

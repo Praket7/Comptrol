@@ -7,22 +7,22 @@
 //! Platforms without an implemented enumeration provider report
 //! `native_restore_unavailable` instead of approximating a restore.
 
-use crate::restore::{NATIVE_UNAVAILABLE, RestoreEntry, RestoreError, RestoreKind, refuse};
+use crate::restore::{
+    NATIVE_UNAVAILABLE, RestoreEntry, RestoreError, RestoreKind, native_unavailable, refuse,
+};
 
 /// Enumerate recently-closed restore entries through the native surface.
 #[cfg(target_os = "macos")]
 pub fn macos_entries() -> Result<Vec<RestoreEntry>, RestoreError> {
     let script = "tell application \"System Events\"\ntell application process \"Google Chrome\"\nset output to \"\"\nrepeat with w in windows\nrepeat with b in (every button of w whose description contains \"Closed\")\nset output to output & (name of b) & linefeed\nend repeat\nend repeat\nreturn output\nend tell\nend tell";
     let output = crate::run_osascript(script).map_err(|error| {
-        refuse(
-            NATIVE_UNAVAILABLE,
+        native_unavailable(
             format!("macOS Accessibility provider unavailable: {error}"),
             Some("Grant Accessibility permission to the Comptrol host".to_owned()),
         )
     })?;
     if !output.status.success() {
-        return Err(refuse(
-            NATIVE_UNAVAILABLE,
+        return Err(native_unavailable(
             "Chrome restore entries are not reachable through macOS Accessibility",
             Some("Open the History menu once or grant Accessibility permission".to_owned()),
         ));
@@ -47,11 +47,7 @@ pub fn macos_restore(entry: &RestoreEntry) -> Result<(), RestoreError> {
         "tell application \"System Events\"\ntell application process \"Google Chrome\"\nset matches to {{}}\nrepeat with w in windows\nset matches to matches & (every button of w whose name is {control})\nend repeat\nif (count of matches) is not 1 then error \"target_ambiguous\"\nperform action \"AXPress\" of item 1 of matches\nreturn \"pressed\"\nend tell\nend tell"
     );
     let output = crate::run_osascript(&script).map_err(|error| {
-        refuse(
-            NATIVE_UNAVAILABLE,
-            format!("macOS restore press failed: {error}"),
-            None,
-        )
+        native_unavailable(format!("macOS restore press failed: {error}"), None)
     })?;
     if !output.status.success() {
         return Err(refuse(
@@ -76,9 +72,11 @@ pub fn macos_restore(_entry: &RestoreEntry) -> Result<(), RestoreError> {
     Err(macos_unavailable())
 }
 
+// Only the non-macOS fallback stubs below need this constructor; on macOS
+// the real provider exists and this would otherwise be dead code.
+#[cfg(not(target_os = "macos"))]
 fn macos_unavailable() -> RestoreError {
-    refuse(
-        NATIVE_UNAVAILABLE,
+    native_unavailable(
         "macOS Accessibility is not available on this platform",
         None,
     )
@@ -87,16 +85,14 @@ fn macos_unavailable() -> RestoreError {
 /// Windows: UIA enumeration of Chrome restore entries is not implemented yet.
 /// The runtime reports this honestly instead of sending keyboard shortcuts.
 pub fn windows_entries() -> Result<Vec<RestoreEntry>, RestoreError> {
-    Err(refuse(
-        NATIVE_UNAVAILABLE,
+    Err(native_unavailable(
         "Windows UIA enumeration of Chrome recently-closed entries is not implemented in this build",
         Some("Use mode native_then_reconstruct or reconstruct_only".to_owned()),
     ))
 }
 
 pub fn windows_restore(_entry: &RestoreEntry) -> Result<(), RestoreError> {
-    Err(refuse(
-        NATIVE_UNAVAILABLE,
+    Err(native_unavailable(
         "Windows UIA restore invocation is not implemented in this build",
         None,
     ))
@@ -112,8 +108,7 @@ pub fn linux_entries() -> Result<Vec<RestoreEntry>, RestoreError> {
 }
 
 pub fn linux_restore(_entry: &RestoreEntry) -> Result<(), RestoreError> {
-    Err(refuse(
-        NATIVE_UNAVAILABLE,
+    Err(native_unavailable(
         "Linux AT-SPI restore invocation is not implemented in this build",
         None,
     ))

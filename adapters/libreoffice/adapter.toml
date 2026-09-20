@@ -40,3 +40,9 @@ risk = "R2"
 background = "supported"
 verification = "application_state"
 
+[[capabilities]]
+intent = "libreoffice.document.export"
+risk = "R2"
+background = "supported"
+verification = "persisted_artifact"
+

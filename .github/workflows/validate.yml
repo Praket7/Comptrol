@@ -41,6 +41,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release
+      - run: python3 scripts/check_versions.py
       - run: python3 scripts/lint_readme.py
       - run: python3 scripts/test_release_verification.py
       - run: python3 scripts/adapter_conformance.py
@@ -66,4 +67,4 @@ jobs:
           name: v4-benchmark-results
           path: benchmark-results/v4-transport.json
           if-no-files-found: error
-      - run: python3 scripts/generate_homebrew_formula.py --version 0.1.0 --url https://example.invalid/comptrol.tar.gz --sha256 0000000000000000000000000000000000000000000000000000000000000000 --output /tmp/comptrol.rb
+      - run: python3 scripts/generate_homebrew_formula.py --version "$(cat VERSION)" --url https://example.invalid/comptrol.tar.gz --sha256 0000000000000000000000000000000000000000000000000000000000000000 --output /tmp/comptrol.rb

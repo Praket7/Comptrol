@@ -39,7 +39,7 @@ await chmod(fakePath, 0o755);
 
 const launcher = spawn(process.execPath, ["packages/mcp/bin/comptrol-mcp.js"], {
   cwd: new URL("..", import.meta.url),
-  env: { ...process.env, COMPTROL_BIN: fakePath, COMPTROL_TEST_MARKER: marker },
+  env: { ...process.env, COMPTROL_BIN: fakePath, COMPTROL_TEST_MARKER: marker, COMPTROL_AUTO_START_CHROME_CDP: "0" },
   stdio: ["pipe", "pipe", "pipe"],
 });
 const exited = once(launcher, "exit");
