@@ -1,0 +1,35 @@
+manifest_version = 1
+id = "comptrol.microsoft-graph-mail"
+name = "Microsoft Graph Mail"
+version = "0.1.0"
+platforms = ["windows", "macos", "linux"]
+applications = ["Microsoft Outlook", "Microsoft 365"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "mail.draft"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "mail.send"
+risk = "R3"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "mail.search"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "mail.read"
+risk = "R0"
+background = "supported"
+verification = "application_state"

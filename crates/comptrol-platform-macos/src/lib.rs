@@ -28,6 +28,18 @@ pub fn execute(_request: Request<'_>) -> Result<Value, String> {
     Err("macOS AX adapter is only available on macOS".to_owned())
 }
 
+/// Whether this process is currently trusted for Accessibility (TCC).
+/// Read-only: it never prompts and never changes authorization state.
+#[cfg(not(target_os = "macos"))]
+pub fn accessibility_trusted() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+pub fn accessibility_trusted() -> bool {
+    native::is_process_trusted()
+}
+
 #[cfg(target_os = "macos")]
 mod native {
     use super::{Action, Request};
@@ -100,8 +112,12 @@ mod native {
         fn CFStringGetTypeID() -> CFTypeID;
     }
 
+    pub(super) fn is_process_trusted() -> bool {
+        unsafe { AXIsProcessTrusted() != 0 }
+    }
+
     pub(super) fn execute(request: Request<'_>) -> Result<Value, String> {
-        if unsafe { AXIsProcessTrusted() } == 0 {
+        if !is_process_trusted() {
             return Err("accessibility_permission_required".to_owned());
         }
         let started = Instant::now();

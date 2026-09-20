@@ -58,6 +58,7 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "libreoffice.calc.range.read",
     "libreoffice.calc.range.write",
     "libreoffice.writer.text.replace",
+    "libreoffice.document.export",
     "obs.scene.list",
     "obs.scene.switch",
     "obs.source.visibility.set",
@@ -69,19 +70,133 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "blender.scene.object.transform",
     "blender.project.save",
     "blender.render",
+    "video.project.list",
+    "video.project.open",
+    "video.project.create",
+    "video.project.save",
+    "video.media.import",
+    "video.media.bin.create",
+    "video.media.list",
+    "video.timeline.list",
+    "video.timeline.open",
+    "video.timeline.create",
+    "video.timeline.items.list",
+    "video.timeline.append",
+    "video.timeline.insert",
+    "video.timeline.batch",
+    "video.timeline.marker.add",
+    "video.timeline.marker.delete",
+    "video.timeline.item.properties.get",
+    "video.timeline.item.properties.set",
+    "video.render.preset.list",
+    "video.render.configure",
+    "video.render.add_job",
+    "video.render.start",
+    "video.render.status",
+    "video.render.cancel",
+    "document.google.read",
+    "document.google.batch_edit",
+    "document.text.insert",
+    "document.text.replace",
+    "document.text.style",
+    "document.export",
+    "presentation.google.read",
+    "presentation.slide.create",
+    "presentation.slide.delete",
+    "presentation.slide.reorder",
+    "presentation.text.replace",
+    "presentation.text.style",
+    "presentation.export",
+    "presentation.read",
+    "presentation.batch_edit",
+    "presentation.desktop.open",
+    "presentation.shape.text.set",
+    "presentation.save",
+    "presentation.export_pdf",
+    "discord.message.draft",
+    "discord.message.send",
+    "discord.message.edit",
+    "discord.message.delete",
+    "discord.message.reply",
+    "discord.message.react",
+    "discord.message.attach",
+    "discord.message.search",
+    "mail.draft",
+    "mail.send",
+    "mail.search",
+    "mail.read",
+    "message.draft",
+    "message.send",
+    "design.list",
+    "design.read",
+    "design.page.list",
+    "design.element.inspect",
+    "design.text.update",
+    "design.image.insert",
+    "design.element.create",
+    "design.element.delete",
+    "design.element.group",
+    "design.export",
 ];
 
 fn is_first_party_adapter_intent(intent: &str) -> bool {
     FIRST_PARTY_ADAPTER_INTENTS.contains(&intent)
 }
 
-fn adapter_id_for_intent(intent: &str) -> Option<&'static str> {
-    match intent.split('.').next()? {
-        "vscode" => Some("vscode"),
-        "libreoffice" => Some("libreoffice"),
-        "obs" => Some("obs"),
-        "blender" => Some("blender"),
-        _ => None,
+fn adapter_id_for_intent(intent: &str, provider: Option<&str>) -> Result<&'static str, String> {
+    match intent.split('.').next().unwrap_or("") {
+        "vscode" => Ok("vscode"),
+        "libreoffice" => Ok("libreoffice"),
+        "obs" => Ok("obs"),
+        "blender" => Ok("blender"),
+        "video" => Ok("davinci-resolve"),
+        "discord" => Ok("discord"),
+        "message" => Ok("apple-messages"),
+        "design" => Ok("canva"),
+        "document" => Ok("google-workspace"),
+        "presentation" => match intent {
+            _ if intent.starts_with("presentation.google.")
+                || intent.starts_with("presentation.text.") =>
+            {
+                Ok("google-workspace")
+            }
+            "presentation.read" | "presentation.batch_edit" => Ok("powerpoint"),
+            _ if intent.starts_with("presentation.desktop.")
+                || intent.starts_with("presentation.shape.")
+                || intent == "presentation.save"
+                || intent == "presentation.export_pdf" =>
+            {
+                Ok("powerpoint-windows")
+            }
+            _ if intent.starts_with("presentation.slide.") => match provider {
+                Some("google" | "slides" | "google-workspace") => Ok("google-workspace"),
+                Some("powerpoint" | "windows" | "desktop" | "powerpoint-windows") => {
+                    Ok("powerpoint-windows")
+                }
+                _ => Err(format!(
+                    "{intent} is served by Google Slides and desktop PowerPoint; set params.provider to \"google\" or \"powerpoint\""
+                )),
+            },
+            "presentation.export" => match provider {
+                Some("google" | "slides" | "google-workspace") => Ok("google-workspace"),
+                Some("powerpoint" | "openxml" | "desktop" | "windows") => Ok("powerpoint"),
+                _ => Err(format!(
+                    "{intent} is served by Google Slides and PowerPoint; set params.provider to \"google\" or \"powerpoint\""
+                )),
+            },
+            _ => Err(format!("No route is implemented for {intent}")),
+        },
+        "mail" => match provider {
+            Some("gmail" | "google") => Ok("gmail"),
+            Some("graph" | "outlook" | "microsoft" | "microsoft-graph-mail") => {
+                Ok("microsoft-graph-mail")
+            }
+            Some("apple-mail" | "apple" | "mail-app") => Ok("apple-mail"),
+            _ => Err(format!(
+                "{intent} is served by Gmail, Microsoft Graph, and Apple Mail; set params.provider to \"gmail\", \"graph\", or \"apple-mail\""
+            )),
+        },
+        _ => Err(format!("No route is implemented for {intent}")),
     }
 }
 
@@ -520,6 +635,11 @@ impl Default for Policy {
                 "browser.cdp.accessibility_snapshot".to_owned(),
                 "browser.cdp.reopen_closed_group".to_owned(),
                 "workflow.execute".to_owned(),
+                "app.resolve".to_owned(),
+                "app.list".to_owned(),
+                "permission.status".to_owned(),
+                "popup.inspect".to_owned(),
+                "browser.session.list".to_owned(),
             ]),
         }
     }
@@ -560,6 +680,48 @@ impl Policy {
             policy.max_risk = Risk::R2;
             policy.allowed_intents.insert("desktop.open_app".to_owned());
             policy.allowed_intents.insert("app.launch".to_owned());
+            policy.allowed_intents.insert("app.resolve".to_owned());
+            policy.allowed_intents.insert("app.list".to_owned());
+            policy
+                .allowed_intents
+                .insert("app.open_resource".to_owned());
+            policy.allowed_intents.insert("app.focus".to_owned());
+        }
+        if std::env::var("COMPTROL_ALLOW_APP_CLOSE").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R3);
+            policy.allowed_intents.insert("app.close".to_owned());
+        }
+        if std::env::var("COMPTROL_ALLOW_SOFTWARE").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R1);
+            policy.allowed_intents.insert("software.search".to_owned());
+            policy
+                .allowed_intents
+                .insert("software.describe".to_owned());
+        }
+        if std::env::var("COMPTROL_ALLOW_SOFTWARE_INSTALL").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R3);
+            policy.allowed_intents.insert("software.install".to_owned());
+            policy.allowed_intents.insert("software.update".to_owned());
+            policy
+                .allowed_intents
+                .insert("software.uninstall".to_owned());
+        }
+        if std::env::var("COMPTROL_ALLOW_SETTINGS").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            policy.allowed_intents.insert("settings.get".to_owned());
+            policy.allowed_intents.insert("settings.set".to_owned());
+            policy.allowed_intents.insert("settings.write".to_owned());
+            policy
+                .allowed_intents
+                .insert("permission.status".to_owned());
+            policy
+                .allowed_intents
+                .insert("permission.request".to_owned());
+        }
+        if std::env::var("COMPTROL_ALLOW_POPUP").as_deref() == Ok("1") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            policy.allowed_intents.insert("popup.inspect".to_owned());
+            policy.allowed_intents.insert("popup.dismiss".to_owned());
         }
         if std::env::var("COMPTROL_ALLOW_COMMANDS").as_deref() == Ok("1") {
             policy.max_risk = policy.max_risk.max(Risk::R3);
@@ -609,6 +771,8 @@ impl Policy {
                 "browser.cdp.workflow".to_owned(),
                 "browser.cdp.screenshot".to_owned(),
                 "browser.cdp.coordinate_click".to_owned(),
+                "browser.cdp.dialog".to_owned(),
+                "browser.session.connect".to_owned(),
             ]);
         }
         if std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1") {
@@ -632,6 +796,11 @@ impl Policy {
                 policy
                     .allowed_intents
                     .insert("obs.recording.stop".to_owned());
+                policy
+                    .allowed_intents
+                    .insert("discord.message.delete".to_owned());
+                policy.allowed_intents.insert("mail.send".to_owned());
+                policy.allowed_intents.insert("message.send".to_owned());
             }
         }
         policy
@@ -1249,6 +1418,24 @@ impl Runtime {
             "desktop.notify" => desktop_notify(&request, operation_id),
             "desktop.open_app" => desktop_open_app(&request, operation_id),
             "app.launch" => app_launch(&request, operation_id),
+            "app.resolve" => app_resolve(&request, operation_id),
+            "app.list" => app_list(&request, operation_id),
+            "app.open_resource" => app_open_resource(&request, operation_id),
+            "app.focus" => app_focus(&request, operation_id),
+            "app.close" => app_close(&request, operation_id),
+            "permission.status" => permission_status(&request, operation_id),
+            "permission.request" => permission_request(self, &request, operation_id),
+            "settings.get" => settings_get(&request, operation_id),
+            "settings.set" | "settings.write" => settings_set(&request, operation_id),
+            "software.search" => software_search(&request, operation_id),
+            "software.describe" => software_describe(&request, operation_id),
+            "software.install" => software_install(self, &request, operation_id),
+            "software.update" => software_update(self, &request, operation_id),
+            "software.uninstall" => software_uninstall(self, &request, operation_id),
+            "popup.inspect" => popup_inspect(&request, operation_id),
+            "popup.dismiss" => popup_dismiss(&request, operation_id),
+            "browser.session.list" => browser_session_list(&request, operation_id),
+            "browser.session.connect" => browser_session_connect(&request, operation_id),
             "browser.chrome.open_tab" => browser_chrome_open_tab(&request, operation_id),
             "browser.chrome.restore_recent" | "browser.chrome.reopen_closed_group" => {
                 browser_chrome_restore_recent(&request, operation_id)
@@ -1283,6 +1470,7 @@ impl Runtime {
             | "browser.cdp.workflow"
             | "browser.cdp.screenshot"
             | "browser.cdp.coordinate_click"
+            | "browser.cdp.dialog"
             | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             intent if is_first_party_adapter_intent(intent) => {
@@ -1654,6 +1842,16 @@ fn classify(intent: &str) -> Risk {
             Risk::R0
         }
         "app.launch" => Risk::R1,
+        "app.resolve" | "app.list" | "permission.status" | "popup.inspect" => Risk::R0,
+        "permission.request" | "software.search" | "software.describe" | "settings.get" => Risk::R1,
+        "app.open_resource"
+        | "app.focus"
+        | "settings.set"
+        | "settings.write"
+        | "popup.dismiss"
+        | "browser.session.connect"
+        | "browser.cdp.dialog" => Risk::R2,
+        "app.close" | "software.install" | "software.update" | "software.uninstall" => Risk::R3,
         "desktop.notify"
         | "filesystem.write"
         | "filesystem.copy"
@@ -1686,6 +1884,30 @@ fn classify(intent: &str) -> Risk {
         "browser.cdp.screenshot" => Risk::R0,
         "browser.cdp.workflow" => Risk::R2,
         "obs.recording.start" | "obs.recording.stop" => Risk::R3,
+        "discord.message.delete" | "mail.send" | "message.send" => Risk::R3,
+        "video.render.cancel"
+        | "document.export"
+        | "presentation.export"
+        | "presentation.export_pdf"
+        | "design.export"
+        | "discord.message.react" => Risk::R1,
+        "discord.message.draft"
+        | "discord.message.search"
+        | "mail.search"
+        | "mail.read"
+        | "design.list"
+        | "design.read"
+        | "design.page.list"
+        | "design.element.inspect"
+        | "document.google.read"
+        | "presentation.google.read"
+        | "presentation.read"
+        | "video.project.list"
+        | "video.media.list"
+        | "video.timeline.list"
+        | "video.timeline.items.list"
+        | "video.render.preset.list"
+        | "video.render.status" => Risk::R0,
         intent if is_first_party_adapter_intent(intent) => Risk::R2,
         "browser.cdp.wait_for"
         | "browser.cdp.accessibility_snapshot"
@@ -1699,16 +1921,22 @@ fn execute_adapter_request(
     request: &OperationRequest,
     operation_id: String,
 ) -> ActionResult {
-    let Some(adapter_name) = adapter_id_for_intent(&request.intent) else {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "adapter_unavailable".to_owned(),
-                message: "The adapter intent has no registered first party adapter".to_owned(),
-                recovery: Some("Inspect adapter descriptors and use a supported intent".to_owned()),
-            },
-        );
+    let provider = request.params.get("provider").and_then(Value::as_str);
+    let adapter_name = match adapter_id_for_intent(&request.intent, provider) {
+        Ok(name) => name,
+        Err(message) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "adapter_unavailable".to_owned(),
+                    message,
+                    recovery: Some(
+                        "Inspect adapter descriptors and use a supported intent".to_owned(),
+                    ),
+                },
+            );
+        }
     };
     let root = std::env::var_os("COMPTROL_ADAPTER_ROOT")
         .map(PathBuf::from)
@@ -2111,6 +2339,34 @@ fn route_plan(request: &OperationRequest, policy: Option<&Policy>) -> RoutePlan 
         candidate.feasible = true;
         candidate.rationale = "Registry-backed app launch allowed by runtime policy".to_owned();
     }
+    // Policy-gated V5 intents may be enabled by direct policy membership
+    // (consent store or setup flow) without process environment switches.
+    // Endpoint-dependent routes (browser protocol, adapters) are excluded:
+    // they still need their endpoint or adapter root.
+    const POLICY_DIRECT_INTENTS: &[&str] = &[
+        "app.open_resource",
+        "app.focus",
+        "permission.request",
+        "settings.get",
+        "settings.set",
+        "settings.write",
+        "software.search",
+        "software.describe",
+        "software.install",
+        "software.update",
+        "software.uninstall",
+        "popup.dismiss",
+        "browser.session.connect",
+    ];
+    if POLICY_DIRECT_INTENTS.contains(&request.intent.as_str())
+        && let Some(policy) = policy
+        && policy.allowed_intents.contains(&request.intent)
+        && let Some(candidate) = plan.candidates.first_mut()
+        && !candidate.feasible
+    {
+        candidate.feasible = true;
+        candidate.rationale = format!("{} allowed by runtime policy", request.intent);
+    }
     plan
 }
 
@@ -2215,6 +2471,75 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
                 target_os = "linux"
             )) && env_enabled("COMPTROL_ALLOW_APP_LAUNCH"),
             "Registry-backed app launch requires an explicit local policy",
+        )),
+        "app.resolve" | "app.list" => Some((
+            "app_registry_read",
+            true,
+            "Registry reads are local and read-only",
+        )),
+        "app.open_resource" | "app.focus" => Some((
+            "app_registry_launch",
+            cfg!(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "linux"
+            )) && env_enabled("COMPTROL_ALLOW_APP_LAUNCH"),
+            "Registry-backed app activation requires an explicit local policy",
+        )),
+        "app.close" => Some((
+            "app_registry_close",
+            env_enabled("COMPTROL_ALLOW_APP_CLOSE"),
+            "Closing an application requires an explicit high-consequence policy",
+        )),
+        "permission.status" => Some((
+            "permission_probe",
+            true,
+            "Permission probing is local and read-only",
+        )),
+        "permission.request" => Some((
+            "permission_surface",
+            env_enabled("COMPTROL_ALLOW_SETTINGS"),
+            "Opening a permission surface requires an explicit local policy",
+        )),
+        "settings.get" => Some((
+            "settings_registry",
+            env_enabled("COMPTROL_ALLOW_SETTINGS"),
+            "Typed settings reads require an explicit local policy",
+        )),
+        "settings.set" | "settings.write" => Some((
+            "settings_registry",
+            env_enabled("COMPTROL_ALLOW_SETTINGS"),
+            "Typed settings writes require an explicit local policy plus a consent grant",
+        )),
+        "software.search" | "software.describe" => Some((
+            "software_provider",
+            env_enabled("COMPTROL_ALLOW_SOFTWARE"),
+            "Software discovery requires an explicit local policy",
+        )),
+        "software.install" | "software.update" | "software.uninstall" => Some((
+            "software_provider",
+            env_enabled("COMPTROL_ALLOW_SOFTWARE_INSTALL"),
+            "Software mutation requires an explicit local policy plus a consent grant",
+        )),
+        "popup.inspect" => Some((
+            "popup_classifier",
+            true,
+            "Popup classification is local and read-only",
+        )),
+        "popup.dismiss" => Some((
+            "popup_manager",
+            env_enabled("COMPTROL_ALLOW_POPUP"),
+            "Popup dismissal requires an explicit local policy and never auto-approves protected prompts",
+        )),
+        "browser.session.list" => Some((
+            "browser_session_broker",
+            true,
+            "Session discovery reports local browser surfaces without connecting",
+        )),
+        "browser.session.connect" => Some((
+            "browser_session_broker",
+            env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
+            "Session connection needs the browser protocol policy",
         )),
         "browser.chrome.open_tab" => Some((
             "browser_launcher",
@@ -2345,6 +2670,24 @@ fn route_catalog() -> Vec<RoutePlan> {
         "desktop.notify",
         "desktop.open_app",
         "app.launch",
+        "app.resolve",
+        "app.list",
+        "app.open_resource",
+        "app.focus",
+        "app.close",
+        "permission.status",
+        "permission.request",
+        "settings.get",
+        "settings.set",
+        "software.search",
+        "software.describe",
+        "software.install",
+        "software.update",
+        "software.uninstall",
+        "popup.inspect",
+        "popup.dismiss",
+        "browser.session.list",
+        "browser.session.connect",
         "browser.chrome.open_tab",
         "browser.chrome.restore_recent",
         "browser.chrome.reopen_closed_group",
@@ -2362,6 +2705,7 @@ fn route_catalog() -> Vec<RoutePlan> {
         "browser.cdp.semantic_click",
         "browser.cdp.screenshot",
         "browser.cdp.coordinate_click",
+        "browser.cdp.dialog",
     ]
     .into_iter()
     .map(|intent| route_plan_for_intent(intent, Value::Null, None))
@@ -2818,6 +3162,9 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
     }
     if request.intent == "browser.cdp.semantic_click" {
         return browser_cdp_semantic_click(request, operation_id, &endpoint);
+    }
+    if request.intent == "browser.cdp.dialog" {
+        return browser_cdp_dialog(request, operation_id, &endpoint);
     }
     if request.intent == "browser.cdp.workflow" {
         return browser_cdp_workflow(request, operation_id, &endpoint);
@@ -3376,6 +3723,90 @@ fn browser_cdp_semantic_click(
                 }),
             )
         }
+        Err(error) => browser_failure(request, operation_id, error),
+    }
+}
+
+/// Handle a JavaScript dialog (`alert`, `confirm`, `prompt`,
+/// `beforeunload`) on one exact target via `Page.handleJavaScriptDialog`.
+///
+/// Only informational dialog handling is allowed here: `accept` maps to
+/// the dialog's default confirmation and `dismiss` to its cancellation.
+/// Security, payment, license, or privilege dialogs must go through
+/// `popup.dismiss`, which refuses protected classes.
+fn browser_cdp_dialog(
+    request: &OperationRequest,
+    operation_id: String,
+    endpoint: &std::ffi::OsStr,
+) -> ActionResult {
+    let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Dialog handling needs a target id".to_owned(),
+                recovery: Some("Inspect browser targets before the dialog action".to_owned()),
+            },
+        );
+    };
+    let browser_context_id = request
+        .params
+        .get("browser_context_id")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let revision = request.params.get("revision").and_then(Value::as_str);
+    let Some(action) = request.params.get("action").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Dialog handling needs params.action accept or dismiss".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let accept = match action {
+        "accept" => true,
+        "dismiss" => false,
+        _ => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "params.action must be accept or dismiss".to_owned(),
+                    recovery: None,
+                },
+            );
+        }
+    };
+    let mut dialog_params = json!({ "accept": accept });
+    if accept && let Some(text) = request.params.get("prompt_text").and_then(Value::as_str) {
+        dialog_params["promptText"] = json!(text);
+    }
+    match browser::cdp_call(
+        &endpoint.to_string_lossy(),
+        target_id,
+        Some(browser_context_id),
+        revision,
+        "Page.handleJavaScriptDialog",
+        dialog_params,
+    ) {
+        Ok(_) => success(
+            request,
+            operation_id,
+            "browser_protocol",
+            EffectState::Changed,
+            VerificationState::Verified,
+            json!({
+                "target_id": target_id,
+                "action": action,
+                "verification": "cdp_dialog_handled",
+                "note": "the browser handled the pending dialog; confirm page state with a follow-up snapshot when it matters",
+            }),
+        ),
         Err(error) => browser_failure(request, operation_id, error),
     }
 }
@@ -4131,6 +4562,7 @@ fn success(
 fn foreground_changed(request: &OperationRequest) -> bool {
     match request.intent.as_str() {
         "desktop.open_app" => true,
+        "app.launch" | "app.open_resource" | "app.focus" => true,
         "browser.cdp.open_tab" => !request
             .params
             .get("background")
@@ -4634,6 +5066,1089 @@ fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult 
                 code: "app_launch_failed".to_owned(),
                 message: error.to_string(),
                 recovery: Some("Inspect the resolved application and retry".to_owned()),
+            },
+        ),
+    }
+}
+
+fn app_resolve(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(app) = request
+        .params
+        .get("app")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "app.resolve needs an app identity or display name".to_owned(),
+                recovery: Some("Provide params.app and retry".to_owned()),
+            },
+        );
+    };
+    match comptrol_app_registry::resolve(&app) {
+        Ok(entry) => success(
+            request,
+            operation_id,
+            "app_registry_read",
+            EffectState::None,
+            VerificationState::Verified,
+            json!({ "app": entry, "mouse": "untouched", "clipboard": "untouched" }),
+        ),
+        Err(error @ comptrol_app_registry::RegistryError::NotFound(_))
+        | Err(error @ comptrol_app_registry::RegistryError::Ambiguous(_, _)) => {
+            ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "app_not_resolved".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some(
+                        "List installed applications and use one exact identity".to_owned(),
+                    ),
+                },
+            )
+        }
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "app_registry_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect platform registry state".to_owned()),
+            },
+        ),
+    }
+}
+
+fn app_list(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let query = request
+        .params
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+    match comptrol_app_registry::registry::system_entries() {
+        Ok(list) => entries.extend(list),
+        Err(error) => errors.push(error.to_string()),
+    }
+    match comptrol_app_registry::registry::path_entries() {
+        Ok(list) => entries.extend(list),
+        Err(error) => errors.push(error.to_string()),
+    }
+    if !query.trim().is_empty() {
+        let needle = query.to_lowercase();
+        entries.retain(|entry| {
+            entry.id.to_lowercase().contains(&needle)
+                || entry.display_name.to_lowercase().contains(&needle)
+        });
+    }
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries.dedup_by(|a, b| a.id == b.id);
+    success(
+        request,
+        operation_id,
+        "app_registry_read",
+        EffectState::None,
+        VerificationState::Verified,
+        json!({ "apps": entries, "count": entries.len(), "provider_errors": errors }),
+    )
+}
+
+fn app_launch_with_resource(
+    request: &OperationRequest,
+    operation_id: String,
+    require_resource: bool,
+    route: &str,
+) -> ActionResult {
+    if request.background.as_deref() == Some("strict_background") {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "background_unavailable".to_owned(),
+                message: "Launching an application may activate the desktop and cannot satisfy strict background posture".to_owned(),
+                recovery: Some("Use foreground_allowed, or drive an app through its API/CDP route".to_owned()),
+            },
+        );
+    }
+    let Some(app) = request
+        .params
+        .get("app")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "This intent needs an exact app identity or display name".to_owned(),
+                recovery: Some(
+                    "Inspect the app registry and retry with the resolved id".to_owned(),
+                ),
+            },
+        );
+    };
+    let resource = match request.params.get("resource") {
+        Some(value) => {
+            match serde_json::from_value::<comptrol_app_registry::Resource>(value.clone()) {
+                Ok(resource) => resource,
+                Err(error) => {
+                    return ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "invalid_input".to_owned(),
+                            message: format!("resource is malformed: {error}"),
+                            recovery: None,
+                        },
+                    );
+                }
+            }
+        }
+        None => comptrol_app_registry::Resource::None,
+    };
+    if require_resource && matches!(resource, comptrol_app_registry::Resource::None) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "app.open_resource needs params.resource (file, url, or deep link)"
+                    .to_owned(),
+                recovery: Some("Provide the exact resource to open".to_owned()),
+            },
+        );
+    }
+    let resolved = match comptrol_app_registry::resolve(&app) {
+        Ok(entry) => entry,
+        Err(error @ comptrol_app_registry::RegistryError::NotFound(_))
+        | Err(error @ comptrol_app_registry::RegistryError::Ambiguous(_, _)) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "app_not_resolved".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some(
+                        "List installed applications and use one exact identity".to_owned(),
+                    ),
+                },
+            );
+        }
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "app_registry_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Inspect platform registry state".to_owned()),
+                },
+            );
+        }
+    };
+    let mut launch_request = comptrol_app_registry::LaunchRequest::new(resolved);
+    launch_request.resource = resource;
+    launch_request.background = request.background.as_deref() == Some("prefer_background");
+    match comptrol_app_registry::launch_verified(&launch_request) {
+        Ok((outcome, verification)) => {
+            let verified = matches!(
+                verification,
+                comptrol_app_registry::LaunchVerification::Verified
+            );
+            success(
+                request,
+                operation_id,
+                route,
+                EffectState::Changed,
+                if verified {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                json!({
+                    "app": outcome.app_id,
+                    "route": outcome.route,
+                    "pid": outcome.pid,
+                    "verification": verification,
+                    "mouse": "untouched",
+                    "clipboard": "untouched",
+                }),
+            )
+        }
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "app_launch_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect the resolved application and retry".to_owned()),
+            },
+        ),
+    }
+}
+
+fn app_open_resource(request: &OperationRequest, operation_id: String) -> ActionResult {
+    app_launch_with_resource(request, operation_id, true, "app_registry_launch")
+}
+
+fn app_focus(request: &OperationRequest, operation_id: String) -> ActionResult {
+    app_launch_with_resource(request, operation_id, false, "app_registry_activate")
+}
+
+fn app_close(request: &OperationRequest, operation_id: String) -> ActionResult {
+    ActionResult::refused(
+        request,
+        operation_id,
+        ComptrolError {
+            code: "route_unavailable".to_owned(),
+            message: "Automated application close is not implemented in this build".to_owned(),
+            recovery: Some("Close the application in its own UI".to_owned()),
+        },
+    )
+}
+
+fn permission_status(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let os = std::env::consts::OS;
+    #[cfg(target_os = "macos")]
+    let accessibility_trusted = comptrol_platform_macos::accessibility_trusted();
+    #[cfg(not(target_os = "macos"))]
+    let accessibility_trusted = false;
+    success(
+        request,
+        operation_id,
+        "permission_probe",
+        EffectState::None,
+        VerificationState::Verified,
+        json!({
+            "platform": os,
+            "accessibility_trusted": accessibility_trusted,
+            "macos_ax_policy": std::env::var("COMPTROL_ALLOW_MACOS_AX").as_deref() == Ok("1"),
+            "windows_uia_policy": std::env::var("COMPTROL_ALLOW_WINDOWS_UIA").as_deref() == Ok("1"),
+            "linux_atspi_bus": std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
+            "linux_session": std::env::var("XDG_SESSION_TYPE").ok().or_else(|| std::env::var("WAYLAND_DISPLAY").ok().map(|_| "wayland".to_owned())),
+            "browser_cdp_configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            "software_policy": std::env::var("COMPTROL_ALLOW_SOFTWARE").as_deref() == Ok("1"),
+            "software_install_policy": std::env::var("COMPTROL_ALLOW_SOFTWARE_INSTALL").as_deref() == Ok("1"),
+            "settings_policy": std::env::var("COMPTROL_ALLOW_SETTINGS").as_deref() == Ok("1"),
+            "human_action": "protected permissions are granted by the user in the OS surface; Comptrol never self-grants",
+        }),
+    )
+}
+
+fn permission_surface_for(permission: &str) -> Option<String> {
+    match std::env::consts::OS {
+        "macos" => Some(match permission {
+            "accessibility" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                    .to_owned()
+            }
+            "automation" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+                    .to_owned()
+            }
+            "screen_recording" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                    .to_owned()
+            }
+            "full_disk_access" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+                    .to_owned()
+            }
+            "microphone" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                    .to_owned()
+            }
+            _ => return None,
+        }),
+        "windows" => Some(match permission {
+            "accessibility" => "ms-settings:privacy-accessibility".to_owned(),
+            "microphone" => "ms-settings:privacy-microphone".to_owned(),
+            "notifications" => "ms-settings:privacy-notifications".to_owned(),
+            _ => return None,
+        }),
+        "linux" => Some(match permission {
+            "notifications" => "gnome-control-center notifications".to_owned(),
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
+fn open_surface_url(surface: &str) -> Result<(), String> {
+    let (program, args): (&str, Vec<&str>) = match std::env::consts::OS {
+        "macos" => ("open", vec![surface]),
+        "windows" => ("cmd", vec!["/c", "start", "", surface]),
+        "linux" => {
+            let first = surface.split_whitespace().next().unwrap_or("");
+            if first == "gnome-control-center" {
+                (
+                    "gnome-control-center",
+                    surface.split_whitespace().skip(1).collect(),
+                )
+            } else {
+                ("xdg-open", vec![surface])
+            }
+        }
+        _ => return Err("unsupported platform".to_owned()),
+    };
+    Command::new(program)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn permission_request(
+    runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    let Some(permission) = request.params.get("permission").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "permission.request needs params.permission".to_owned(),
+                recovery: Some(
+                    "Ask permission.status which permissions can be requested".to_owned(),
+                ),
+            },
+        );
+    };
+    let Some(surface) = permission_surface_for(permission) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "unsupported_permission".to_owned(),
+                message: format!(
+                    "No known OS surface for permission {permission} on this platform"
+                ),
+                recovery: Some("Open the OS settings surface manually".to_owned()),
+            },
+        );
+    };
+    if let Err(error) = open_surface_url(&surface) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "surface_unavailable".to_owned(),
+                message: format!("The permission surface could not be opened: {error}"),
+                recovery: Some(format!("Open {surface} manually")),
+            },
+        );
+    }
+    let challenge = comptrol_consent::HumanActionChallenge {
+        kind: comptrol_consent::human_action::ChallengeKind::PermissionGrant {
+            platform: std::env::consts::OS.to_owned(),
+            permission: permission.to_owned(),
+        },
+        reason: format!("Grant {permission} to the Comptrol host in the OS surface"),
+        target: None,
+        requested_change: Some(format!("permission {permission} granted by user")),
+        prompt_location: "os_settings_surface".to_owned(),
+        agent_must_not_enter_secret: true,
+    };
+    let human = runtime
+        .human_actions
+        .request(&operation_id, &request.intent, challenge);
+    let mut result = success(
+        request,
+        operation_id,
+        "permission_surface",
+        EffectState::None,
+        VerificationState::Unverified,
+        json!({
+            "permission": permission,
+            "surface": surface,
+            "state": "awaiting_human_action",
+            "human_action_id": human.id,
+            "agent_must_not_enter_secret": true,
+        }),
+    );
+    result.recovery = RecoveryState::RequiresReconciliation;
+    result
+}
+
+fn settings_get(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(name) = request.params.get("key").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "settings.get needs params.key from the typed settings registry"
+                    .to_owned(),
+                recovery: Some("Use a declared settings.* key".to_owned()),
+            },
+        );
+    };
+    let Some(key) = comptrol_settings::SettingKey::from_name(name) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "unknown_setting".to_owned(),
+                message: format!("{name} is not a declared Comptrol setting"),
+                recovery: Some(
+                    "Arbitrary registry/defaults mutation is not a setting route".to_owned(),
+                ),
+            },
+        );
+    };
+    match comptrol_settings::get(&key) {
+        Ok(observation) => success(
+            request,
+            operation_id,
+            "settings_registry",
+            EffectState::None,
+            if observation.readback_verified {
+                VerificationState::Verified
+            } else {
+                VerificationState::Unverified
+            },
+            json!({ "observation": observation }),
+        ),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "settings_unavailable".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect platform support for this setting".to_owned()),
+            },
+        ),
+    }
+}
+
+fn settings_set(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(name) = request.params.get("key").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "settings.set needs params.key from the typed settings registry"
+                    .to_owned(),
+                recovery: Some("Use a declared settings.* key".to_owned()),
+            },
+        );
+    };
+    let Some(key) = comptrol_settings::SettingKey::from_name(name) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "unknown_setting".to_owned(),
+                message: format!("{name} is not a declared Comptrol setting"),
+                recovery: Some(
+                    "Arbitrary registry/defaults mutation is not a setting route".to_owned(),
+                ),
+            },
+        );
+    };
+    let Some(value) = request.params.get("value").cloned() else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "settings.set needs params.value".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let value = if let Some(b) = value.get("value").and_then(Value::as_bool) {
+        comptrol_settings::SettingValue::bool(b)
+    } else if let Some(n) = value.get("value").and_then(Value::as_i64) {
+        comptrol_settings::SettingValue::Integer { value: n }
+    } else if let Some(s) = value.get("value").and_then(Value::as_str) {
+        comptrol_settings::SettingValue::Text {
+            value: s.to_owned(),
+        }
+    } else if value.is_boolean() {
+        comptrol_settings::SettingValue::bool(value.as_bool().unwrap_or(false))
+    } else if value.is_i64() || value.is_u64() {
+        comptrol_settings::SettingValue::Integer {
+            value: value.as_i64().unwrap_or(0),
+        }
+    } else if value.is_string() {
+        comptrol_settings::SettingValue::Text {
+            value: value.as_str().unwrap_or("").to_owned(),
+        }
+    } else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "params.value must be a bool, integer, or string".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    match comptrol_settings::set(&key, value) {
+        Ok(observation) => success(
+            request,
+            operation_id,
+            "settings_registry",
+            EffectState::Changed,
+            if observation.readback_verified {
+                VerificationState::Verified
+            } else {
+                VerificationState::Unverified
+            },
+            json!({ "observation": observation }),
+        ),
+        Err(comptrol_settings::SettingsError::HumanActionRequired { key, surface }) => {
+            ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "human_action_required".to_owned(),
+                    message: format!("{key} is protected; the user must act in {surface}"),
+                    recovery: Some(format!(
+                        "Use permission.request and wait for the user in {surface}"
+                    )),
+                },
+            )
+        }
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "settings_write_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect platform support for this setting".to_owned()),
+            },
+        ),
+    }
+}
+
+fn software_search(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(query) = request.params.get("query").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "software.search needs params.query".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let provider = request
+        .params
+        .get("provider")
+        .and_then(Value::as_str)
+        .and_then(|name| match name {
+            "winget" => Some(comptrol_software::providers::ProviderId::WinGet),
+            "brew" | "homebrew" => Some(comptrol_software::providers::ProviderId::Homebrew),
+            "flatpak" => Some(comptrol_software::providers::ProviderId::Flatpak),
+            "packagekit" => Some(comptrol_software::providers::ProviderId::PackageKit),
+            _ => None,
+        });
+    match comptrol_software::search(query, provider) {
+        Ok(results) => success(
+            request,
+            operation_id,
+            "software_provider",
+            EffectState::None,
+            VerificationState::Verified,
+            json!({ "results": results, "count": results.len(), "note": "search results never install; use software.describe then software.install with the exact id" }),
+        ),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "software_unavailable".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect available software providers on this machine".to_owned()),
+            },
+        ),
+    }
+}
+
+fn software_describe(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(package) = request.params.get("package").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "software.describe needs params.package".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    match comptrol_software::describe(package, None) {
+        Ok(described) => success(
+            request,
+            operation_id,
+            "software_provider",
+            EffectState::None,
+            VerificationState::Verified,
+            json!({ "package": described }),
+        ),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "software_unavailable".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Search for the exact package id first".to_owned()),
+            },
+        ),
+    }
+}
+
+fn software_mutation_error(
+    request: &OperationRequest,
+    operation_id: String,
+    route: &str,
+    error: comptrol_software::SoftwareError,
+) -> ActionResult {
+    let code = match &error {
+        comptrol_software::SoftwareError::NoProvider(_) => "software_unavailable",
+        comptrol_software::SoftwareError::NotFound(_) => "package_not_found",
+        comptrol_software::SoftwareError::Ambiguous { .. } => "package_ambiguous",
+        comptrol_software::SoftwareError::AgreementsRequired { .. } => "agreements_required",
+        comptrol_software::SoftwareError::ElevationRequired { .. } => "human_action_required",
+        comptrol_software::SoftwareError::VerificationFailed { .. } => "verification_failed",
+        _ => "software_failed",
+    };
+    let mut result = ActionResult::refused(
+        request,
+        operation_id,
+        ComptrolError {
+            code: code.to_owned(),
+            message: error.to_string(),
+            recovery: Some(match &error {
+                comptrol_software::SoftwareError::Ambiguous { .. } => {
+                    "Choose one exact package id from software.search".to_owned()
+                }
+                comptrol_software::SoftwareError::AgreementsRequired { .. } => {
+                    "Show the agreements to the user and retry with accept_agreements only after explicit approval".to_owned()
+                }
+                comptrol_software::SoftwareError::ElevationRequired { .. } => {
+                    "The native privilege prompt is waiting for the user; Comptrol never enters the credential".to_owned()
+                }
+                _ => "Inspect the software provider state".to_owned(),
+            }),
+        },
+    );
+    result.route = route.to_owned();
+    result
+}
+
+fn software_install(
+    runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    let Some(package) = request.params.get("package").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "software.install needs params.package with the exact id".to_owned(),
+                recovery: Some("Use software.search and software.describe first".to_owned()),
+            },
+        );
+    };
+    let install = comptrol_software::InstallRequest {
+        package: package.to_owned(),
+        provider: None,
+        version: request
+            .params
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        source: request
+            .params
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        accept_agreements: request
+            .params
+            .get("accept_agreements")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        launch_after_install: false,
+    };
+    match comptrol_software::install(&install) {
+        Ok(outcome) => {
+            let verified = matches!(
+                outcome.verification,
+                comptrol_software::InstallVerification::Verified { .. }
+            );
+            success(
+                request,
+                operation_id,
+                "software_provider",
+                EffectState::Changed,
+                if verified {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                json!({ "outcome": outcome }),
+            )
+        }
+        Err(error @ comptrol_software::SoftwareError::ElevationRequired { .. }) => {
+            let challenge = comptrol_consent::HumanActionChallenge {
+                kind: match std::env::consts::OS {
+                    "windows" => {
+                        comptrol_consent::human_action::ChallengeKind::NativeAuthentication {
+                            platform: "windows".to_owned(),
+                        }
+                    }
+                    "linux" => comptrol_consent::human_action::ChallengeKind::PrivilegeAgent {
+                        platform: "linux".to_owned(),
+                    },
+                    _ => comptrol_consent::human_action::ChallengeKind::NativeAuthentication {
+                        platform: std::env::consts::OS.to_owned(),
+                    },
+                },
+                reason: format!("The installer for {package} requests elevation"),
+                target: Some(package.to_owned()),
+                requested_change: Some(format!("install {package}")),
+                prompt_location: "secure_desktop".to_owned(),
+                agent_must_not_enter_secret: true,
+            };
+            let human = runtime
+                .human_actions
+                .request(&operation_id, &request.intent, challenge);
+            let mut result =
+                software_mutation_error(request, operation_id, "software_provider", error);
+            result.data = json!({
+                "state": "awaiting_human_action",
+                "human_action_id": human.id,
+                "agent_must_not_enter_secret": true,
+            });
+            result.recovery = RecoveryState::RequiresReconciliation;
+            result
+        }
+        Err(error) => software_mutation_error(request, operation_id, "software_provider", error),
+    }
+}
+
+fn software_update(
+    _runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    let Some(package) = request.params.get("package").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "software.update needs params.package with the exact id".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    match comptrol_software::update(package, None) {
+        Ok(outcome) => success(
+            request,
+            operation_id,
+            "software_provider",
+            EffectState::Changed,
+            VerificationState::Verified,
+            json!({ "outcome": outcome }),
+        ),
+        Err(error) => software_mutation_error(request, operation_id, "software_provider", error),
+    }
+}
+
+fn software_uninstall(
+    _runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    let Some(package) = request.params.get("package").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "software.uninstall needs params.package with the exact id".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    match comptrol_software::uninstall(package, None) {
+        Ok(outcome) => success(
+            request,
+            operation_id,
+            "software_provider",
+            EffectState::Changed,
+            VerificationState::Verified,
+            json!({ "outcome": outcome }),
+        ),
+        Err(error) => software_mutation_error(request, operation_id, "software_provider", error),
+    }
+}
+
+fn popup_signals(request: &OperationRequest) -> (String, String, String) {
+    (
+        request
+            .params
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("dialog")
+            .to_owned(),
+        request
+            .params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        request
+            .params
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+    )
+}
+
+fn popup_inspect(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let (role, name, text) = popup_signals(request);
+    let class = comptrol_popup::classify(&role, &name, &text);
+    let target = request
+        .target
+        .as_ref()
+        .and_then(|t| t.id.clone().or_else(|| t.name.clone()))
+        .unwrap_or_else(|| "unspecified".to_owned());
+    success(
+        request,
+        operation_id,
+        "popup_classifier",
+        EffectState::None,
+        VerificationState::Verified,
+        json!({
+            "popup": {
+                "class": class.as_str(),
+                "title": if name.is_empty() { Value::Null } else { Value::String(name) },
+                "target": target,
+            },
+            "never_auto": class.never_auto(),
+            "note": "classification only; use popup.dismiss with policy for eligible classes",
+        }),
+    )
+}
+
+fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let (role, name, text) = popup_signals(request);
+    let class = comptrol_popup::classify(&role, &name, &text);
+    if class.never_auto() {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "authorization_required".to_owned(),
+                message: format!(
+                    "popup class {} always needs explicit user authorization; it is never auto-dismissed",
+                    class.as_str()
+                ),
+                recovery: Some("Ask the user to resolve this dialog".to_owned()),
+            },
+        );
+    }
+    let policy = comptrol_popup::PopupPolicy {
+        dismiss_informational: request
+            .params
+            .get("dismiss_informational")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        dismiss_cookie_banners: request
+            .params
+            .get("dismiss_cookie_banners")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        dismiss_update_prompts: request
+            .params
+            .get("dismiss_update_prompts")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        dismiss_tips: request
+            .params
+            .get("dismiss_tips")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    let popup = comptrol_popup::PopupInfo {
+        id: format!("popup-{operation_id}"),
+        class,
+        title: if name.is_empty() { None } else { Some(name) },
+        target: request
+            .target
+            .as_ref()
+            .and_then(|t| t.id.clone().or_else(|| t.name.clone()))
+            .unwrap_or_else(|| "unspecified".to_owned()),
+        close_actions: request
+            .params
+            .get("close_actions")
+            .and_then(Value::as_array)
+            .map(|actions| {
+                actions
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        observed_at_ms: now_ms(),
+    };
+    match comptrol_popup::authorize_dismissal(&popup, &policy) {
+        Ok(plan) => {
+            // Authorized dismissal still needs the actuation route: semantic
+            // platform control for native dialogs, Page.handleJavaScriptDialog
+            // for browser dialogs. Until the originating surface is bound,
+            // return the authorized plan without claiming dismissal.
+            let mut result = success(
+                request,
+                operation_id,
+                "popup_manager",
+                EffectState::NotAttempted,
+                VerificationState::NotAttempted,
+                json!({
+                    "popup": popup,
+                    "plan": plan,
+                    "status": "dismissal_authorized_actuation_requires_bound_surface",
+                }),
+            );
+            result.recovery = RecoveryState::RequiresReconciliation;
+            result
+        }
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "authorization_required".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Set the matching user popup preference or ask the user".to_owned()),
+            },
+        ),
+    }
+}
+
+fn browser_session_list(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let sessions = comptrol_browser::list_sessions();
+    success(
+        request,
+        operation_id,
+        "browser_session_broker",
+        EffectState::None,
+        VerificationState::Verified,
+        json!({
+            "providers": sessions.iter().map(|session| json!({
+                "id": session.provider.id(),
+                "available": session.available,
+                "reason": session.reason,
+                "signed_in_capable": session.signed_in_capable,
+                "preferred_for": match session.provider {
+                    comptrol_browser::SessionProvider::PermissionedAutoConnect => "signed-in tabs and tab groups",
+                    comptrol_browser::SessionProvider::CompanionExtension => "closed-group restore without full CDP",
+                    comptrol_browser::SessionProvider::ExplicitCdp => "dedicated automation profiles and custom endpoints",
+                    comptrol_browser::SessionProvider::DedicatedProfile => "isolated automation",
+                    comptrol_browser::SessionProvider::NativeLauncher => "foreground fallback with launcher-acceptance reporting only",
+                },
+            })).collect::<Vec<_>>(),
+            "default_profile_cdp_bypass": "refused: Chrome 136+ ignores remote-debugging flags for the default user-data directory",
+            "profile_copying": "refused: Comptrol never copies profiles or cookies",
+        }),
+    )
+}
+
+fn browser_session_connect(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let Some(provider) = request.params.get("provider").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "browser.session.connect needs params.provider from browser.session.list"
+                    .to_owned(),
+                recovery: Some("List sessions and choose one provider".to_owned()),
+            },
+        );
+    };
+    match provider {
+        "explicit_cdp_endpoint" => {
+            if std::env::var_os("COMPTROL_CDP_ENDPOINT").is_none() {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "browser_unavailable".to_owned(),
+                        message: "COMPTROL_CDP_ENDPOINT is not configured".to_owned(),
+                        recovery: Some("Configure a local browser DevTools endpoint".to_owned()),
+                    },
+                );
+            }
+            success(
+                request,
+                operation_id,
+                "browser_session_broker",
+                EffectState::None,
+                VerificationState::Verified,
+                json!({ "provider": provider, "status": "connected_to_configured_endpoint" }),
+            )
+        }
+        "chrome_permissioned_auto_connect" => match comptrol_browser::select_provider(true) {
+            Ok(selected) => success(
+                request,
+                operation_id,
+                "browser_session_broker",
+                EffectState::None,
+                VerificationState::Unverified,
+                json!({
+                    "provider": selected.id(),
+                    "status": "permissioned_route_selected_browser_allow_prompt_still_required",
+                    "note": "Chrome shows its native Allow prompt per connection; Comptrol never bypasses it",
+                }),
+            ),
+            Err(reason) => ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "route_unavailable".to_owned(),
+                    message: reason,
+                    recovery: Some("Use the explicit CDP endpoint provider".to_owned()),
+                },
+            ),
+        },
+        "companion_extension" => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "route_unavailable".to_owned(),
+                message: format!("provider {provider} is not wired in this build"),
+                recovery: Some("Use the explicit CDP endpoint provider".to_owned()),
+            },
+        ),
+        _ => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: format!("unknown browser session provider {provider}"),
+                recovery: Some("Use browser.session.list".to_owned()),
             },
         ),
     }
@@ -6182,6 +7697,139 @@ pub fn capabilities() -> Vec<Capability> {
             note: "Opens an exact app through the native desktop launcher without mouse or clipboard input".to_owned(),
         },
         Capability {
+            name: "app.resolve".to_owned(),
+            available: true,
+            risk: Risk::R0,
+            route: "app_registry_read".to_owned(),
+            note: "Resolves a display name to the exact installed application identity without launching".to_owned(),
+        },
+        Capability {
+            name: "app.list".to_owned(),
+            available: true,
+            risk: Risk::R0,
+            route: "app_registry_read".to_owned(),
+            note: "Lists installed applications from platform registrations".to_owned(),
+        },
+        Capability {
+            name: "app.open_resource".to_owned(),
+            available: (cfg!(target_os = "macos")
+                || cfg!(target_os = "windows")
+                || cfg!(target_os = "linux"))
+                && std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "app_registry_launch".to_owned(),
+            note: "Opens an exact file, URL, or deep link in its resolved application and verifies the resource".to_owned(),
+        },
+        Capability {
+            name: "app.focus".to_owned(),
+            available: (cfg!(target_os = "macos")
+                || cfg!(target_os = "windows")
+                || cfg!(target_os = "linux"))
+                && std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "app_registry_activate".to_owned(),
+            note: "Activates an exact installed application through the native launcher".to_owned(),
+        },
+        Capability {
+            name: "permission.status".to_owned(),
+            available: true,
+            risk: Risk::R0,
+            route: "permission_probe".to_owned(),
+            note: "Reports accessibility, automation, session, and policy state without changing anything".to_owned(),
+        },
+        Capability {
+            name: "permission.request".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_SETTINGS").as_deref() == Ok("1"),
+            risk: Risk::R1,
+            route: "permission_surface".to_owned(),
+            note: "Opens the exact OS permission surface and waits for the user; never self-grants".to_owned(),
+        },
+        Capability {
+            name: "settings.get".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_SETTINGS").as_deref() == Ok("1"),
+            risk: Risk::R1,
+            route: "settings_registry".to_owned(),
+            note: "Reads a declared typed setting through its documented surface".to_owned(),
+        },
+        Capability {
+            name: "settings.set".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_SETTINGS").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "settings_registry".to_owned(),
+            note: "Writes a declared typed setting with readback verification; protected settings wait for the user".to_owned(),
+        },
+        Capability {
+            name: "software.search".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_SOFTWARE").as_deref() == Ok("1"),
+            risk: Risk::R1,
+            route: "software_provider".to_owned(),
+            note: "Searches trusted package providers; results never install directly".to_owned(),
+        },
+        Capability {
+            name: "software.describe".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_SOFTWARE").as_deref() == Ok("1"),
+            risk: Risk::R1,
+            route: "software_provider".to_owned(),
+            note: "Describes one exact package including publisher, version, and agreements".to_owned(),
+        },
+        Capability {
+            name: "software.install".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_SOFTWARE_INSTALL").as_deref() == Ok("1"),
+            risk: Risk::R3,
+            route: "software_provider".to_owned(),
+            note: "Installs one exact package after consent; elevation waits for the user and inventory verifies the result".to_owned(),
+        },
+        Capability {
+            name: "software.update".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_SOFTWARE_INSTALL").as_deref() == Ok("1"),
+            risk: Risk::R3,
+            route: "software_provider".to_owned(),
+            note: "Updates one exact installed package with inventory verification".to_owned(),
+        },
+        Capability {
+            name: "software.uninstall".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_SOFTWARE_INSTALL").as_deref() == Ok("1"),
+            risk: Risk::R3,
+            route: "software_provider".to_owned(),
+            note: "Uninstalls one exact package and verifies its absence".to_owned(),
+        },
+        Capability {
+            name: "popup.inspect".to_owned(),
+            available: true,
+            risk: Risk::R0,
+            route: "popup_classifier".to_owned(),
+            note: "Classifies a popup into its typed class without dismissing anything".to_owned(),
+        },
+        Capability {
+            name: "popup.dismiss".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_POPUP").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "popup_manager".to_owned(),
+            note: "Dismisses only user-permitted popup classes; protected prompts always need the user".to_owned(),
+        },
+        Capability {
+            name: "browser.session.list".to_owned(),
+            available: true,
+            risk: Risk::R0,
+            route: "browser_session_broker".to_owned(),
+            note: "Lists browser control surfaces without connecting or touching signed-in state".to_owned(),
+        },
+        Capability {
+            name: "browser.session.connect".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            risk: Risk::R2,
+            route: "browser_session_broker".to_owned(),
+            note: "Connects through the selected browser surface; permissioned routes keep the browser consent UI".to_owned(),
+        },
+        Capability {
+            name: "browser.cdp.dialog".to_owned(),
+            available: std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1")
+                && std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            risk: Risk::R2,
+            route: "browser_protocol".to_owned(),
+            note: "Handles a JavaScript dialog on one exact target; protected dialogs go through popup.dismiss".to_owned(),
+        },
+        Capability {
             name: "browser.chrome.open_tab".to_owned(),
             available: (cfg!(target_os = "macos")
                 || cfg!(target_os = "windows")
@@ -6519,7 +8167,17 @@ fn doctor(runtime: &Runtime) -> Value {
             "vscode_bridge": if std::env::var_os("COMPTROL_VSCODE_BRIDGE_TOKEN").is_some() { "configured" } else { "requires_consent" },
             "libreoffice_uno": "implemented_not_live_verified",
             "obs_websocket": "implemented_not_live_verified",
-            "blender": "offline_only_live_pending"
+            "blender": "offline_only_live_pending",
+            "davinci_resolve": if std::env::var_os("COMPTROL_RESOLVE_SCRIPTING_DIR").is_some() || cfg!(target_os = "macos") { "probed_at_handshake" } else { "implemented_not_live_verified" },
+            "google_workspace": if std::env::var_os("COMPTROL_GOOGLE_ACCESS_TOKEN").is_some() { "configured" } else { "requires_consent" },
+            "powerpoint_openxml": "implemented_not_live_verified",
+            "powerpoint_windows_com": if cfg!(target_os = "windows") { "probed_at_handshake" } else { "unsupported_on_platform" },
+            "discord_bot": if std::env::var_os("COMPTROL_DISCORD_BOT_TOKEN").is_some() { "configured" } else { "requires_consent" },
+            "gmail": if std::env::var_os("COMPTROL_GMAIL_ACCESS_TOKEN").is_some() { "configured" } else { "requires_consent" },
+            "microsoft_graph_mail": if std::env::var_os("COMPTROL_GRAPH_ACCESS_TOKEN").is_some() { "configured" } else { "requires_consent" },
+            "apple_mail": if cfg!(target_os = "macos") { "implemented_not_live_verified" } else { "unsupported_on_platform" },
+            "apple_messages": if cfg!(target_os = "macos") { "implemented_not_live_verified" } else { "unsupported_on_platform" },
+            "canva": if std::env::var_os("COMPTROL_CANVA_ACCESS_TOKEN").is_some() { "configured_preview" } else { "requires_consent" }
         },
         "workflow": { "typed_ir": "implemented", "parameter_lifting": "implemented", "clean_replay_promotion": "implemented_not_live_verified" },
         "route_statistics": { "durable": "implemented", "planner_feedback": "implemented", "latency": "implemented" },
@@ -6547,6 +8205,7 @@ fn consent_gate_applies(intent: &str) -> bool {
         "software.install"
             | "software.update"
             | "software.uninstall"
+            | "settings.set"
             | "settings.write"
             | "software.launch_after_install"
     )
@@ -7576,5 +9235,297 @@ mod tests {
         assert_eq!(report["consent"]["store"]["available"], json!(true));
         let consent = runtime.inspect("consent");
         assert!(consent["human_actions"]["pending"].is_u64());
+    }
+
+    fn allow(runtime: &mut Runtime, intent: &str, risk: Risk) {
+        runtime.policy.max_risk = runtime.policy.max_risk.max(risk);
+        runtime.policy.allowed_intents.insert(intent.to_owned());
+    }
+
+    fn operate(runtime: &mut Runtime, intent: &str, params: Value, risk: Risk) -> ActionResult {
+        runtime.operate(OperationRequest {
+            intent: intent.to_owned(),
+            target: None,
+            params,
+            postcondition: None,
+            risk: Some(risk),
+            idempotency_key: None,
+            dry_run: false,
+            background: None,
+        })
+    }
+
+    #[test]
+    fn new_intents_are_policy_denied_by_default() {
+        let mut runtime = runtime();
+        for intent in [
+            "app.open_resource",
+            "settings.get",
+            "settings.set",
+            "software.search",
+            "software.install",
+            "popup.dismiss",
+        ] {
+            let result = operate(&mut runtime, intent, json!({}), Risk::R3);
+            assert_eq!(
+                result.error.as_ref().map(|e| e.code.as_str()),
+                Some("policy_denied"),
+                "{intent} must be policy denied by default"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_v5_intents_work_by_default() {
+        let mut runtime = runtime();
+        let listed = operate(&mut runtime, "browser.session.list", json!({}), Risk::R0);
+        assert!(listed.error.is_none());
+        assert_eq!(listed.verification, VerificationState::Verified);
+        let status = operate(&mut runtime, "permission.status", json!({}), Risk::R0);
+        assert!(status.error.is_none());
+        assert_eq!(
+            status.data["accessibility_trusted"].as_bool(),
+            Some(comptrol_platform_macos_stub())
+        );
+        let inspected = operate(
+            &mut runtime,
+            "popup.inspect",
+            json!({"role": "dialog", "name": "Checkout", "text": "Enter payment details"}),
+            Risk::R0,
+        );
+        assert!(inspected.error.is_none());
+        assert_eq!(
+            inspected.data["popup"]["class"],
+            json!("purchase_or_payment")
+        );
+        assert_eq!(inspected.data["never_auto"], json!(true));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn comptrol_platform_macos_stub() -> bool {
+        comptrol_platform_macos::accessibility_trusted()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn comptrol_platform_macos_stub() -> bool {
+        false
+    }
+
+    #[test]
+    fn popup_dismiss_never_auto_approves_protected_classes() {
+        let mut runtime = runtime();
+        allow(&mut runtime, "popup.dismiss", Risk::R2);
+        let result = operate(
+            &mut runtime,
+            "popup.dismiss",
+            json!({
+                "role": "dialog",
+                "name": "User Account Control",
+                "text": "Do you want to allow this app",
+                "dismiss_informational": true,
+                "dismiss_cookie_banners": true,
+                "dismiss_update_prompts": true,
+                "dismiss_tips": true,
+            }),
+            Risk::R2,
+        );
+        assert_eq!(
+            result.error.as_ref().map(|e| e.code.as_str()),
+            Some("authorization_required")
+        );
+    }
+
+    #[test]
+    fn popup_dismiss_returns_plan_without_claiming_dismissal() {
+        let mut runtime = runtime();
+        allow(&mut runtime, "popup.dismiss", Risk::R2);
+        let result = operate(
+            &mut runtime,
+            "popup.dismiss",
+            json!({
+                "role": "dialog",
+                "name": "Tip of the day",
+                "text": "Did you know about this feature dialog",
+                "dismiss_informational": true,
+                "close_actions": ["Not Now"],
+            }),
+            Risk::R2,
+        );
+        assert!(result.error.is_none());
+        assert_eq!(result.verification, VerificationState::NotAttempted);
+        assert_eq!(
+            result.data["status"],
+            json!("dismissal_authorized_actuation_requires_bound_surface")
+        );
+    }
+
+    #[test]
+    fn settings_rejects_unknown_keys_without_guessing() {
+        let mut runtime = runtime();
+        allow(&mut runtime, "settings.get", Risk::R1);
+        let result = operate(
+            &mut runtime,
+            "settings.get",
+            json!({"key": "registry.HKLM.Software.Evil"}),
+            Risk::R1,
+        );
+        assert_eq!(
+            result.error.as_ref().map(|e| e.code.as_str()),
+            Some("unknown_setting")
+        );
+        allow(&mut runtime, "settings.set", Risk::R2);
+        let write = operate(
+            &mut runtime,
+            "settings.set",
+            json!({"key": "settings.bluetooth.enabled", "value": true}),
+            Risk::R2,
+        );
+        // Consent gate blocks ungranted settings writes before any provider runs.
+        assert_eq!(
+            write.error.as_ref().map(|e| e.code.as_str()),
+            Some("consent_required")
+        );
+    }
+
+    #[test]
+    fn software_search_needs_query_and_policy() {
+        let mut runtime = runtime();
+        allow(&mut runtime, "software.search", Risk::R1);
+        let missing = operate(&mut runtime, "software.search", json!({}), Risk::R1);
+        assert_eq!(
+            missing.error.as_ref().map(|e| e.code.as_str()),
+            Some("invalid_input")
+        );
+        // The failure must be honest unavailability, never a guess.
+        let result = operate(
+            &mut runtime,
+            "software.search",
+            json!({"query": "vlc"}),
+            Risk::R1,
+        );
+        if let Some(error) = &result.error {
+            assert_eq!(error.code, "software_unavailable");
+        } else {
+            assert!(result.data["results"].is_array());
+        }
+    }
+
+    #[test]
+    fn app_open_resource_requires_resource() {
+        let mut runtime = runtime();
+        runtime.policy.max_risk = Risk::R2;
+        runtime.policy.allow_app_launch = true;
+        runtime
+            .policy
+            .allowed_intents
+            .insert("app.open_resource".to_owned());
+        let result = operate(
+            &mut runtime,
+            "app.open_resource",
+            json!({"app": "TextEdit"}),
+            Risk::R2,
+        );
+        assert_eq!(
+            result.error.as_ref().map(|e| e.code.as_str()),
+            Some("invalid_input")
+        );
+    }
+
+    #[test]
+    fn adapter_routing_resolves_exact_providers() {
+        assert_eq!(
+            adapter_id_for_intent("video.timeline.append", None),
+            Ok("davinci-resolve")
+        );
+        assert_eq!(
+            adapter_id_for_intent("document.text.replace", None),
+            Ok("google-workspace")
+        );
+        assert_eq!(
+            adapter_id_for_intent("presentation.read", None),
+            Ok("powerpoint")
+        );
+        assert_eq!(
+            adapter_id_for_intent("presentation.save", None),
+            Ok("powerpoint-windows")
+        );
+        assert_eq!(
+            adapter_id_for_intent("discord.message.send", None),
+            Ok("discord")
+        );
+        assert_eq!(
+            adapter_id_for_intent("message.send", None),
+            Ok("apple-messages")
+        );
+        assert_eq!(adapter_id_for_intent("design.export", None), Ok("canva"));
+        assert_eq!(
+            adapter_id_for_intent("mail.send", Some("gmail")),
+            Ok("gmail")
+        );
+        assert_eq!(
+            adapter_id_for_intent("mail.send", Some("graph")),
+            Ok("microsoft-graph-mail")
+        );
+        assert_eq!(
+            adapter_id_for_intent("mail.send", Some("apple-mail")),
+            Ok("apple-mail")
+        );
+        assert_eq!(
+            adapter_id_for_intent("presentation.slide.create", Some("google")),
+            Ok("google-workspace")
+        );
+        assert_eq!(
+            adapter_id_for_intent("presentation.slide.create", Some("powerpoint")),
+            Ok("powerpoint-windows")
+        );
+        assert_eq!(
+            adapter_id_for_intent("presentation.export", Some("powerpoint")),
+            Ok("powerpoint")
+        );
+    }
+
+    #[test]
+    fn adapter_routing_refuses_ambiguous_providers_without_guessing() {
+        assert!(adapter_id_for_intent("mail.send", None).is_err());
+        assert!(adapter_id_for_intent("mail.send", Some("carrier-pigeon")).is_err());
+        assert!(adapter_id_for_intent("presentation.slide.create", None).is_err());
+        assert!(adapter_id_for_intent("presentation.export", None).is_err());
+        assert!(adapter_id_for_intent(" spreadsheets.sum", None).is_err());
+    }
+
+    #[test]
+    fn high_consequence_sends_classify_r3() {
+        assert_eq!(classify("mail.send"), Risk::R3);
+        assert_eq!(classify("message.send"), Risk::R3);
+        assert_eq!(classify("discord.message.delete"), Risk::R3);
+        assert_eq!(classify("discord.message.send"), Risk::R2);
+        assert_eq!(classify("design.export"), Risk::R1);
+        assert_eq!(classify("mail.search"), Risk::R0);
+    }
+
+    #[test]
+    fn browser_session_connect_validates_provider() {
+        let mut runtime = runtime();
+        allow(&mut runtime, "browser.session.connect", Risk::R2);
+        let unknown = operate(
+            &mut runtime,
+            "browser.session.connect",
+            json!({"provider": "nope"}),
+            Risk::R2,
+        );
+        assert_eq!(
+            unknown.error.as_ref().map(|e| e.code.as_str()),
+            Some("invalid_input")
+        );
+        let unavailable = operate(
+            &mut runtime,
+            "browser.session.connect",
+            json!({"provider": "companion_extension"}),
+            Risk::R2,
+        );
+        assert_eq!(
+            unavailable.error.as_ref().map(|e| e.code.as_str()),
+            Some("route_unavailable")
+        );
     }
 }

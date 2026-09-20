@@ -1,0 +1,5 @@
+# Verification contract
+
+Reads and searches are verified from live /me/messages responses, returning bounded excerpts plus attachment metadata rather than raw API JSON. Drafts are verified with a GET readback requiring the message to still be a draft with the composed subject. Sends are never verified by the 202 accepted-for-processing response: verified=true additionally requires a Sent Items readback (/me/mailFolders/sentitems/messages, newest first) matching the sent subject plus recipients; anything less returns verified=false with a `graph_accepted_unverified` marker and `accepted_for_processing=true`. File bytes never travel through the frame.
+
+Verify with: `python3 -m py_compile src/adapter.py`, a handshake frame through stdio expecting `comptrol.microsoft-graph-mail`, a search against a loopback stub via `COMPTROL_GRAPH_API_BASE` asserting bounded results, a send asserting verified=false with `accepted_for_processing=true` when Sent Items has no match, and a send asserting verified=true when the stub returns the matching Sent Items entry.

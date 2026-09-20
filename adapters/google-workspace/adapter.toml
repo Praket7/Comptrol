@@ -1,0 +1,89 @@
+manifest_version = 1
+id = "comptrol.google-workspace"
+name = "Google Workspace"
+version = "0.1.0"
+platforms = ["windows", "macos", "linux"]
+applications = ["Google Docs", "Google Slides", "Google Drive"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "document.google.read"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "document.google.batch_edit"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "document.text.insert"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "document.text.replace"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "document.text.style"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "document.export"
+risk = "R1"
+background = "supported"
+verification = "persisted_artifact"
+
+[[capabilities]]
+intent = "presentation.google.read"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.slide.create"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.slide.delete"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.slide.reorder"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.text.replace"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.text.style"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.export"
+risk = "R1"
+background = "supported"
+verification = "persisted_artifact"

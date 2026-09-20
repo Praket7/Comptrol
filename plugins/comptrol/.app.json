@@ -1,3 +1,14 @@
 {
-  "apps": {}
+  "apps": {
+    "comptrol-setup": {
+      "kind": "local_command",
+      "command": "comptrol setup",
+      "description": "One-command local setup: installs the user daemon, configures supported clients with backup, and runs live doctor checks."
+    },
+    "comptrol-doctor": {
+      "kind": "local_command",
+      "command": "comptrol doctor --fix",
+      "description": "Diagnoses daemon, client, browser, and permission state and safely repairs what local policy allows."
+    }
+  }
 }

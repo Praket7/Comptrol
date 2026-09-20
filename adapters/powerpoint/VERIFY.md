@@ -1,0 +1,3 @@
+# Verification contract
+
+Reads verify by reopening the file with python-pptx and reporting slide count, per-slide texts, notes, size, and sha256 (`application_state`). Batch edits checkpoint to `.bak`, record sha256 before/after, then reopen the saved file: the artifact must exist with nonzero size, the slide count must equal start + creates − deletes, and every replacement/notes string must be present in the readback (`persisted_artifact`). Exports verify the output file exists with nonzero size and sha256; `pptx` copies are additionally reopened for a slide-count readback, and `pdf` outputs require a successful `soffice` conversion. Process exit or save-call return alone is never proof.

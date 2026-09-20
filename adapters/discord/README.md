@@ -1,0 +1,7 @@
+# Discord adapter
+
+The adapter drives Discord messaging through the official Bot HTTP API only (`https://discord.com/api/v10`) with the standard library (`urllib`). Run `python3 src/adapter.py` as the isolated host child; it speaks the shared framed RPC on stdio.
+
+Authentication is a bot token read only from `COMPTROL_DISCORD_BOT_TOKEN` at request time. The token is never stored, never logged, never echoed, and never copied into responses or errors. Optional `COMPTROL_DISCORD_API_BASE` exists so verification can run against a loopback stub; production defaults to the official endpoint. Attachments are read only from files under `COMPTROL_DISCORD_ASSETS_ROOT` (8 MB cap) and return size plus sha256, never file bytes.
+
+Every mutating intent binds the exact channel first (`GET /channels/{id}`): an optional `guild_id` must equal the channel's `guild_id`, and an optional `dm_user_id` must appear in a DM channel's recipients. Sends, replies, and attachments carry a client-generated `nonce` with `enforce_nonce=true`; after every POST the adapter GETs the message id back and returns author/target/content-hash. Ambiguous acknowledgements return `ambiguous_ack` with reconcile-before-retry guidance and never blind retry. Drafts never POST. User tokens are refused with `selfbot_refused`; normal user-account operation is refused with `user_account_ui_route` (operate the signed-in Discord UI instead). No token automation is implemented.

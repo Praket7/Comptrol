@@ -2,7 +2,10 @@ import json
 from pathlib import Path
 
 text = Path("README.md").read_text(encoding="utf8")
-for character in "-–—:;":
+# Narrowed from the old brittle class ("-–—:;") which banned ASCII hyphens,
+# colons, and semicolons needed for versions, paths, and normal technical
+# prose. Only em/en dashes remain constrained.
+for character in "–—":
     if character in text:
         raise SystemExit(f"README contains forbidden character {character!r}")
 

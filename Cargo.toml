@@ -11,6 +11,9 @@ members = [
     "crates/comptrol-workflow",
     "crates/comptrol-consent",
     "crates/comptrol-app-registry",
+    "crates/comptrol-software",
+    "crates/comptrol-settings",
+    "crates/comptrol-popup",
 ]
 resolver = "2"
 

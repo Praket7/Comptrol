@@ -1,0 +1,5 @@
+# Verification contract
+
+Reads are verified from live documents.get and presentations.get responses, returning bounded excerpts rather than raw API JSON. Every edit binds the target id plus its revisionId, sends all independent edits as one batchUpdate guarded by WriteControl.requiredRevisionId, refuses stale expected_revision_id values without writing, and rereads to compare the new revisionId plus the affected ranges before reporting verified=true. A bare upstream success is delivery evidence, not task completion. Exports verify the persisted artifact on disk by size_bytes and sha256, and never move file bytes through the frame.
+
+Verify with: `python3 -m py_compile src/adapter.py`, a handshake frame through stdio expecting `comptrol.google-workspace`, a read against a loopback stub via `COMPTROL_GOOGLE_DOCS_BASE` (or Slides/Drive equivalents) asserting the excerpt and revision, an insert with a stale expected_revision_id asserting a `stale_revision` refusal with no batchUpdate issued, and an export asserting the on-disk bytes hash to the reported sha256.

@@ -1,0 +1,5 @@
+# Canva adapter
+
+The adapter drives Canva through the official Canva Connect REST API (`https://api.canva.com/rest/v1`: designs, design pages, exports) with the standard library only, plus a companion Canva App built on the Apps SDK Design Editing model for the operations the Connect API cannot express. Run `python3 src/adapter.py` as the isolated host child; it speaks the shared framed RPC on stdio.
+
+Authentication is a user OAuth bearer token read only from `COMPTROL_CANVA_ACCESS_TOKEN` at request time. The token is never stored, never logged, and never copied into responses or errors. Optional `COMPTROL_CANVA_BASE` override exists so verification can run against a loopback stub; production defaults to the official endpoint. Exports persist under `COMPTROL_CANVA_EXPORT_DIR` and return only size plus sha256, never file bytes. Element inspection and all edits bind the exact design id, validate the typed operation, and resolve through the App bridge; full-screen coordinate replay is never performed.

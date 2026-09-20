@@ -298,6 +298,9 @@ dependencies = [
  "comptrol-platform-linux",
  "comptrol-platform-macos",
  "comptrol-platform-windows",
+ "comptrol-popup",
+ "comptrol-settings",
+ "comptrol-software",
  "comptrol-verification",
  "comptrol-workflow",
  "getrandom 0.3.4",
@@ -387,6 +390,33 @@ version = "0.1.63"
 dependencies = [
  "serde_json",
  "windows",
+]
+
+[[package]]
+name = "comptrol-popup"
+version = "0.1.63"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "comptrol-settings"
+version = "0.1.63"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "comptrol-software"
+version = "0.1.63"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

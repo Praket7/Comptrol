@@ -3,10 +3,50 @@
 
 import json
 import pathlib
+import re
 import struct
 import subprocess
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: minimal parser for the flat manifest shape
+    tomllib = None
+
+
+def load_manifest(text):
+    if tomllib is not None:
+        return tomllib.loads(text)
+    manifest = {"capabilities": []}
+    current = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line == "[[capabilities]]":
+            current = {}
+            manifest["capabilities"].append(current)
+            continue
+        if line.startswith("["):
+            current = None
+            if line == "[isolation]":
+                current = manifest.setdefault("isolation", {})
+            continue
+        match = re.match(r'(\w+)\s*=\s*(".*?"|\[.*?\]|\d+)', line)
+        if not match:
+            continue
+        key, raw = match.groups()
+        if raw.startswith('"'):
+            value = raw[1:-1]
+        elif raw.startswith("["):
+            value = [item.strip().strip('"') for item in raw[1:-1].split(",") if item.strip()]
+        else:
+            value = int(raw)
+        if current is not None:
+            current[key] = value
+        else:
+            manifest[key] = value
+    return manifest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -15,6 +55,16 @@ ADAPTERS = {
     "libreoffice": ROOT / "adapters" / "libreoffice" / "src" / "adapter.py",
     "obs": ROOT / "adapters" / "obs" / "src" / "adapter.py",
     "blender": ROOT / "adapters" / "blender" / "src" / "adapter.py",
+    "davinci-resolve": ROOT / "adapters" / "davinci-resolve" / "src" / "adapter.py",
+    "google-workspace": ROOT / "adapters" / "google-workspace" / "src" / "adapter.py",
+    "powerpoint": ROOT / "adapters" / "powerpoint" / "src" / "adapter.py",
+    "powerpoint-windows": ROOT / "adapters" / "powerpoint-windows" / "src" / "adapter.py",
+    "discord": ROOT / "adapters" / "discord" / "src" / "adapter.py",
+    "gmail": ROOT / "adapters" / "gmail" / "src" / "adapter.py",
+    "microsoft-graph-mail": ROOT / "adapters" / "microsoft-graph-mail" / "src" / "adapter.py",
+    "apple-mail": ROOT / "adapters" / "apple-mail" / "src" / "adapter.py",
+    "apple-messages": ROOT / "adapters" / "apple-messages" / "src" / "adapter.py",
+    "canva": ROOT / "adapters" / "canva" / "src" / "adapter.py",
 }
 
 
@@ -80,9 +130,24 @@ HANDLER_SENTINELS = {
     "obs.recording.stop": ("adapters/obs/src/adapter.py", "GetRecordStatus"),
 }
 
+# New adapters dispatch on closed intent strings: every declared mutable
+# intent must appear as a handler branch in its implementation file.
+INTENT_LITERAL_ADAPTERS = {
+    "davinci-resolve": "adapters/davinci-resolve/src/adapter.py",
+    "google-workspace": "adapters/google-workspace/src/adapter.py",
+    "powerpoint": "adapters/powerpoint/src/adapter.py",
+    "powerpoint-windows": "adapters/powerpoint-windows/src/adapter.py",
+    "discord": "adapters/discord/src/adapter.py",
+    "gmail": "adapters/gmail/src/adapter.py",
+    "microsoft-graph-mail": "adapters/microsoft-graph-mail/src/adapter.py",
+    "apple-mail": "adapters/apple-mail/src/adapter.py",
+    "apple-messages": "adapters/apple-messages/src/adapter.py",
+    "canva": "adapters/canva/src/adapter.py",
+}
+
 
 for name, script in ADAPTERS.items():
-    manifest = tomllib.loads((ROOT / "adapters" / name / "adapter.toml").read_text(encoding="utf-8"))
+    manifest = load_manifest((ROOT / "adapters" / name / "adapter.toml").read_text(encoding="utf-8"))
     assert manifest["manifest_version"] == 1
     assert manifest["isolation"] == {"mode": "out_of_process", "network": "loopback_only", "filesystem": "declared_scopes"}
     assert manifest["capabilities"]
@@ -92,7 +157,20 @@ for name, script in ADAPTERS.items():
         assert intent, (name, "capability without intent")
         # A declared mutable capability must declare a verification level.
         assert capability.get("verification"), (name, intent, "missing verification level")
+        assert capability.get("risk") in ("R0", "R1", "R2", "R3"), (name, intent, "missing risk class")
         if capability.get("risk") in ("R2", "R3"):
+            registered = HANDLER_SENTINELS.get(intent)
+            if registered is None and name in INTENT_LITERAL_ADAPTERS:
+                handler_file = INTENT_LITERAL_ADAPTERS[name]
+                handler_path = ROOT / handler_file
+                assert handler_path.exists(), (name, intent, f"handler file missing: {handler_file}")
+                assert intent in handler_path.read_text(encoding="utf-8"), (
+                    name,
+                    intent,
+                    f"declared but not implemented: missing {intent!r} branch in {handler_file}",
+                )
+                continue
+            assert registered, (name, intent, "no handler sentinel registered")
             registered = HANDLER_SENTINELS.get(intent)
             assert registered, (name, intent, "no handler sentinel registered")
             handler_file, sentinel = registered
@@ -127,4 +205,33 @@ for name, script in ADAPTERS.items():
         process.wait(timeout=5)
 
 print(f"adapter conformance passed for {len(ADAPTERS)} isolated adapters")
+
+# Cross-platform adapter IPC: the shared client must expose all transports,
+# and migrated live bridges must not assume AF_UNIX-only connectivity.
+shared = ROOT / "adapters" / "_shared"
+sys.path.insert(0, str(shared))
+import adapter_ipc  # noqa: E402
+
+for symbol in ("connect", "resolve_endpoint", "bridge_request", "send_frame", "recv_frame"):
+    assert callable(getattr(adapter_ipc, symbol, None)), f"adapter_ipc.{symbol} missing"
+assert "pipe:" in (shared / "adapter_ipc.py").read_text(encoding="utf-8")
+assert "tcp:127.0.0.1" in (shared / "adapter_ipc.py").read_text(encoding="utf-8")
+
+for migrated in (
+    "adapters/vscode/src/adapter.py",
+    "adapters/blender/src/adapter.py",
+):
+    source = (ROOT / migrated).read_text(encoding="utf-8")
+    assert "adapter_ipc" in source, (migrated, "must use the shared IPC client")
+    assert "AF_UNIX" not in source, (migrated, "must not assume AF_UNIX-only transport")
+
+bridge = (ROOT / "adapters" / "blender" / "src" / "comptrol_live_bridge.py").read_text(encoding="utf-8")
+assert '"nonce"' in bridge or "'nonce'" in bridge, "live bridge must echo the request nonce"
+assert "127.0.0.1" in bridge, "live bridge needs the loopback TCP fallback"
+
+extension = (ROOT / "adapters" / "vscode" / "src" / "extension.ts").read_text(encoding="utf-8")
+assert "secrets" in extension, "extension must pair through SecretStorage"
+assert "pipe:" in extension or "pipe\\\\" in extension, "extension must support named pipes"
+
+print("adapter IPC conformance passed: shared client, migrated bridges, pairing")
 

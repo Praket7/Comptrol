@@ -1,0 +1,5 @@
+# Verification contract
+
+Drafts are verified with a staged-file readback: the JSON record must exist and round-trip with the same body hash and nonce (`messages_draft_staged`). Sends are never verified by osascript success: verified=true additionally requires the post-send readback to show the exact message-count increment plus a last-message text match (`messages_chat_readback`); anything less returns verified=false with a `messages_delivery_only_unverified` marker and an explicit reason. The sent nonce record always persists, so even an unverified send is protected against duplicate retry with the same nonce. File bytes never travel through the frame.
+
+Verify with: `python3 -m py_compile src/adapter.py`, a handshake frame through stdio expecting `comptrol.apple-messages`, a payload carrying a `script` key asserting `arbitrary_script_refused`, a draft asserting the staged record round-trips, a body over 2000 characters asserting refusal, and (on macOS) a send asserting count increment plus last-message match, then a same-nonce resend asserting `duplicate_send_refused`.

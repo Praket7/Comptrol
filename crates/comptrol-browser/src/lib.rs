@@ -2,9 +2,14 @@
 
 mod blocking;
 mod manager;
+mod session;
 
 pub use blocking::{BlockingBrowserManager, WaitGraphSnapshot};
 pub use manager::BrowserManager;
+pub use session::{
+    BrowserSession, CachedTargetState, SessionProvider, TargetStateCache, list_sessions,
+    select_provider,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

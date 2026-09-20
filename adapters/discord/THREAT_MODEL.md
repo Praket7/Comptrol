@@ -1,0 +1,7 @@
+# Threat model
+
+The bot token is taken only from `COMPTROL_DISCORD_BOT_TOKEN` at request time; it is never written to disk, never logged, never echoed, and every upstream error is redacted before it leaves the adapter, so the secret cannot leak through responses or audit payloads. Only explicit `Authorization: Bot` calls to the official `/api/v10` surface (or a configured loopback stub) are made; no gateway, no browser, and no cookie handling exists.
+
+Impersonation safety comes from exact identity binding: every intent GETs the channel first and refuses on id, guild, or DM-recipient mismatch (`identity_mismatch`) before any write, so a caller cannot redirect a send by guessing names. Duplicate-send safety comes from a client-generated `nonce` with `enforce_nonce=true` on every POST, plus a mandatory post-write GET that returns message id, author, target, and content-hash; ambiguous outcomes return `ambiguous_ack` with reconcile-before-retry guidance and the adapter never blind retries with a fresh nonce.
+
+Exfiltration and injection safety comes from the attachment cage: only regular files under `COMPTROL_DISCORD_ASSETS_ROOT` are readable, path traversal is refused, files over 8 MB are refused, and only size plus sha256 leave the adapter. Self-bot routes are refused with `selfbot_refused` without touching the network, and normal user-account operation is refused with `user_account_ui_route` (operate the signed-in UI), so no user-token automation path exists to abuse.

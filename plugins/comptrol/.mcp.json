@@ -1,3 +1,8 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "comptrol-local": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:7317/mcp"
+    }
+  }
 }

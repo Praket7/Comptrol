@@ -10,7 +10,7 @@ The initial runtime is intentionally conservative. It observes the host and expo
 
 ## Workflow execution
 
-The library includes a closed workflow representation with sense, assert, set, wait, and return operations. It does not execute model supplied scripts. A later compiler can lower a verified trace into this representation after validating target identity and postconditions.
+The runtime has a typed workflow IR (`crates/comptrol-workflow`): Observe, Assert, Act, Wait, Verify, Checkpoint, Branch, Loop, ParallelRead, and Return nodes with validation, SHA-256 structural fingerprints, bounded loops, step budgets, cancellation, and clean-replay promotion gates. It never executes model-supplied scripts. Verified traces can be compiled and promoted into versioned warm skills after independent replay evidence; the trace compiler (`trace.rs`) records sanitized candidates with app/site version envelopes and keeps secrets as runtime parameters.
 
 ## Transport
 

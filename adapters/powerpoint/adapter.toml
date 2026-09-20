@@ -1,0 +1,29 @@
+manifest_version = 1
+id = "comptrol.powerpoint"
+name = "PowerPoint (Offline Open XML)"
+version = "0.1.0"
+platforms = ["windows", "macos", "linux"]
+applications = ["POWERPNT.EXE", "PowerPoint", "powerpoint"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "presentation.read"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.batch_edit"
+risk = "R2"
+background = "supported"
+verification = "persisted_artifact"
+
+[[capabilities]]
+intent = "presentation.export"
+risk = "R1"
+background = "supported"
+verification = "persisted_artifact"

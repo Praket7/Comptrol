@@ -1,0 +1,53 @@
+manifest_version = 1
+id = "comptrol.powerpoint-windows"
+name = "PowerPoint (Windows COM)"
+version = "0.1.0"
+platforms = ["windows"]
+applications = ["POWERPNT.EXE"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "presentation.desktop.open"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.slide.create"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.slide.delete"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.slide.reorder"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.shape.text.set"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.save"
+risk = "R2"
+background = "supported"
+verification = "persisted_artifact"
+
+[[capabilities]]
+intent = "presentation.export_pdf"
+risk = "R1"
+background = "supported"
+verification = "persisted_artifact"

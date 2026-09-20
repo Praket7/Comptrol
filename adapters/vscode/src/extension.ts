@@ -1,4 +1,8 @@
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
 import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as vscode from "vscode";
 
 // This bridge deliberately exposes a closed allowlist of official VS Code APIs.
@@ -10,10 +14,48 @@ const allowed = new Set([
   "vscode.document.save",
 ]);
 
-export function activate(context: vscode.ExtensionContext): void {
-  const socketPath = process.env.COMPTROL_VSCODE_BRIDGE_SOCKET;
-  const bridgeToken = process.env.COMPTROL_VSCODE_BRIDGE_TOKEN;
-  if (!socketPath || !bridgeToken) return;
+const TOKEN_SECRET_KEY = "comptrol.bridgeToken";
+
+function stateDir(): string {
+  const override = process.env.COMPTROL_STATE_DIR;
+  if (override) return override;
+  return path.join(os.homedir(), ".comptrol");
+}
+
+function defaultEndpoint(): string {
+  if (process.platform === "win32") return "pipe:comptrol-vscode-bridge";
+  const dir = path.join(stateDir(), "bridges");
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, "vscode.sock");
+}
+
+function publishDescriptor(endpoint: string, instance: Record<string, unknown>): void {
+  // The endpoint only. The token lives in SecretStorage (or the launch
+  // environment) and is never written to disk.
+  const dir = path.join(stateDir(), "bridges");
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const descriptor = path.join(dir, "vscode.json");
+  fs.writeFileSync(
+    descriptor,
+    JSON.stringify({ version: 1, endpoint, instance }),
+    { mode: 0o600 },
+  );
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  const configuredEndpoint =
+    process.env.COMPTROL_VSCODE_BRIDGE_SOCKET ?? defaultEndpoint();
+  let bridgeToken =
+    process.env.COMPTROL_VSCODE_BRIDGE_TOKEN ??
+    (await context.secrets.get(TOKEN_SECRET_KEY));
+  if (!bridgeToken) {
+    // First activation pairs this instance: generate one token, keep it in
+    // platform SecretStorage, and publish the endpoint for daemon discovery.
+    // The daemon must be given the same token once through `comptrol setup`.
+    bridgeToken = crypto.randomBytes(32).toString("hex");
+    await context.secrets.store(TOKEN_SECRET_KEY, bridgeToken);
+  }
+  const token: string = bridgeToken;
   const server = net.createServer((socket) => {
     let buffer = "";
     socket.on("data", async (chunk) => {
@@ -25,7 +67,7 @@ export function activate(context: vscode.ExtensionContext): void {
         newline = buffer.indexOf("\n");
         try {
           const envelope = JSON.parse(line);
-          if (envelope.version !== 1 || envelope.token !== bridgeToken || typeof envelope.nonce !== "string") {
+          if (envelope.version !== 1 || envelope.token !== token || typeof envelope.nonce !== "string") {
             throw new Error("bridge authentication failed");
           }
           const request = envelope.request ?? {};
@@ -39,7 +81,20 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     });
   });
-  server.listen(socketPath, "127.0.0.1");
+  const listenTarget =
+    configuredEndpoint.startsWith("pipe:")
+      ? `\\\\.\\pipe\\${configuredEndpoint.slice("pipe:".length)}`
+      : configuredEndpoint;
+  if (process.platform === "win32" && !configuredEndpoint.startsWith("pipe:")) {
+    // A bare env path on Windows is treated as a named pipe name.
+    server.listen(`\\\\.\\pipe\\${path.basename(configuredEndpoint)}`);
+  } else {
+    server.listen(listenTarget);
+  }
+  publishDescriptor(configuredEndpoint, {
+    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString()),
+    windowId: `${vscode.env.sessionId}`,
+  });
   context.subscriptions.push({ dispose: () => server.close() });
 }
 

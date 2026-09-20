@@ -1,0 +1,5 @@
+# Apple Messages adapter
+
+The adapter drives Apple Messages on macOS through the published AppleScript surface only (buddies, text chats, send) via fixed templates executed as subprocess argv (`/usr/bin/osascript -e`, never a shell). There is no private IMCore access and `~/Library/Messages/chat.db` is never read. Run `python3 src/adapter.py` as the isolated host child; it speaks the shared framed RPC on stdio.
+
+The model never supplies script source. Payloads carry typed data only (exactly one of recipient handle or chat GUID, body up to 2000 characters, one attachment path), which the adapter quotes and escapes into closed template slots; any script-source keys are refused. The optional attachment must resolve under `COMPTROL_MAIL_ASSETS_ROOT`, must already exist, is capped at 10 MB, and is reported with size plus sha256. Intents are `message.draft` (R2, staged locally since Messages has no draft API) and `message.send` (R3). Outside macOS every intent returns unsupported. Denied Automation permission returns `automation_permission_required` with a remediation hint.

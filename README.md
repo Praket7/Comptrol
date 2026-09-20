@@ -4,7 +4,13 @@ Comptrol is a local first control layer for computer using agents.
 
 It gives an MCP client one bounded operation surface with explicit policy, stable operation identity, audit records, recovery state, and honest verification.
 
-The first release is a small foundation. It runs on macOS, Windows, and Linux. Basic platform observation is available on the current machine. Browser CDP control is available only for an explicitly configured local endpoint. macOS semantic mutation is available only with Accessibility permission and explicit policy. Windows UI Automation and Linux AT SPI semantic mutation routes are implemented behind persistent platform workers and explicit local policy. They are exercised by conformance harnesses but still need live validation on real Windows and Linux hosts, and their traversal paths do not yet use event driven caching.
+The first release is a small foundation. It runs on macOS, Windows, and Linux. Basic platform observation is available on the current machine. Browser CDP control is available only for an explicitly configured local endpoint. macOS semantic mutation is available only with Accessibility permission and explicit policy. Windows UI Automation and Linux AT SPI semantic mutation routes are implemented behind persistent platform workers and explicit local policy. They are exercised by conformance harnesses but still need live validation on real Windows and Linux hosts; event-driven target caches now back the browser and popup paths, and native accessibility event caching is tracked work.
+
+## What V5 adds
+
+One semantic `operate` call compiles to the fastest permitted verified route: official service APIs (Google Docs/Slides batch edits with revision control, Gmail/Graph mail, Discord bot API, Canva Connect), official application surfaces (DaVinci Resolve scripting, PowerPoint COM/Open XML, LibreOffice UNO, OBS WebSocket, Blender bridge, VS Code extension API), the permissioned signed-in browser session, native accessibility, or narrowly scoped visual fallback.
+
+New in this branch: persistent consent broker with human-action waits (`awaiting_human_action`, never typing secrets), registry-backed app launch plus deep resource opening, typed settings registry, trusted software installation with inventory verification and native elevation handoff, popup classification that never auto-approves protected prompts, a browser session broker with revision-keyed target state cache, cross-platform adapter IPC, and first-party adapters for Resolve, Google Workspace, PowerPoint, Discord, mail, Messages, and Canva. Capability details live in `docs/adapters.md`; per-adapter setup lives in each `adapters/<name>/README.md`.
 
 ## Why it exists
 

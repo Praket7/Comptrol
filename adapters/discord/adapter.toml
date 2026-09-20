@@ -1,0 +1,59 @@
+manifest_version = 1
+id = "comptrol.discord"
+name = "Discord"
+version = "0.1.0"
+platforms = ["windows", "macos", "linux"]
+applications = ["Discord", "Discord.exe", "discord"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "discord.message.draft"
+risk = "R0"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "discord.message.send"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "discord.message.edit"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "discord.message.delete"
+risk = "R3"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "discord.message.reply"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "discord.message.react"
+risk = "R1"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "discord.message.attach"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "discord.message.search"
+risk = "R0"
+background = "supported"
+verification = "application_state"

@@ -1,0 +1,3 @@
+# Threat model
+
+Presentations can carry macro/VBA payloads and external image links, so the adapter never executes macros: any `macro`/`vba` request key is refused, `.pptm` files are opened read-only through python-pptx (which does not run code), and macro parts are never preserved on export. Mutations checkpoint the source to `<file>.bak` before writing, validate a closed op schema with bounded string lengths, scope presentation and asset paths under `COMPTROL_PRESENTATIONS_ROOT` when set, and restrict images to a small bitmap allowlist. PDF conversion shells only to a locally probed `soffice` binary with captured output and a timeout.

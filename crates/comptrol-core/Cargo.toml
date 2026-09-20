@@ -11,6 +11,9 @@ comptrol-app-registry = { path = "../comptrol-app-registry" }
 comptrol-adapter-sdk = { path = "../comptrol-adapter-sdk" }
 comptrol-browser = { path = "../comptrol-browser" }
 comptrol-consent = { path = "../comptrol-consent" }
+comptrol-popup = { path = "../comptrol-popup" }
+comptrol-settings = { path = "../comptrol-settings" }
+comptrol-software = { path = "../comptrol-software" }
 comptrol-platform-windows = { path = "../comptrol-platform-windows" }
 comptrol-verification = { path = "../comptrol-verification" }
 comptrol-workflow = { path = "../comptrol-workflow" }

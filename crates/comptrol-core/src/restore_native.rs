@@ -7,9 +7,7 @@
 //! Platforms without an implemented enumeration provider report
 //! `native_restore_unavailable` instead of approximating a restore.
 
-use crate::restore::{
-    NATIVE_UNAVAILABLE, RestoreEntry, RestoreError, RestoreKind, native_unavailable, refuse,
-};
+use crate::restore::{RestoreEntry, RestoreError, RestoreKind, native_unavailable, refuse};
 
 /// Enumerate recently-closed restore entries through the native surface.
 #[cfg(target_os = "macos")]
@@ -100,8 +98,7 @@ pub fn windows_restore(_entry: &RestoreEntry) -> Result<(), RestoreError> {
 
 /// Linux: AT-SPI enumeration of Chrome restore entries is not implemented yet.
 pub fn linux_entries() -> Result<Vec<RestoreEntry>, RestoreError> {
-    Err(refuse(
-        NATIVE_UNAVAILABLE,
+    Err(native_unavailable(
         "Linux AT-SPI enumeration of Chrome recently-closed entries is not implemented in this build",
         Some("Use mode native_then_reconstruct or reconstruct_only".to_owned()),
     ))
@@ -154,20 +151,29 @@ mod tests {
             title: Some("Research".to_owned()),
             urls: vec![],
         };
-        assert_eq!(macos_entries().unwrap_err().code(), NATIVE_UNAVAILABLE);
+        assert_eq!(
+            macos_entries().unwrap_err().code(),
+            crate::restore::NATIVE_UNAVAILABLE
+        );
         assert_eq!(
             macos_restore(&entry).unwrap_err().code(),
-            NATIVE_UNAVAILABLE
+            crate::restore::NATIVE_UNAVAILABLE
         );
-        assert_eq!(windows_entries().unwrap_err().code(), NATIVE_UNAVAILABLE);
+        assert_eq!(
+            windows_entries().unwrap_err().code(),
+            crate::restore::NATIVE_UNAVAILABLE
+        );
         assert_eq!(
             windows_restore(&entry).unwrap_err().code(),
-            NATIVE_UNAVAILABLE
+            crate::restore::NATIVE_UNAVAILABLE
         );
-        assert_eq!(linux_entries().unwrap_err().code(), NATIVE_UNAVAILABLE);
+        assert_eq!(
+            linux_entries().unwrap_err().code(),
+            crate::restore::NATIVE_UNAVAILABLE
+        );
         assert_eq!(
             linux_restore(&entry).unwrap_err().code(),
-            NATIVE_UNAVAILABLE
+            crate::restore::NATIVE_UNAVAILABLE
         );
     }
 }

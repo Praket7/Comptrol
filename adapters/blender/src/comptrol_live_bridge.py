@@ -14,14 +14,16 @@ import bpy
 
 _requests = queue.Queue()
 _server = None
+_endpoint = None
 _token = os.environ.get("COMPTROL_BLENDER_BRIDGE_TOKEN", "")
 
 
-def _reply(connection, request, ok, payload=None, error=None):
+def _reply(connection, request, ok, payload=None, error=None, authenticated=True):
     result = {
         "version": 1,
         "request_id": request.get("request_id"),
-        "authenticated": True,
+        "nonce": request.get("nonce"),
+        "authenticated": bool(authenticated),
         "ok": ok,
         "payload": payload or {},
     }
@@ -94,7 +96,9 @@ def _timer():
         return 0.05
     try:
         if request.get("token") != _token or not _token:
-            raise PermissionError("bridge authentication failed")
+            _reply(connection, request, False, authenticated=False,
+                   error=PermissionError("bridge authentication failed"))
+            return 0.01
         _reply(connection, request, True, _execute(request))
     except Exception as exc:
         _reply(connection, request, False, error=exc)
@@ -125,22 +129,56 @@ def _accept_loop():
 
 
 def start():
-    global _server
+    global _server, _endpoint
     if _server is not None:
-        return
+        return _endpoint
     path = os.environ.get("COMPTROL_BLENDER_BRIDGE_SOCKET", "")
     if not path or not _token:
         raise RuntimeError("COMPTROL_BLENDER_BRIDGE_SOCKET and COMPTROL_BLENDER_BRIDGE_TOKEN are required")
-    _server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    bound_tcp = None
     try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    _server.bind(path)
-    os.chmod(path, 0o600)
+        _server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        _server.bind(path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        _endpoint = path
+    except (OSError, AttributeError):
+        # AF_UNIX is unavailable (notably Windows Blender builds): fall
+        # back to authenticated loopback TCP, never a wider bind.
+        if _server is not None:
+            _server.close()
+        _server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _server.bind(("127.0.0.1", 0))
+        bound_tcp = _server.getsockname()[1]
+        _endpoint = f"tcp:127.0.0.1:{bound_tcp}"
     _server.listen(8)
+    _write_descriptor(_endpoint)
     threading.Thread(target=_accept_loop, daemon=True).start()
     bpy.app.timers.register(_timer, first_interval=0.01, persistent=True)
+    return _endpoint
+
+
+def _write_descriptor(endpoint):
+    try:
+        home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or "."
+        directory = os.path.join(home, ".comptrol", "bridges")
+        os.makedirs(directory, exist_ok=True)
+        descriptor = os.path.join(directory, "blender.json")
+        with open(descriptor, "w", encoding="utf-8") as handle:
+            # The endpoint only. The token always travels in the environment.
+            handle.write(json.dumps({"version": 1, "endpoint": endpoint}))
+        try:
+            os.chmod(descriptor, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
 
 
 def stop():

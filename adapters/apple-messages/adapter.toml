@@ -1,0 +1,23 @@
+manifest_version = 1
+id = "comptrol.apple-messages"
+name = "Apple Messages"
+version = "0.1.0"
+platforms = ["macos"]
+applications = ["Messages"]
+
+[isolation]
+mode = "out_of_process"
+network = "loopback_only"
+filesystem = "declared_scopes"
+
+[[capabilities]]
+intent = "message.draft"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "message.send"
+risk = "R3"
+background = "supported"
+verification = "application_state"

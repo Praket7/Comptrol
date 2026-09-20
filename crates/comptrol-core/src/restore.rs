@@ -658,6 +658,9 @@ pub fn execute(
     params: &Value,
     process_id: Option<u32>,
 ) -> Result<RestoreOutcome, RestoreError> {
+    // Validate the request shape before requiring the endpoint so malformed
+    // params report invalid_input even without a live browser attached.
+    parse_request(params)?;
     if endpoint.is_none() {
         return Err(refuse(
             "browser_unavailable",
