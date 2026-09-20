@@ -9,6 +9,7 @@ description = "Local first computer control runtime and MCP server"
 comptrol-adapter-host = { path = "../comptrol-adapter-host" }
 comptrol-adapter-sdk = { path = "../comptrol-adapter-sdk" }
 comptrol-browser = { path = "../comptrol-browser" }
+comptrol-consent = { path = "../comptrol-consent" }
 comptrol-platform-windows = { path = "../comptrol-platform-windows" }
 comptrol-verification = { path = "../comptrol-verification" }
 comptrol-workflow = { path = "../comptrol-workflow" }

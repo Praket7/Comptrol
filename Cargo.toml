@@ -9,6 +9,7 @@ members = [
     "crates/comptrol-verification",
     "crates/comptrol-browser",
     "crates/comptrol-workflow",
+    "crates/comptrol-consent",
 ]
 resolver = "2"
 

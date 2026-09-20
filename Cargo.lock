@@ -293,6 +293,7 @@ dependencies = [
  "comptrol-adapter-host",
  "comptrol-adapter-sdk",
  "comptrol-browser",
+ "comptrol-consent",
  "comptrol-platform-linux",
  "comptrol-platform-macos",
  "comptrol-platform-windows",
@@ -340,6 +341,16 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+]
+
+[[package]]
+name = "comptrol-consent"
+version = "0.1.63"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

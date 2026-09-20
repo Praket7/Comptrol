@@ -917,6 +917,11 @@ pub struct Runtime {
     pub durable_events: DurableEventHub,
     pub trace: Option<TraceRecorder>,
     pub stop: StopLatch,
+    /// Persistent consent store. Opened lazily; failures surface in doctor.
+    pub consent: Option<comptrol_consent::ConsentStore>,
+    /// Human action broker tracking paused operations awaiting user
+    /// approval (UAC, polkit, TCC, browser consent...).
+    pub human_actions: comptrol_consent::HumanActionBroker,
     operation_cancel: Option<Arc<AtomicBool>>,
     adapter_hosts: HashMap<String, AdapterHost>,
     idempotent: HashMap<String, ActionResult>,
@@ -1028,6 +1033,8 @@ impl Runtime {
                 .map_err(io::Error::other)?,
             trace,
             stop: StopLatch::new(&state_dir),
+            consent: comptrol_consent::ConsentStore::open(state_dir.join("consent.jsonl")).ok(),
+            human_actions: comptrol_consent::HumanActionBroker::new(),
             operation_cancel: None,
             adapter_hosts: HashMap::new(),
             idempotent,
@@ -1104,6 +1111,49 @@ impl Runtime {
             let result = ActionResult::refused(&request, operation_id, error);
             self.remember(&request, result.clone());
             return result;
+        }
+        // Consent gate: mutations with an exact resource identity must be
+        // covered by a persistent consent grant. Environment policy alone is
+        // no longer sufficient for consent-gated capabilities.
+        let consent_resource = request.target.as_ref().and_then(|target| {
+            target
+                .id
+                .as_deref()
+                .or(target.name.as_deref())
+                .map(str::to_owned)
+        });
+        if risk.mutation()
+            && let Some(store) = &self.consent
+            && consent_gate_applies(&request.intent)
+        {
+            let denied = match store.authorize(
+                &request.intent,
+                &request.intent,
+                to_consent_risk(risk),
+                consent_resource.as_deref(),
+            ) {
+                comptrol_consent::ConsentDecision::Denied { .. } => true,
+                comptrol_consent::ConsentDecision::Allowed { .. } => false,
+            };
+            if denied {
+                let result = ActionResult::refused(
+                    &request,
+                    operation_id,
+                    ComptrolError {
+                        code: "consent_required".to_owned(),
+                        message: format!(
+                            "No active consent grant covers {}",
+                            request.intent
+                        ),
+                        recovery: Some(
+                            "Run setup to grant this capability locally, or ask the user to approve it"
+                                .to_owned(),
+                        ),
+                    },
+                );
+                self.remember(&request, result.clone());
+                return result;
+            }
         }
         let plan = route_plan_with_history(&request, &self.route_history);
         if request.dry_run {
@@ -1321,6 +1371,17 @@ impl Runtime {
     pub fn inspect(&mut self, kind: &str) -> Value {
         match kind {
             "doctor" => doctor(self),
+            "consent" => json!({
+                "store": match &self.consent {
+                    Some(store) => json!({ "available": true, "path": store.path(), "active_grants": store.active(None).len() }),
+                    None => json!({ "available": false, "reason": "consent store failed to open; run setup to recreate it" }),
+                },
+                "human_actions": {
+                    "pending": self.human_actions.all().iter().filter(|action| action.resolution.is_none()).count(),
+                    "total": self.human_actions.all().len(),
+                    "requests": self.human_actions.all(),
+                },
+            }),
             "capabilities" => json!(capabilities()),
             "routes" => json!(route_catalog()),
             "route_stats" => json!({
@@ -6205,6 +6266,13 @@ fn doctor(runtime: &Runtime) -> Value {
             "browser_fixture": runtime.policy.allowed_intents.contains("browser.fixture.submit"),
             "commands": runtime.policy.allowed_intents.contains("command.run")
         },
+        "consent": {
+            "store": match &runtime.consent {
+                Some(store) => json!({ "available": true, "path": store.path(), "active_grants": store.active(None).len() }),
+                None => json!({ "available": false, "reason": "consent store failed to open; run setup to recreate it" }),
+            },
+            "awaiting_human_action": runtime.human_actions.all().iter().filter(|action| action.resolution.is_none()).count(),
+        },
         "journal": { "available": true, "path": runtime.journal.path() },
         "operations": { "available": true, "path": runtime.operations.path() },
         "checkpoints": { "available": true, "path": runtime.checkpoints.path() },
@@ -6233,6 +6301,29 @@ fn doctor(runtime: &Runtime) -> Value {
         "remote": { "available": false, "binding": "loopback_only" },
         "state_dir": state_dir()
     })
+}
+
+fn to_consent_risk(risk: Risk) -> comptrol_consent::Risk {
+    match risk {
+        Risk::R0 => comptrol_consent::Risk::R0,
+        Risk::R1 => comptrol_consent::Risk::R1,
+        Risk::R2 => comptrol_consent::Risk::R2,
+        Risk::R3 | Risk::R4 => comptrol_consent::Risk::R3,
+    }
+}
+
+/// Capabilities where a missing consent grant blocks execution. Ordinary
+/// read-only or already-policy-gated intents continue to work unchanged;
+/// software/settings/intall-class mutations require explicit local consent.
+fn consent_gate_applies(intent: &str) -> bool {
+    matches!(
+        intent,
+        "software.install"
+            | "software.update"
+            | "software.uninstall"
+            | "settings.write"
+            | "software.launch_after_install"
+    )
 }
 
 fn state_dir() -> PathBuf {
@@ -7143,5 +7234,81 @@ mod tests {
         let contents = fs::read_to_string(journal.path()).expect("audit");
         assert!(!contents.contains("secret body"));
         assert!(contents.contains("risk_data"));
+    }
+
+    #[test]
+    fn consent_gate_blocks_ungranted_install_and_allows_granted() {
+        let mut runtime = runtime();
+        // Environment policy alone must no longer authorize an install.
+        runtime.policy.max_risk = Risk::R3;
+        runtime
+            .policy
+            .allowed_intents
+            .insert("software.install".to_owned());
+        let refused = runtime.operate(OperationRequest {
+            intent: "software.install".to_owned(),
+            target: Some(Target {
+                kind: "package".to_owned(),
+                id: Some("winget:VideoLAN.VLC".to_owned()),
+                name: None,
+            }),
+            params: json!({}),
+            postcondition: None,
+            risk: Some(Risk::R3),
+            idempotency_key: None,
+            dry_run: true,
+            background: None,
+        });
+        assert_eq!(
+            refused.error.as_ref().map(|e| e.code.as_str()),
+            Some("consent_required")
+        );
+
+        // Granting consent locally (the setup path) unblocks the intent.
+        let grant = runtime
+            .consent
+            .as_mut()
+            .expect("consent store")
+            .grant(
+                "software.install",
+                comptrol_consent::ConsentScope {
+                    intent: Some("software.install".to_owned()),
+                    resource: Some("winget:VideoLAN.VLC".to_owned()),
+                    max_risk: Some(comptrol_consent::Risk::R3),
+                    ..Default::default()
+                },
+                comptrol_consent::GrantSubject::LocalUser,
+                comptrol_consent::Risk::R3,
+                None,
+            )
+            .expect("grant");
+        assert!(!grant.id.is_empty());
+        let allowed = runtime.operate(OperationRequest {
+            intent: "software.install".to_owned(),
+            target: Some(Target {
+                kind: "package".to_owned(),
+                id: Some("winget:VideoLAN.VLC".to_owned()),
+                name: None,
+            }),
+            params: json!({}),
+            postcondition: None,
+            risk: Some(Risk::R3),
+            idempotency_key: None,
+            dry_run: true,
+            background: None,
+        });
+        assert_ne!(
+            allowed.error.as_ref().map(|e| e.code.as_str()),
+            Some("consent_required")
+        );
+    }
+
+    #[test]
+    fn doctor_reports_consent_state() {
+        let mut runtime = runtime();
+        let report = runtime.inspect("doctor");
+        assert_eq!(report["consent"]["store"]["available"], json!(true));
+        let consent = runtime.inspect("consent");
+        assert!(consent["human_actions"]["pending"].is_u64());
     }
 }
