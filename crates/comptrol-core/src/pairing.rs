@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_TTL_MS: u128 = 300_000;
 const MAX_TTL_MS: u128 = 86_400_000;
 const TOKEN_BYTES: usize = 32;
+const NONCE_TTL_MS: u128 = 120_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PairingRecord {
@@ -20,12 +21,21 @@ pub struct PairingRecord {
     pub expires_at_ms: u128,
     pub accepted: bool,
     pub revoked: bool,
+    pub identity_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplayNonce {
+    pub nonce_hash: String,
+    pub created_at_ms: u128,
+    pub pairing_id: String,
 }
 
 #[derive(Debug)]
 pub struct PairingStore {
     path: std::path::PathBuf,
     records: HashMap<String, PairingRecord>,
+    replay_cache: HashMap<String, ReplayNonce>,
 }
 
 impl PairingStore {
@@ -33,6 +43,7 @@ impl PairingStore {
         fs::create_dir_all(state_dir)?;
         let path = state_dir.join("pairings.jsonl");
         let mut records = HashMap::new();
+        let mut replay_cache = HashMap::new();
         if path.exists() {
             for line in BufReader::new(File::open(&path)?).lines() {
                 if let Ok(record) = serde_json::from_str::<PairingRecord>(&line?) {
@@ -40,13 +51,130 @@ impl PairingStore {
                 }
             }
         }
-        Ok(Self { path, records })
+        let replay_path = state_dir.join("replay_nonces.jsonl");
+        if replay_path.exists() {
+            for line in BufReader::new(File::open(&replay_path)?).lines() {
+                if let Ok(nonce) = serde_json::from_str::<ReplayNonce>(&line?) {
+                    if now_ms().saturating_sub(nonce.created_at_ms) < NONCE_TTL_MS {
+                        replay_cache.insert(nonce.nonce_hash.clone(), nonce);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            path,
+            records,
+            replay_cache,
+        })
+    }
+
+    pub fn bind_identity(&mut self, pairing_id: &str, fingerprint: &str) -> io::Result<()> {
+        let record = self
+            .records
+            .get_mut(pairing_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pairing id not found"))?;
+        if record.revoked {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pairing revoked",
+            ));
+        }
+        let cloned = record.clone();
+        drop(record);
+        let mut updated = cloned;
+        updated.identity_fingerprint = Some(fingerprint.to_owned());
+        self.write(updated)
+    }
+
+    pub fn verify_mtls_identity(
+        &self,
+        pairing_id: &str,
+        fingerprint: &str,
+        scopes: &[String],
+    ) -> io::Result<&PairingRecord> {
+        let record = self
+            .records
+            .get(pairing_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pairing id not found"))?;
+        if record.revoked {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pairing revoked",
+            ));
+        }
+        if !record.accepted {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pairing not accepted",
+            ));
+        }
+        if record.expires_at_ms <= now_ms() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pairing expired",
+            ));
+        }
+        match &record.identity_fingerprint {
+            Some(fp) if fp == fingerprint => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "identity fingerprint mismatch",
+                ));
+            }
+        }
+        for scope in scopes {
+            if !record.scopes.contains(&scope.to_owned()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("scope not authorized: {scope}"),
+                ));
+            }
+        }
+        Ok(record)
+    }
+
+    pub fn record_nonce(&mut self, nonce: &str, pairing_id: &str) -> io::Result<bool> {
+        let now = now_ms();
+        let nonce_hash = hash(nonce);
+        self.replay_cache
+            .retain(|_, entry| now.saturating_sub(entry.created_at_ms) < NONCE_TTL_MS);
+        if self.replay_cache.contains_key(&nonce_hash) {
+            return Ok(false);
+        }
+        let entry = ReplayNonce {
+            nonce_hash: nonce_hash.clone(),
+            created_at_ms: now,
+            pairing_id: pairing_id.to_owned(),
+        };
+        self.replay_cache.insert(nonce_hash, entry.clone());
+        let replay_path = self.path.with_file_name("replay_nonces.jsonl");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&replay_path)?;
+        serde_json::to_writer(&mut file, &entry)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        Ok(true)
+    }
+
+    pub fn list(&self) -> Vec<PairingRecord> {
+        self.records.values().cloned().collect()
+    }
+
+    pub fn identity_bound_count(&self) -> usize {
+        self.records
+            .values()
+            .filter(|r| r.identity_fingerprint.is_some())
+            .count()
     }
 
     pub fn create(
         &mut self,
         scopes: Vec<String>,
         ttl_ms: Option<u128>,
+        identity_fingerprint: Option<String>,
     ) -> io::Result<(PairingRecord, String)> {
         let now = now_ms();
         let ttl = ttl_ms.unwrap_or(DEFAULT_TTL_MS).clamp(1_000, MAX_TTL_MS);
@@ -62,6 +190,7 @@ impl PairingStore {
             expires_at_ms: now.saturating_add(ttl),
             accepted: false,
             revoked: false,
+            identity_fingerprint,
         };
         self.write(record.clone())?;
         Ok((record, token_text))
@@ -113,10 +242,6 @@ impl PairingStore {
         record.revoked = true;
         self.write(record.clone())?;
         Ok(record)
-    }
-
-    pub fn list(&self) -> Vec<PairingRecord> {
-        self.records.values().cloned().collect()
     }
 
     fn write(&mut self, record: PairingRecord) -> io::Result<()> {
@@ -201,6 +326,7 @@ mod tests {
             .create(
                 vec!["observe".to_owned(), "observe".to_owned()],
                 Some(60_000),
+                None,
             )
             .expect("create");
         assert_eq!(record.scopes, vec!["observe"]);
@@ -215,7 +341,11 @@ mod tests {
     fn pairing_rejects_unknown_scope() {
         let path = test_path();
         let mut store = PairingStore::open(&path).expect("store");
-        assert!(store.create(vec!["terminal_all".to_owned()], None).is_err());
+        assert!(
+            store
+                .create(vec!["terminal_all".to_owned()], None, None)
+                .is_err()
+        );
         let _ = fs::remove_dir_all(path);
     }
 
@@ -224,7 +354,7 @@ mod tests {
         let path = test_path();
         let mut store = PairingStore::open(&path).expect("store");
         let (record, token) = store
-            .create(vec!["observe".to_owned()], Some(60_000))
+            .create(vec!["observe".to_owned()], Some(60_000), None)
             .expect("create");
         store
             .records
@@ -232,6 +362,67 @@ mod tests {
             .expect("record")
             .expires_at_ms = now_ms().saturating_sub(1);
         assert!(store.accept(&token).is_err());
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn identity_binding_and_verification() {
+        let path = test_path();
+        let mut store = PairingStore::open(&path).expect("store");
+        let fp = "sha256:abc123def456";
+        let (record, token) = store
+            .create(
+                vec!["observe".to_owned()],
+                Some(60_000),
+                Some(fp.to_owned()),
+            )
+            .expect("create");
+        let accepted = store.accept(&token).expect("accept");
+        assert!(accepted.identity_fingerprint.as_deref() == Some(fp));
+        let verified = store
+            .verify_mtls_identity(&record.pairing_id, fp, &["observe".to_owned()])
+            .expect("verify");
+        assert_eq!(verified.identity_fingerprint.as_deref(), Some(fp));
+        assert!(
+            store
+                .verify_mtls_identity(&record.pairing_id, "sha256:wrong", &["observe".to_owned()])
+                .is_err()
+        );
+        assert!(
+            store
+                .verify_mtls_identity(&record.pairing_id, fp, &["terminal".to_owned()])
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn replay_nonce_prevents_reuse() {
+        let path = test_path();
+        let mut store = PairingStore::open(&path).expect("store");
+        let nonce = "nonce-abc-123";
+        let pid = "test-pairing";
+        assert!(store.record_nonce(nonce, pid).expect("record"));
+        assert!(
+            !store
+                .record_nonce(nonce, pid)
+                .expect("should detect replay")
+        );
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn identity_bound_count() {
+        let path = test_path();
+        let mut store = PairingStore::open(&path).expect("store");
+        assert_eq!(store.identity_bound_count(), 0);
+        store
+            .create(vec!["observe".to_owned()], None, Some("fp1".to_owned()))
+            .expect("create");
+        store
+            .create(vec!["observe".to_owned()], None, None)
+            .expect("create");
+        assert_eq!(store.identity_bound_count(), 1);
         let _ = fs::remove_dir_all(path);
     }
 }

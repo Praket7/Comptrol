@@ -1,10 +1,54 @@
-# Local benchmark
+# Comptrol V5 Benchmarks
 
-Run `python3 scripts/benchmark.py` after building the debug binary for the transport suite. Run `python3 scripts/benchmark.py --suite verified-task` for the end to end verified task suite.
+## Overview
 
-Run `COMPTROL_BIN=target/release/comptrol node scripts/browser_conformance.mjs` for the fixture browser benchmark. It emits a structured result containing verified success, end-to-end latency, MCP calls, compiled workflow steps, bytes, retries, disturbance, false-positive count, resource identity, WebSocket reuse, protocol events, and target-list requests. The measured result from the 2026-09-15 WSL2 run is retained in `docs/benchmarks/browser-fixture-2026-09-15.json`. This is an independent fixture benchmark; it is not a matched comparison against native ChatGPT computer use or another MCP.
+V5 benchmarks are driven by an **executable** runner (`bench/runners/run_matrix.py`) that spawns the release `comptrol` binary over stdio MCP and records per-task latency distributions with p50/p95. Every task is defined as JSON in `bench/tasks/v5/`. Results are written to `bench/results/` with full metadata.
 
-The transport suite measures warm MCP ping latency over the local standard input and output transport. The verified task suite submits a real asynchronous `system.ping` MCP Task, waits for completion, retrieves the result, and requires the independent structured verification field to be `verified`. It reports completion latency, MCP calls, steps, bytes, retries, disturbance, false positive verification count, resource evidence, and verifier identity. These are raw local measurements only. They do not claim daemon latency, browser latency, semantic action latency, cross platform performance, or superiority over native ChatGPT computer use. Comparisons require the same initial state and final verifier.
+## Running
 
-The browser fixture exposes `targetListRequests` in its metrics. This supports a focused cache check: warm target-bound reads should reuse the persistent page websocket and avoid unnecessary `/json/list` requests, while mutations and stale identity checks invalidate the cache. It is not, by itself, a general browser latency or native-computer-use comparison.
+```bash
+python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/browser_matrix.json --binary target/debug/comptrol --iterations 5
+python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/adapter_matrix.json --binary target/release/comptrol --iterations 3
+```
 
+All scripts must run with `/opt/homebrew/bin/python3.11` **and** `/usr/bin/python3` (3.10; no `tomllib`).
+
+## Task Matrix Contract
+
+Each `bench/tasks/v5/<name>.json` contains:
+- `task_id`: unique identifier
+- `benchmark_suite`: category
+- `goal`: plain-language goal
+- `tasks`: array of task objects, each with:
+  - `task_id`, `goal`, `method`, `params`, `iterations`, `final_verifier`
+  - Optional `skip_reason` for live-platform tasks that need unavailable permissions
+- `final_verifier`: overall matrix verification string
+
+## Measurement Scope
+
+Each row records:
+- `verified`: whether the independent verifier passed
+- `latency_ms`: wall-clock per iteration
+- `mcp_calls`, `internal_route_actions`, `screenshots`, `bytes_returned`
+- `retries`, `wrong_target_events`, `foreground_disturbances`, `false_positive_verifications`
+
+The runner computes p50/p95 per task over N iterations and writes a full results JSON with per-iteration rows.
+
+## Transport Ping vs Task Performance
+
+The transport ping (`v4.transport.smoke`) is a **connectivity check only**. It must never be presented as task performance. Task performance requires an independent final verifier and a real fixture or live platform.
+
+## Results Schema
+
+Results JSON contains:
+- `matrix`, `benchmark_suite`, `metadata` (os, arch, cpu, python, rust, git head)
+- `generated_at`
+- `tasks`: array of per-task summaries with p50/p95 and full iteration rows
+
+## Matched Comparison
+
+Comparing two runs requires:
+1. Same initial state (fresh state directory)
+2. Same independent verifier
+3. Same iteration count
+4. Transport ping excluded from performance claims

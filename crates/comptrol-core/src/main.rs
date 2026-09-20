@@ -5,6 +5,7 @@ use comptrol::{
     validate_compiled_workflow,
 };
 use comptrol_adapter_sdk::AdapterManifest;
+use getrandom::fill;
 use rusqlite::{Connection, OptionalExtension, params};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -12,6 +13,7 @@ use rustls::server::WebPkiClientVerifier;
 use rustls_pemfile::{certs, private_key};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{File, OpenOptions};
@@ -1034,6 +1036,7 @@ fn run_pair(args: Vec<String>) -> i32 {
             let mut ttl_ms = None;
             let mut scopes = Vec::new();
             let mut index = 1;
+            let mut fingerprint = None;
             while index < args.len() {
                 match args[index].as_str() {
                     "--ttl-ms" => {
@@ -1046,8 +1049,14 @@ fn run_pair(args: Vec<String>) -> i32 {
                             scopes.push(scope.clone());
                         }
                     }
+                    "--fingerprint" => {
+                        index += 1;
+                        fingerprint = args.get(index).cloned();
+                    }
                     _ => {
-                        eprintln!("pair show accepts --ttl-ms and repeated --scope");
+                        eprintln!(
+                            "pair show accepts --ttl-ms, --scope, and repeated --fingerprint"
+                        );
                         return 2;
                     }
                 }
@@ -1056,13 +1065,14 @@ fn run_pair(args: Vec<String>) -> i32 {
             if scopes.is_empty() {
                 scopes.push("observe".to_owned());
             }
-            match store.create(scopes, ttl_ms) {
+            match store.create(scopes, ttl_ms, fingerprint) {
                 Ok((record, code)) => print_json(json!({
                     "pairing_id": record.pairing_id,
                     "code": code,
                     "scopes": record.scopes,
                     "expires_at_ms": record.expires_at_ms,
-                    "remote_transport": "disabled_until_mtls"
+                    "identity_fingerprint": record.identity_fingerprint,
+                    "remote_transport": if record.identity_fingerprint.is_some() { "mtls_bound" } else { "disabled_until_mtls" }
                 })),
                 Err(error) => {
                     eprintln!("pairing creation refused: {error}");
@@ -1097,8 +1107,15 @@ fn run_pair(args: Vec<String>) -> i32 {
             }
         }
         "list" => print_json(json!({
-            "remote_transport": "disabled_until_mtls",
-            "pairings": store.list().iter().map(public_pairing).collect::<Vec<_>>()
+            "pairings": store.list().iter().map(|r| {
+                let mut public = public_pairing(r);
+                public["identity_fingerprint"] = match &r.identity_fingerprint {
+                    Some(fp) => json!(fp),
+                    None => json!(null),
+                };
+                public["remote_transport"] = if r.identity_fingerprint.is_some() { json!("mtls_bound") } else { json!("disabled_until_mtls") };
+                public
+            }).collect::<Vec<_>>()
         })),
         _ => {
             eprintln!("pair accepts show, accept, revoke, or list");
@@ -1624,7 +1641,17 @@ fn run_http(port: u16) -> i32 {
                 let http_state = Arc::clone(&http_state);
                 let active_connections = Arc::clone(&active_connections);
                 thread::spawn(move || {
-                    if let Err(error) = handle_http(&mut stream, &runtime, &tasks, &http_state) {
+                    let pairing_store = Arc::new(Mutex::new(
+                        PairingStore::open(&default_state_dir()).unwrap(),
+                    ));
+                    if let Err(error) = handle_http(
+                        &mut stream,
+                        &runtime,
+                        &tasks,
+                        &http_state,
+                        pairing_store,
+                        None,
+                    ) {
                         eprintln!("http request failed: {error}");
                     }
                     active_connections.fetch_sub(1, Ordering::AcqRel);
@@ -1725,6 +1752,13 @@ fn run_mtls(port: u16) -> i32 {
             return 1;
         }
     };
+    let pairing_store = match PairingStore::open(&default_state_dir()) {
+        Ok(store) => Arc::new(Mutex::new(store)),
+        Err(error) => {
+            eprintln!("pairing store startup failed: {error}");
+            return 1;
+        }
+    };
     eprintln!("comptrol mutual-TLS HTTP listening on {bind}:{port}/mcp");
     let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
@@ -1739,6 +1773,7 @@ fn run_mtls(port: u16) -> i32 {
         let runtime = Arc::clone(&runtime);
         let tasks = Arc::clone(&tasks);
         let http_state = Arc::clone(&http_state);
+        let pairing_store = Arc::clone(&pairing_store);
         let active_connections = Arc::clone(&active_connections);
         thread::spawn(move || {
             let result = (|| -> io::Result<()> {
@@ -1750,8 +1785,32 @@ fn run_mtls(port: u16) -> i32 {
                 while connection.is_handshaking() {
                     connection.complete_io(&mut stream)?;
                 }
+                let peer_cert_fingerprint = connection
+                    .peer_certificates()
+                    .map(|certs| {
+                        certs
+                            .first()
+                            .map(|der| {
+                                let mut hasher = Sha256::new();
+                                hasher.update(der.as_ref());
+                                let digest = hasher.finalize();
+                                digest
+                                    .iter()
+                                    .map(|byte| format!("{byte:02x}").to_string())
+                                    .collect::<String>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .filter(|fp| !fp.is_empty());
                 let mut tls = rustls::StreamOwned::new(connection, stream);
-                handle_http(&mut tls, &runtime, &tasks, &http_state)
+                handle_http(
+                    &mut tls,
+                    &runtime,
+                    &tasks,
+                    &http_state,
+                    Arc::clone(&pairing_store),
+                    peer_cert_fingerprint,
+                )
             })();
             if let Err(error) = result {
                 eprintln!("mTLS request failed: {error}");
@@ -2149,6 +2208,8 @@ fn handle_http<S: HttpStream>(
     runtime: &Arc<Mutex<Runtime>>,
     tasks: &Arc<TaskManager>,
     http_state: &Arc<HttpStore>,
+    pairing_store: Arc<Mutex<PairingStore>>,
+    peer_fingerprint: Option<String>,
 ) -> io::Result<()> {
     // ponytail: bounded local parser, replace with a full HTTP implementation before public network exposure
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -2398,6 +2459,56 @@ fn handle_http<S: HttpStream>(
             );
         }
     };
+    if let (Some(peer_fp), Some(pairing_id)) = (
+        peer_fingerprint.as_deref(),
+        request
+            .get("params")
+            .and_then(|p| p.get("pairing_id"))
+            .and_then(Value::as_str),
+    ) {
+        let store = pairing_store.lock().expect("pairing store lock poisoned");
+        let scopes: Vec<String> = request
+            .get("params")
+            .and_then(|p| p.get("scopes"))
+            .and_then(|s| s.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        match store.verify_mtls_identity(pairing_id, peer_fp, &scopes) {
+            Ok(_) => {}
+            Err(_) => {
+                return write_http_response(
+                    stream,
+                    403,
+                    "Forbidden",
+                    "application/json",
+                    serde_json::to_vec(&json!({"error":"mtls_identity_refused"}))
+                        .unwrap_or_default(),
+                    None,
+                );
+            }
+        };
+        let nonce = request
+            .get("params")
+            .and_then(|p| p.get("nonce"))
+            .and_then(Value::as_str);
+        if let Some(nonce) = nonce {
+            let mut store = pairing_store.lock().expect("pairing store lock poisoned");
+            if !store.record_nonce(nonce, pairing_id).unwrap_or(false) {
+                return write_http_response(
+                    stream,
+                    403,
+                    "Forbidden",
+                    "application/json",
+                    serde_json::to_vec(&json!({"error":"nonce_replay"})).unwrap_or_default(),
+                    None,
+                );
+            }
+        }
+    }
     let is_initialize = request.get("method").and_then(Value::as_str) == Some("initialize");
     if is_initialize {
         if session.is_some() {
