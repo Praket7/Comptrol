@@ -17,6 +17,7 @@ python3 scripts/platform_conformance.py
 python3 scripts/privacy_conformance.py
 python3 scripts/command_conformance.py
 python3 scripts/browser_launcher_conformance.py
+node scripts/chrome_auto_connect_conformance.mjs
 python3 scripts/http_conformance.py
 python3 scripts/ipc_conformance.py
 python3 scripts/chrome_conformance.py

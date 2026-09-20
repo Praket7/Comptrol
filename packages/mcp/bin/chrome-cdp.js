@@ -70,12 +70,42 @@ function defaultProfile() {
   return path.join(root, "chrome-cdp-profile");
 }
 
-async function ensureChromeCdp() {
-  if (process.env.COMPTROL_CDP_ENDPOINT) {
-    const endpoint = process.env.COMPTROL_CDP_ENDPOINT.replace(/\/$/, "");
-    if (await waitForEndpoint(endpoint, 2)) return { endpoint, owned: false };
+// Chrome 136+ deliberately ignores --remote-debugging-port/--pipe for the
+// default user-data directory, and profile copying is forbidden. The
+// permissioned route is the only path into the user's signed-in session:
+// the user enables Remote Debugging at chrome://inspect/#remote-debugging,
+// Chrome shows its native permission dialog, and the user clicks Allow.
+// Everything Comptrol may do automatically is: detect an already-open
+// endpoint, or start Chrome with a DEDICATED (non-default) profile.
+async function detectExistingCdpEndpoint() {
+  const explicit = process.env.COMPTROL_CDP_ENDPOINT;
+  if (explicit) {
+    const endpoint = explicit.replace(/\/$/, "");
+    if (await waitForEndpoint(endpoint, 2)) return { endpoint, owned: false, source: "configured" };
     console.error(`Comptrol CDP endpoint is configured but unreachable: ${endpoint}`);
     return undefined;
+  }
+  // A permissioned existing-session Chrome or any user-launched
+  // debug-enabled Chrome exposes /json/version on its loopback port.
+  for (const port of [process.env.COMPTROL_CHROME_CDP_PORT, "9222"].filter(Boolean)) {
+    const endpoint = `http://127.0.0.1:${port}`;
+    if (await waitForEndpoint(endpoint, 1)) {
+      return { endpoint, owned: false, source: "existing_permissioned" };
+    }
+  }
+  return undefined;
+}
+
+async function ensureChromeCdp() {
+  const existing = await detectExistingCdpEndpoint();
+  if (existing) {
+    process.env.COMPTROL_CDP_ENDPOINT = existing.endpoint;
+    process.env.COMPTROL_ALLOW_BROWSER_CDP = "1";
+    process.env.COMPTROL_AUTO_START_CHROME_CDP = "0";
+    if (existing.source === "existing_permissioned") {
+      console.error(`Comptrol attached to an existing permissioned Chrome CDP endpoint at ${existing.endpoint}`);
+    }
+    return existing;
   }
   if (process.env.COMPTROL_AUTO_START_CHROME_CDP === "0") return undefined;
 
@@ -109,7 +139,7 @@ async function ensureChromeCdp() {
   process.env.COMPTROL_ALLOW_BROWSER_CDP = "1";
   process.env.COMPTROL_AUTO_START_CHROME_CDP = "0";
   console.error(`Comptrol Chrome CDP ready at ${endpoint} using isolated profile ${profile}`);
-  return { endpoint, owned: true, version };
+  return { endpoint, owned: true, version, source: "dedicated_profile" };
 }
 
 function closeOwnedChrome() {
