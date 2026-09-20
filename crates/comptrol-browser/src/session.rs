@@ -20,7 +20,57 @@
 use super::TargetRecord;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Attempt to connect via Chrome 144+ permissioned auto-connect.
+///
+/// This implements the official Chrome auto-connect protocol:
+/// 1. GET /json/auto-connect on the Chrome debug port
+/// 2. Chrome returns a WebSocket URL after user approval
+/// 3. Connect to the returned WebSocket URL
+pub async fn connect_permissioned_auto_connect(
+    debug_port: u16,
+    timeout: Duration,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let url = format!("http://127.0.0.1:{}/json/auto-connect", debug_port);
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        let response = client.get(&url).send().await;
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| format!("read response: {e}"))?;
+                let ws_url = text.trim().trim_matches('"');
+                if ws_url.starts_with("ws://") || ws_url.starts_with("wss://") {
+                    return Ok(ws_url.to_owned());
+                }
+                // Still waiting for user approval
+            }
+            Ok(resp) if resp.status() == 404 => {
+                return Err("Chrome auto-connect endpoint not found. Ensure Chrome 144+ with remote debugging enabled.".to_owned());
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err("Auto-connect timed out waiting for user approval".to_owned())
+}
+
+/// Discover the auto-connect debug port from environment or defaults.
+pub fn auto_connect_debug_port() -> u16 {
+    std::env::var("COMPTROL_CHROME_DEBUG_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9222)
+}
 
 /// Control surfaces the broker knows about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

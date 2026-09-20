@@ -134,6 +134,15 @@ impl PairingStore {
         Ok(record)
     }
 
+    pub fn find_by_fingerprint(&self, fingerprint: &str) -> Option<&PairingRecord> {
+        self.records.values().find(|r| {
+            r.identity_fingerprint.as_deref() == Some(fingerprint)
+                && r.accepted
+                && !r.revoked
+                && r.expires_at_ms > now_ms()
+        })
+    }
+
     pub fn record_nonce(&mut self, nonce: &str, pairing_id: &str) -> io::Result<bool> {
         let now = now_ms();
         let nonce_hash = hash(nonce);

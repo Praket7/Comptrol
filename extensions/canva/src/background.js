@@ -6,31 +6,73 @@ const PROTOCOL = "comptrol.canva.bridge/0.1.0";
 const RUNTIME_PORT_NAME = "comptrol_canva_bridge";
 
 let port = null;
+const pendingRequests = new Map();
+let requestCounter = 0;
 
 function connect() {
   try {
     port = chrome.runtime.connectNative(RUNTIME_PORT_NAME);
+    port.onMessage.addListener(onNativeMessage);
     port.onDisconnect.addListener(() => { port = null; });
   } catch (_) { port = null; }
 }
 
-function post(envelope) {
-  if (!port) { connect(); }
-  if (!port) { throw new Error("native_messaging_not_available"); }
-  try { port.postMessage(envelope); } catch (_) { connect(); }
+function onNativeMessage(response) {
+  const requestId = response.request_id;
+  if (!requestId || !pendingRequests.has(requestId)) {
+    return;
+  }
+  const { resolve, reject } = pendingRequests.get(requestId);
+  pendingRequests.delete(requestId);
+  if (response.ok) {
+    resolve(response);
+  } else {
+    reject(new Error(response.error || "native_host_error"));
+  }
 }
 
-chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
-  const origin = sender?.url ?? "";
-  if (!isAllowedOrigin(origin)) { sendResponse({ ok: false, error: "origin_not_allowed" }); return true; }
+function post(envelope) {
+  return new Promise((resolve, reject) => {
+    if (!port) { connect(); }
+    if (!port) { reject(new Error("native_messaging_not_available")); return; }
+    
+    const requestId = ++requestCounter;
+    const messageWithId = { ...envelope, request_id: requestId };
+    
+    pendingRequests.set(requestId, { resolve, reject });
+    
+    try {
+      port.postMessage(messageWithId);
+      // Timeout after 30 seconds
+      setTimeout(() => {
+        if (pendingRequests.has(requestId)) {
+          pendingRequests.delete(requestId);
+          reject(new Error("native_messaging_timeout"));
+        }
+      }, 30000);
+    } catch (e) {
+      pendingRequests.delete(requestId);
+      reject(e);
+    }
+  });
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const origin = sender?.url ? new URL(sender.url).origin : "";
+  if (!isAllowedOrigin(origin)) { 
+    sendResponse({ ok: false, error: "origin_not_allowed" }); 
+    return true; 
+  }
+  
   try {
     const envelope = { ...message, protocol: PROTOCOL };
-    post(envelope);
-    sendResponse({ ok: true });
+    post(envelope)
+      .then(response => sendResponse({ ok: true, ...response }))
+      .catch(error => sendResponse({ ok: false, error: error.message }));
   } catch (error) {
     sendResponse({ ok: false, error: error.message });
   }
-  return true;
+  return true; // async response
 });
 
 function isAllowedOrigin(origin) {

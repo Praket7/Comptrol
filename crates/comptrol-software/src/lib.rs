@@ -20,7 +20,7 @@
 
 pub mod providers;
 
-pub use providers::{Provider, ProviderId, available_providers, provider_for};
+pub use providers::{Provider, ProviderId, available_providers, provider_for, provider_supports};
 
 use serde::{Deserialize, Serialize};
 
@@ -136,7 +136,7 @@ pub fn search(
     query: &str,
     provider: Option<ProviderId>,
 ) -> Result<Vec<PackageDescription>, SoftwareError> {
-    let provider = provider_for(provider)?;
+    let provider = provider_for(provider, "search")?;
     provider.search(query)
 }
 
@@ -145,13 +145,13 @@ pub fn describe(
     package: &str,
     provider: Option<ProviderId>,
 ) -> Result<PackageDescription, SoftwareError> {
-    let provider = provider_for(provider)?;
+    let provider = provider_for(provider, "describe")?;
     provider.describe_exact(package)
 }
 
 /// Install one exact package after agreement gating and inventory verification.
 pub fn install(request: &InstallRequest) -> Result<SoftwareOutcome, SoftwareError> {
-    let provider = provider_for(request.provider)?;
+    let provider = provider_for(request.provider, "install")?;
     // Exactness gate: the reference must resolve to exactly one package.
     let candidates = provider.search(&request.package)?;
     let exact: Vec<&PackageDescription> = candidates
@@ -228,7 +228,7 @@ pub fn update(
     package: &str,
     provider: Option<ProviderId>,
 ) -> Result<SoftwareOutcome, SoftwareError> {
-    let provider = provider_for(provider)?;
+    let provider = provider_for(provider, "update")?;
     let before = provider.describe_exact(package)?;
     if before.installed_version.is_none() {
         return Err(SoftwareError::NotFound(package.to_owned()));
@@ -258,7 +258,7 @@ pub fn uninstall(
     package: &str,
     provider: Option<ProviderId>,
 ) -> Result<SoftwareOutcome, SoftwareError> {
-    let provider = provider_for(provider)?;
+    let provider = provider_for(provider, "uninstall")?;
     let described = provider.describe_exact(package)?;
     if described.installed_version.is_none() {
         return Err(SoftwareError::NotFound(package.to_owned()));

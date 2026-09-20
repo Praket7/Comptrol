@@ -1,1 +1,38 @@
-{"task_id": "v5.adapter_matrix", "benchmark_suite": "adapter", "goal": "Verify all 14 adapters respond to handshake, capabilities, and describe-class commands.", "timeout_ms": 60000, "initial_state": "fresh Comptrol state directory", "required_capabilities": ["adapter.handshake", "adapter.capabilities", "adapter.describe"], "tasks": [{"task_id": "v5.adapter.resolve_handshake", "goal": "Resolve adapter handshake and verify provider metadata.", "method": "adapter.resolve", "params": {"action": "handshake"}, "iterations": 2, "final_verifier": "response contains provider metadata"}, {"task_id": "v5.adapter.google_workspace_handshake", "goal": "Google Workspace adapter handshake with no live credentials.", "method": "adapter.google_workspace", "params": {"action": "handshake"}, "iterations": 2, "final_verifier": "response contains provider metadata or honest unavailable status"}, {"task_id": "v5.adapter.powerpoint_handshake", "goal": "PowerPoint adapter handshake.", "method": "adapter.powerpoint", "params": {"action": "handshake"}, "iterations": 2, "final_verifier": "response contains provider metadata"}, {"task_id": "v5.adapter.discord_handshake", "goal": "Discord adapter handshake.", "method": "adapter.discord", "params": {"action": "handshake"}, "iterations": 2, "final_verifier": "response contains provider metadata"}, {"task_id": "v5.adapter.gmail_handshake", "goal": "Gmail adapter handshake.", "method": "adapter.gmail", "params": {"action": "handshake"}, "iterations": 2, "final_verifier": "response contains provider metadata"}, {"task_id": "v5.adapter.graph_handshake", "goal": "Graph adapter handshake.", "method": "adapter.graph", "params": {"action": "handshake"}, "iterations": 2, "final_verifier": "response contains provider metadata"}, {"task_id": "v5.adapter.apple_mail_handshake", "goal": "Apple Mail adapter handshake.", "method": "adapter.apple_mail", "params": {"action": "handshake"}, "iterations": 2, "final_verifier": "response contains provider metadata"}, {"task_id": "v5.adapter.apple_messages_handshake", "goal": "Apple Messages adapter handshake.", "method": "adapter.apple_messages", "params": {"action": "handshake"}, "iterations": 2, "final_verifier": "response contains provider metadata"}, {"task_id": "v5.adapter.canva_handshake", "goal": "Canva adapter handshake.", "method": "adapter.canva", "params": {"action": "handshake"}, "iterations": 2, "final_verifier": "response contains provider metadata"}, {"task_id": "v5.adapter.capabilities_all", "goal": "Request capabilities from all adapters and verify non-empty result.", "method": "adapter.capabilities", "params": {}, "iterations": 1, "final_verifier": "response contains non-empty capabilities map"}, {"task_id": "v5.adapter.describe_all", "goal": "Describe all adapters and verify the result is a non-empty map.", "method": "adapter.describe", "params": {}, "iterations": 1, "final_verifier": "response contains non-empty description map"}, {"task_id": "v5.adapter.backend_availability", "goal": "Check honest backend availability for all adapters.", "method": "adapter.backend_status", "params": {}, "iterations": 1, "final_verifier": "response contains availability map with honest status for each adapter"}], "final_verifier": "all task final_verifiers pass"}
+{
+  "task_id": "v5.adapter_matrix",
+  "benchmark_suite": "adapter",
+  "goal": "Verify all 14 adapters respond to handshake, capabilities, and describe-class commands.",
+  "timeout_ms": 60000,
+  "initial_state": "fresh Comptrol state directory",
+  "required_capabilities": ["adapter.handshake", "adapter.capabilities", "adapter.describe"],
+  "tasks": [
+    {
+      "task_id": "v5.adapter.resolve_handshake",
+      "goal": "Resolve adapter handshake and verify provider metadata.",
+      "iterations": 2,
+      "final_verifier": "response contains provider metadata",
+      "steps": [
+        {"method": "adapter.resolve", "params": {"action": "handshake"}}
+      ]
+    },
+    {
+      "task_id": "v5.adapter.capabilities_all",
+      "goal": "Request capabilities from all adapters and verify non-empty result.",
+      "iterations": 1,
+      "final_verifier": "response contains non-empty capabilities map",
+      "steps": [
+        {"method": "adapter.capabilities", "params": {}}
+      ]
+    },
+    {
+      "task_id": "v5.adapter.describe_all",
+      "goal": "Describe all adapters and verify the result is a non-empty map.",
+      "iterations": 1,
+      "final_verifier": "response contains non-empty description map",
+      "steps": [
+        {"method": "adapter.describe", "params": {}}
+      ]
+    }
+  ],
+  "final_verifier": "all task final_verifiers pass"
+}

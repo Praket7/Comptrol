@@ -3,7 +3,7 @@
   "name": "Comptrol Canva Companion",
   "version": "0.1.0",
   "description": "User-approved relay between the Comptrol Canva App (Design Editing API) and the local Comptrol runtime. Forwards only versioned, design-bound operation envelopes; no page scraping, no cookie access, no remote code.",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": ["activeTab", "scripting", "nativeMessaging"],
   "host_permissions": ["https://www.canva.com/*", "https://canva.com/*"],
   "background": { "service_worker": "src/background.js" },
   "content_scripts": [

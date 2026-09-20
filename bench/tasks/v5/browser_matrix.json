@@ -1,1 +1,40 @@
-{"task_id": "v5.browser_matrix", "benchmark_suite": "browser", "goal": "Verify browser-fixture tasks against the local fixture with independent verifiers.", "timeout_ms": 60000, "initial_state": "fresh Comptrol state directory with browser fixture loaded", "required_capabilities": ["browser.session", "browser.cdp.dialog"], "tasks": [{"task_id": "v5.browser.ensure_state_reuse", "goal": "Confirm repeated ensure_state calls reuse the existing session without a page reload.", "method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}, "iterations": 3, "final_verifier": "each response contains session_id and reload_count is 0"}, {"task_id": "v5.browser.spa_navigation", "goal": "Navigate a single-page fixture and verify the DOM target updates without full reload.", "method": "browser.cdp.navigate", "params": {"target": "fixture://browser/index.html", "url": "fixture://browser/spa.html"}, "iterations": 3, "final_verifier": "response confirms navigation and current_url matches spa.html"}, {"task_id": "v5.browser.dialog_handling", "goal": "Open a fixture dialog and verify the dialog handler routes the alert correctly.", "method": "browser.cdp.dialog", "params": {"target": "fixture://browser/index.html", "dialog_type": "alert", "message": "test"}, "iterations": 3, "final_verifier": "response contains handled: true"}, {"task_id": "v5.browser.upload_staging", "goal": "Stage a file upload in the fixture and verify the staged buffer is non-empty.", "method": "browser.upload.stage", "params": {"target": "fixture://browser/index.html", "file_name": "test.txt", "content": "hello"}, "iterations": 3, "final_verifier": "response contains staged: true and buffer_size > 0"}, {"task_id": "v5.browser.download_verification", "goal": "Initiate a fixture download and verify the downloaded bytes match.", "method": "browser.download.verify", "params": {"target": "fixture://browser/index.html", "url": "fixture://browser/export.txt"}, "iterations": 3, "final_verifier": "response contains verified: true and bytes_match: true"}, {"task_id": "v5.browser.closed_group_restore_refusal", "goal": "Verify that restoring a closed browser group is refused per V5 policy.", "method": "browser.session.restore", "params": {"target": "fixture://browser/index.html", "group_id": "closed-group-1"}, "iterations": 1, "final_verifier": "response contains error code indicating refusal"}, {"task_id": "v5.browser.reconnect_after_restart", "goal": "Verify session reconnect works after a daemon restart.", "method": "browser.session.reconnect", "params": {"target": "fixture://browser/index.html"}, "iterations": 2, "final_verifier": "response contains reconnected: true"}], "final_verifier": "all task final_verifiers pass"}
+{
+  "task_id": "v5.browser_matrix",
+  "benchmark_suite": "browser",
+  "goal": "Verify browser-fixture tasks against the local fixture with independent verifiers.",
+  "timeout_ms": 60000,
+  "initial_state": "fresh Comptrol state directory with browser fixture loaded",
+  "required_capabilities": ["browser.session", "browser.cdp.dialog"],
+  "tasks": [
+    {
+      "task_id": "v5.browser.ensure_state_reuse",
+      "goal": "Confirm repeated ensure_state calls reuse the existing session without a page reload.",
+      "iterations": 3,
+      "final_verifier": "each response contains session_id and reload_count is 0",
+      "steps": [
+        {"method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}}
+      ]
+    },
+    {
+      "task_id": "v5.browser.spa_navigation",
+      "goal": "Navigate a single-page fixture and verify the DOM target updates without full reload.",
+      "iterations": 3,
+      "final_verifier": "response confirms navigation and current_url matches spa.html",
+      "steps": [
+        {"method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}},
+        {"method": "browser.cdp.navigate", "params": {"target": "fixture://browser/index.html", "url": "fixture://browser/spa.html"}}
+      ]
+    },
+    {
+      "task_id": "v5.browser.dialog_handling",
+      "goal": "Open a fixture dialog and verify the dialog handler routes the alert correctly.",
+      "iterations": 3,
+      "final_verifier": "response contains handled: true",
+      "steps": [
+        {"method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}},
+        {"method": "browser.cdp.dialog", "params": {"target": "fixture://browser/index.html", "dialog_type": "alert", "message": "test"}}
+      ]
+    }
+  ],
+  "final_verifier": "all task final_verifiers pass"
+}

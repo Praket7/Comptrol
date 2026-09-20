@@ -26,7 +26,7 @@ fn provider_ids_have_stable_names() {
 
 #[test]
 fn explicit_unavailable_provider_is_honest() {
-    let result = provider_for(Some(ProviderId::MacAppStore));
+    let result = provider_for(Some(ProviderId::MacAppStore), "install");
     // Either unsupported or unavailable on this machine; never Ok by accident.
     assert!(result.is_err());
 }

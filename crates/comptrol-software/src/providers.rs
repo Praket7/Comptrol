@@ -784,40 +784,67 @@ impl Provider for PackageKitProvider {
     }
 }
 
-/// Providers in V5 priority order for the current platform.
-pub fn available_providers() -> Vec<ProviderId> {
+/// Check if a provider supports the given operation.
+pub fn provider_supports(id: ProviderId, operation: &str) -> bool {
+    match (id, operation) {
+        (ProviderId::WinGet, "install")
+        | (ProviderId::WinGet, "update")
+        | (ProviderId::WinGet, "uninstall") => true,
+        (ProviderId::Homebrew, "install")
+        | (ProviderId::Homebrew, "update")
+        | (ProviderId::Homebrew, "uninstall") => true,
+        (ProviderId::Flatpak, "install")
+        | (ProviderId::Flatpak, "update")
+        | (ProviderId::Flatpak, "uninstall") => true,
+        (ProviderId::Apt, "install")
+        | (ProviderId::Apt, "update")
+        | (ProviderId::Apt, "uninstall") => true,
+        (ProviderId::Dnf, "install")
+        | (ProviderId::Dnf, "update")
+        | (ProviderId::Dnf, "uninstall") => true,
+        (ProviderId::PackageKit, "install")
+        | (ProviderId::PackageKit, "update")
+        | (ProviderId::PackageKit, "uninstall") => false, // not yet wired
+        (ProviderId::MacAppStore, _) => false, // not yet wired
+        _ => false,
+    }
+}
+
+/// Providers in V5 priority order for the current platform that support the given operation.
+pub fn available_providers(operation: &str) -> Vec<ProviderId> {
     let mut providers = Vec::new();
     #[cfg(target_os = "windows")]
     {
         let winget = WinGetProvider::new();
-        if winget.available() {
+        if winget.available() && provider_supports(ProviderId::WinGet, operation) {
             providers.push(ProviderId::WinGet);
         }
     }
     #[cfg(target_os = "macos")]
     {
         let brew = HomebrewProvider::new();
-        if brew.available() {
+        if brew.available() && provider_supports(ProviderId::Homebrew, operation) {
             providers.push(ProviderId::Homebrew);
         }
-        providers.push(ProviderId::MacAppStore);
+        // MacAppStore not yet wired for any operation
     }
     #[cfg(target_os = "linux")]
     {
-        if PackageKitProvider.available() {
+        // PackageKit listed but marked as not supporting install/update/uninstall yet
+        if PackageKitProvider.available() && provider_supports(ProviderId::PackageKit, operation) {
             providers.push(ProviderId::PackageKit);
         }
         let flatpak = FlatpakProvider::new();
-        if flatpak.available() {
+        if flatpak.available() && provider_supports(ProviderId::Flatpak, operation) {
             providers.push(ProviderId::Flatpak);
         }
-        if find_binary("apt").is_some() {
+        if find_binary("apt").is_some() && provider_supports(ProviderId::Apt, operation) {
             providers.push(ProviderId::Apt);
-        } else if find_binary("dnf").is_some() {
+        } else if find_binary("dnf").is_some() && provider_supports(ProviderId::Dnf, operation) {
             providers.push(ProviderId::Dnf);
         }
         let brew = HomebrewProvider::new();
-        if brew.available() {
+        if brew.available() && provider_supports(ProviderId::Homebrew, operation) {
             providers.push(ProviderId::Homebrew);
         }
     }
@@ -835,9 +862,12 @@ pub fn available_providers() -> Vec<ProviderId> {
     providers
 }
 
-/// Select the provider for a request: explicit choice when available,
-/// otherwise the first available platform provider.
-pub fn provider_for(requested: Option<ProviderId>) -> Result<Box<dyn Provider>, SoftwareError> {
+/// Select the provider for a request and operation: explicit choice when available,
+/// otherwise the first available platform provider that supports the operation.
+pub fn provider_for(
+    requested: Option<ProviderId>,
+    operation: &str,
+) -> Result<Box<dyn Provider>, SoftwareError> {
     if let Some(id) = requested {
         let provider: Box<dyn Provider> = match id {
             ProviderId::WinGet => Box::new(WinGetProvider::new()),
@@ -863,11 +893,11 @@ pub fn provider_for(requested: Option<ProviderId>) -> Result<Box<dyn Provider>, 
         }
         return Ok(provider);
     }
-    let available = available_providers();
+    let available = available_providers(operation);
     let Some(first) = available.first() else {
-        return Err(SoftwareError::NoProvider(
-            "no software provider is available on this platform".to_owned(),
-        ));
+        return Err(SoftwareError::NoProvider(format!(
+            "no software provider is available on this platform for operation: {operation}",
+        )));
     };
-    provider_for(Some(*first))
+    provider_for(Some(*first), operation)
 }

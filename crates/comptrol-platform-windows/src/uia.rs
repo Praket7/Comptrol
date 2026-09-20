@@ -1,15 +1,19 @@
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Instant;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationElement,
-    IUIAutomationInvokePattern, IUIAutomationValuePattern, IUIAutomationWindowPattern,
-    TreeScope_Children, TreeScope_Descendants, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
-    UIA_ComboBoxControlTypeId, UIA_EditControlTypeId, UIA_WindowControlTypeId,
+    IUIAutomationInvokePattern, IUIAutomationValuePattern, TreeScope_Children,
+    TreeScope_Descendants, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
+    UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
+    UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_InvokePatternId, UIA_IsEnabledPropertyId,
+    UIA_IsOffscreenPropertyId, UIA_NamePropertyId, UIA_ProcessIdPropertyId, UIA_ValuePatternId,
+    UIA_WindowControlTypeId, UIA_WindowPatternId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,17 +90,36 @@ pub struct SemanticCacheEntry {
 
 #[derive(Debug)]
 pub struct UiaScopedCache {
-    automation: IUIAutomation,
     cache_request: IUIAutomationCacheRequest,
     per_window_index: HashMap<u64, Vec<SemanticCacheEntry>>,
-    subscribed_processes: HashSet<u32>,
 }
 
 impl UiaScopedCache {
-    pub fn new(automation: IUIAutomation) -> Result<Self, String> {
+    pub fn new(automation: &IUIAutomation) -> Result<Self, String> {
         let cache_request = unsafe { automation.CreateCacheRequest() }
             .map_err(|error| format!("cache request creation failed: {error}"))?;
         unsafe {
+            cache_request
+                .AddProperty(UIA_ProcessIdPropertyId)
+                .map_err(|error| format!("failed to add ProcessId to cache: {error}"))?;
+            cache_request
+                .AddProperty(UIA_NamePropertyId)
+                .map_err(|error| format!("failed to add Name to cache: {error}"))?;
+            cache_request
+                .AddProperty(UIA_AutomationIdPropertyId)
+                .map_err(|error| format!("failed to add AutomationId to cache: {error}"))?;
+            cache_request
+                .AddProperty(UIA_ControlTypePropertyId)
+                .map_err(|error| format!("failed to add ControlType to cache: {error}"))?;
+            cache_request
+                .AddProperty(UIA_BoundingRectanglePropertyId)
+                .map_err(|error| format!("failed to add BoundingRectangle to cache: {error}"))?;
+            cache_request
+                .AddProperty(UIA_IsEnabledPropertyId)
+                .map_err(|error| format!("failed to add IsEnabled to cache: {error}"))?;
+            cache_request
+                .AddProperty(UIA_IsOffscreenPropertyId)
+                .map_err(|error| format!("failed to add IsOffscreen to cache: {error}"))?;
             cache_request
                 .AddPattern(UIA_InvokePatternId)
                 .map_err(|error| format!("failed to add InvokePattern to cache: {error}"))?;
@@ -108,45 +131,19 @@ impl UiaScopedCache {
                 .map_err(|error| format!("failed to add WindowPattern to cache: {error}"))?;
         }
         Ok(Self {
-            automation,
             cache_request,
             per_window_index: HashMap::new(),
-            subscribed_processes: HashSet::new(),
         })
-    }
-
-    pub fn find_window_by_process(
-        &mut self,
-        process_id: u32,
-    ) -> Result<Option<IUIAutomationElement>, String> {
-        let root = unsafe { self.automation.GetRootElement() }
-            .map_err(|error| format!("UI Automation root unavailable: {error}"))?;
-        let condition = unsafe { self.automation.CreateTrueCondition() }
-            .map_err(|error| format!("UI Automation condition unavailable: {error}"))?;
-        let cached = unsafe {
-            root.FindFirstBuildCache(TreeScope_Children, &condition, &self.cache_request)
-        }
-        .map_err(|error| format!("scoped window cache query failed: {error}"))?;
-        let window_handle = unsafe { cached.CurrentNativeWindowHandle() }
-            .map_err(|error| format!("native window handle read failed: {error}"))?;
-        if window_handle.0 == 0 {
-            return Ok(None);
-        }
-        let pid = unsafe { cached.CurrentProcessId() }
-            .map_err(|error| format!("process id read failed: {error}"))?;
-        if pid != process_id as i32 {
-            return Ok(None);
-        }
-        Ok(Some(cached))
     }
 
     pub fn index_process_windows(
         &mut self,
+        automation: &IUIAutomation,
         process_id: u32,
     ) -> Result<Vec<SemanticCacheEntry>, String> {
-        let root = unsafe { self.automation.GetRootElement() }
+        let root = unsafe { automation.GetRootElement() }
             .map_err(|error| format!("UI Automation root unavailable: {error}"))?;
-        let condition = unsafe { self.automation.CreateTrueCondition() }
+        let condition = unsafe { automation.CreateTrueCondition() }
             .map_err(|error| format!("UI Automation condition unavailable: {error}"))?;
         let cached = unsafe {
             root.FindAllBuildCache(TreeScope_Descendants, &condition, &self.cache_request)
@@ -158,50 +155,74 @@ impl UiaScopedCache {
         for index in 0..count.min(4096) {
             let element = unsafe { cached.GetElement(index) }
                 .map_err(|error| format!("cache element read failed: {error}"))?;
-            let entry_process_id = unsafe { element.CurrentProcessId() }
-                .map_err(|error| format!("process id read failed: {error}"))?
+            let entry_process_id = unsafe { element.CachedProcessId() }
+                .map_err(|error| format!("cached process id failed: {error}"))?
                 as u32;
-            let entry = SemanticCacheEntry {
+            if entry_process_id != process_id {
+                continue;
+            }
+            let rect: RECT = unsafe { element.CachedBoundingRectangle() }
+                .map_err(|error| format!("cached bounding rect failed: {error}"))?;
+            let automation_id = unsafe { element.CachedAutomationId() }
+                .ok()
+                .and_then(|bstr| {
+                    let s = bstr.to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                });
+            let name = unsafe { element.CachedName() }.ok().and_then(|bstr| {
+                let s = bstr.to_string();
+                if s.is_empty() { None } else { Some(s) }
+            });
+            let control_type = unsafe { element.CachedControlType() }
+                .map_err(|error| format!("cached control type failed: {error}"))?;
+            let is_enabled = unsafe { element.CachedIsEnabled() }
+                .map_err(|error| format!("cached enabled failed: {error}"))?
+                .as_bool();
+            let is_offscreen = unsafe { element.CachedIsOffscreen() }
+                .map_err(|error| format!("cached offscreen failed: {error}"))?
+                .as_bool();
+            let window_handle = unsafe { element.CurrentNativeWindowHandle() }
+                .map_err(|error| format!("window handle failed: {error}"))?
+                .0 as u64;
+            let role = match control_type {
+                UIA_ButtonControlTypeId => Some("button"),
+                UIA_CheckBoxControlTypeId => Some("checkbox"),
+                UIA_ComboBoxControlTypeId => Some("combobox"),
+                UIA_EditControlTypeId => Some("edit"),
+                UIA_WindowControlTypeId => Some("window"),
+                _ => None,
+            }
+            .map(str::to_owned);
+            entries.push(SemanticCacheEntry {
                 process_id: entry_process_id,
-                automation_id: unsafe { element.CurrentAutomationId() }.ok().flatten(),
-                name: unsafe { element.CurrentName() }.ok().flatten(),
-                role: None,
-                bounding_rect: unsafe { element.CurrentBoundingRectangle() }
-                    .ok()
-                    .map(|rect| (rect.left, rect.top, rect.width, rect.height)),
-                is_enabled: unsafe { element.CurrentIsEnabled() }
-                    .map_err(|error| format!("enabled state failed: {error}"))
-                    .map(|v| v.as_bool())
-                    .unwrap_or(false),
-                is_offscreen: unsafe { element.CurrentIsOffscreen() }
-                    .map_err(|error| format!("offscreen state failed: {error}"))
-                    .map(|v| v.as_bool())
-                    .unwrap_or(false),
-                window_handle: unsafe { element.CurrentNativeWindowHandle() }
-                    .map_err(|error| format!("window handle read failed: {error}"))
-                    .map(|v| v.0)
-                    .unwrap_or(0),
-            };
-            entries.push(entry);
+                automation_id,
+                name,
+                role,
+                bounding_rect: Some((
+                    rect.left as f64,
+                    rect.top as f64,
+                    (rect.right - rect.left) as f64,
+                    (rect.bottom - rect.top) as f64,
+                )),
+                is_enabled,
+                is_offscreen,
+                window_handle,
+            });
         }
-        self.per_window_index.insert(process_id as u64, entries);
+        self.per_window_index
+            .insert(process_id as u64, entries.clone());
         Ok(entries)
     }
 
-    pub fn subscribe_process_events(&mut self, process_id: u32) -> Result<(), String> {
-        self.subscribed_processes.insert(process_id);
-        Ok(())
-    }
-
-    pub fn get_indexed(&self, window_handle: u64) -> Vec<&SemanticCacheEntry> {
+    pub fn get_indexed(&self, process_id: u32) -> Vec<&SemanticCacheEntry> {
         self.per_window_index
-            .get(&window_handle)
+            .get(&(process_id as u64))
             .map(|entries| entries.iter().collect())
             .unwrap_or_default()
     }
 
-    pub fn invalidate_window(&mut self, window_handle: u64) {
-        self.per_window_index.remove(&window_handle);
+    pub fn invalidate_process(&mut self, process_id: u32) {
+        self.per_window_index.remove(&(process_id as u64));
     }
 }
 
@@ -209,16 +230,14 @@ struct UiaWorker {
     requests: WorkerSender,
 }
 
-type WorkItem = (OwnedRequest, mpsc::Sender<Result<Value, String>>);
-type WorkerSender = mpsc::Sender<WorkItem>;
+type WorkItem = (OwnedRequest, std::sync::mpsc::Sender<Result<Value, String>>);
+type WorkerSender = std::sync::mpsc::Sender<WorkItem>;
 
 static WORKER: OnceLock<UiaWorker> = OnceLock::new();
-static CACHE: OnceLock<Arc<Mutex<UiaScopedCache>>> = OnceLock::new();
 
 fn worker() -> &'static UiaWorker {
     WORKER.get_or_init(|| {
-        let (requests, receiver) =
-            mpsc::channel::<(OwnedRequest, mpsc::Sender<Result<Value, String>>)>();
+        let (requests, _receiver) = std::sync::mpsc::channel::<WorkItem>();
         std::thread::Builder::new()
             .name("comptrol-windows-uia".to_owned())
             .spawn(move || {
@@ -234,12 +253,13 @@ fn worker() -> &'static UiaWorker {
                 };
                 let mut cache = automation
                     .as_ref()
-                    .and_then(|a| UiaScopedCache::new(a.clone()).ok());
-                while let Ok((request, response)) = receiver.recv() {
+                    .and_then(|a| UiaScopedCache::new(a).ok());
+                while let Ok((request, response)) = _receiver.recv() {
                     let result = match (&com, &automation, &mut cache) {
                         (Ok(_), Some(automation), Some(cache)) => {
                             execute_once(automation, cache, request.as_request())
                         }
+                        (Ok(_), Some(_), None) => Err("UIA cache not initialized".to_owned()),
                         (_, None, _) => Err("UI Automation activation unavailable".to_owned()),
                         (Err(error), _, _) => Err(error.clone()),
                     };
@@ -252,7 +272,7 @@ fn worker() -> &'static UiaWorker {
 }
 
 pub fn execute(request: Request<'_>) -> Result<Value, String> {
-    let (response, receiver) = mpsc::channel();
+    let (response, receiver) = std::sync::mpsc::channel();
     worker()
         .requests
         .send((request.into(), response))
@@ -268,6 +288,25 @@ fn execute_once(
     request: Request<'_>,
 ) -> Result<Value, String> {
     let started = Instant::now();
+    let entries = cache.get_indexed(request.process_id);
+    if !entries.is_empty() {
+        for entry in entries {
+            if matches_cached_entry(entry, &request) {
+                let window_handle = entry.window_handle;
+                let verified = verify_cached_entry(entry, &request)?;
+                return Ok(json!({
+                    "verified": verified,
+                    "route": "windows_uia_cached",
+                    "process_id": request.process_id,
+                    "cache_hit": true,
+                    "window_handle": window_handle,
+                    "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                    "mouse": "untouched",
+                    "clipboard": "untouched"
+                }));
+            }
+        }
+    }
     let root = unsafe { automation.GetRootElement() }
         .map_err(|error| format!("UI Automation root unavailable: {error}"))?;
     let condition = unsafe { automation.CreateTrueCondition() }
@@ -300,28 +339,27 @@ fn execute_once(
         return Err("target_disabled".to_owned());
     }
     let window_handle = unsafe { element.CurrentNativeWindowHandle() }
-        .map_err(|error| format!("window handle read failed: {error}"))?;
+        .map_err(|error| format!("window handle read failed: {error}"))?
+        .0 as u64;
     match request.action {
         Action::Press => {
-            let pattern: IUIAutomationInvokePattern = unsafe {
-                element.GetCurrentPatternAs(windows::Win32::UI::Accessibility::UIA_InvokePatternId)
-            }
-            .map_err(|error| format!("Invoke pattern unavailable: {error}"))?;
+            let pattern: IUIAutomationInvokePattern =
+                unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }
+                    .map_err(|error| format!("Invoke pattern unavailable: {error}"))?;
             unsafe { pattern.Invoke() }.map_err(|error| format!("Invoke failed: {error}"))?;
         }
         Action::SetValue => {
             let value = request.value.ok_or("value_required")?;
-            let pattern: IUIAutomationValuePattern = unsafe {
-                element.GetCurrentPatternAs(windows::Win32::UI::Accessibility::UIA_ValuePatternId)
-            }
-            .map_err(|error| format!("Value pattern unavailable: {error}"))?;
+            let pattern: IUIAutomationValuePattern =
+                unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) }
+                    .map_err(|error| format!("Value pattern unavailable: {error}"))?;
             let value = windows::core::BSTR::from(value);
             unsafe { pattern.SetValue(&value) }
                 .map_err(|error| format!("SetValue failed: {error}"))?;
         }
     }
     let verified = verify(&element, &request)?;
-    let entries = cache.get_indexed(window_handle.0);
+    let _ = cache.index_process_windows(automation, request.process_id);
     Ok(json!({
         "verified": verified,
         "route": "windows_uia_scoped_cache",
@@ -331,10 +369,38 @@ fn execute_once(
         "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
         "mouse": "untouched",
         "clipboard": "untouched",
-        "cache_hit": !entries.is_empty(),
-        "window_handle": window_handle.0,
-        "indexed_entries": entries.len()
+        "cache_hit": false,
+        "window_handle": window_handle,
+        "indexed_entries": cache.get_indexed(request.process_id).len()
     }))
+}
+
+fn matches_cached_entry(entry: &SemanticCacheEntry, request: &Request<'_>) -> bool {
+    if let Some(name) = request.name {
+        if entry.name.as_deref() != Some(name) {
+            return false;
+        }
+    }
+    if let Some(automation_id) = request.automation_id {
+        if entry.automation_id.as_deref() != Some(automation_id) {
+            return false;
+        }
+    }
+    if let Some(role) = request.role {
+        if entry.role.as_deref() != Some(role) {
+            return false;
+        }
+    }
+    true
+}
+
+fn verify_cached_entry(entry: &SemanticCacheEntry, request: &Request<'_>) -> Result<bool, String> {
+    match request.expected_attribute {
+        None => Ok(false),
+        Some("name") => Ok(entry.name.as_deref() == request.expected_value),
+        Some("enabled") => Ok(entry.is_enabled == (request.expected_value == Some("true"))),
+        Some(_) => Err("unsupported_verification_attribute".to_owned()),
+    }
 }
 
 fn matches_element(element: &IUIAutomationElement, request: &Request<'_>) -> Result<bool, String> {
@@ -381,10 +447,9 @@ fn verify(element: &IUIAutomationElement, request: &Request<'_>) -> Result<bool,
             .map_err(|error| format!("UI Automation verification failed: {error}"))?
             == request.expected_value.unwrap_or_default()),
         Some("value") => {
-            let pattern: IUIAutomationValuePattern = unsafe {
-                element.GetCurrentPatternAs(windows::Win32::UI::Accessibility::UIA_ValuePatternId)
-            }
-            .map_err(|error| format!("Value verification pattern unavailable: {error}"))?;
+            let pattern: IUIAutomationValuePattern =
+                unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) }
+                    .map_err(|error| format!("Value verification pattern unavailable: {error}"))?;
             Ok(unsafe { pattern.CurrentValue() }
                 .map_err(|error| format!("Value verification failed: {error}"))?
                 == request.expected_value.unwrap_or_default())

@@ -1677,6 +1677,37 @@ fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no private key found"))
 }
 
+fn is_mutation_method(method: &str) -> bool {
+    matches!(
+        method,
+        "tools/call"
+            | "workflow.execute"
+            | "trace.replay"
+            | "browser.session.ensure_state"
+            | "browser.cdp.navigate"
+            | "browser.cdp.dialog"
+            | "browser.upload.stage"
+            | "browser.download.verify"
+            | "desktop.settings.write"
+            | "file.write"
+            | "terminal.execute"
+    )
+}
+
+fn scope_for_method(method: &str) -> &'static str {
+    match method {
+        "tools/call" | "workflow.execute" | "trace.replay" => "semantic_input",
+        "browser.session.ensure_state"
+        | "browser.cdp.navigate"
+        | "browser.cdp.dialog"
+        | "browser.upload.stage"
+        | "browser.download.verify" => "accessibility_read",
+        "desktop.settings.write" | "file.write" => "file_write",
+        "terminal.execute" => "terminal",
+        _ => "observe",
+    }
+}
+
 fn mtls_config() -> io::Result<Arc<ServerConfig>> {
     let cert_path = env::var_os("COMPTROL_MTLS_CERT")
         .map(PathBuf::from)
@@ -2459,45 +2490,62 @@ fn handle_http<S: HttpStream>(
             );
         }
     };
-    if let (Some(peer_fp), Some(pairing_id)) = (
-        peer_fingerprint.as_deref(),
-        request
-            .get("params")
-            .and_then(|p| p.get("pairing_id"))
-            .and_then(Value::as_str),
-    ) {
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    let is_initialize = method == "initialize";
+    let is_mutation = is_mutation_method(method);
+    if let Some(peer_fp) = peer_fingerprint.as_deref() {
         let store = pairing_store.lock().expect("pairing store lock poisoned");
-        let scopes: Vec<String> = request
-            .get("params")
-            .and_then(|p| p.get("scopes"))
-            .and_then(|s| s.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        match store.verify_mtls_identity(pairing_id, peer_fp, &scopes) {
-            Ok(_) => {}
-            Err(_) => {
+        let pairing = match store.find_by_fingerprint(peer_fp) {
+            Some(p) => p,
+            None => {
                 return write_http_response(
                     stream,
                     403,
                     "Forbidden",
                     "application/json",
-                    serde_json::to_vec(&json!({"error":"mtls_identity_refused"}))
+                    serde_json::to_vec(&json!({"error":"mtls_identity_not_paired"}))
                         .unwrap_or_default(),
                     None,
                 );
             }
         };
-        let nonce = request
-            .get("params")
-            .and_then(|p| p.get("nonce"))
-            .and_then(Value::as_str);
-        if let Some(nonce) = nonce {
+        let pairing_id = pairing.pairing_id.clone();
+        let required_scope = scope_for_method(method);
+        if !pairing.scopes.iter().any(|s| s == required_scope) {
+            return write_http_response(
+                stream,
+                403,
+                "Forbidden",
+                "application/json",
+                serde_json::to_vec(
+                    &json!({"error":"mtls_scope_insufficient","required":required_scope}),
+                )
+                .unwrap_or_default(),
+                None,
+            );
+        }
+        if is_mutation {
+            let nonce = match request
+                .get("params")
+                .and_then(|p| p.get("nonce"))
+                .and_then(Value::as_str)
+            {
+                Some(n) => n,
+                None => {
+                    return write_http_response(
+                        stream,
+                        403,
+                        "Forbidden",
+                        "application/json",
+                        serde_json::to_vec(&json!({"error":"mtls_nonce_required"}))
+                            .unwrap_or_default(),
+                        None,
+                    );
+                }
+            };
+            drop(store);
             let mut store = pairing_store.lock().expect("pairing store lock poisoned");
-            if !store.record_nonce(nonce, pairing_id).unwrap_or(false) {
+            if !store.record_nonce(nonce, &pairing_id).unwrap_or(false) {
                 return write_http_response(
                     stream,
                     403,
@@ -2509,7 +2557,6 @@ fn handle_http<S: HttpStream>(
             }
         }
     }
-    let is_initialize = request.get("method").and_then(Value::as_str) == Some("initialize");
     if is_initialize {
         if session.is_some() {
             return write_http_response(

@@ -12,7 +12,15 @@
     try {
       chrome.runtime.sendMessage(payload, (response) => {
         if (chrome.runtime.lastError) { return; }
-        if (response && !response.ok) { return; }
+        if (!response || !response.ok) {
+          // Optionally post error back to iframe
+          if (response?.error) {
+            event.source?.postMessage({ ok: false, error: response.error }, event.origin);
+          }
+          return;
+        }
+        // Forward success receipt back to iframe
+        event.source?.postMessage({ ok: true, ...response }, event.origin);
       });
     } catch (_) { /* native messaging may be unavailable */ }
   });

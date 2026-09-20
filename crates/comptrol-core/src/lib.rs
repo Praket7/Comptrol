@@ -6016,10 +6016,29 @@ fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResu
     };
     match comptrol_popup::authorize_dismissal(&popup, &policy) {
         Ok(plan) => {
-            // Authorized dismissal still needs the actuation route: semantic
-            // platform control for native dialogs, Page.handleJavaScriptDialog
-            // for browser dialogs. Until the originating surface is bound,
-            // return the authorized plan without claiming dismissal.
+            // Execute the dismissal on the originating surface.
+            // For browser targets: use CDP Page.handleJavaScriptDialog with dismiss.
+            // For native targets: use platform accessibility API (not yet wired).
+            if let Some(target_spec) = request.target.as_ref()
+                && let Some(target_id) = target_spec.id.as_ref().or(target_spec.name.as_ref())
+            {
+                let mut dialog_request = request.clone();
+                dialog_request.intent = "browser.cdp.dialog".to_owned();
+                dialog_request.params = json!({
+                    "target_id": target_id,
+                    "action": "dismiss",
+                    "browser_context_id": "default".to_owned(),
+                });
+                // Try to execute via CDP dialog handler
+                if let Ok(endpoint) = std::env::var("COMPTROL_CDP_ENDPOINT") {
+                    return browser_cdp_dialog(
+                        &dialog_request,
+                        operation_id,
+                        &std::ffi::OsStr::new(&endpoint),
+                    );
+                }
+            }
+            // Fallback: return authorized plan for native/platform actuation
             let mut result = success(
                 request,
                 operation_id,
@@ -6030,6 +6049,7 @@ fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResu
                     "popup": popup,
                     "plan": plan,
                     "status": "dismissal_authorized_actuation_requires_bound_surface",
+                    "note": "browser dismissal attempted via CDP if endpoint available; native actuation not yet wired"
                 }),
             );
             result.recovery = RecoveryState::RequiresReconciliation;

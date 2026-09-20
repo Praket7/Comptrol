@@ -55,29 +55,33 @@ def run_task(binary: str, task: dict, state_dir: pathlib.Path) -> dict:
     for attempt in range(task.get("iterations", 1)):
         row = {"iteration": attempt, "verified": False, "latency_ms": 0, "mcp_calls": 0, "internal_route_actions": 0, "screenshots": 0, "bytes_returned": 0, "retries": 0, "wrong_target_events": 0, "foreground_disturbances": 0, "false_positive_verifications": 0}
         task_start = time.monotonic()
-        try:
-            for step in task.get("steps", []):
-                params = step.get("params", {})
-                resp = send_mcp(proc, request_id, step["method"], params)
-                request_id += 1
-                row["mcp_calls"] += 1
-                if "error" in resp:
-                    row["retries"] += 1
-                    continue
-                result = resp.get("result", {})
-                row["bytes_returned"] += len(json.dumps(result).encode())
-                for key in ("internal_route_actions", "target_list_reads", "screenshots", "wrong_target_events", "foreground_disturbances", "false_positive_verifications"):
-                    if key in result and isinstance(result[key], (int, float)):
-                        row[key] += int(result[key])
-            elapsed = (time.monotonic() - task_start) * 1000
-            row["latency_ms"] = round(elapsed, 2)
-            row["verified"] = True
-        except Exception as error:
-            row["latency_ms"] = round((time.monotonic() - task_start) * 1000, 2)
+        steps = task.get("steps", [])
+        if not steps:
+            row["error"] = "no steps defined in task"
             row["verified"] = False
-            row["error"] = str(error)
-        finally:
-            rows.append(row)
+        else:
+            try:
+                for step in steps:
+                    params = step.get("params", {})
+                    resp = send_mcp(proc, request_id, step["method"], params)
+                    request_id += 1
+                    row["mcp_calls"] += 1
+                    if "error" in resp:
+                        row["retries"] += 1
+                        continue
+                    result = resp.get("result", {})
+                    row["bytes_returned"] += len(json.dumps(result).encode())
+                    for key in ("internal_route_actions", "target_list_reads", "screenshots", "wrong_target_events", "foreground_disturbances", "false_positive_verifications"):
+                        if key in result and isinstance(result[key], (int, float)):
+                            row[key] += int(result[key])
+                elapsed = (time.monotonic() - task_start) * 1000
+                row["latency_ms"] = round(elapsed, 2)
+                row["verified"] = True
+            except Exception as error:
+                row["latency_ms"] = round((time.monotonic() - task_start) * 1000, 2)
+                row["verified"] = False
+                row["error"] = str(error)
+        rows.append(row)
     proc.stdin.close()
     proc.wait(timeout=5)
     total_wall = (time.monotonic() - start_wall) * 1000
