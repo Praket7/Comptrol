@@ -99,6 +99,16 @@ try {
     assert.equal(navigationWorkflow.result.structuredContent.verification, "verified", JSON.stringify(navigationWorkflow))
     workflowSteps += navigationWorkflow.result.structuredContent.data.step_count
     const snapshot = await response(43, { jsonrpc: "2.0", id: 43, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.accessibility_snapshot", idempotency_key: "accessibility-snapshot", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, depth: 4 } } } })
+    // SPA fast path: the navigation workflow above left the target on
+    // /next, so asking for that same URL must skip Page.navigate and
+    // report the requested state as already live.
+    const currentUrl = `http://127.0.0.1:${port}/next`
+    const ensureSkip = await response(52, { jsonrpc: "2.0", id: 52, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.navigate", idempotency_key: "ensure-state-skip", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, url: currentUrl, url_contains: "/next" } } } })
+    assert.equal(ensureSkip.result.structuredContent.data.navigated, false, JSON.stringify(ensureSkip.result.structuredContent))
+    assert.equal(ensureSkip.result.structuredContent.verification, "verified")
+    const ensureProbe = await response(53, { jsonrpc: "2.0", id: 53, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.ensure_state", idempotency_key: "ensure-state-probe", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, url_contains: "/next", ready_expression: "document.title === 'Comptrol browser fixture'" } } } })
+    assert.equal(ensureProbe.result.structuredContent.verification, "verified")
+    assert.equal(ensureProbe.result.structuredContent.data.satisfied, true)
     assert.equal(snapshot.result.structuredContent.verification, "verified")
     assert.equal(snapshot.result.structuredContent.data.snapshot.nodes[0].name.value, "Comptrol browser fixture")
     const screenshot = await response(51, { jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.screenshot", idempotency_key: "target-screenshot", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, format: "png" } } } })

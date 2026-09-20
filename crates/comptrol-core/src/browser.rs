@@ -78,6 +78,75 @@ pub fn fresh_target_url(endpoint: &str, target_id: &str) -> Result<Option<String
         .and_then(|target| target.url))
 }
 
+/// Decide whether the requested navigation postcondition already holds so
+/// the fast path can skip `Page.navigate` entirely (the ESPN problem:
+/// dynamic sites must not be reloaded when the requested state is live).
+///
+/// The check compares the current URL against the requested URL (exact or
+/// `url_contains`) and optionally evaluates an in-page readiness
+/// expression. Returns the observation needed to answer without mutating.
+pub fn ensure_state(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: Option<&str>,
+    revision: Option<&str>,
+    url: Option<&str>,
+    url_contains: Option<&str>,
+    ready_expression: Option<&str>,
+) -> Result<Value, ComptrolError> {
+    let targets = discover_cached(endpoint)?;
+    let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
+    let current_url = target.url.clone().unwrap_or_default();
+
+    // URL identity gate: exact match or containment, mirroring the
+    // navigate verification criteria so a skipped navigation proves the
+    // same postcondition a performed one would have.
+    let url_satisfied = match (url, url_contains) {
+        (Some(expected), _) => current_url == expected,
+        (None, Some(fragment)) => current_url.contains(fragment),
+        (None, None) => true,
+    };
+
+    // Optional readiness probe on the live document (SPA state that a URL
+    // alone cannot prove). Only runs when the URL gate already passed.
+    let mut ready = Option::<Value>::None;
+    if url_satisfied && let Some(expression) = ready_expression {
+        let result = cdp_call(
+            endpoint,
+            target_id,
+            browser_context_id,
+            target.revision.as_deref(),
+            "Runtime.evaluate",
+            json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
+        )?;
+        // The bridge already unwraps the CDP response envelope, so the
+        // evaluation payload lives at result.result.value (matching the
+        // shape every other Runtime.evaluate caller observes).
+        let value = result
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        // An unknown expression result (null) must count as *not passed*
+        // rather than silently granting readiness; boolean true and
+        // non-empty values count as readiness signals.
+        let passed = value.as_bool() == Some(true)
+            || (value.is_string() && !value.as_str().unwrap_or_default().is_empty())
+            || (value.is_number() && value.as_f64().unwrap_or_default() != 0.0);
+        ready = Some(json!({ "expression": expression, "value": value, "passed": passed }));
+    }
+
+    Ok(json!({
+        "current_url": current_url,
+        "url_requested": url,
+        "url_contains": url_contains,
+        "url_satisfied": url_satisfied,
+        "ready": ready,
+        "satisfied": url_satisfied && ready.as_ref().map(|r| r["passed"] == json!(true)).unwrap_or(true),
+        "revision": target.revision,
+    }))
+}
+
 fn invalidate_target_cache(endpoint: &str) {
     if let Ok(mut caches) = target_caches().lock() {
         caches.remove(endpoint);
@@ -1566,5 +1635,15 @@ mod tests {
         assert_eq!(targets[0].id, "tab");
         assert_eq!(targets[0].browser_context_id.as_deref(), Some("context"));
         assert_eq!(targets[0].revision.as_deref(), Some("rev"));
+    }
+
+    #[test]
+    fn real_context_id_strips_canonical_default_label() {
+        // Chrome omits browserContextId for default-context targets; the
+        // canonical "default" label must never cross the wire as a GUID.
+        assert_eq!(real_context_id(Some("default")), None);
+        assert_eq!(real_context_id(Some("")), None);
+        assert_eq!(real_context_id(None), None);
+        assert_eq!(real_context_id(Some("ABC123")), Some("ABC123"));
     }
 }

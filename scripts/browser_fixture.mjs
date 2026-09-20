@@ -221,6 +221,10 @@ server.on("upgrade", (request, socket) => {
             ? { result: { type: "boolean", value: true } }
           : message.params.expression.includes("element.focus()")
             ? { result: { type: "boolean", value: true } }
+          : message.params.expression === "document.readyState"
+            ? { result: { type: "string", value: "complete" } }
+          : message.params.expression === "document.title === 'Comptrol browser fixture'"
+            ? { result: { type: "boolean", value: true } }
             : { result: { type: "string", value: "fixture evaluation" } }
         : message.method === "Page.getNavigationHistory"
           ? { currentIndex: fixtureHistoryIndex, entries: fixtureHistory }

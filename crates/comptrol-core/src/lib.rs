@@ -594,6 +594,7 @@ impl Policy {
             policy.allowed_intents.extend([
                 "browser.cdp.evaluate".to_owned(),
                 "browser.cdp.frame_evaluate".to_owned(),
+                "browser.cdp.ensure_state".to_owned(),
                 "browser.cdp.navigate".to_owned(),
                 "browser.cdp.upload".to_owned(),
                 "browser.cdp.download".to_owned(),
@@ -1267,6 +1268,7 @@ impl Runtime {
             }
             "browser.cdp.evaluate"
             | "browser.cdp.frame_evaluate"
+            | "browser.cdp.ensure_state"
             | "browser.cdp.navigate"
             | "browser.cdp.upload"
             | "browser.cdp.download"
@@ -1668,6 +1670,7 @@ fn classify(intent: &str) -> Risk {
         "browser.fixture.submit" => Risk::R1,
         "browser.cdp.evaluate"
         | "browser.cdp.frame_evaluate"
+        | "browser.cdp.ensure_state"
         | "browser.cdp.navigate"
         | "browser.cdp.upload"
         | "browser.cdp.download"
@@ -3077,6 +3080,37 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             Some(revision),
         );
     }
+    if request.intent == "browser.cdp.ensure_state" {
+        return match browser::ensure_state(
+            &endpoint.to_string_lossy(),
+            target_id,
+            Some(browser_context_id),
+            Some(revision),
+            request.params.get("url").and_then(Value::as_str),
+            request.params.get("url_contains").and_then(Value::as_str),
+            request
+                .params
+                .get("ready_expression")
+                .and_then(Value::as_str),
+        ) {
+            Ok(state) => {
+                let satisfied = state.get("satisfied").and_then(Value::as_bool) == Some(true);
+                success(
+                    request,
+                    operation_id,
+                    "browser_protocol",
+                    EffectState::None,
+                    if satisfied {
+                        VerificationState::Verified
+                    } else {
+                        VerificationState::Unverified
+                    },
+                    json!({ "ensure_state": state, "satisfied": satisfied }),
+                )
+            }
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
     let (method, params) = match request.intent.as_str() {
         "browser.cdp.evaluate" => {
             let Some(expression) = request.params.get("expression").and_then(Value::as_str) else {
@@ -3111,6 +3145,46 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
                     },
                 );
             };
+            // SPA fast path: when the requested postcondition already holds
+            // on the live target, skip Page.navigate entirely instead of
+            // reloading a dynamic page into the state the caller wants.
+            if request
+                .params
+                .get("skip_if_current")
+                .and_then(Value::as_bool)
+                != Some(false)
+            {
+                let ensure = browser::ensure_state(
+                    &endpoint.to_string_lossy(),
+                    target_id,
+                    Some(browser_context_id),
+                    Some(revision),
+                    request.params.get("url").and_then(Value::as_str),
+                    request.params.get("url_contains").and_then(Value::as_str),
+                    request
+                        .params
+                        .get("ready_expression")
+                        .and_then(Value::as_str),
+                );
+                if let Ok(state) = &ensure
+                    && state.get("satisfied").and_then(Value::as_bool) == Some(true)
+                {
+                    return success(
+                        request,
+                        operation_id,
+                        "browser_protocol",
+                        EffectState::None,
+                        VerificationState::Verified,
+                        json!({
+                            "navigated": false,
+                            "reason": "requested state already live on the exact target",
+                            "ensure_state": state,
+                            "mouse": "untouched",
+                            "clipboard": "untouched",
+                        }),
+                    );
+                }
+            }
             ("Page.navigate", json!({ "url": url }))
         }
         _ => unreachable!(),
