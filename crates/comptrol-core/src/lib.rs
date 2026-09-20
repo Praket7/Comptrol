@@ -500,6 +500,7 @@ impl Default for LeaseManager {
 pub struct Policy {
     pub allow_sandbox_writes: bool,
     pub allow_desktop_notify: bool,
+    pub allow_app_launch: bool,
     pub max_risk: Risk,
     pub allowed_intents: HashSet<String>,
 }
@@ -509,6 +510,7 @@ impl Default for Policy {
         Self {
             allow_sandbox_writes: false,
             allow_desktop_notify: false,
+            allow_app_launch: false,
             max_risk: Risk::R0,
             allowed_intents: HashSet::from([
                 "system.ping".to_owned(),
@@ -554,8 +556,10 @@ impl Policy {
                 .insert("browser.chrome.restore_recent".to_owned());
         }
         if std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1") {
+            policy.allow_app_launch = true;
             policy.max_risk = Risk::R2;
             policy.allowed_intents.insert("desktop.open_app".to_owned());
+            policy.allowed_intents.insert("app.launch".to_owned());
         }
         if std::env::var("COMPTROL_ALLOW_COMMANDS").as_deref() == Ok("1") {
             policy.max_risk = policy.max_risk.max(Risk::R3);
@@ -1155,7 +1159,7 @@ impl Runtime {
                 return result;
             }
         }
-        let plan = route_plan_with_history(&request, &self.route_history);
+        let plan = route_plan_with_history(&request, &self.route_history, Some(&self.policy));
         if request.dry_run {
             let route_error = plan.selected.is_none().then(|| ComptrolError {
                 code: "route_unavailable".to_owned(),
@@ -1243,6 +1247,7 @@ impl Runtime {
             }
             "desktop.notify" => desktop_notify(&request, operation_id),
             "desktop.open_app" => desktop_open_app(&request, operation_id),
+            "app.launch" => app_launch(&request, operation_id),
             "browser.chrome.open_tab" => browser_chrome_open_tab(&request, operation_id),
             "browser.chrome.restore_recent" | "browser.chrome.reopen_closed_group" => {
                 browser_chrome_restore_recent(&request, operation_id)
@@ -1646,6 +1651,7 @@ fn classify(intent: &str) -> Risk {
         "system.ping" | "desktop.observe" | "platform.broker.observe" | "workflow.execute" => {
             Risk::R0
         }
+        "app.launch" => Risk::R1,
         "desktop.notify"
         | "filesystem.write"
         | "filesystem.copy"
@@ -2084,19 +2090,33 @@ fn stable_hash(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix length"))
 }
 
-fn route_plan(request: &OperationRequest) -> RoutePlan {
-    route_plan_for_intent(
+fn route_plan(request: &OperationRequest, policy: Option<&Policy>) -> RoutePlan {
+    let mut plan = route_plan_for_intent(
         &request.intent,
         request.params.clone(),
         request.background.as_deref(),
-    )
+    );
+    // Runtime-policy flags may grant feasibility that env vars alone
+    // would gate (embedded daemon setups and tests configure the policy
+    // object directly instead of the process environment).
+    if request.intent == "app.launch"
+        && let Some(policy) = policy
+        && policy.allow_app_launch
+        && let Some(candidate) = plan.candidates.first_mut()
+        && !candidate.feasible
+    {
+        candidate.feasible = true;
+        candidate.rationale = "Registry-backed app launch allowed by runtime policy".to_owned();
+    }
+    plan
 }
 
 fn route_plan_with_history(
     request: &OperationRequest,
     history: &HashMap<String, RouteHistory>,
+    policy: Option<&Policy>,
 ) -> RoutePlan {
-    let mut plan = route_plan(request);
+    let mut plan = route_plan(request, policy);
     for candidate in &mut plan.candidates {
         if !candidate.feasible {
             candidate.utility = None;
@@ -2183,6 +2203,15 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
                 target_os = "linux"
             )) && env_enabled("COMPTROL_ALLOW_APP_LAUNCH"),
             "Native app launch requires an explicit local policy",
+        )),
+        "app.launch" => Some((
+            "app_registry_launch",
+            cfg!(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "linux"
+            )) && env_enabled("COMPTROL_ALLOW_APP_LAUNCH"),
+            "Registry-backed app launch requires an explicit local policy",
         )),
         "browser.chrome.open_tab" => Some((
             "browser_launcher",
@@ -2312,6 +2341,7 @@ fn route_catalog() -> Vec<RoutePlan> {
         "filesystem.restore_checkpoint",
         "desktop.notify",
         "desktop.open_app",
+        "app.launch",
         "browser.chrome.open_tab",
         "browser.chrome.restore_recent",
         "browser.chrome.reopen_closed_group",
@@ -4410,6 +4440,128 @@ fn desktop_notify(request: &OperationRequest, operation_id: String) -> ActionRes
                 recovery: Some("Use desktop.observe or configure a platform adapter".to_owned()),
             },
         )
+    }
+}
+
+/// Registry-backed launch: resolve the exact installed app, launch
+/// through the native mechanism, and verify the process identity is
+/// alive afterwards. The registry refuses ambiguous or missing apps
+/// instead of guessing.
+fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult {
+    if request.background.as_deref() == Some("strict_background") {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "background_unavailable".to_owned(),
+                message: "Launching an application may activate the desktop and cannot satisfy strict background posture".to_owned(),
+                recovery: Some("Use foreground_allowed, or drive an app through its API/CDP route".to_owned()),
+            },
+        );
+    }
+    let Some(app) = request
+        .params
+        .get("app")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "app.launch needs an exact app identity or display name".to_owned(),
+                recovery: Some(
+                    "Inspect the app registry and retry with the resolved id".to_owned(),
+                ),
+            },
+        );
+    };
+    let resource = match request.params.get("resource") {
+        Some(value) => {
+            match serde_json::from_value::<comptrol_app_registry::Resource>(value.clone()) {
+                Ok(resource) => resource,
+                Err(error) => {
+                    return ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "invalid_input".to_owned(),
+                            message: format!("app.launch resource is malformed: {error}"),
+                            recovery: None,
+                        },
+                    );
+                }
+            }
+        }
+        None => comptrol_app_registry::Resource::None,
+    };
+    let resolved = match comptrol_app_registry::resolve(&app) {
+        Ok(entry) => entry,
+        Err(error @ comptrol_app_registry::RegistryError::NotFound(_))
+        | Err(error @ comptrol_app_registry::RegistryError::Ambiguous(_, _)) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "app_not_resolved".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some(
+                        "List installed applications and use one exact identity".to_owned(),
+                    ),
+                },
+            );
+        }
+        Err(error) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "app_registry_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Inspect platform registry state".to_owned()),
+                },
+            );
+        }
+    };
+    let mut launch_request = comptrol_app_registry::LaunchRequest::new(resolved);
+    launch_request.resource = resource;
+    launch_request.background = request.background.as_deref() == Some("prefer_background");
+    match comptrol_app_registry::launch_verified(&launch_request) {
+        Ok((outcome, verification)) => {
+            let verified = matches!(
+                verification,
+                comptrol_app_registry::LaunchVerification::Verified
+            );
+            success(
+                request,
+                operation_id,
+                "app_registry_launch",
+                EffectState::Changed,
+                if verified {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                json!({
+                    "app": outcome.app_id,
+                    "route": outcome.route,
+                    "pid": outcome.pid,
+                    "verification": verification,
+                    "mouse": "untouched",
+                    "clipboard": "untouched",
+                }),
+            )
+        }
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "app_launch_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Inspect the resolved application and retry".to_owned()),
+            },
+        ),
     }
 }
 
@@ -7234,6 +7386,46 @@ mod tests {
         let contents = fs::read_to_string(journal.path()).expect("audit");
         assert!(!contents.contains("secret body"));
         assert!(contents.contains("risk_data"));
+    }
+
+    #[test]
+    fn app_launch_refuses_ambiguous_and_missing_apps_without_guessing() {
+        let mut runtime = runtime();
+        runtime.policy.max_risk = Risk::R2;
+        runtime.policy.allow_app_launch = true;
+        runtime
+            .policy
+            .allowed_intents
+            .insert("app.launch".to_owned());
+        let refused = runtime.operate(OperationRequest {
+            intent: "app.launch".to_owned(),
+            target: None,
+            params: json!({ "app": "definitely-not-an-app-xyz" }),
+            postcondition: None,
+            risk: Some(Risk::R1),
+            idempotency_key: None,
+            dry_run: false,
+            background: None,
+        });
+        assert_eq!(
+            refused.error.as_ref().map(|e| e.code.as_str()),
+            Some("app_not_resolved")
+        );
+        // No path traversal through the app name.
+        let traversal = runtime.operate(OperationRequest {
+            intent: "app.launch".to_owned(),
+            target: None,
+            params: json!({ "app": "/tmp/evil" }),
+            postcondition: None,
+            risk: Some(Risk::R1),
+            idempotency_key: None,
+            dry_run: false,
+            background: None,
+        });
+        assert_eq!(
+            traversal.error.as_ref().map(|e| e.code.as_str()),
+            Some("app_not_resolved")
+        );
     }
 
     #[test]

@@ -292,6 +292,7 @@ version = "0.1.63"
 dependencies = [
  "comptrol-adapter-host",
  "comptrol-adapter-sdk",
+ "comptrol-app-registry",
  "comptrol-browser",
  "comptrol-consent",
  "comptrol-platform-linux",
@@ -328,6 +329,16 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "comptrol-app-registry"
+version = "0.1.63"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
