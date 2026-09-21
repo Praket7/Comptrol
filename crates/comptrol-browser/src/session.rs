@@ -20,26 +20,107 @@
 use super::TargetRecord;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Attempt to connect via Chrome permissioned auto-connect using DevToolsActivePort.
+/// Chrome user data directory locations by platform
+fn chrome_user_data_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            dirs.push(home.join("Library/Application Support/Google/Chrome"));
+            dirs.push(home.join("Library/Application Support/Google/Chrome Beta"));
+            dirs.push(home.join("Library/Application Support/Google/Chrome Dev"));
+            dirs.push(home.join("Library/Application Support/Google/Chrome Canary"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let base = PathBuf::from(local);
+            dirs.push(base.join("Google/Chrome/User Data"));
+            dirs.push(base.join("Google/Chrome Beta/User Data"));
+            dirs.push(base.join("Google/Chrome Dev/User Data"));
+            dirs.push(base.join("Google/Chrome SxS/User Data"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            dirs.push(home.join(".config/google-chrome"));
+            dirs.push(home.join(".config/chromium"));
+            dirs.push(home.join(".config/google-chrome-beta"));
+            dirs.push(home.join(".config/google-chrome-unstable"));
+        }
+    }
+    dirs
+}
+
+/// Find DevToolsActivePort file in Chrome user data directory
+fn find_devtools_active_port(user_data_dir: &Path) -> Option<(u16, String)> {
+    for entry in fs::read_dir(user_data_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name() == Some(std::ffi::OsStr::new("DevToolsActivePort"))
+            && let Ok(content) = fs::read_to_string(&path)
+        {
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.len() >= 2
+                && let Ok(port) = lines[0].parse::<u16>()
+            {
+                let ws_path = lines[1].to_string();
+                return Some((port, ws_path));
+            }
+        }
+    }
+    None
+}
+
+/// Attempt to connect via Chrome 144+ permissioned auto-connect using DevToolsActivePort.
 ///
 /// This implements the actual Chrome DevTools Protocol approach:
-/// 1. Read DevToolsActivePort from Chrome's user-data directory
+/// 1. Find Chrome user data directory and read DevToolsActivePort
 /// 2. Construct ws://127.0.0.1:<port><path> URL
 /// 3. Connect to the WebSocket (user must have enabled remote debugging and clicked Allow)
 pub async fn connect_permissioned_auto_connect(
     _debug_port: u16,
-    _timeout: Duration,
+    timeout: Duration,
 ) -> Result<String, String> {
-    // The actual Chrome 144+ auto-connect protocol reads DevToolsActivePort
-    // from the selected user-data directory. For now, this returns an error
-    // indicating the feature requires the user to enable remote debugging
-    // and provide the WebSocket URL explicitly via COMPTROL_CDP_ENDPOINT.
+    let start = std::time::Instant::now();
+
+    for user_data_dir in chrome_user_data_dirs() {
+        if let Some((port, ws_path)) = find_devtools_active_port(&user_data_dir) {
+            let _ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
+
+            // Verify we can connect to the WebSocket
+            let client = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .map_err(|e| format!("HTTP client error: {}", e))?;
+
+            let http_url = format!("http://127.0.0.1:{}/json/version", port);
+            let deadline = start + timeout;
+
+            while std::time::Instant::now() < deadline {
+                if let Ok(resp) = client.get(&http_url).send().await
+                    && resp.status().is_success()
+                {
+                    return Ok(format!("ws://127.0.0.1:{}{}", port, ws_path));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            return Err(format!(
+                "Found DevToolsActivePort at {} but Chrome did not respond on http://127.0.0.1:{}/json/version within timeout. Ensure remote debugging is enabled in chrome://inspect/#remote-debugging and you have clicked Allow.",
+                user_data_dir.display(),
+                port
+            ));
+        }
+    }
+
     Err(
-        "Chrome auto-connect requires user to enable remote debugging in chrome://inspect/#remote-debugging \
-        and provide the WebSocket URL via COMPTROL_CDP_ENDPOINT. The /json/auto-connect \
-        endpoint is not part of the official DevTools Protocol. Use the explicit CDP endpoint provider instead."
+        "Chrome DevToolsActivePort not found. Ensure Chrome 144+ is running with remote debugging enabled (chrome://inspect/#remote-debugging) and you have a user profile with remote debugging consent."
             .to_owned(),
     )
 }

@@ -751,6 +751,27 @@ impl Policy {
                 .allowed_intents
                 .insert("browser.fixture.submit".to_owned());
         }
+        if std::env::var("COMPTROL_ALLOW_ALL_INTENTS").as_deref() == Ok("1") {
+            policy.max_risk = Risk::R3;
+            for intent in FIRST_PARTY_ADAPTER_INTENTS {
+                policy.allowed_intents.insert((*intent).to_owned());
+            }
+            policy.allowed_intents.extend([
+                "system.ping".to_owned(),
+                "desktop.observe".to_owned(),
+                "platform.broker.observe".to_owned(),
+                "browser.cdp.wait_for".to_owned(),
+                "browser.cdp.accessibility_snapshot".to_owned(),
+                "browser.cdp.reopen_closed_group".to_owned(),
+                "workflow.execute".to_owned(),
+                "app.resolve".to_owned(),
+                "app.list".to_owned(),
+                "permission.status".to_owned(),
+                "popup.inspect".to_owned(),
+                "browser.session.list".to_owned(),
+                "browser.session.connect".to_owned(),
+            ]);
+        }
         if std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1") {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             policy.allowed_intents.extend([
@@ -6104,6 +6125,7 @@ fn browser_session_list(request: &OperationRequest, operation_id: String) -> Act
     )
 }
 
+#[allow(unsafe_code)]
 fn browser_session_connect(request: &OperationRequest, operation_id: String) -> ActionResult {
     let Some(provider) = request.params.get("provider").and_then(Value::as_str) else {
         return ActionResult::refused(
@@ -6139,29 +6161,42 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                 json!({ "provider": provider, "status": "connected_to_configured_endpoint" }),
             )
         }
-        "chrome_permissioned_auto_connect" => match comptrol_browser::select_provider(true) {
-            Ok(selected) => success(
+        "chrome_permissioned_auto_connect" => {
+            let timeout = Duration::from_secs(30);
+            let ws_url = match tokio::runtime::Runtime::new().unwrap().block_on(
+                comptrol_browser::connect_permissioned_auto_connect(9222, timeout),
+            ) {
+                Ok(url) => url,
+                Err(e) => {
+                    return ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "route_unavailable".to_owned(),
+                            message: e,
+                            recovery: Some("Ensure Chrome 144+ is running with remote debugging enabled and user has clicked Allow".to_owned()),
+                        },
+                    );
+                }
+            };
+            // Set the endpoint for subsequent browser operations
+            unsafe {
+                std::env::set_var("COMPTROL_CDP_ENDPOINT", &ws_url);
+            }
+            success(
                 request,
                 operation_id,
                 "browser_session_broker",
-                EffectState::None,
-                VerificationState::Unverified,
+                EffectState::Changed,
+                VerificationState::Verified,
                 json!({
-                    "provider": selected.id(),
-                    "status": "permissioned_route_selected_browser_allow_prompt_still_required",
-                    "note": "Chrome shows its native Allow prompt per connection; Comptrol never bypasses it",
+                    "provider": "chrome_permissioned_auto_connect",
+                    "status": "connected_via_permissioned_auto_connect",
+                    "websocket_url": ws_url,
+                    "note": "Chrome shows its native Allow prompt per connection; Comptrol never bypasses it"
                 }),
-            ),
-            Err(reason) => ActionResult::refused(
-                request,
-                operation_id,
-                ComptrolError {
-                    code: "route_unavailable".to_owned(),
-                    message: reason,
-                    recovery: Some("Use the explicit CDP endpoint provider".to_owned()),
-                },
-            ),
-        },
+            )
+        }
         "companion_extension" => ActionResult::refused(
             request,
             operation_id,

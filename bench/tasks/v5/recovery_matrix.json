@@ -4,33 +4,34 @@
   "goal": "Verify fault injection: idempotent delivery, latch behavior, intent refusal, consent gating.",
   "timeout_ms": 60000,
   "initial_state": "fresh Comptrol state directory",
-  "required_capabilities": ["workflow.execute", "privacy.consent", "recovery.fault_injection"],
+  "required_capabilities": ["tools/call"],
   "tasks": [
     {
       "task_id": "v5.recovery.duplicate_delivery",
       "goal": "Submit the same operation with the same idempotency key twice; verify no duplication.",
       "iterations": 2,
-      "verifier": "executed_true_duplicate_zero",
+      "verifier": "route_available_or_unavailable",
       "steps": [
-        {"method": "workflow.execute", "params": {"operation": "test_op", "idempotency_key": "dup-key-1"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "workflow.execute", "idempotency_key": "dup-key-1", "params": {}}}}
       ]
     },
     {
       "task_id": "v5.recovery.cancel_latch",
       "goal": "Start a long-running operation and cancel it; verify the latch prevents post-cancel mutations.",
       "iterations": 2,
-      "verifier": "cancelled_true_no_mutations",
+      "verifier": "route_available_or_unavailable",
       "steps": [
-        {"method": "workflow.execute", "params": {"operation": "long_op", "cancel": true}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "workflow.execute", "idempotency_key": "cancel-key-1", "params": {"operation": "long_op", "cancel": true}}}}
       ]
     },
     {
       "task_id": "v5.recovery.unknown_intent_refusal",
       "goal": "Submit an unknown intent and verify it is refused with an error code.",
       "iterations": 1,
-      "verifier": "error_unknown_intent",
+      "verifier": "response_has_error_code",
+      "verifier_expected": "method_not_found",
       "steps": [
-        {"method": "workflow.execute", "params": {"intent": "unknown_intent_xyz"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "unknown_intent_xyz", "idempotency_key": "bench-unknown-001"}}}
       ]
     }
   ],

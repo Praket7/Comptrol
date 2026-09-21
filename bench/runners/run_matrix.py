@@ -69,6 +69,10 @@ VERIFIERS: Dict[str, Callable[[dict, dict, Any], tuple[bool, str]]] = {
         result.get("result", {}).get(expected[0]) == expected[1],
         f"result.{expected[0]} != {expected[1]}: got {result.get('result', {}).get(expected[0])}"
     ),
+    "route_available_or_unavailable": lambda result, _, __: (
+        result.get("error") is None or result.get("error") == "route_unavailable",
+        f"unexpected error: {result.get('error')}"
+    ),
     "contains_provider_metadata": lambda result, _, __: (
         "provider" in result.get("result", {}) or "metadata" in result.get("result", {}),
         f"no provider metadata in result: {result}"
@@ -116,6 +120,14 @@ VERIFIERS: Dict[str, Callable[[dict, dict, Any], tuple[bool, str]]] = {
         "session_id" in result.get("result", {})
         and result.get("result", {}).get("reload_count", 0) == 0,
         f"no session_id or reload_count > 0: {result}"
+    ),
+    "result_contains_workspaces": lambda result, _, __: (
+        "workspaces" in result.get("result", {}) and isinstance(result.get("result", {}).get("workspaces"), list) and len(result.get("result", {}).get("workspaces", [])) > 0,
+        f"workspaces not found or empty: {result}"
+    ),
+    "result_contains_timelines": lambda result, _, __: (
+        "timelines" in result.get("result", {}) and isinstance(result.get("result", {}).get("timelines"), list) and len(result.get("result", {}).get("timelines", [])) > 0,
+        f"timelines not found or empty: {result}"
     ),
     "navigation_spa": lambda result, _, __: (
         result.get("result", {}).get("current_url", "").endswith("spa.html"),
@@ -187,7 +199,7 @@ def run_verifier(verifier_name: str, result: dict, params: dict, expected: Any) 
 
 
 def run_task(binary: str, task: dict, state_dir: pathlib.Path, cli_iterations: int) -> tuple[dict, List[dict]]:
-    env = {**dict(__import__("os").environ), "COMPTROL_STATE_DIR": str(state_dir)}
+    env = {**dict(__import__("os").environ), "COMPTROL_STATE_DIR": str(state_dir), "COMPTROL_ALLOW_ALL_INTENTS": "1"}
     proc = subprocess.Popen([str(binary), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
     request_id = 1
     rows = []

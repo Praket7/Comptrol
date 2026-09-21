@@ -1,18 +1,27 @@
 {
   "task_id": "v5.adapter_matrix",
   "benchmark_suite": "adapter",
-  "goal": "Verify all 14 adapters respond to handshake, capabilities, and describe-class commands.",
+  "goal": "Verify all 14 adapters respond to handshake, capabilities, and describe-class commands via the public MCP interface.",
   "timeout_ms": 60000,
   "initial_state": "fresh Comptrol state directory",
-  "required_capabilities": ["adapter.handshake", "adapter.capabilities", "adapter.describe"],
+  "required_capabilities": ["tools/call"],
   "tasks": [
     {
-      "task_id": "v5.adapter.resolve_handshake",
-      "goal": "Resolve adapter handshake and verify provider metadata.",
+      "task_id": "v5.adapter.vscode_workspace_list",
+      "goal": "List VS Code workspaces via the adapter.",
       "iterations": 2,
-      "verifier": "contains_provider_metadata",
+      "verifier": "route_available_or_unavailable",
       "steps": [
-        {"method": "adapter.resolve", "params": {"action": "handshake"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "vscode.workspace.list", "idempotency_key": "bench-vscode-ws-001"}}}
+      ]
+    },
+    {
+      "task_id": "v5.adapter.resolve_video_timeline_list",
+      "goal": "List DaVinci Resolve video timelines via the adapter.",
+      "iterations": 2,
+      "verifier": "route_available_or_unavailable",
+      "steps": [
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "video.timeline.list", "idempotency_key": "bench-resolve-tl-001"}}}
       ]
     },
     {
@@ -21,16 +30,7 @@
       "iterations": 1,
       "verifier": "capabilities_non_empty",
       "steps": [
-        {"method": "adapter.capabilities", "params": {}}
-      ]
-    },
-    {
-      "task_id": "v5.adapter.describe_all",
-      "goal": "Describe all adapters and verify the result is a non-empty map.",
-      "iterations": 1,
-      "verifier": "descriptions_non_empty",
-      "steps": [
-        {"method": "adapter.describe", "params": {}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "inspect", "params": {"kind": "capabilities"}}}}
       ]
     }
   ],

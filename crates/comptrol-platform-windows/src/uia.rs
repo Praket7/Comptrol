@@ -193,6 +193,8 @@ impl UiaScopedCache {
                 _ => None,
             }
             .map(str::to_owned);
+            #[allow(clippy::nonstandard_macro_braces)]
+            let _ = control_type; // suppress unused warning for match arm constants
             entries.push(SemanticCacheEntry {
                 process_id: entry_process_id,
                 automation_id,
@@ -418,6 +420,7 @@ fn matches_cached_entry(entry: &SemanticCacheEntry, request: &Request<'_>) -> bo
     true
 }
 
+#[allow(dead_code)]
 fn verify_cached_entry(entry: &SemanticCacheEntry, request: &Request<'_>) -> Result<bool, String> {
     match request.expected_attribute {
         None => Ok(false),
