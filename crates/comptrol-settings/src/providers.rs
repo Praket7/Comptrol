@@ -37,13 +37,11 @@ pub struct WindowsProvider;
 
 impl SettingProvider for WindowsProvider {
     fn supports(&self, key: &SettingKey) -> bool {
-        matches!(
-            key,
-            SettingKey::BluetoothEnabled
-                | SettingKey::DefaultBrowser
-                | SettingKey::NotificationsAppEnabled { .. }
-                | SettingKey::AccessibilityComptrolStatus
-        )
+        // Windows has no programmatic read or write surfaces wired in this
+        // build. All operations return UnsupportedPlatform/WriteRefused.
+        // Only human_surface() is available for opening the Settings page.
+        let _ = key;
+        false
     }
 
     fn human_surface(&self, key: &SettingKey) -> String {
@@ -77,14 +75,9 @@ pub struct MacosProvider;
 
 impl SettingProvider for MacosProvider {
     fn supports(&self, key: &SettingKey) -> bool {
-        matches!(
-            key,
-            SettingKey::BluetoothEnabled
-                | SettingKey::DisplayBrightness
-                | SettingKey::DefaultBrowser
-                | SettingKey::AccessibilityComptrolStatus
-                | SettingKey::PrivacyMicrophoneAppStatus { .. }
-        )
+        // Only DefaultBrowser can be read programmatically via LaunchServices
+        // defaults read. All other settings have no wired read/write surface.
+        matches!(key, SettingKey::DefaultBrowser)
     }
 
     fn human_surface(&self, key: &SettingKey) -> String {
@@ -171,12 +164,12 @@ impl SettingProvider for LinuxProvider {
         {
             return false;
         }
+        // DisplayBrightness is readable and writable via GSettings.
+        // DefaultBrowser is readable via GSettings (read-only).
+        // All other settings have no wired surface on Linux.
         matches!(
             key,
-            SettingKey::BluetoothEnabled
-                | SettingKey::DisplayBrightness
-                | SettingKey::NotificationsAppEnabled { .. }
-                | SettingKey::DefaultBrowser
+            SettingKey::DisplayBrightness | SettingKey::DefaultBrowser
         )
     }
 

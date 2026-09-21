@@ -855,6 +855,7 @@ fn main() {
         Some("capabilities") => print_json(json!(capabilities())),
         Some("stop") => change_stop(true),
         Some("resume") => change_stop(false),
+        Some("resolve-action") => resolve_human_action_cli(env::args().skip(2).collect()),
         Some("serve-http") => run_http(
             env::args()
                 .nth(2)
@@ -1521,7 +1522,8 @@ fn tools() -> Value {
         { "name": "watch", "description": "Return the known state of an operation without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
         { "name": "reconcile", "description": "Reconcile a durable unknown operation from observed local state without repeating its mutation", "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
         { "name": "restore_checkpoint", "description": "Restore a local sandbox checkpoint under explicit local write policy", "inputSchema": { "type": "object", "required":["checkpoint"], "properties": { "checkpoint": {"type":"string"}, "idempotency_key": {"type":"string"} } } },
-        { "name": "capabilities", "description": "Return capabilities that are actually available in this runtime", "inputSchema": { "type": "object" } }
+        { "name": "capabilities", "description": "Return capabilities that are actually available in this runtime", "inputSchema": { "type": "object" } },
+        { "name": "human_action.resolve", "description": "Resolve a pending human action (approve or decline) after the user has acted in the native prompt. Use this after awaiting_human_action to record the user's decision so the operation can be retried.", "inputSchema": { "type": "object", "required": ["action_id", "resolution"], "properties": { "action_id": {"type":"string", "description":"The human_action_id from the awaiting_human_action response"}, "resolution": {"type":"string", "enum":["approved","declined"], "description":"The user's decision"} } } }
     ])
 }
 
@@ -1550,6 +1552,39 @@ fn call_tool_with_cancel(
         "reconcile" => json!(runtime.reconcile(arguments.get("operation_id").and_then(Value::as_str).unwrap_or_default())),
         "restore_checkpoint" => serde_json::from_value::<OperationRequest>(json!({ "intent": "filesystem.restore_checkpoint", "params": arguments.clone(), "idempotency_key": arguments.get("idempotency_key"), "risk": "R1" })).map(|request| json!(runtime.operate(request))).unwrap_or_else(|error| json!({ "error": { "code": "invalid_input", "message": error.to_string() } })),
         "capabilities" => json!(capabilities()),
+        "human_action.resolve" => {
+            let action_id = arguments.get("action_id").and_then(Value::as_str).unwrap_or_default();
+            let resolution_str = arguments.get("resolution").and_then(Value::as_str).unwrap_or_default();
+            let resolution = match resolution_str {
+                "approved" => comptrol_consent::human_action::HumanActionResolution::Approved,
+                "declined" => comptrol_consent::human_action::HumanActionResolution::Declined,
+                _ => comptrol_consent::human_action::HumanActionResolution::TimedOut,
+            };
+            if action_id.is_empty() {
+                json!({ "error": { "code": "invalid_input", "message": "human_action.resolve needs action_id" } })
+            } else {
+                match Runtime::new(default_state_dir()) {
+                    Ok(mut runtime) => {
+                        if runtime.human_actions.resolve(action_id, resolution.clone()) {
+                            json!({ "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                                "resolved": true,
+                                "action_id": action_id,
+                                "resolution": resolution_str,
+                                "note": "Human action recorded. Retry the original operation to continue."
+                            })).unwrap_or_default() }], "structuredContent": json!({
+                                "resolved": true,
+                                "action_id": action_id,
+                                "resolution": resolution_str,
+                                "note": "Human action recorded. Retry the original operation to continue."
+                            }) })
+                        } else {
+                            json!({ "error": { "code": "action_not_found", "message": format!("No pending human action with id {action_id}") } })
+                        }
+                    }
+                    Err(error) => json!({ "error": { "code": "startup_failed", "message": error.to_string() } }),
+                }
+            }
+        }
         _ => json!({ "error": { "code": "tool_not_found", "message": format!("Unknown tool {name}") } }),
     };
     json!({ "content": [{ "type": "text", "text": serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned()) }], "structuredContent": value })
@@ -1559,6 +1594,36 @@ fn run_inspect(kind: &str) -> Value {
     match Runtime::new(default_state_dir()) {
         Ok(mut runtime) => runtime.inspect(kind),
         Err(error) => json!({ "error": error.to_string() }),
+    }
+}
+
+fn resolve_human_action_cli(args: Vec<String>) -> i32 {
+    if args.len() < 2 {
+        eprintln!("usage: comptrol resolve-action <action_id> <approved|declined>");
+        return 1;
+    }
+    let action_id = &args[0];
+    let resolution = match args[1].as_str() {
+        "approved" => comptrol_consent::human_action::HumanActionResolution::Approved,
+        "declined" => comptrol_consent::human_action::HumanActionResolution::Declined,
+        _ => {
+            eprintln!("resolution must be 'approved' or 'declined'");
+            return 1;
+        }
+    };
+    let mut runtime = match Runtime::new(default_state_dir()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("startup failed: {error}");
+            return 1;
+        }
+    };
+    if runtime.human_actions.resolve(action_id, resolution) {
+        println!("resolved");
+        0
+    } else {
+        eprintln!("no pending human action with id {action_id}");
+        1
     }
 }
 
