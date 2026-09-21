@@ -80,23 +80,23 @@ pub fn process_alive(pid: u32) -> Result<bool, LaunchError> {
     #[cfg(windows)]
     {
         use std::os::windows::io::RawHandle;
-        extern "system" {
+        unsafe extern "system" {
             fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> RawHandle;
             fn CloseHandle(handle: RawHandle) -> i32;
             fn WaitForSingleObject(handle: RawHandle, milliseconds: u32) -> u32;
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-        const STILL_ACTIVE: u32 = 258;
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT: u32 = 258;
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {
                 return Ok(false);
             }
-            // Check if process has exited by waiting briefly (0ms = immediate check)
-            let exit_code = WaitForSingleObject(handle, 0);
+            let result = WaitForSingleObject(handle, 0);
             CloseHandle(handle);
-            // WAIT_OBJECT_0 (0) means process has exited, WAIT_TIMEOUT (258) means still running
-            Ok(exit_code == STILL_ACTIVE || exit_code == 0x102) // 0x102 = WAIT_TIMEOUT
+            // WAIT_OBJECT_0 means process exited; WAIT_TIMEOUT means still running
+            Ok(result == WAIT_TIMEOUT || result == WAIT_OBJECT_0)
         }
     }
     #[cfg(not(any(unix, windows)))]

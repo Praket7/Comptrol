@@ -184,6 +184,44 @@ fn now_ms() -> u128 {
 }
 
 /// Discover local browser surfaces without connecting to anything.
+/// Check if the companion extension native host is registered on this platform.
+fn native_bridge_available() -> bool {
+    let host_id = "comptrol_browser_bridge";
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let manifest = std::path::PathBuf::from(format!(
+            "{home}/Library/Application Support/Google/Chrome/NativeMessagingHosts/{host_id}.json"
+        ));
+        manifest.exists()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let manifest = std::path::PathBuf::from(format!(
+            "{home}/.config/google-chrome/NativeMessagingHosts/{host_id}.json"
+        ));
+        manifest.exists()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Check registry for native messaging host registration
+        std::process::Command::new("reg")
+            .args([
+                "query",
+                "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\comptrol_browser_bridge",
+                "/ve",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 pub fn list_sessions() -> Vec<BrowserSession> {
     let cdp_configured = std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some();
     let auto_connect_armed = std::env::var("COMPTROL_CHROME_AUTO_CONNECT").as_deref() == Ok("1");
@@ -200,9 +238,15 @@ pub fn list_sessions() -> Vec<BrowserSession> {
         },
         BrowserSession {
             provider: SessionProvider::CompanionExtension,
-            available: false,
-            reason: "the signed companion extension is not installed in this build".to_owned(),
-            signed_in_capable: false,
+            available: native_bridge_available(),
+            reason: if native_bridge_available() {
+                "companion extension native host is registered; CDP commands route through the daemon"
+                    .to_owned()
+            } else {
+                "companion extension native host is not registered; install the Browser Bridge extension"
+                    .to_owned()
+            },
+            signed_in_capable: true,
         },
         BrowserSession {
             provider: SessionProvider::ExplicitCdp,
@@ -431,12 +475,13 @@ mod tests {
         for session in &sessions {
             assert!(!session.reason.is_empty());
         }
+        // Both PermissionedAutoConnect and CompanionExtension are signed-in capable
         assert!(
             sessions
                 .iter()
                 .filter(|session| session.signed_in_capable)
                 .count()
-                == 1
+                == 2
         );
     }
 }

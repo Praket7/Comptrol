@@ -263,7 +263,7 @@ fn scan_windows_shortcuts(
 fn read_lnk_target(lnk_path: &std::path::Path) -> Option<std::path::PathBuf> {
     use std::fs;
     let data = fs::read(lnk_path).ok()?;
-    // Minimal .lnk parser: read ShellLinkHeader (76 bytes) then locate LinkTargetIDList or LinkInfo
+    // Minimal .lnk parser per MS-SHLLINK specification
     if data.len() < 76 {
         return None;
     }
@@ -271,8 +271,11 @@ fn read_lnk_target(lnk_path: &std::path::Path) -> Option<std::path::PathBuf> {
     if data[0..4] != [0x4C, 0x00, 0x00, 0x00] {
         return None;
     }
-    let has_link_info = (data[0x14] & 0x01) != 0;
-    let has_link_target_id_list = (data[0x14] & 0x02) != 0;
+    // LinkFlags at offset 0x10 (4 bytes, little-endian)
+    let link_flags = u32::from_le_bytes([data[0x10], data[0x11], data[0x12], data[0x13]]);
+    // Bit 0: HasLinkTargetIDList, Bit 1: HasLinkInfo
+    let has_link_target_id_list = (link_flags & 0x01) != 0;
+    let has_link_info = (link_flags & 0x02) != 0;
     let mut offset = 76usize;
 
     // Skip LinkTargetIDList if present
@@ -286,7 +289,7 @@ fn read_lnk_target(lnk_path: &std::path::Path) -> Option<std::path::PathBuf> {
 
     // Parse LinkInfo if present to extract local base path
     if has_link_info {
-        if offset + 4 > data.len() {
+        if offset + 28 > data.len() {
             return None;
         }
         let link_info_size = u32::from_le_bytes([
@@ -295,21 +298,23 @@ fn read_lnk_target(lnk_path: &std::path::Path) -> Option<std::path::PathBuf> {
             data[offset + 2],
             data[offset + 3],
         ]) as usize;
-        if offset + link_info_size > data.len() || link_info_size < 28 {
+        if link_info_size < 28 || offset + link_info_size > data.len() {
             return None;
         }
+        // LinkInfoFlags at offset +8 from LinkInfo start
         let link_info_flags = u32::from_le_bytes([
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
+            data[offset + 8],
+            data[offset + 9],
+            data[offset + 10],
+            data[offset + 11],
         ]);
         let has_local_base_path = (link_info_flags & 0x01) != 0;
+        // LocalBasePathOffset at offset +12 from LinkInfo start
         let local_base_path_offset = u32::from_le_bytes([
-            data[offset + 16],
-            data[offset + 17],
-            data[offset + 18],
-            data[offset + 19],
+            data[offset + 12],
+            data[offset + 13],
+            data[offset + 14],
+            data[offset + 15],
         ]) as usize;
         if has_local_base_path
             && local_base_path_offset > 0
@@ -423,7 +428,7 @@ fn parse_desktop_file_inline(content: &str, path: &std::path::Path) -> Option<Ap
         id,
         display_name: name.unwrap(),
         platform: "linux".to_owned(),
-        executable: None,
+        executable: exec.map(|e| std::path::PathBuf::from(e)),
         version,
         metadata,
     })

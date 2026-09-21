@@ -196,31 +196,24 @@ pub fn registry() -> Vec<serde_json::Value> {
         .into_iter()
         .map(|key| {
             let provider = provider_for();
-            let readable = provider
+            let caps = provider
                 .as_ref()
-                .map(|p| p.supports(&key) && p.read(&key).is_ok())
-                .unwrap_or(false);
-            let writable = provider
-                .as_ref()
-                .map(|p| p.supports(&key) && p.write(&key, &SettingValue::bool(false)).is_ok())
-                .unwrap_or(false);
-            let human_surface_available = provider
-                .as_ref()
-                .map(|p| !p.human_surface(&key).is_empty())
-                .unwrap_or(false);
-            let readback_verifiable = readable && matches!(
-                key,
-                SettingKey::DefaultBrowser | SettingKey::DisplayBrightness
-            );
+                .map(|p| p.capabilities(&key))
+                .unwrap_or(crate::providers::SettingCapabilities {
+                    readable: false,
+                    writable: false,
+                    human_surface_available: false,
+                    readback_verifiable: false,
+                });
             serde_json::json!({
                 "key": key.name(),
                 "human_gated": key.human_gated(),
                 "reversible": key.reversible(),
-                "supported_on_this_platform": readable || writable || human_surface_available,
-                "readable": readable,
-                "writable": writable,
-                "human_surface_available": human_surface_available,
-                "readback_verifiable": readback_verifiable,
+                "supported_on_this_platform": caps.readable || caps.writable || caps.human_surface_available,
+                "readable": caps.readable,
+                "writable": caps.writable,
+                "human_surface_available": caps.human_surface_available,
+                "readback_verifiable": caps.readback_verifiable,
             })
         })
         .collect()

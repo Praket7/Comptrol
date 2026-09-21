@@ -8,8 +8,19 @@
 use crate::{SettingKey, SettingObservation, SettingValue, SettingsError};
 use std::process::Command;
 
+/// Declarative capability metadata for a setting on a given platform.
+/// No read or write is performed during capability enumeration.
+#[derive(Clone, Debug)]
+pub struct SettingCapabilities {
+    pub readable: bool,
+    pub writable: bool,
+    pub human_surface_available: bool,
+    pub readback_verifiable: bool,
+}
+
 pub trait SettingProvider {
     fn supports(&self, key: &SettingKey) -> bool;
+    fn capabilities(&self, key: &SettingKey) -> SettingCapabilities;
     fn human_surface(&self, key: &SettingKey) -> String;
     fn read(&self, key: &SettingKey) -> Result<SettingObservation, SettingsError>;
     fn write(&self, key: &SettingKey, value: &SettingValue) -> Result<(), SettingsError>;
@@ -42,6 +53,16 @@ impl SettingProvider for WindowsProvider {
         // Only human_surface() is available for opening the Settings page.
         let _ = key;
         false
+    }
+
+    fn capabilities(&self, key: &SettingKey) -> SettingCapabilities {
+        let _ = key;
+        SettingCapabilities {
+            readable: false,
+            writable: false,
+            human_surface_available: true,
+            readback_verifiable: false,
+        }
     }
 
     fn human_surface(&self, key: &SettingKey) -> String {
@@ -78,6 +99,31 @@ impl SettingProvider for MacosProvider {
         // Only DefaultBrowser can be read programmatically via LaunchServices
         // defaults read. All other settings have no wired read/write surface.
         matches!(key, SettingKey::DefaultBrowser)
+    }
+
+    fn capabilities(&self, key: &SettingKey) -> SettingCapabilities {
+        match key {
+            SettingKey::DefaultBrowser => SettingCapabilities {
+                readable: true,
+                writable: false,
+                human_surface_available: true,
+                readback_verifiable: true,
+            },
+            SettingKey::BluetoothEnabled
+            | SettingKey::AccessibilityComptrolStatus
+            | SettingKey::PrivacyMicrophoneAppStatus { .. } => SettingCapabilities {
+                readable: false,
+                writable: false,
+                human_surface_available: true,
+                readback_verifiable: false,
+            },
+            _ => SettingCapabilities {
+                readable: false,
+                writable: false,
+                human_surface_available: false,
+                readback_verifiable: false,
+            },
+        }
     }
 
     fn human_surface(&self, key: &SettingKey) -> String {
@@ -171,6 +217,40 @@ impl SettingProvider for LinuxProvider {
             key,
             SettingKey::DisplayBrightness | SettingKey::DefaultBrowser
         )
+    }
+
+    fn capabilities(&self, key: &SettingKey) -> SettingCapabilities {
+        if !(self.desktop.contains("gnome")
+            || self.desktop.contains("unity")
+            || self.desktop.is_empty())
+        {
+            return SettingCapabilities {
+                readable: false,
+                writable: false,
+                human_surface_available: true,
+                readback_verifiable: false,
+            };
+        }
+        match key {
+            SettingKey::DisplayBrightness => SettingCapabilities {
+                readable: true,
+                writable: true,
+                human_surface_available: true,
+                readback_verifiable: false,
+            },
+            SettingKey::DefaultBrowser => SettingCapabilities {
+                readable: true,
+                writable: false,
+                human_surface_available: true,
+                readback_verifiable: false,
+            },
+            _ => SettingCapabilities {
+                readable: false,
+                writable: false,
+                human_surface_available: true,
+                readback_verifiable: false,
+            },
+        }
     }
 
     fn human_surface(&self, key: &SettingKey) -> String {

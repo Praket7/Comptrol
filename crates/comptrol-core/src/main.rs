@@ -2647,15 +2647,81 @@ fn handle_http<S: HttpStream>(
                     400,
                     "Bad Request",
                     "application/json",
-                    serde_json::to_vec(&json!({"ok":false,"error":"invalid_json"})).unwrap_or_default(),
+                    serde_json::to_vec(&json!({"ok":false,"error":"invalid_json"}))
+                        .unwrap_or_default(),
                     None,
                 );
             }
         };
-        let target_id = request_body.get("target_id").and_then(Value::as_str).unwrap_or("");
-        let method = request_body.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = request_body.get("params").cloned().unwrap_or(Value::Object(Default::default()));
-        return match comptrol::browser::cdp_call(&cdp_endpoint, target_id, None, None, method, params) {
+        let target_id = request_body
+            .get("target_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let method = request_body
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // CDP method allowlist: only safe read-only and common action methods
+        // are permitted through the unauthenticated HTTP bridge.
+        // Dangerous methods (process management, file system, security bypasses)
+        // must go through the normal MCP intent/policy pipeline.
+        const CDP_ALLOWLIST: &[&str] = &[
+            "Page.navigate",
+            "Page.reload",
+            "Page.captureScreenshot",
+            "Page.getFrameTree",
+            "Runtime.evaluate",
+            "Runtime.getProperties",
+            "DOM.getDocument",
+            "DOM.querySelector",
+            "DOM.querySelectorAll",
+            "DOM.getOuterHTML",
+            "DOM.focus",
+            "Input.dispatchMouseEvent",
+            "Input.dispatchKeyEvent",
+            "Input.insertText",
+            "Target.getTargets",
+            "Target.attachToTarget",
+            "Target.detachFromTarget",
+            "Target.activateTarget",
+            "Target.closeTarget",
+            "Target.createTarget",
+            "Browser.getVersion",
+            "Console.enable",
+            "Network.enable",
+            "Network.getResponseBody",
+            "Overlay.highlightNode",
+            "Overlay.hideHighlight",
+            "Accessibility.getFullAXTree",
+        ];
+        if !CDP_ALLOWLIST.contains(&method) {
+            return write_http_response(
+                stream,
+                403,
+                "Forbidden",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok":false,
+                    "error":"method_not_allowed",
+                    "message":format!("CDP method '{method}' is not allowed through the unauthenticated bridge"),
+                    "recovery":"Use the MCP tools/call interface for methods not in the bridge allowlist"
+                }))
+                    .unwrap_or_default(),
+                None,
+            );
+        }
+        let params = request_body
+            .get("params")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default()));
+        return match comptrol::browser::cdp_call(
+            &cdp_endpoint,
+            target_id,
+            None,
+            None,
+            method,
+            params,
+        ) {
             Ok(result) => write_http_response(
                 stream,
                 200,
@@ -2710,6 +2776,38 @@ fn handle_http<S: HttpStream>(
             "OK",
             "application/json",
             serde_json::to_vec(&json!({"ok":true,"connected":connected})).unwrap_or_default(),
+            None,
+        );
+    }
+
+    // ── Browser Bridge extension event endpoints ──────────────────────────
+    if request_line.starts_with("POST /browser/extension/targets ") {
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
+            None,
+        );
+    }
+    if request_line.starts_with("POST /browser/extension/cdp_result ") {
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
+            None,
+        );
+    }
+    if request_line.starts_with("POST /browser/extension/event ") {
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
             None,
         );
     }

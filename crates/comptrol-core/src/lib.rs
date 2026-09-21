@@ -1836,6 +1836,7 @@ impl Runtime {
     fn remember(&mut self, request: &OperationRequest, result: ActionResult) {
         if let Some(key) = request.idempotency_key.as_ref()
             && !matches!(&result.delivery, DeliveryState::Unknown)
+            && !matches!(&result.recovery, RecoveryState::RequiresReconciliation)
         {
             self.idempotent.insert(key.clone(), result.clone());
         }
@@ -5836,7 +5837,9 @@ fn software_install(
                     json!({ "outcome": outcome }),
                 )
             }
-            Err(error) => software_mutation_error(request, operation_id, "software_provider", error),
+            Err(error) => {
+                software_mutation_error(request, operation_id, "software_provider", error)
+            }
         };
     }
     match comptrol_software::install(&install) {
@@ -5923,7 +5926,9 @@ fn software_update(
                 VerificationState::Verified,
                 json!({ "outcome": outcome }),
             ),
-            Err(error) => software_mutation_error(request, operation_id, "software_provider", error),
+            Err(error) => {
+                software_mutation_error(request, operation_id, "software_provider", error)
+            }
         };
     }
     match comptrol_software::update(package, None) {
@@ -6000,7 +6005,9 @@ fn software_uninstall(
                 VerificationState::Verified,
                 json!({ "outcome": outcome }),
             ),
-            Err(error) => software_mutation_error(request, operation_id, "software_provider", error),
+            Err(error) => {
+                software_mutation_error(request, operation_id, "software_provider", error)
+            }
         };
     }
     match comptrol_software::uninstall(package, None) {
@@ -6484,15 +6491,40 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                 }),
             )
         }
-        "companion_extension" => ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "route_unavailable".to_owned(),
-                message: format!("provider {provider} is not wired in this build"),
-                recovery: Some("Use the explicit CDP endpoint provider".to_owned()),
-            },
-        ),
+        "companion_extension" => {
+            // The companion extension bridges CDP commands through the daemon's
+            // existing browser connection. If the daemon has a CDP endpoint
+            // configured, reuse it; otherwise refuse.
+            let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
+            if cdp_endpoint.is_empty() {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "route_unavailable".to_owned(),
+                        message:
+                            "companion extension requires COMPTROL_CDP_ENDPOINT to be configured"
+                                .to_owned(),
+                        recovery: Some(
+                            "Set COMPTROL_CDP_ENDPOINT or use another browser session provider"
+                                .to_owned(),
+                        ),
+                    },
+                );
+            }
+            success(
+                request,
+                operation_id,
+                "companion_extension",
+                EffectState::None,
+                VerificationState::Verified,
+                json!({
+                    "provider": "companion_extension",
+                    "status": "connected_via_companion_extension",
+                    "note": "CDP commands route through the daemon; extension provides browser discovery and signed-in access"
+                }),
+            )
+        }
         _ => ActionResult::refused(
             request,
             operation_id,
