@@ -1,9 +1,9 @@
 {
   "name": "comptrol_browser_bridge",
   "description": "Comptrol Browser Bridge Native Messaging Host",
-  "path": "native_host.py",
+  "path": "__INSTALL_PATH__/native_host.py",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://<EXTENSION_ID>/"
+    "chrome-extension://__EXTENSION_ID__/"
   ]
 }

@@ -5815,6 +5815,30 @@ fn software_install(
             .unwrap_or(false),
         launch_after_install: false,
     };
+    // If human action was already approved, skip the elevation check and retry directly.
+    if runtime.human_actions.approved(operation_id.as_str()) {
+        return match comptrol_software::install(&install) {
+            Ok(outcome) => {
+                let verified = matches!(
+                    outcome.verification,
+                    comptrol_software::InstallVerification::Verified { .. }
+                );
+                success(
+                    request,
+                    operation_id,
+                    "software_provider",
+                    EffectState::Changed,
+                    if verified {
+                        VerificationState::Verified
+                    } else {
+                        VerificationState::Unverified
+                    },
+                    json!({ "outcome": outcome }),
+                )
+            }
+            Err(error) => software_mutation_error(request, operation_id, "software_provider", error),
+        };
+    }
     match comptrol_software::install(&install) {
         Ok(outcome) => {
             let verified = matches!(
@@ -5888,6 +5912,20 @@ fn software_update(
             },
         );
     };
+    // If human action was already approved, skip the elevation check and retry directly.
+    if runtime.human_actions.approved(operation_id.as_str()) {
+        return match comptrol_software::update(package, None) {
+            Ok(outcome) => success(
+                request,
+                operation_id,
+                "software_provider",
+                EffectState::Changed,
+                VerificationState::Verified,
+                json!({ "outcome": outcome }),
+            ),
+            Err(error) => software_mutation_error(request, operation_id, "software_provider", error),
+        };
+    }
     match comptrol_software::update(package, None) {
         Ok(outcome) => success(
             request,
@@ -5951,6 +5989,20 @@ fn software_uninstall(
             },
         );
     };
+    // If human action was already approved, skip the elevation check and retry directly.
+    if runtime.human_actions.approved(operation_id.as_str()) {
+        return match comptrol_software::uninstall(package, None) {
+            Ok(outcome) => success(
+                request,
+                operation_id,
+                "software_provider",
+                EffectState::Changed,
+                VerificationState::Verified,
+                json!({ "outcome": outcome }),
+            ),
+            Err(error) => software_mutation_error(request, operation_id, "software_provider", error),
+        };
+    }
     match comptrol_software::uninstall(package, None) {
         Ok(outcome) => success(
             request,

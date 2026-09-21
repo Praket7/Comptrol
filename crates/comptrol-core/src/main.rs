@@ -2578,6 +2578,142 @@ fn handle_http<S: HttpStream>(
             }
         }
     }
+    // ── Browser Bridge HTTP API (native messaging host → daemon) ──────────
+    if request_line.starts_with("POST /browser/targets ") {
+        let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
+        if cdp_endpoint.is_empty() {
+            return write_http_response(
+                stream,
+                503,
+                "Service Unavailable",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":false,"error":"browser_unavailable"}))
+                    .unwrap_or_default(),
+                None,
+            );
+        }
+        return match comptrol::browser::discover_cached_targets(&cdp_endpoint) {
+            Ok(targets) => {
+                let list: Vec<Value> = targets
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "id": t.id,
+                            "type": t.target_type,
+                            "title": t.title,
+                            "url": t.url,
+                            "web_socket_url": t.web_socket_url,
+                        })
+                    })
+                    .collect();
+                write_http_response(
+                    stream,
+                    200,
+                    "OK",
+                    "application/json",
+                    serde_json::to_vec(&json!({"ok":true,"targets":list})).unwrap_or_default(),
+                    None,
+                )
+            }
+            Err(error) => write_http_response(
+                stream,
+                502,
+                "Bad Gateway",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":false,"error":error.code,"message":error.message}))
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
+    }
+    if request_line.starts_with("POST /browser/cdp/command ") {
+        let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
+        if cdp_endpoint.is_empty() {
+            return write_http_response(
+                stream,
+                503,
+                "Service Unavailable",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":false,"error":"browser_unavailable"}))
+                    .unwrap_or_default(),
+                None,
+            );
+        }
+        let request_body: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return write_http_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    serde_json::to_vec(&json!({"ok":false,"error":"invalid_json"})).unwrap_or_default(),
+                    None,
+                );
+            }
+        };
+        let target_id = request_body.get("target_id").and_then(Value::as_str).unwrap_or("");
+        let method = request_body.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = request_body.get("params").cloned().unwrap_or(Value::Object(Default::default()));
+        return match comptrol::browser::cdp_call(&cdp_endpoint, target_id, None, None, method, params) {
+            Ok(result) => write_http_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":true,"result":result})).unwrap_or_default(),
+                None,
+            ),
+            Err(error) => write_http_response(
+                stream,
+                502,
+                "Bad Gateway",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":false,"error":error.code,"message":error.message}))
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
+    }
+    if request_line.starts_with("POST /browser/debugger/attach ")
+        || request_line.starts_with("POST /browser/debugger/detach ")
+    {
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
+            None,
+        );
+    }
+    if request_line.starts_with("POST /browser/groups/restore ") {
+        return write_http_response(
+            stream,
+            501,
+            "Not Implemented",
+            "application/json",
+            serde_json::to_vec(&json!({"ok":false,"error":"not_implemented","message":"Tab group restore requires browser extension API"}))
+                .unwrap_or_default(),
+            None,
+        );
+    }
+    if request_line.starts_with("POST /browser/status ") {
+        let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
+        let connected = !cdp_endpoint.is_empty()
+            && comptrol::browser::discover_cached_targets(&cdp_endpoint)
+                .map(|t| !t.is_empty())
+                .unwrap_or(false);
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(&json!({"ok":true,"connected":connected})).unwrap_or_default(),
+            None,
+        );
+    }
+
     if !request_line.starts_with("POST /mcp ") {
         return write_http_response(
             stream,

@@ -259,15 +259,79 @@ fn scan_windows_shortcuts(
 }
 
 #[cfg(target_os = "windows")]
+#[cfg(target_os = "windows")]
 fn read_lnk_target(lnk_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    // Simplified .lnk parsing - just check if it points to an executable
-    // In production, use a proper .lnk parser or COM shell link
+    use std::fs;
+    let data = fs::read(lnk_path).ok()?;
+    // Minimal .lnk parser: read ShellLinkHeader (76 bytes) then locate LinkTargetIDList or LinkInfo
+    if data.len() < 76 {
+        return None;
+    }
+    // Check signature: 4C 00 00 00 (CLSID_ShellLink)
+    if data[0..4] != [0x4C, 0x00, 0x00, 0x00] {
+        return None;
+    }
+    let has_link_info = (data[0x14] & 0x01) != 0;
+    let has_link_target_id_list = (data[0x14] & 0x02) != 0;
+    let mut offset = 76usize;
+
+    // Skip LinkTargetIDList if present
+    if has_link_target_id_list {
+        if offset + 2 > data.len() {
+            return None;
+        }
+        let id_list_size = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2 + id_list_size;
+    }
+
+    // Parse LinkInfo if present to extract local base path
+    if has_link_info {
+        if offset + 4 > data.len() {
+            return None;
+        }
+        let link_info_size = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        if offset + link_info_size > data.len() || link_info_size < 28 {
+            return None;
+        }
+        let link_info_flags = u32::from_le_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]);
+        let has_local_base_path = (link_info_flags & 0x01) != 0;
+        let local_base_path_offset = u32::from_le_bytes([
+            data[offset + 16],
+            data[offset + 17],
+            data[offset + 18],
+            data[offset + 19],
+        ]) as usize;
+        if has_local_base_path
+            && local_base_path_offset > 0
+            && offset + local_base_path_offset < data.len()
+        {
+            let path_bytes = &data[offset + local_base_path_offset..];
+            let end = path_bytes.iter().position(|&b| b == 0)?;
+            let path_str = std::str::from_utf8(&path_bytes[..end]).ok()?;
+            return Some(std::path::PathBuf::from(path_str));
+        }
+    }
     None
 }
 
 #[cfg(not(target_os = "windows"))]
 fn windows_entries() -> Result<Vec<AppEntry>, RegistryError> {
     Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_lnk_target(_lnk_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    None
 }
 
 /// Linux: enumerate apps via XDG desktop entries

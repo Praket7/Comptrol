@@ -77,7 +77,29 @@ pub fn process_alive(pid: u32) -> Result<bool, LaunchError> {
         let rc = unsafe { probe_liveness(pid as i32) };
         Ok(rc == 0)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::RawHandle;
+        extern "system" {
+            fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> RawHandle;
+            fn CloseHandle(handle: RawHandle) -> i32;
+            fn WaitForSingleObject(handle: RawHandle, milliseconds: u32) -> u32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 258;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return Ok(false);
+            }
+            // Check if process has exited by waiting briefly (0ms = immediate check)
+            let exit_code = WaitForSingleObject(handle, 0);
+            CloseHandle(handle);
+            // WAIT_OBJECT_0 (0) means process has exited, WAIT_TIMEOUT (258) means still running
+            Ok(exit_code == STILL_ACTIVE || exit_code == 0x102) // 0x102 = WAIT_TIMEOUT
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         Err(LaunchError::Io(std::io::Error::other(
@@ -159,6 +181,29 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
             })
         }
         Resource::None => {
+            // On Windows, detect AUMID (AppUserModelID) patterns and use shell:AppsFolder
+            #[cfg(windows)]
+            {
+                let app_id = &request.app.id;
+                let is_aumid = app_id.contains('_')
+                    && (app_id.ends_with("!App") || app_id.ends_with("!Application"));
+                if is_aumid {
+                    let shell_path = format!("shell:AppsFolder\\{app_id}");
+                    let mut command = std::process::Command::new("explorer.exe");
+                    command.arg(&shell_path);
+                    command.stdin(Stdio::null()).stdout(Stdio::null());
+                    let child = command.spawn()?;
+                    let pid = child.id();
+                    std::thread::sleep(settle);
+                    return Ok(LaunchOutcome {
+                        app_id: request.app.id.clone(),
+                        route: "aumid_shell".to_owned(),
+                        pid: Some(pid),
+                        resource: request.resource.clone(),
+                        metadata,
+                    });
+                }
+            }
             let executable = request
                 .app
                 .executable

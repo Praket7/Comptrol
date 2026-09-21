@@ -152,7 +152,7 @@ async function sendTargetsToNative() {
       pinned: tab.pinned,
       groupId: tab.groupId,
       status: tab.status
-    });
+    }));
     sendToNative({ type: "targets_list", targets: targetList });
   } catch (error) {
     console.error("Failed to get targets:", error);

@@ -195,12 +195,32 @@ pub fn registry() -> Vec<serde_json::Value> {
     SettingKey::all()
         .into_iter()
         .map(|key| {
-            let supported = provider_for().map(|p| p.supports(&key)).unwrap_or(false);
+            let provider = provider_for();
+            let readable = provider
+                .as_ref()
+                .map(|p| p.supports(&key) && p.read(&key).is_ok())
+                .unwrap_or(false);
+            let writable = provider
+                .as_ref()
+                .map(|p| p.supports(&key) && p.write(&key, &SettingValue::bool(false)).is_ok())
+                .unwrap_or(false);
+            let human_surface_available = provider
+                .as_ref()
+                .map(|p| !p.human_surface(&key).is_empty())
+                .unwrap_or(false);
+            let readback_verifiable = readable && matches!(
+                key,
+                SettingKey::DefaultBrowser | SettingKey::DisplayBrightness
+            );
             serde_json::json!({
                 "key": key.name(),
                 "human_gated": key.human_gated(),
                 "reversible": key.reversible(),
-                "supported_on_this_platform": supported,
+                "supported_on_this_platform": readable || writable || human_surface_available,
+                "readable": readable,
+                "writable": writable,
+                "human_surface_available": human_surface_available,
+                "readback_verifiable": readback_verifiable,
             })
         })
         .collect()
