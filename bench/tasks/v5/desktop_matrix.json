@@ -1,7 +1,7 @@
 {
   "task_id": "v5.desktop_matrix",
   "benchmark_suite": "desktop",
-  "goal": "Measure desktop resolution, permission, and popup classification tasks against local fixtures and live macOS where safe.",
+  "goal": "Measure app resolution, permission, and popup classification tasks against local fixtures and live macOS where safe.",
   "timeout_ms": 60000,
   "initial_state": "fresh Comptrol state directory",
   "required_capabilities": ["tools/call"],
@@ -12,7 +12,7 @@
       "iterations": 3,
       "verifier": "resolved_true_path_nonempty",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "desktop.resolve", "params": {"bundle_id": "com.apple.TextEdit"}, "idempotency_key": "bench-desktop-resolve-001"}}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "app.resolve", "params": {"app": "TextEdit"}, "idempotency_key": "bench-desktop-resolve-001"}}}
       ]
     },
     {
@@ -21,16 +21,16 @@
       "iterations": 2,
       "verifier": "apps_array_nonempty",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "desktop.list", "params": {}, "idempotency_key": "bench-desktop-list-001"}}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "app.list", "params": {}, "idempotency_key": "bench-desktop-list-001"}}}
       ]
     },
     {
       "task_id": "v5.desktop.permission_status",
-      "goal": "Check accessibility permission status; record honestly if unavailable.",
+      "goal": "Check permission status; record honestly if unavailable.",
       "iterations": 1,
       "verifier": "has_status_field",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "desktop.permission.status", "params": {"permission": "accessibility"}, "idempotency_key": "bench-desktop-perm-001"}}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "permission.status", "params": {"permission": "accessibility"}, "idempotency_key": "bench-desktop-perm-001"}}}
       ]
     },
     {

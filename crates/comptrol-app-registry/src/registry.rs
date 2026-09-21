@@ -361,12 +361,12 @@ fn linux_entries() -> Result<Vec<AppEntry>, RegistryError> {
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
                 continue;
             }
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Some(app_entry) = parse_desktop_file_inline(&content, &path) {
-                    let id = app_entry.id.clone();
-                    if seen.insert(id) {
-                        entries.push(app_entry);
-                    }
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && let Some(app_entry) = parse_desktop_file_inline(&content, &path)
+            {
+                let id = app_entry.id.clone();
+                if seen.insert(id) {
+                    entries.push(app_entry);
                 }
             }
         }

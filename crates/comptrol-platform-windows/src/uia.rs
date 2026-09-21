@@ -16,6 +16,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_WindowControlTypeId, UIA_WindowPatternId,
 };
 
+#[allow(non_upper_case_globals)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     Press,
@@ -193,7 +194,6 @@ impl UiaScopedCache {
                 _ => None,
             }
             .map(str::to_owned);
-            #[allow(clippy::nonstandard_macro_braces)]
             let _ = control_type; // suppress unused warning for match arm constants
             entries.push(SemanticCacheEntry {
                 process_id: entry_process_id,

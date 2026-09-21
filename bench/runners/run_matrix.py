@@ -315,6 +315,8 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(results, indent=2, sort_keys=True))
+    if any(not task["verified_success"] for task in results["tasks"]):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

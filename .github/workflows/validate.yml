@@ -69,6 +69,10 @@ jobs:
           if-no-files-found: error
       - name: V5 desktop benchmark matrix
         run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/desktop_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-desktop.json
+      - name: V5 browser benchmark matrix
+        run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/browser_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-browser.json
+      - name: V5 workflow benchmark matrix
+        run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/workflow_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-workflow.json
       - name: V5 adapter benchmark matrix
         run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/adapter_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-adapter.json
       - name: V5 recovery benchmark matrix

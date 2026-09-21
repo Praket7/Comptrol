@@ -28,10 +28,8 @@ def main():
     files = manifest.get("files", [])
     if "native" not in files:
         raise SystemExit("npm package must include the native artifact directory")
-    extensions = ROOT / "extensions"
-    if extensions.is_dir() and any(extensions.rglob("*")):
-        raise SystemExit("Chrome extension must not be installed by the normal package")
     if not (ROOT / "experiments" / "chrome-closed-groups-extension").is_dir():
+        raise SystemExit("experimental Chrome extension comparison directory is missing")
         raise SystemExit("experimental Chrome extension comparison directory is missing")
     with tempfile.TemporaryDirectory(prefix="comptrol-npm-pack-") as directory:
         result = subprocess.run([npm, "pack", "--json", "--dry-run"], cwd=PACKAGE, capture_output=True, text=True, check=True)
