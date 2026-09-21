@@ -37,6 +37,9 @@ POLL_INTERVAL_MS = 200
 POLL_INTERVAL_MAX_MS = 2000
 
 
+# Shared lock for stdout writes to prevent interleaved messages
+stdout_lock = threading.Lock()
+
 def read_message():
     """Read a length-prefixed JSON message from stdin."""
     raw_length = sys.stdin.buffer.read(4)
@@ -48,11 +51,12 @@ def read_message():
 
 
 def write_message(message):
-    """Write a length-prefixed JSON message to stdout."""
+    """Write a length-prefixed JSON message to stdout with locking."""
     encoded = json.dumps(message, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(struct.pack("<I", len(encoded)))
-    sys.stdout.buffer.write(encoded)
-    sys.stdout.buffer.flush()
+    with stdout_lock:
+        sys.stdout.buffer.write(struct.pack("<I", len(encoded)))
+        sys.stdout.buffer.write(encoded)
+        sys.stdout.buffer.flush()
 
 
 def daemon_post(endpoint, params=None):
@@ -87,10 +91,8 @@ def command_poll_loop(native_port_ref):
         # Wait a bit before polling
         time.sleep(poll_interval)
 
-        # Get the current native port
-        port = native_port_ref.get("port")
         connected = native_port_ref.get("connected", False)
-        if not port or not connected:
+        if not connected:
             continue
 
         # Poll daemon for pending commands
@@ -120,7 +122,7 @@ def command_poll_loop(native_port_ref):
             }
 
             try:
-                port.postMessage(extension_msg)
+                write_message(extension_msg)
             except Exception as e:
                 # Failed to send; report error back to daemon
                 daemon_post("/browser/command/result", {

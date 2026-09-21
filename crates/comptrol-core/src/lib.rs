@@ -326,7 +326,7 @@ pub enum RecoveryState {
     Stopped,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct ComptrolError {
     pub code: String,
     pub message: String,
@@ -6507,40 +6507,18 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                 }),
             )
         }
-        "companion_extension" => {
-            // The companion extension bridges CDP commands through the daemon's
-            // existing browser connection. If the daemon has a CDP endpoint
-            // configured, reuse it; otherwise refuse.
-            let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
-            if cdp_endpoint.is_empty() {
-                return ActionResult::refused(
-                    request,
-                    operation_id,
-                    ComptrolError {
-                        code: "route_unavailable".to_owned(),
-                        message:
-                            "companion extension requires COMPTROL_CDP_ENDPOINT to be configured"
-                                .to_owned(),
-                        recovery: Some(
-                            "Set COMPTROL_CDP_ENDPOINT or use another browser session provider"
-                                .to_owned(),
-                        ),
-                    },
-                );
-            }
-            success(
-                request,
-                operation_id,
-                "companion_extension",
-                EffectState::None,
-                VerificationState::Verified,
-                json!({
-                    "provider": "companion_extension",
-                    "status": "connected_via_companion_extension",
-                    "note": "CDP commands route through the daemon; extension provides browser discovery and signed-in access"
-                }),
-            )
-        }
+        "companion_extension" => success(
+            request,
+            operation_id,
+            "companion_extension",
+            EffectState::None,
+            VerificationState::Verified,
+            json!({
+                "provider": "companion_extension",
+                "status": "connected_via_companion_extension",
+                "note": "CDP commands route through the daemon; extension provides browser discovery and signed-in access"
+            }),
+        ),
         _ => ActionResult::refused(
             request,
             operation_id,
@@ -9922,9 +9900,11 @@ mod tests {
             json!({"provider": "companion_extension"}),
             Risk::R2,
         );
+        // CompanionExtension no longer requires COMPTROL_CDP_ENDPOINT;
+        // it routes through the daemon's native bridge instead.
         assert_eq!(
-            unavailable.error.as_ref().map(|e| e.code.as_str()),
-            Some("route_unavailable")
+            unavailable.error, None,
+            "CompanionExtension should not return route_unavailable when CDP endpoint is absent"
         );
     }
 }

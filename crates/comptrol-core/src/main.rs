@@ -3054,10 +3054,13 @@ fn handle_http<S: HttpStream>(
         );
     }
     if request_line.starts_with("GET /browser/command/result/") {
-        // Agent polls for a specific command result by request_id
-        let request_id = request_line
-            .trim_start_matches("GET /browser/command/result/")
-            .trim_end_matches(" ")
+        // Agent polls for a specific command result by request_id.
+        // Request line format: "GET /browser/command/result/br_123 HTTP/1.1"
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
+        let path = parts.get(1).copied().unwrap_or("");
+        let request_id = path
+            .strip_prefix("/browser/command/result/")
+            .unwrap_or(path)
             .to_owned();
         let mut queue = command_queue.lock().expect("command queue lock poisoned");
         return match queue.take_result(&request_id) {
