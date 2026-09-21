@@ -179,23 +179,23 @@ fn windows_entries() -> Result<Vec<AppEntry>, RegistryError> {
         ])
         .output();
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Ok(apps) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
-                for app in apps {
-                    let id = app.get("AppID").and_then(|v| v.as_str()).unwrap_or("");
-                    let name = app.get("Name").and_then(|v| v.as_str()).unwrap_or("");
-                    if !id.is_empty() && !name.is_empty() && seen.insert(id.to_owned()) {
-                        entries.push(AppEntry {
-                            id: id.to_owned(),
-                            display_name: name.to_owned(),
-                            platform: "windows".to_owned(),
-                            executable: None,
-                            version: None,
-                            metadata: BTreeMap::new(),
-                        });
-                    }
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Ok(apps) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
+            for app in apps {
+                let id = app.get("AppID").and_then(|v| v.as_str()).unwrap_or("");
+                let name = app.get("Name").and_then(|v| v.as_str()).unwrap_or("");
+                if !id.is_empty() && !name.is_empty() && seen.insert(id.to_owned()) {
+                    entries.push(AppEntry {
+                        id: id.to_owned(),
+                        display_name: name.to_owned(),
+                        platform: "windows".to_owned(),
+                        executable: None,
+                        version: None,
+                        metadata: BTreeMap::new(),
+                    });
                 }
             }
         }
@@ -234,23 +234,23 @@ fn scan_windows_shortcuts(
             scan_windows_shortcuts(&path, entries, seen)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("lnk") {
             // Parse .lnk file to get target path
-            if let Some(target) = read_lnk_target(&path) {
-                if let Some(stem) = target.file_stem().and_then(|s| s.to_str()) {
-                    let stem = stem.to_owned();
-                    if seen.insert(stem.clone()) {
-                        entries.push(AppEntry {
-                            id: format!("lnk.{stem}"),
-                            display_name: path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or(&stem)
-                                .to_owned(),
-                            platform: "windows".to_owned(),
-                            executable: Some(target),
-                            version: None,
-                            metadata: BTreeMap::new(),
-                        });
-                    }
+            if let Some(target) = read_lnk_target(&path)
+                && let Some(stem) = target.file_stem().and_then(|s| s.to_str())
+            {
+                let stem = stem.to_owned();
+                if seen.insert(stem.clone()) {
+                    entries.push(AppEntry {
+                        id: format!("lnk.{stem}"),
+                        display_name: path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&stem)
+                            .to_owned(),
+                        platform: "windows".to_owned(),
+                        executable: Some(target),
+                        version: None,
+                        metadata: BTreeMap::new(),
+                    });
                 }
             }
         }

@@ -52,7 +52,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-mtls-") as directory:
     (root / "client.ext").write_text("extendedKeyUsage=clientAuth\n", encoding="utf-8")
     run(["openssl", "x509", "-req", "-in", "client.csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-CAcreateserial", "-out", "client.crt", "-days", "1", "-extfile", "client.ext"], root)
     port = free_port()
-    environment = {**os.environ, "COMPTROL_STATE_DIR": str(root / "state"), "COMPTROL_MTLS_BIND": "127.0.0.1", "COMPTROL_MTLS_CERT": str(root / "server.crt"), "COMPTROL_MTLS_KEY": str(root / "server.key"), "COMPTROL_MTLS_CLIENT_CA": str(root / "ca.crt")}
+    environment = {**os.environ, "COMPTROL_STATE_DIR": str(root / "state"), "COMPTROL_MTLS_BIND": "127.0.0.1", "COMPTROL_MTLS_CERT": str(root / "server.crt"), "COMPTROL_MTLS_KEY": str(root / "server.key"), "COMPTROL_MTLS_CLIENT_CA": str(root / "ca.crt"), "COMPTROL_MTLS_AUTO_PAIR": "1"}
     process = subprocess.Popen([BIN, "serve-mtls", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment)
     try:
         deadline = time.time() + 30

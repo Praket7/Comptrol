@@ -190,6 +190,7 @@ fn now_ms() -> u128 {
 /// Discover local browser surfaces without connecting to anything.
 /// Check if the companion extension native host is registered on this platform.
 fn native_bridge_available() -> bool {
+    #[allow(unused_variables)]
     let host_id = "comptrol_browser_bridge";
     #[cfg(target_os = "macos")]
     {

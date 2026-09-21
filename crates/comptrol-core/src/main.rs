@@ -3119,9 +3119,23 @@ fn handle_http<S: HttpStream>(
         let mut store = pairing_store.lock().expect("pairing store lock poisoned");
         let pairing = match store.find_by_fingerprint(peer_fp).cloned() {
             Some(p) => p,
-            None => match store.auto_pair(peer_fp) {
-                Ok(p) => p,
-                Err(_) => {
+            None => {
+                if std::env::var("COMPTROL_MTLS_AUTO_PAIR").as_deref() == Ok("1") {
+                    match store.auto_pair(peer_fp) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return write_http_response(
+                                stream,
+                                403,
+                                "Forbidden",
+                                "application/json",
+                                serde_json::to_vec(&json!({"error":"mtls_identity_not_paired"}))
+                                    .unwrap_or_default(),
+                                None,
+                            );
+                        }
+                    }
+                } else {
                     return write_http_response(
                         stream,
                         403,
@@ -3132,7 +3146,7 @@ fn handle_http<S: HttpStream>(
                         None,
                     );
                 }
-            },
+            }
         };
         let pairing_id = pairing.pairing_id.clone();
         let required_scope = scope_for_method(method, request.get("params"));
