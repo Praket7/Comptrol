@@ -196,9 +196,19 @@ def main():
 
         elif msg_type == "debugger_event":
             result = daemon_post("/browser/extension/event", {
-                "event": message.get("event"),
+                "event": message.get("method") or message.get("event"),
                 "targetId": message.get("targetId"),
-                "data": message.get("data"),
+                "generation": message.get("generation"),
+                "data": message.get("params") or message.get("data"),
+            })
+            if request_id:
+                result["requestId"] = request_id
+            write_message(result)
+
+        elif msg_type == "group_snapshots":
+            result = daemon_post("/browser/extension/event", {
+                "event": "group_snapshots",
+                "data": message.get("snapshots"),
             })
             if request_id:
                 result["requestId"] = request_id

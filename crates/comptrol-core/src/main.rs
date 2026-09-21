@@ -2938,7 +2938,7 @@ fn handle_http<S: HttpStream>(
             .unwrap_or("");
         if !request_id.is_empty() {
             let mut queue = command_queue.lock().expect("command queue lock poisoned");
-            let result = if let Some(error) = request_body.get("error") {
+            let result = if let Some(error) = request_body.get("error").filter(|v| !v.is_null()) {
                 json!({"ok": false, "error": error})
             } else {
                 json!({"ok": true, "result": request_body.get("result")})
@@ -2970,7 +2970,7 @@ fn handle_http<S: HttpStream>(
         // Store event results for commands that have a requestId
         if !request_id.is_empty() {
             let mut queue = command_queue.lock().expect("command queue lock poisoned");
-            let result = if let Some(error) = request_body.get("error") {
+            let result = if let Some(error) = request_body.get("error").filter(|v| !v.is_null()) {
                 json!({"ok": false, "error": error, "event": event})
             } else {
                 json!({"ok": true, "event": event, "data": request_body.get("data")})

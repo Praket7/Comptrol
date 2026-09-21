@@ -15,7 +15,10 @@ import os
 import platform
 import shutil
 import sys
-import winreg
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
 
 def get_manifest_dir():

@@ -7,6 +7,7 @@
 //! Platforms without an implemented enumeration provider report
 //! `native_restore_unavailable` instead of approximating a restore.
 
+#[allow(unused_imports)]
 use crate::restore::{RestoreEntry, RestoreError, RestoreKind, native_unavailable, refuse};
 
 /// Enumerate recently-closed restore entries through the native surface.

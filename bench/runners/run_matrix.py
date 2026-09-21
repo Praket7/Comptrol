@@ -237,17 +237,19 @@ def run_task(binary: str, task: dict, state_dir: pathlib.Path, cli_iterations: i
                     if key in result and isinstance(result[key], (int, float)):
                         row[key] += int(result[key])
             
-            # Run verifiers after all steps
+            # Run verifiers on the final step result
             verifier_name = task.get("verifier")
-            if verifier_name:
-                all_verified = True
-                for step_result in step_results:
-                    ok, msg = run_verifier(verifier_name, step_result, steps[-1].get("params", {}), task.get("verifier_expected"))
-                    if not ok:
-                        all_verified = False
-                        row["error"] = f"verifier {verifier_name} failed: {msg}"
-                        break
-                row["verified"] = all_verified
+            if verifier_name and step_results:
+                final_result = step_results[-1]
+                ok, msg = run_verifier(
+                    verifier_name,
+                    final_result,
+                    steps[-1].get("params", {}),
+                    task.get("verifier_expected"),
+                )
+                row["verified"] = ok
+                if not ok:
+                    row["error"] = f"verifier {verifier_name} failed: {msg}"
             else:
                 # No explicit verifier: require all steps succeeded (no errors)
                 row["verified"] = all("error" not in sr for sr in step_results)

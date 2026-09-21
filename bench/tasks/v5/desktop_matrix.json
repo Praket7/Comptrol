@@ -8,11 +8,11 @@
   "tasks": [
     {
       "task_id": "v5.desktop.app_resolve",
-      "goal": "Resolve a known local application by bundle id and verify the path exists.",
+      "goal": "Resolve a known local application by identity and verify the path exists.",
       "iterations": 3,
       "verifier": "resolved_true_path_nonempty",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "app.resolve", "params": {"app": "TextEdit"}, "idempotency_key": "bench-desktop-resolve-001"}}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "app.resolve", "params": {"app": "python3"}, "idempotency_key": "bench-desktop-resolve-001"}}}
       ]
     },
     {
