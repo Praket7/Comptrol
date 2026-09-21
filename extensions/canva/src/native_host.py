@@ -11,8 +11,8 @@ Message format (native messaging):
 - UTF-8 JSON message body
 
 Protocol:
-- Extension -> Host: {"protocol": "...", "token": "...", "nonce": "...", "session_id": "...", "design_id": "...", "op": {...}}
-- Host -> Extension: {"ok": true, "protocol": "...", "receipt": {...}, "nonce_echo": "..."}
+- Extension -> Host: {"protocol": "...", "request_id": "...", "token": "...", "nonce": "...", "session_id": "...", "design_id": "...", "op": {...}}
+- Host -> Extension: {"ok": true, "protocol": "...", "request_id": "...", "receipt": {...}, "nonce_echo": "..."}
 
 The host validates each message against the local bridge server and
 returns correlated receipts.
@@ -22,13 +22,13 @@ import json
 import os
 import struct
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
 
 LOCAL_BRIDGE_URL = os.environ.get("COMPTROL_CANVA_BRIDGE_URL", "http://127.0.0.1:8765")
 PROTOCOL = "comptrol.canva.bridge/0.1.0"
+NATIVE_HOST_ID = "comptrol_canva_native_host"
 
 def read_message():
     """Read a length-prefixed JSON message from stdin."""
@@ -53,7 +53,10 @@ def forward_to_bridge(envelope):
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-Comptrol-Native-Host": NATIVE_HOST_ID,
+        },
         method="POST"
     )
     try:
@@ -72,10 +75,14 @@ def main():
             break
         
         if not isinstance(message, dict) or message.get("protocol") != PROTOCOL:
-            write_message({"ok": False, "error": "invalid_protocol"})
+            write_message({"ok": False, "error": "invalid_protocol", "request_id": message.get("request_id")})
             continue
         
+        request_id = message.get("request_id")
         response = forward_to_bridge(message)
+        # Preserve request_id in response for correlation
+        if request_id:
+            response["request_id"] = request_id
         write_message(response)
 
 if __name__ == "__main__":

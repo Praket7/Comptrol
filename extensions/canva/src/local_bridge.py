@@ -46,6 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PROTOCOL = "comptrol.canva.bridge/0.1.0"
 TOKEN_ENV = "COMPTROL_CANVA_BRIDGE_TOKEN"
 ORIGIN_ALLOWLIST = ("https://www.canva.com", "https://canva.com")
+NATIVE_HOST_ID = "comptrol_canva_native_host"
 LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -166,6 +167,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
     # -- generic helpers -------------------------------------------------
 
     def _allow_origin(self) -> str | None:
+        # Allow native host requests via special header
+        native_host = self.headers.get("X-Comptrol-Native-Host")
+        if native_host == NATIVE_HOST_ID:
+            return "native_host"
         origin = self.headers.get("Origin")
         return origin if origin in ORIGIN_ALLOWLIST else None
 

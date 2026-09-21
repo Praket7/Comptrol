@@ -10,7 +10,7 @@
       "task_id": "v5.adapter.resolve_handshake",
       "goal": "Resolve adapter handshake and verify provider metadata.",
       "iterations": 2,
-      "final_verifier": "response contains provider metadata",
+      "verifier": "contains_provider_metadata",
       "steps": [
         {"method": "adapter.resolve", "params": {"action": "handshake"}}
       ]
@@ -19,7 +19,7 @@
       "task_id": "v5.adapter.capabilities_all",
       "goal": "Request capabilities from all adapters and verify non-empty result.",
       "iterations": 1,
-      "final_verifier": "response contains non-empty capabilities map",
+      "verifier": "capabilities_non_empty",
       "steps": [
         {"method": "adapter.capabilities", "params": {}}
       ]
@@ -28,11 +28,11 @@
       "task_id": "v5.adapter.describe_all",
       "goal": "Describe all adapters and verify the result is a non-empty map.",
       "iterations": 1,
-      "final_verifier": "response contains non-empty description map",
+      "verifier": "descriptions_non_empty",
       "steps": [
         {"method": "adapter.describe", "params": {}}
       ]
     }
   ],
-  "final_verifier": "all task final_verifiers pass"
+  "final_verifier": "all task verifiers pass"
 }

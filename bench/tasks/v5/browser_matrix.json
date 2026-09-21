@@ -10,7 +10,7 @@
       "task_id": "v5.browser.ensure_state_reuse",
       "goal": "Confirm repeated ensure_state calls reuse the existing session without a page reload.",
       "iterations": 3,
-      "final_verifier": "each response contains session_id and reload_count is 0",
+      "verifier": "session_id_no_reload",
       "steps": [
         {"method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}}
       ]
@@ -19,7 +19,7 @@
       "task_id": "v5.browser.spa_navigation",
       "goal": "Navigate a single-page fixture and verify the DOM target updates without full reload.",
       "iterations": 3,
-      "final_verifier": "response confirms navigation and current_url matches spa.html",
+      "verifier": "navigation_spa",
       "steps": [
         {"method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}},
         {"method": "browser.cdp.navigate", "params": {"target": "fixture://browser/index.html", "url": "fixture://browser/spa.html"}}
@@ -29,12 +29,12 @@
       "task_id": "v5.browser.dialog_handling",
       "goal": "Open a fixture dialog and verify the dialog handler routes the alert correctly.",
       "iterations": 3,
-      "final_verifier": "response contains handled: true",
+      "verifier": "dialog_handled",
       "steps": [
         {"method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}},
         {"method": "browser.cdp.dialog", "params": {"target": "fixture://browser/index.html", "dialog_type": "alert", "message": "test"}}
       ]
     }
   ],
-  "final_verifier": "all task final_verifiers pass"
+  "final_verifier": "all task verifiers pass"
 }

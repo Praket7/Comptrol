@@ -5947,11 +5947,19 @@ fn popup_inspect(request: &OperationRequest, operation_id: String) -> ActionResu
                 "target": target,
             },
             "never_auto": class.never_auto(),
-            "note": "classification only; use popup.dismiss with policy for eligible classes",
+            "note": "classification only; use popup.dismiss with policy for eligible classes. Browser JS dialogs (alert/confirm/prompt) are dismissed via CDP. Native platform popups are NOT YET SUPPORTED for automated dismissal.",
         }),
     )
 }
 
+/// Dismiss a popup on a specific target.
+///
+/// Supports:
+/// - Browser JavaScript dialogs (alert, confirm, prompt, beforeunload) via CDP Page.handleJavaScriptDialog
+/// - NOT YET SUPPORTED: Native platform popups (Windows UIA, macOS AX, Linux AT-SPI)
+///
+/// Protected classes (auth, payment, security, privilege) are never auto-dismissed.
+/// Eligible classes require explicit user policy preferences.
 fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResult {
     let (role, name, text) = popup_signals(request);
     let class = comptrol_popup::classify(&role, &name, &text);
@@ -6018,7 +6026,8 @@ fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResu
         Ok(plan) => {
             // Execute the dismissal on the originating surface.
             // For browser targets: use CDP Page.handleJavaScriptDialog with dismiss.
-            // For native targets: use platform accessibility API (not yet wired).
+            // For native targets: platform accessibility API actuation is NOT YET IMPLEMENTED.
+            //   See https://github.com/Praket7/Comptrol/issues/XXX for tracking.
             if let Some(target_spec) = request.target.as_ref()
                 && let Some(target_id) = target_spec.id.as_ref().or(target_spec.name.as_ref())
             {
@@ -6034,7 +6043,7 @@ fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResu
                     return browser_cdp_dialog(
                         &dialog_request,
                         operation_id,
-                        &std::ffi::OsStr::new(&endpoint),
+                        std::ffi::OsStr::new(&endpoint),
                     );
                 }
             }

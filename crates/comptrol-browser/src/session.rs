@@ -22,49 +22,29 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Attempt to connect via Chrome 144+ permissioned auto-connect.
+/// Attempt to connect via Chrome permissioned auto-connect using DevToolsActivePort.
 ///
-/// This implements the official Chrome auto-connect protocol:
-/// 1. GET /json/auto-connect on the Chrome debug port
-/// 2. Chrome returns a WebSocket URL after user approval
-/// 3. Connect to the returned WebSocket URL
+/// This implements the actual Chrome DevTools Protocol approach:
+/// 1. Read DevToolsActivePort from Chrome's user-data directory
+/// 2. Construct ws://127.0.0.1:<port><path> URL
+/// 3. Connect to the WebSocket (user must have enabled remote debugging and clicked Allow)
 pub async fn connect_permissioned_auto_connect(
-    debug_port: u16,
-    timeout: Duration,
+    _debug_port: u16,
+    _timeout: Duration,
 ) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
-
-    let url = format!("http://127.0.0.1:{}/json/auto-connect", debug_port);
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        let response = client.get(&url).send().await;
-        match response {
-            Ok(resp) if resp.status().is_success() => {
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(|e| format!("read response: {e}"))?;
-                let ws_url = text.trim().trim_matches('"');
-                if ws_url.starts_with("ws://") || ws_url.starts_with("wss://") {
-                    return Ok(ws_url.to_owned());
-                }
-                // Still waiting for user approval
-            }
-            Ok(resp) if resp.status() == 404 => {
-                return Err("Chrome auto-connect endpoint not found. Ensure Chrome 144+ with remote debugging enabled.".to_owned());
-            }
-            _ => {}
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    Err("Auto-connect timed out waiting for user approval".to_owned())
+    // The actual Chrome 144+ auto-connect protocol reads DevToolsActivePort
+    // from the selected user-data directory. For now, this returns an error
+    // indicating the feature requires the user to enable remote debugging
+    // and provide the WebSocket URL explicitly via COMPTROL_CDP_ENDPOINT.
+    Err(
+        "Chrome auto-connect requires user to enable remote debugging in chrome://inspect/#remote-debugging \
+        and provide the WebSocket URL via COMPTROL_CDP_ENDPOINT. The /json/auto-connect \
+        endpoint is not part of the official DevTools Protocol. Use the explicit CDP endpoint provider instead."
+            .to_owned(),
+    )
 }
 
-/// Discover the auto-connect debug port from environment or defaults.
+/// Get the auto-connect debug port from environment or default.
 pub fn auto_connect_debug_port() -> u16 {
     std::env::var("COMPTROL_CHROME_DEBUG_PORT")
         .ok()

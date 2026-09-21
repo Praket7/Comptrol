@@ -54,10 +54,10 @@ impl PairingStore {
         let replay_path = state_dir.join("replay_nonces.jsonl");
         if replay_path.exists() {
             for line in BufReader::new(File::open(&replay_path)?).lines() {
-                if let Ok(nonce) = serde_json::from_str::<ReplayNonce>(&line?) {
-                    if now_ms().saturating_sub(nonce.created_at_ms) < NONCE_TTL_MS {
-                        replay_cache.insert(nonce.nonce_hash.clone(), nonce);
-                    }
+                if let Ok(nonce) = serde_json::from_str::<ReplayNonce>(&line?)
+                    && now_ms().saturating_sub(nonce.created_at_ms) < NONCE_TTL_MS
+                {
+                    replay_cache.insert(nonce.nonce_hash.clone(), nonce);
                 }
             }
         }
@@ -79,9 +79,7 @@ impl PairingStore {
                 "pairing revoked",
             ));
         }
-        let cloned = record.clone();
-        drop(record);
-        let mut updated = cloned;
+        let mut updated = record.clone();
         updated.identity_fingerprint = Some(fingerprint.to_owned());
         self.write(updated)
     }

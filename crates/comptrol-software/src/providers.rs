@@ -798,10 +798,10 @@ pub fn provider_supports(id: ProviderId, operation: &str) -> bool {
         | (ProviderId::Flatpak, "uninstall") => true,
         (ProviderId::Apt, "install")
         | (ProviderId::Apt, "update")
-        | (ProviderId::Apt, "uninstall") => true,
+        | (ProviderId::Apt, "uninstall") => false, // not yet wired
         (ProviderId::Dnf, "install")
         | (ProviderId::Dnf, "update")
-        | (ProviderId::Dnf, "uninstall") => true,
+        | (ProviderId::Dnf, "uninstall") => false, // not yet wired
         (ProviderId::PackageKit, "install")
         | (ProviderId::PackageKit, "update")
         | (ProviderId::PackageKit, "uninstall") => false, // not yet wired

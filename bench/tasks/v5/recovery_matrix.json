@@ -10,7 +10,7 @@
       "task_id": "v5.recovery.duplicate_delivery",
       "goal": "Submit the same operation with the same idempotency key twice; verify no duplication.",
       "iterations": 2,
-      "final_verifier": "response contains executed: true and duplicate_count is 0",
+      "verifier": "executed_true_duplicate_zero",
       "steps": [
         {"method": "workflow.execute", "params": {"operation": "test_op", "idempotency_key": "dup-key-1"}}
       ]
@@ -19,7 +19,7 @@
       "task_id": "v5.recovery.cancel_latch",
       "goal": "Start a long-running operation and cancel it; verify the latch prevents post-cancel mutations.",
       "iterations": 2,
-      "final_verifier": "response contains cancelled: true and no mutations after cancel",
+      "verifier": "cancelled_true_no_mutations",
       "steps": [
         {"method": "workflow.execute", "params": {"operation": "long_op", "cancel": true}}
       ]
@@ -28,11 +28,11 @@
       "task_id": "v5.recovery.unknown_intent_refusal",
       "goal": "Submit an unknown intent and verify it is refused with an error code.",
       "iterations": 1,
-      "final_verifier": "response contains error code indicating unknown_intent",
+      "verifier": "error_unknown_intent",
       "steps": [
         {"method": "workflow.execute", "params": {"intent": "unknown_intent_xyz"}}
       ]
     }
   ],
-  "final_verifier": "all task final_verifiers pass"
+  "final_verifier": "all task verifiers pass"
 }

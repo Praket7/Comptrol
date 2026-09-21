@@ -293,7 +293,31 @@ fn execute_once(
         for entry in entries {
             if matches_cached_entry(entry, &request) {
                 let window_handle = entry.window_handle;
-                let verified = verify_cached_entry(entry, &request)?;
+                let element = find_element_by_window_handle(automation, window_handle)?;
+                let enabled = unsafe { element.CurrentIsEnabled() }
+                    .map_err(|error| format!("UI Automation enabled state failed: {error}"))?;
+                if !enabled.as_bool() {
+                    return Err("target_disabled".to_owned());
+                }
+                match request.action {
+                    Action::Press => {
+                        let pattern: IUIAutomationInvokePattern =
+                            unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }
+                                .map_err(|error| format!("Invoke pattern unavailable: {error}"))?;
+                        unsafe { pattern.Invoke() }
+                            .map_err(|error| format!("Invoke failed: {error}"))?;
+                    }
+                    Action::SetValue => {
+                        let value = request.value.ok_or("value_required")?;
+                        let pattern: IUIAutomationValuePattern =
+                            unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) }
+                                .map_err(|error| format!("Value pattern unavailable: {error}"))?;
+                        let value = windows::core::BSTR::from(value);
+                        unsafe { pattern.SetValue(&value) }
+                            .map_err(|error| format!("SetValue failed: {error}"))?;
+                    }
+                }
+                let verified = verify(&element, &request)?;
                 return Ok(json!({
                     "verified": verified,
                     "route": "windows_uia_cached",
@@ -438,6 +462,30 @@ fn matches_element(element: &IUIAutomationElement, request: &Request<'_>) -> Res
         }
     }
     Ok(true)
+}
+
+fn find_element_by_window_handle(
+    automation: &IUIAutomation,
+    window_handle: u64,
+) -> Result<IUIAutomationElement, String> {
+    let root = unsafe { automation.GetRootElement() }
+        .map_err(|error| format!("UI Automation root unavailable: {error}"))?;
+    let condition = unsafe { automation.CreateTrueCondition() }
+        .map_err(|error| format!("UI Automation condition unavailable: {error}"))?;
+    let candidates = unsafe { root.FindAll(TreeScope_Descendants, &condition) }
+        .map_err(|error| format!("UI Automation tree query failed: {error}"))?;
+    let count = unsafe { candidates.Length() }
+        .map_err(|error| format!("UI Automation result count failed: {error}"))?;
+    for index in 0..count.min(4096) {
+        let element = unsafe { candidates.GetElement(index) }
+            .map_err(|error| format!("UI Automation element read failed: {error}"))?;
+        let handle = unsafe { element.CurrentNativeWindowHandle() }
+            .map_err(|error| format!("window handle read failed: {error}"))?;
+        if handle.0 as u64 == window_handle {
+            return Ok(element);
+        }
+    }
+    Err("window handle not found in automation tree".to_owned())
 }
 
 fn verify(element: &IUIAutomationElement, request: &Request<'_>) -> Result<bool, String> {

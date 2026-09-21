@@ -5,6 +5,7 @@ use comptrol::{
     validate_compiled_workflow,
 };
 use comptrol_adapter_sdk::AdapterManifest;
+#[allow(unused_imports)]
 use getrandom::fill;
 use rusqlite::{Connection, OptionalExtension, params};
 use rustls::ServerConfig;
@@ -1694,9 +1695,19 @@ fn is_mutation_method(method: &str) -> bool {
     )
 }
 
-fn scope_for_method(method: &str) -> &'static str {
+fn scope_for_method(method: &str, params: Option<&Value>) -> &'static str {
+    // For tools/call, extract the actual tool name and derive scope from the operation
+    if method == "tools/call"
+        && let Some(params) = params
+        && let Some(name) = params.get("name").and_then(Value::as_str)
+    {
+        return scope_for_tool(name, params.get("arguments"));
+    }
+    if method == "tools/call" {
+        return "semantic_input"; // fallback
+    }
     match method {
-        "tools/call" | "workflow.execute" | "trace.replay" => "semantic_input",
+        "workflow.execute" | "trace.replay" => "semantic_input",
         "browser.session.ensure_state"
         | "browser.cdp.navigate"
         | "browser.cdp.dialog"
@@ -1705,6 +1716,49 @@ fn scope_for_method(method: &str) -> &'static str {
         "desktop.settings.write" | "file.write" => "file_write",
         "terminal.execute" => "terminal",
         _ => "observe",
+    }
+}
+
+fn scope_for_tool(tool_name: &str, arguments: Option<&Value>) -> &'static str {
+    match tool_name {
+        "operate" => {
+            // Extract intent from OperationRequest arguments
+            if let Some(args) = arguments
+                && let Some(intent) = args.get("intent").and_then(Value::as_str)
+            {
+                return scope_for_intent(intent);
+            }
+            "semantic_input"
+        }
+        "inspect" => "observe",
+        "watch" | "reconcile" => "observe",
+        "restore_checkpoint" => "file_read",
+        "capabilities" => "observe",
+        _ => "semantic_input",
+    }
+}
+
+fn scope_for_intent(intent: &str) -> &'static str {
+    // Map intents to their required scopes
+    match intent {
+        // Browser intents
+        i if i.starts_with("browser.") => "accessibility_read",
+        // Desktop intents
+        i if i.starts_with("desktop.") && (i.contains("write") || i.contains("settings")) => {
+            "file_write"
+        }
+        i if i.starts_with("desktop.") => "accessibility_read",
+        // File intents
+        i if i.starts_with("file.write") => "file_write",
+        i if i.starts_with("file.read") => "file_read",
+        // Terminal intents
+        i if i.starts_with("terminal.") => "terminal",
+        // Workflow intents
+        i if i.starts_with("workflow.") => "semantic_input",
+        // Trace intents
+        i if i.starts_with("trace.") => "semantic_input",
+        // Other intents default to semantic_input
+        _ => "semantic_input",
     }
 }
 
@@ -2510,7 +2564,7 @@ fn handle_http<S: HttpStream>(
             }
         };
         let pairing_id = pairing.pairing_id.clone();
-        let required_scope = scope_for_method(method);
+        let required_scope = scope_for_method(method, request.get("params"));
         if !pairing.scopes.iter().any(|s| s == required_scope) {
             return write_http_response(
                 stream,

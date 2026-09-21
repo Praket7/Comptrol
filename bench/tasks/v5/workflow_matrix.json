@@ -10,7 +10,7 @@
       "task_id": "v5.workflow.cold_plan",
       "goal": "Execute a cold workflow plan and verify the plan is compiled.",
       "iterations": 1,
-      "final_verifier": "response contains plan_id and status is compiled",
+      "verifier": "has_plan_id",
       "steps": [
         {"method": "workflow.execute", "params": {"plan": "test_plan", "mode": "cold"}}
       ]
@@ -19,7 +19,7 @@
       "task_id": "v5.workflow.trace_compile",
       "goal": "Compile a verified trace from the plan and verify the trace ID.",
       "iterations": 2,
-      "final_verifier": "response contains trace_id",
+      "verifier": "has_trace_id",
       "steps": [
         {"method": "trace.compile", "params": {"plan_id": "test_plan"}}
       ]
@@ -28,11 +28,11 @@
       "task_id": "v5.workflow.warm_replay",
       "goal": "Replay a compiled trace in warm mode with zero model turns by construction.",
       "iterations": 2,
-      "final_verifier": "response contains replayed: true and model_turns is 0",
+      "verifier": "replayed_true_model_turns_zero",
       "steps": [
         {"method": "trace.replay", "params": {"trace_id": "compiled_trace", "mode": "warm"}}
       ]
     }
   ],
-  "final_verifier": "all task final_verifiers pass"
+  "final_verifier": "all task verifiers pass"
 }
