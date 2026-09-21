@@ -292,17 +292,77 @@ fn linux_entries() -> Result<Vec<AppEntry>, RegistryError> {
                 continue;
             }
             if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Some(entry) = parse_desktop_file(&content, &path) {
-                    let id = entry.id.clone();
-                    if entries.iter().any(|e| e.id == id) {
-                        continue; // Skip duplicates
+                if let Some(app_entry) = parse_desktop_file_inline(&content, &path) {
+                    let id = app_entry.id.clone();
+                    if seen.insert(id) {
+                        entries.push(app_entry);
                     }
-                    entries.push(entry);
                 }
             }
         }
     }
     Ok(entries)
+}
+
+/// Parse a .desktop file inline. Returns None for files that are hidden,
+/// missing required fields, or are not valid desktop entries.
+#[cfg(target_os = "linux")]
+fn parse_desktop_file_inline(content: &str, path: &std::path::Path) -> Option<AppEntry> {
+    let mut name = None;
+    let mut exec = None;
+    let mut version = None;
+    let mut categories = Vec::new();
+    let mut no_display = false;
+    let mut terminal = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "Name" => name = Some(value.trim().to_owned()),
+                "Exec" => exec = Some(value.trim().to_owned()),
+                "Version" => version = Some(value.trim().to_owned()),
+                "Categories" => {
+                    categories = value
+                        .split(';')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.trim().to_owned())
+                        .collect()
+                }
+                "NoDisplay" => no_display = value.trim() == "true",
+                "Terminal" => terminal = value.trim() == "true",
+                _ => {}
+            }
+        }
+    }
+
+    if name.is_none() || exec.is_none() || no_display {
+        return None;
+    }
+
+    let id = format!(
+        "desktop.{}",
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+    );
+    let mut metadata = BTreeMap::new();
+    if !categories.is_empty() {
+        metadata.insert("categories".to_owned(), categories.join(";"));
+    }
+    metadata.insert("terminal".to_owned(), terminal.to_string());
+
+    Some(AppEntry {
+        id,
+        display_name: name.unwrap(),
+        platform: "linux".to_owned(),
+        executable: None,
+        version,
+        metadata,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]

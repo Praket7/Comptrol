@@ -494,6 +494,9 @@ struct RouteHistory {
     dispatch_failures: u64,
     disturbance_events: u64,
     ewma_latency_ms: Option<f64>,
+    // Note: this is a running maximum latency, not a true p95 quantile.
+    // A true p95 would require storing all samples. The running max is
+    // more conservative (always >= p95) and suitable for routing decisions.
     p95_latency_ms: Option<f64>,
     last_success_at_ms: Option<u128>,
 }
@@ -1229,7 +1232,9 @@ impl Runtime {
             trace,
             stop: StopLatch::new(&state_dir),
             consent: comptrol_consent::ConsentStore::open(state_dir.join("consent.jsonl")).ok(),
-            human_actions: comptrol_consent::HumanActionBroker::new(),
+            human_actions: comptrol_consent::HumanActionBroker::with_path(
+                state_dir.join("human_actions.json"),
+            ),
             operation_cancel: None,
             adapter_hosts: HashMap::new(),
             idempotent,
@@ -1540,6 +1545,7 @@ impl Runtime {
             Some(previous) => (previous * 0.8) + (latency_ms * 0.2),
             None => latency_ms,
         });
+        // Running maximum (not true p95 quantile - see field doc comment).
         entry.p95_latency_ms = Some(match entry.p95_latency_ms {
             Some(previous) => previous.max(latency_ms),
             None => latency_ms,
@@ -6071,22 +6077,27 @@ fn native_popup_dismiss(
                 Err(msg) => Err(msg),
             };
         }
-        // If target is not a PID, try osascript to find and press the button.
-        let script = format!(
-            r#"
+        // If target is not a PID, use osascript with properly quoted arguments
+        // to avoid injection. The `quoted form of` operator handles escaping.
+        let script = r#"
+        on run argv
+            set targetName to item 1 of argv
+            set actionLabel to item 2 of argv
             tell application "System Events"
-                set targetProcess to first process whose name contains "{target_name}"
-                set frontmost of targetProcess to true
-                delay 0.2
                 try
-                    click button "{action_label}" of window 1 of targetProcess
+                    set targetProcess to first process whose name contains targetName
+                    set frontmost of targetProcess to true
+                    delay 0.2
+                    click button actionLabel of window 1 of targetProcess
                     return "true"
                 on error
                     try
+                        set targetProcess to first process whose name contains targetName
                         click button "Cancel" of window 1 of targetProcess
                         return "true"
                     on error
                         try
+                            set targetProcess to first process whose name contains targetName
                             click button "Close" of window 1 of targetProcess
                             return "true"
                         on error
@@ -6095,10 +6106,10 @@ fn native_popup_dismiss(
                     end try
                 end try
             end tell
-            "#
-        );
+        end run
+        "#;
         match std::process::Command::new("osascript")
-            .args(["-e", &script])
+            .args(["-e", script, "--", target_name, &action_label])
             .output()
         {
             Ok(output) if output.status.success() => {
@@ -6162,7 +6173,7 @@ fn popup_inspect(request: &OperationRequest, operation_id: String) -> ActionResu
 ///
 /// Supports:
 /// - Browser JavaScript dialogs (alert, confirm, prompt, beforeunload) via CDP Page.handleJavaScriptDialog
-/// - Native platform popups via accessibility APIs (macOS AX, Windows UIA, Linux AT-SPI)
+/// - Native macOS popups via Accessibility API (AXButton press)
 ///
 /// Protected classes (auth, payment, security, privilege) are never auto-dismissed.
 /// Eligible classes require explicit user policy preferences.

@@ -203,8 +203,15 @@ impl SettingProvider for LinuxProvider {
             }
             SettingKey::DefaultBrowser => {
                 let text = self
-                    .gsettings_get("org.gnome.desktop.default-applications.terminal", "exec")
-                    .map_err(|_| unsupported("GNOME default-application lookup failed"))?;
+                    .gsettings_get("org.gnome.desktop.default-applications", "browser")
+                    .or_else(|_| {
+                        // Fallback: try the older schema path
+                        self.gsettings_get(
+                            "org.gnome.desktop.default-applications.internet",
+                            "browser",
+                        )
+                    })
+                    .map_err(|_| unsupported("GNOME default browser lookup failed"))?;
                 Ok(SettingObservation {
                     key: key.clone(),
                     value: SettingValue::Text { value: text },

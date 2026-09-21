@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
@@ -84,11 +85,19 @@ pub struct PendingHumanAction {
     pub resolved_at_ms: Option<u64>,
 }
 
-/// Registry of paused operations. The broker is deliberately dumb: it
-/// tracks state and hands out challenges; observation of the post-auth
-/// environment belongs to the operation's own verification step.
+/// Registry of paused operations. The broker tracks state and hands out
+/// challenges; observation of the post-auth environment belongs to the
+/// operation's own verification step. State is persisted to a JSON file
+/// so it survives process restarts and CLI invocations.
 #[derive(Debug, Default)]
 pub struct HumanActionBroker {
+    pending: HashMap<String, PendingHumanAction>,
+    sequence: u64,
+    path: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BrokerState {
     pending: HashMap<String, PendingHumanAction>,
     sequence: u64,
 }
@@ -96,6 +105,39 @@ pub struct HumanActionBroker {
 impl HumanActionBroker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a broker backed by a durable JSON file.
+    pub fn with_path(path: PathBuf) -> Self {
+        let mut broker = Self {
+            pending: HashMap::new(),
+            sequence: 0,
+            path: Some(path),
+        };
+        broker.load();
+        broker
+    }
+
+    fn load(&mut self) {
+        if let Some(path) = &self.path
+            && let Ok(data) = std::fs::read_to_string(path)
+            && let Ok(state) = serde_json::from_str::<BrokerState>(&data)
+        {
+            self.pending = state.pending;
+            self.sequence = state.sequence;
+        }
+    }
+
+    fn save(&self) {
+        if let Some(path) = &self.path {
+            let state = BrokerState {
+                pending: self.pending.clone(),
+                sequence: self.sequence,
+            };
+            if let Ok(data) = serde_json::to_string_pretty(&state) {
+                let _ = std::fs::write(path, data);
+            }
+        }
     }
 
     /// Pause an operation with a structured challenge.
@@ -121,6 +163,7 @@ impl HumanActionBroker {
                 resolved_at_ms: None,
             },
         );
+        self.save();
         request
     }
 
@@ -129,6 +172,7 @@ impl HumanActionBroker {
         if let Some(pending) = self.pending.get_mut(request_id) {
             pending.resolution = Some(resolution);
             pending.resolved_at_ms = Some(now_ms());
+            self.save();
             true
         } else {
             false

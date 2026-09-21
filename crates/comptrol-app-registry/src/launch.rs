@@ -9,8 +9,6 @@
 
 use crate::registry::AppEntry;
 use crate::{Resource, Resource as OpenResource};
-#[cfg(unix)]
-use libc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::process::Stdio;
@@ -141,10 +139,8 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
             if request.background {
                 #[cfg(unix)]
                 {
-                    // Detach on Unix
-                    unsafe {
-                        libc::setsid();
-                    }
+                    use std::os::unix::process::CommandExt;
+                    command.process_group(0);
                 }
             }
             command
@@ -176,9 +172,8 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
             if request.background {
                 #[cfg(unix)]
                 {
-                    unsafe {
-                        libc::setsid();
-                    }
+                    use std::os::unix::process::CommandExt;
+                    command.process_group(0);
                 }
             }
             let child = command.spawn()?;
@@ -240,12 +235,13 @@ fn open_native(target: &str, background: bool) -> Result<std::process::Child, La
     {
         let mut cmd = std::process::Command::new("xdg-open");
         if background {
-            // xdg-open doesn't have a background flag, but we can detach
+            // Create a new process group so the child doesn't receive
+            // signals from the parent's terminal. Uses process_group(0)
+            // instead of calling setsid() in the parent process.
             #[cfg(unix)]
             {
-                unsafe {
-                    libc::setsid();
-                }
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
             }
         }
         Ok(cmd

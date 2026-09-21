@@ -1562,27 +1562,20 @@ fn call_tool_with_cancel(
             };
             if action_id.is_empty() {
                 json!({ "error": { "code": "invalid_input", "message": "human_action.resolve needs action_id" } })
+            } else if runtime.human_actions.resolve(action_id, resolution.clone()) {
+                json!({ "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                    "resolved": true,
+                    "action_id": action_id,
+                    "resolution": resolution_str,
+                    "note": "Human action recorded. Retry the original operation to continue."
+                })).unwrap_or_default() }], "structuredContent": json!({
+                    "resolved": true,
+                    "action_id": action_id,
+                    "resolution": resolution_str,
+                    "note": "Human action recorded. Retry the original operation to continue."
+                }) })
             } else {
-                match Runtime::new(default_state_dir()) {
-                    Ok(mut runtime) => {
-                        if runtime.human_actions.resolve(action_id, resolution.clone()) {
-                            json!({ "content": [{ "type": "text", "text": serde_json::to_string(&json!({
-                                "resolved": true,
-                                "action_id": action_id,
-                                "resolution": resolution_str,
-                                "note": "Human action recorded. Retry the original operation to continue."
-                            })).unwrap_or_default() }], "structuredContent": json!({
-                                "resolved": true,
-                                "action_id": action_id,
-                                "resolution": resolution_str,
-                                "note": "Human action recorded. Retry the original operation to continue."
-                            }) })
-                        } else {
-                            json!({ "error": { "code": "action_not_found", "message": format!("No pending human action with id {action_id}") } })
-                        }
-                    }
-                    Err(error) => json!({ "error": { "code": "startup_failed", "message": error.to_string() } }),
-                }
+                json!({ "error": { "code": "action_not_found", "message": format!("No pending human action with id {action_id}") } })
             }
         }
         _ => json!({ "error": { "code": "tool_not_found", "message": format!("Unknown tool {name}") } }),
