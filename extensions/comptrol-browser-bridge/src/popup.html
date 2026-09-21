@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Comptrol Browser Bridge</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+      color: #1d1d1f;
+      background: #f5f5f7;
+      min-width: 320px;
+      max-width: 360px;
+      padding: 16px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #e5e5ea;
+    }
+    .icon {
+      width: 28px;
+      height: 28px;
+      background: linear-gradient(135deg, #007aff, #5856d6);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .title {
+      font-weight: 600;
+      font-size: 15px;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      background: #f0f0f5;
+      border-radius: 8px;
+      margin-bottom: 16px;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #c4c4c4;
+    }
+    .status-dot.connected { background: #34c759; }
+    .status-dot.disconnected { background: #ff3b30; }
+    .status-text { font-size: 13px; color: #6e6e73; }
+    .section {
+      margin-bottom: 16px;
+    }
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #8e8e93;
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+    .target-list {
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    .target-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      background: white;
+      border-radius: 6px;
+      margin-bottom: 6px;
+      border: 1px solid #e5e5ea;
+    }
+    .target-favicon {
+      width: 16px;
+      height: 16px;
+      border-radius: 3px;
+      background: #f0f0f5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      color: #8e8e93;
+    }
+    .target-info {
+      flex: 1;
+      min-width: 0;
+    }
+    .target-title {
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .target-url {
+      font-size: 11px;
+      color: #8e8e93;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .target-badge {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: #e5e5ea;
+      color: #8e8e93;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .target-badge.attached { background: #e8f5e9; color: #34c759; }
+    .target-badge.group { background: #e8f0fe; color: #007aff; }
+    .target-badge.pinned { background: #fce4ec; color: #e91e63; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 14px;
+      border: none;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s ease;
+      width: 100%;
+    }
+    .btn-primary {
+      background: #007aff;
+      color: white;
+    }
+    .btn-primary:hover { background: #0062cc; }
+    .btn-secondary {
+      background: #e5e5ea;
+      color: #1d1d1f;
+    }
+    .btn-secondary:hover { background: #d1d1d6; }
+    .btn-danger {
+      background: #ffebee;
+      color: #ff3b30;
+    }
+    .btn-danger:hover { background: #ffcdd2; }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .divider {
+      height: 1px;
+      background: #e5e5ea;
+      margin: 12px 0;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 20px;
+      color: #8e8e93;
+      font-size: 12px;
+    }
+    .loading {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid #007aff;
+      border-right-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-right: 8px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="icon">CB</div>
+    <div class="title">Comptrol Browser Bridge</div>
+  </div>
+  
+  <div class="status">
+    <div class="status-dot" id="statusDot"></div>
+    <span class="status-text" id="statusText">Connecting...</span>
+  </div>
+  
+  <div class="section">
+    <div class="section-title">Browser Targets</div>
+    <div class="target-list" id="targetList">
+      <div class="empty-state">Loading targets...</div>
+    </div>
+  </div>
+  
+  <div class="divider"></div>
+  
+  <div class="section">
+    <div class="section-title">Bridge Control</div>
+    <button class="btn btn-primary" id="reconnectBtn">
+      <span class="loading" id="reconnectLoading" style="display:none;"></span>
+      <span>Reconnect Daemon</span>
+    </button>
+    <button class="btn btn-secondary" id="refreshBtn" style="margin-top: 8px;">
+      <span class="loading" id="refreshLoading" style="display:none;"></span>
+      <span>Refresh Targets</span>
+    </button>
+  </div>
+  
+  <div class="divider"></div>
+  
+  <div class="section">
+    <div class="section-title">Quick Actions</div>
+    <button class="btn btn-secondary" id="observeGroupsBtn">Observe Groups</button>
+    <button class="btn btn-secondary" id="listSnapshotsBtn">List Snapshots</button>
+    <button class="btn btn-danger" id="disconnectBtn" style="margin-top: 8px;">Disconnect</button>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>

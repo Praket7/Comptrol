@@ -4,7 +4,7 @@
   "goal": "Measure desktop resolution, permission, and popup classification tasks against local fixtures and live macOS where safe.",
   "timeout_ms": 60000,
   "initial_state": "fresh Comptrol state directory",
-  "required_capabilities": ["desktop.resolve", "desktop.permission", "popup.inspect"],
+  "required_capabilities": ["tools/call"],
   "tasks": [
     {
       "task_id": "v5.desktop.app_resolve",
@@ -12,7 +12,7 @@
       "iterations": 3,
       "verifier": "resolved_true_path_nonempty",
       "steps": [
-        {"method": "desktop.resolve", "params": {"bundle_id": "com.apple.TextEdit"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "desktop.resolve", "params": {"bundle_id": "com.apple.TextEdit"}, "idempotency_key": "bench-desktop-resolve-001"}}}
       ]
     },
     {
@@ -21,7 +21,7 @@
       "iterations": 2,
       "verifier": "apps_array_nonempty",
       "steps": [
-        {"method": "desktop.list", "params": {}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "desktop.list", "params": {}, "idempotency_key": "bench-desktop-list-001"}}}
       ]
     },
     {
@@ -30,7 +30,7 @@
       "iterations": 1,
       "verifier": "has_status_field",
       "steps": [
-        {"method": "desktop.permission.status", "params": {"permission": "accessibility"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "desktop.permission.status", "params": {"permission": "accessibility"}, "idempotency_key": "bench-desktop-perm-001"}}}
       ]
     },
     {
@@ -39,7 +39,7 @@
       "iterations": 2,
       "verifier": "classification_in_allowed",
       "steps": [
-        {"method": "popup.inspect", "params": {"window_id": "fixture-popup-1"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "popup.inspect", "params": {"window_id": "fixture-popup-1"}, "idempotency_key": "bench-desktop-popup-001"}}}
       ]
     }
   ],

@@ -4,7 +4,7 @@
   "goal": "Measure cold plan, trace compile, and warm replay with model-turn counting.",
   "timeout_ms": 120000,
   "initial_state": "fresh Comptrol state directory",
-  "required_capabilities": ["workflow.execute", "trace.compile", "trace.replay"],
+  "required_capabilities": ["tools/call"],
   "tasks": [
     {
       "task_id": "v5.workflow.cold_plan",
@@ -12,7 +12,7 @@
       "iterations": 1,
       "verifier": "has_plan_id",
       "steps": [
-        {"method": "workflow.execute", "params": {"plan": "test_plan", "mode": "cold"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "workflow.execute", "params": {"plan": "test_plan", "mode": "cold"}, "idempotency_key": "bench-workflow-cold-001"}}}
       ]
     },
     {
@@ -21,7 +21,7 @@
       "iterations": 2,
       "verifier": "has_trace_id",
       "steps": [
-        {"method": "trace.compile", "params": {"plan_id": "test_plan"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "trace.compile", "params": {"plan_id": "test_plan"}, "idempotency_key": "bench-workflow-trace-001"}}}
       ]
     },
     {
@@ -30,7 +30,7 @@
       "iterations": 2,
       "verifier": "replayed_true_model_turns_zero",
       "steps": [
-        {"method": "trace.replay", "params": {"trace_id": "compiled_trace", "mode": "warm"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "trace.replay", "params": {"trace_id": "compiled_trace", "mode": "warm"}, "idempotency_key": "bench-workflow-warm-001"}}}
       ]
     }
   ],

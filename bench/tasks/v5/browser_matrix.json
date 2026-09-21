@@ -4,7 +4,7 @@
   "goal": "Verify browser-fixture tasks against the local fixture with independent verifiers.",
   "timeout_ms": 60000,
   "initial_state": "fresh Comptrol state directory with browser fixture loaded",
-  "required_capabilities": ["browser.session", "browser.cdp.dialog"],
+  "required_capabilities": ["tools/call"],
   "tasks": [
     {
       "task_id": "v5.browser.ensure_state_reuse",
@@ -12,7 +12,7 @@
       "iterations": 3,
       "verifier": "session_id_no_reload",
       "steps": [
-        {"method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.ensure_state", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "action": "ensure_state"}, "idempotency_key": "bench-browser-ensure-001"}}}
       ]
     },
     {
@@ -21,8 +21,8 @@
       "iterations": 3,
       "verifier": "navigation_spa",
       "steps": [
-        {"method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}},
-        {"method": "browser.cdp.navigate", "params": {"target": "fixture://browser/index.html", "url": "fixture://browser/spa.html"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.ensure_state", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "action": "ensure_state"}, "idempotency_key": "bench-browser-nav-001"}}},
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "url": "fixture://browser/spa.html"}, "idempotency_key": "bench-browser-nav-002"}}}
       ]
     },
     {
@@ -31,8 +31,8 @@
       "iterations": 3,
       "verifier": "dialog_handled",
       "steps": [
-        {"method": "browser.session.ensure_state", "params": {"target": "fixture://browser/index.html", "action": "ensure_state"}},
-        {"method": "browser.cdp.dialog", "params": {"target": "fixture://browser/index.html", "dialog_type": "alert", "message": "test"}}
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.ensure_state", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "action": "ensure_state"}, "idempotency_key": "bench-browser-dlg-001"}}},
+        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.dialog", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "dialog_type": "alert", "message": "test"}, "idempotency_key": "bench-browser-dlg-002"}}}
       ]
     }
   ],

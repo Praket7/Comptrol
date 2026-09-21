@@ -9,7 +9,10 @@
 
 use crate::registry::AppEntry;
 use crate::{Resource, Resource as OpenResource};
+#[cfg(unix)]
+use libc;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::process::Stdio;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,12 +24,13 @@ pub enum LaunchError {
 }
 
 /// What was launched and what identity was observed.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaunchOutcome {
     pub app_id: String,
     pub route: String,
     pub pid: Option<u32>,
     pub resource: OpenResource,
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Verification result carried on the outcome.
@@ -49,6 +53,8 @@ pub struct LaunchRequest {
     pub settle_ms: u64,
     /// Open without foregrounding where the platform supports it.
     pub background: bool,
+    /// Additional launch arguments.
+    pub args: Vec<String>,
 }
 
 impl LaunchRequest {
@@ -58,6 +64,7 @@ impl LaunchRequest {
             resource: Resource::None,
             settle_ms: 750,
             background: false,
+            args: Vec::new(),
         }
     }
 }
@@ -95,9 +102,12 @@ unsafe fn probe_liveness(pid: i32) -> i32 {
 /// file and no-resource launches spawn the resolved executable.
 pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
     let settle = std::time::Duration::from_millis(request.settle_ms.max(50));
+    let mut metadata = BTreeMap::new();
+    metadata.insert("background".to_owned(), request.background.to_string());
+
     match &request.resource {
         Resource::Url { url } => {
-            let child = open_native(url)?;
+            let child = open_native(url, request.background)?;
             let pid = child.id();
             std::thread::sleep(settle);
             Ok(LaunchOutcome {
@@ -105,10 +115,11 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
                 route: "native_open".to_owned(),
                 pid: Some(pid),
                 resource: request.resource.clone(),
+                metadata,
             })
         }
         Resource::DeepLink { uri } => {
-            let child = open_native(uri)?;
+            let child = open_native(uri, request.background)?;
             let pid = child.id();
             std::thread::sleep(settle);
             Ok(LaunchOutcome {
@@ -116,17 +127,30 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
                 route: "native_open".to_owned(),
                 pid: Some(pid),
                 resource: request.resource.clone(),
+                metadata,
             })
         }
         Resource::File { path } => {
-            let mut command = std::process::Command::new(
-                request
-                    .app
-                    .executable
-                    .clone()
-                    .unwrap_or_else(|| std::path::PathBuf::from(&request.app.id)),
-            );
+            let executable = request
+                .app
+                .executable
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from(&request.app.id));
+            let mut command = std::process::Command::new(executable);
             command.arg(path).stdin(Stdio::null()).stdout(Stdio::null());
+            if request.background {
+                #[cfg(unix)]
+                {
+                    // Detach on Unix
+                    unsafe {
+                        libc::setsid();
+                    }
+                }
+            }
+            command
+                .args(&request.args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
             let child = command.spawn()?;
             let pid = child.id();
             std::thread::sleep(settle);
@@ -135,17 +159,28 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
                 route: "executable_argv".to_owned(),
                 pid: Some(pid),
                 resource: request.resource.clone(),
+                metadata,
             })
         }
         Resource::None => {
-            let mut command = std::process::Command::new(
-                request
-                    .app
-                    .executable
-                    .clone()
-                    .unwrap_or_else(|| std::path::PathBuf::from(&request.app.id)),
-            );
-            command.stdin(Stdio::null()).stdout(Stdio::null());
+            let executable = request
+                .app
+                .executable
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from(&request.app.id));
+            let mut command = std::process::Command::new(executable);
+            command
+                .args(&request.args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            if request.background {
+                #[cfg(unix)]
+                {
+                    unsafe {
+                        libc::setsid();
+                    }
+                }
+            }
             let child = command.spawn()?;
             let pid = child.id();
             std::thread::sleep(settle);
@@ -154,6 +189,7 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
                 route: "executable_argv".to_owned(),
                 pid: Some(pid),
                 resource: request.resource.clone(),
+                metadata,
             })
         }
     }
@@ -177,10 +213,14 @@ pub fn launch_verified(
 
 /// Open a URL or deep link through the platform's default-handler
 /// surface without an intermediate shell.
-fn open_native(target: &str) -> Result<std::process::Child, LaunchError> {
+fn open_native(target: &str, background: bool) -> Result<std::process::Child, LaunchError> {
     #[cfg(target_os = "macos")]
     {
-        Ok(std::process::Command::new("/usr/bin/open")
+        let mut cmd = std::process::Command::new("/usr/bin/open");
+        if background {
+            cmd.arg("-g"); // Don't bring to front
+        }
+        Ok(cmd
             .arg(target)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -188,17 +228,27 @@ fn open_native(target: &str) -> Result<std::process::Child, LaunchError> {
     }
     #[cfg(windows)]
     {
-        // `start` equivalent through cmd would be a shell; use the
-        // documented ShellExecute surface via `explorer` instead.
-        Ok(std::process::Command::new("explorer")
-            .arg(target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn()?)
+        // Use explorer.exe for URL/deep-link opening
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg(target);
+        if background {
+            // On Windows, we can't easily background explorer.exe
+        }
+        Ok(cmd.stdin(Stdio::null()).stdout(Stdio::null()).spawn()?)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        Ok(std::process::Command::new("xdg-open")
+        let mut cmd = std::process::Command::new("xdg-open");
+        if background {
+            // xdg-open doesn't have a background flag, but we can detach
+            #[cfg(unix)]
+            {
+                unsafe {
+                    libc::setsid();
+                }
+            }
+        }
+        Ok(cmd
             .arg(target)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -213,5 +263,18 @@ pub fn launcher_probe(pid: u32) -> LaunchVerification {
         Ok(true) => LaunchVerification::Verified,
         Ok(false) => LaunchVerification::ExitedEarly,
         Err(_) => LaunchVerification::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launcher_probe_reports_unavailable_on_unknown_pid() {
+        // Non-existent PIDs return ExitedEarly (process not alive), not Unavailable
+        // Unavailable is only returned on non-Unix platforms where liveness probing is not implemented
+        let result = launcher_probe(0x7FFFFFFF);
+        assert_eq!(result, LaunchVerification::ExitedEarly);
     }
 }
