@@ -1,4 +1,4 @@
-#![allow(non_upper_case_globals, non_camel_case_types)]
+#![allow(non_upper_case_globals, non_camel_case_types, clippy::collapsible_if)]
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::OnceLock;

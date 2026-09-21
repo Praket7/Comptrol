@@ -177,6 +177,19 @@ impl PairingStore {
             .count()
     }
 
+    pub fn auto_pair(&mut self, fingerprint: &str) -> io::Result<PairingRecord> {
+        let scopes = vec![
+            "file_read".to_owned(),
+            "file_write".to_owned(),
+            "accessibility_read".to_owned(),
+            "terminal".to_owned(),
+            "semantic_input".to_owned(),
+            "observe".to_owned(),
+        ];
+        let (_record, token) = self.create(scopes, None, Some(fingerprint.to_owned()))?;
+        self.accept(&token)
+    }
+
     pub fn create(
         &mut self,
         scopes: Vec<String>,

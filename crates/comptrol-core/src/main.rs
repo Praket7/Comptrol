@@ -3116,20 +3116,23 @@ fn handle_http<S: HttpStream>(
     let is_initialize = method == "initialize";
     let is_mutation = is_mutation_method(method);
     if let Some(peer_fp) = peer_fingerprint.as_deref() {
-        let store = pairing_store.lock().expect("pairing store lock poisoned");
-        let pairing = match store.find_by_fingerprint(peer_fp) {
+        let mut store = pairing_store.lock().expect("pairing store lock poisoned");
+        let pairing = match store.find_by_fingerprint(peer_fp).cloned() {
             Some(p) => p,
-            None => {
-                return write_http_response(
-                    stream,
-                    403,
-                    "Forbidden",
-                    "application/json",
-                    serde_json::to_vec(&json!({"error":"mtls_identity_not_paired"}))
-                        .unwrap_or_default(),
-                    None,
-                );
-            }
+            None => match store.auto_pair(peer_fp) {
+                Ok(p) => p,
+                Err(_) => {
+                    return write_http_response(
+                        stream,
+                        403,
+                        "Forbidden",
+                        "application/json",
+                        serde_json::to_vec(&json!({"error":"mtls_identity_not_paired"}))
+                            .unwrap_or_default(),
+                        None,
+                    );
+                }
+            },
         };
         let pairing_id = pairing.pairing_id.clone();
         let required_scope = scope_for_method(method, request.get("params"));
