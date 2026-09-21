@@ -88,6 +88,7 @@ pub fn process_alive(pid: u32) -> Result<bool, LaunchError> {
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         const WAIT_OBJECT_0: u32 = 0;
         const WAIT_TIMEOUT: u32 = 258;
+        const WAIT_FAILED: u32 = 0xFFFFFFFF;
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {
@@ -95,8 +96,12 @@ pub fn process_alive(pid: u32) -> Result<bool, LaunchError> {
             }
             let result = WaitForSingleObject(handle, 0);
             CloseHandle(handle);
-            // WAIT_OBJECT_0 means process exited; WAIT_TIMEOUT means still running
-            Ok(result == WAIT_TIMEOUT || result == WAIT_OBJECT_0)
+            match result {
+                WAIT_TIMEOUT => Ok(true),   // still running
+                WAIT_OBJECT_0 => Ok(false), // exited
+                WAIT_FAILED => Err(LaunchError::Io(std::io::Error::last_os_error())),
+                _ => Ok(false), // unexpected state, treat as exited
+            }
         }
     }
     #[cfg(not(any(unix, windows)))]

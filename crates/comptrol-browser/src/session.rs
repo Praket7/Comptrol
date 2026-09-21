@@ -161,9 +161,13 @@ impl SessionProvider {
     }
 
     /// Whether this provider can observe the user's signed-in state.
-    /// Only the permissioned route (with the user's Allow click) may do so.
+    /// PermissionedAutoConnect (user clicks Allow) and CompanionExtension
+    /// (extension has access to the user's browser session) both qualify.
     pub fn signed_in_capable(self) -> bool {
-        matches!(self, SessionProvider::PermissionedAutoConnect)
+        matches!(
+            self,
+            SessionProvider::PermissionedAutoConnect | SessionProvider::CompanionExtension
+        )
     }
 }
 
@@ -287,13 +291,19 @@ pub fn select_provider(needs_signed_in: bool) -> Result<SessionProvider, String>
             .expect("broker lists every provider")
     };
     if needs_signed_in {
+        // Try permissioned auto-connect first (user clicks Allow in Chrome)
         let permissioned = get(SessionProvider::PermissionedAutoConnect);
         if permissioned.available {
             return Ok(SessionProvider::PermissionedAutoConnect);
         }
+        // Fall back to companion extension if native host is registered
+        let extension = get(SessionProvider::CompanionExtension);
+        if extension.available {
+            return Ok(SessionProvider::CompanionExtension);
+        }
         return Err(format!(
-            "signed-in browser control needs the permissioned existing-session route: {}",
-            permissioned.reason
+            "signed-in browser control needs either the permissioned existing-session route ({}) or the companion extension ({})",
+            permissioned.reason, extension.reason
         ));
     }
     for provider in [

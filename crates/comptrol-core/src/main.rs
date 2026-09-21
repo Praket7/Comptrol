@@ -2661,38 +2661,38 @@ fn handle_http<S: HttpStream>(
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or("");
-        // CDP method allowlist: only safe read-only and common action methods
-        // are permitted through the unauthenticated HTTP bridge.
-        // Dangerous methods (process management, file system, security bypasses)
-        // must go through the normal MCP intent/policy pipeline.
+        // CDP method allowlist: only safe read-only methods are permitted
+        // through the unauthenticated HTTP bridge.
+        // All mutation/navigate/evaluate/input methods require the normal
+        // MCP intent/policy/consent/verification pipeline.
         const CDP_ALLOWLIST: &[&str] = &[
-            "Page.navigate",
-            "Page.reload",
-            "Page.captureScreenshot",
+            // Page inspection (read-only)
             "Page.getFrameTree",
-            "Runtime.evaluate",
-            "Runtime.getProperties",
+            "Page.captureScreenshot",
+            // DOM inspection (read-only)
             "DOM.getDocument",
             "DOM.querySelector",
             "DOM.querySelectorAll",
             "DOM.getOuterHTML",
-            "DOM.focus",
-            "Input.dispatchMouseEvent",
-            "Input.dispatchKeyEvent",
-            "Input.insertText",
+            "DOM.getBoxModel",
+            // Runtime inspection (read-only, no evaluate)
+            "Runtime.getProperties",
+            "Runtime.consoleAPICalled",
+            // Target listing (read-only)
             "Target.getTargets",
-            "Target.attachToTarget",
-            "Target.detachFromTarget",
-            "Target.activateTarget",
-            "Target.closeTarget",
-            "Target.createTarget",
+            // Browser info (read-only)
             "Browser.getVersion",
+            // Console (read-only)
             "Console.enable",
+            // Network inspection (read-only)
             "Network.enable",
             "Network.getResponseBody",
+            "Network.getRequestPostData",
+            // Accessibility (read-only)
+            "Accessibility.getFullAXTree",
+            // Overlay (visual feedback only, no DOM mutation)
             "Overlay.highlightNode",
             "Overlay.hideHighlight",
-            "Accessibility.getFullAXTree",
         ];
         if !CDP_ALLOWLIST.contains(&method) {
             return write_http_response(

@@ -5817,7 +5817,13 @@ fn software_install(
         launch_after_install: false,
     };
     // If human action was already approved, skip the elevation check and retry directly.
-    if runtime.human_actions.approved(operation_id.as_str()) {
+    // Support resume_operation_id for retries where the original idempotency_key was not passed.
+    let effective_id = request
+        .params
+        .get("resume_operation_id")
+        .and_then(Value::as_str)
+        .unwrap_or(operation_id.as_str());
+    if runtime.human_actions.approved(effective_id) {
         return match comptrol_software::install(&install) {
             Ok(outcome) => {
                 let verified = matches!(
@@ -5916,7 +5922,12 @@ fn software_update(
         );
     };
     // If human action was already approved, skip the elevation check and retry directly.
-    if runtime.human_actions.approved(operation_id.as_str()) {
+    let effective_id = request
+        .params
+        .get("resume_operation_id")
+        .and_then(Value::as_str)
+        .unwrap_or(operation_id.as_str());
+    if runtime.human_actions.approved(effective_id) {
         return match comptrol_software::update(package, None) {
             Ok(outcome) => success(
                 request,
@@ -5995,7 +6006,12 @@ fn software_uninstall(
         );
     };
     // If human action was already approved, skip the elevation check and retry directly.
-    if runtime.human_actions.approved(operation_id.as_str()) {
+    let effective_id = request
+        .params
+        .get("resume_operation_id")
+        .and_then(Value::as_str)
+        .unwrap_or(operation_id.as_str());
+    if runtime.human_actions.approved(effective_id) {
         return match comptrol_software::uninstall(package, None) {
             Ok(outcome) => success(
                 request,

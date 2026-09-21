@@ -335,6 +335,7 @@ fn windows_entries() -> Result<Vec<AppEntry>, RegistryError> {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 fn read_lnk_target(_lnk_path: &std::path::Path) -> Option<std::path::PathBuf> {
     None
 }
@@ -383,15 +384,21 @@ fn parse_desktop_file_inline(content: &str, path: &std::path::Path) -> Option<Ap
     let mut categories = Vec::new();
     let mut no_display = false;
     let mut terminal = false;
+    let mut in_desktop_entry = false;
 
     for line in content.lines() {
         let line = line.trim();
+        // Only parse [Desktop Entry] section
         if line.starts_with('[') {
+            in_desktop_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_desktop_entry {
             continue;
         }
         if let Some((key, value)) = line.split_once('=') {
             match key.trim() {
-                "Name" => name = Some(value.trim().to_owned()),
+                "Name" if name.is_none() => name = Some(value.trim().to_owned()),
                 "Exec" => exec = Some(value.trim().to_owned()),
                 "Version" => version = Some(value.trim().to_owned()),
                 "Categories" => {
@@ -412,6 +419,12 @@ fn parse_desktop_file_inline(content: &str, path: &std::path::Path) -> Option<Ap
         return None;
     }
 
+    // Parse Exec line: split into executable and argv, handling quoting and
+    // field codes (%f, %F, %u, %U, %i, %c, %k) which are removed at launch time.
+    let exec_str = exec.unwrap();
+    let argv = parse_exec_line(&exec_str);
+    let executable = argv.first().cloned().map(std::path::PathBuf::from);
+
     let id = format!(
         "desktop.{}",
         path.file_stem()
@@ -423,15 +436,84 @@ fn parse_desktop_file_inline(content: &str, path: &std::path::Path) -> Option<Ap
         metadata.insert("categories".to_owned(), categories.join(";"));
     }
     metadata.insert("terminal".to_owned(), terminal.to_string());
+    metadata.insert(
+        "argv".to_owned(),
+        serde_json::to_string(&argv).unwrap_or_default(),
+    );
 
     Some(AppEntry {
         id,
         display_name: name.unwrap(),
         platform: "linux".to_owned(),
-        executable: exec.map(|e| std::path::PathBuf::from(e)),
+        executable,
         version,
         metadata,
     })
+}
+
+/// Parse a `.desktop` file `Exec=` value into a list of arguments.
+///
+/// Handles:
+/// - Quoted strings: `"foo bar"` stays as one token
+/// - Escaped spaces: `foo\ bar` stays as one token
+/// - Field codes (%f, %F, %u, %U, %i, %c, %k) are removed (caller fills them at launch)
+/// - Double-percent `%%` becomes a single `%`
+#[cfg(target_os = "linux")]
+fn parse_exec_line(exec: &str) -> Vec<String> {
+    let mut argv = Vec::new();
+    let mut current = String::new();
+    let mut chars = exec.chars().peekable();
+    let mut in_quote = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quote => {
+                in_quote = false;
+            }
+            '"' if !in_quote => {
+                in_quote = true;
+            }
+            '\\' if !in_quote => {
+                // Escaped character: take the next char literally
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            ' ' if !in_quote && !current.is_empty() => {
+                argv.push(std::mem::take(&mut current));
+            }
+            '%' => {
+                match chars.peek() {
+                    Some('f' | 'F' | 'u' | 'U') => {
+                        chars.next(); // consume field code
+                        // Skip field code; caller fills at launch time.
+                        // For now we leave the argument empty.
+                        if current.is_empty() {
+                            // Don't push empty string; field code was the only content
+                        }
+                    }
+                    Some('i' | 'c' | 'k') => {
+                        chars.next(); // consume; skip these codes too
+                    }
+                    Some('%') => {
+                        chars.next(); // consume escaped percent
+                        current.push('%');
+                    }
+                    _ => {}
+                }
+            }
+            _ if in_quote || ch != ' ' => {
+                current.push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    if !current.is_empty() {
+        argv.push(current);
+    }
+
+    argv
 }
 
 #[cfg(not(target_os = "linux"))]
