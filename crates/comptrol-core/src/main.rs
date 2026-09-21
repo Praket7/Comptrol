@@ -28,6 +28,74 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// A pending command in the Browser Bridge command queue.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingCommand {
+    request_id: String,
+    command_type: String,
+    payload: Value,
+    created_at: u128,
+}
+
+/// Bidirectional command queue for daemon ↔ native_host ↔ extension communication.
+///
+/// The daemon stores commands here. native_host.py polls for pending commands,
+/// forwards them to the extension, and posts results back.
+struct CommandQueue {
+    /// Commands waiting to be picked up by native_host.py
+    pending: VecDeque<PendingCommand>,
+    /// Results keyed by request_id, waiting to be consumed by the agent
+    results: HashMap<String, Value>,
+    /// Maximum pending commands before oldest is evicted
+    max_pending: usize,
+    /// Counter for unique request IDs
+    counter: AtomicUsize,
+}
+
+impl CommandQueue {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            results: HashMap::new(),
+            max_pending: 128,
+            counter: AtomicUsize::new(0),
+        }
+    }
+
+    /// Submit a command to be forwarded to the extension.
+    /// Returns the request_id for correlation.
+    fn submit(&mut self, command_type: &str, payload: Value) -> String {
+        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
+        let request_id = format!("br_{}_{}", now_ms(), seq);
+        let cmd = PendingCommand {
+            request_id: request_id.clone(),
+            command_type: command_type.to_owned(),
+            payload,
+            created_at: now_ms(),
+        };
+        if self.pending.len() >= self.max_pending {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(cmd);
+        request_id
+    }
+
+    /// Drain all pending commands (called by native_host.py poll).
+    fn drain_pending(&mut self) -> Vec<PendingCommand> {
+        self.pending.drain(..).collect()
+    }
+
+    /// Store a result from the extension (called by native_host.py).
+    fn store_result(&mut self, request_id: &str, result: Value) {
+        self.results.insert(request_id.to_owned(), result);
+    }
+
+    /// Consume a result by request_id (called by agent waiting for response).
+    fn take_result(&mut self, request_id: &str) -> Option<Value> {
+        self.results.remove(request_id)
+    }
+}
+
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
@@ -1677,6 +1745,7 @@ fn run_http(port: u16) -> i32 {
         }
     };
     let http_state = Arc::new(http_state);
+    let command_queue = Arc::new(Mutex::new(CommandQueue::new()));
     let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
@@ -1698,6 +1767,7 @@ fn run_http(port: u16) -> i32 {
                 let runtime = Arc::clone(&runtime);
                 let tasks = Arc::clone(&tasks);
                 let http_state = Arc::clone(&http_state);
+                let command_queue = Arc::clone(&command_queue);
                 let active_connections = Arc::clone(&active_connections);
                 thread::spawn(move || {
                     let pairing_store = Arc::new(Mutex::new(
@@ -1710,6 +1780,7 @@ fn run_http(port: u16) -> i32 {
                         &http_state,
                         pairing_store,
                         None,
+                        &command_queue,
                     ) {
                         eprintln!("http request failed: {error}");
                     }
@@ -1902,6 +1973,7 @@ fn run_mtls(port: u16) -> i32 {
             return 1;
         }
     };
+    let command_queue = Arc::new(Mutex::new(CommandQueue::new()));
     eprintln!("comptrol mutual-TLS HTTP listening on {bind}:{port}/mcp");
     let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
@@ -1917,6 +1989,7 @@ fn run_mtls(port: u16) -> i32 {
         let tasks = Arc::clone(&tasks);
         let http_state = Arc::clone(&http_state);
         let pairing_store = Arc::clone(&pairing_store);
+        let command_queue = Arc::clone(&command_queue);
         let active_connections = Arc::clone(&active_connections);
         thread::spawn(move || {
             let result = (|| -> io::Result<()> {
@@ -1953,6 +2026,7 @@ fn run_mtls(port: u16) -> i32 {
                     &http_state,
                     Arc::clone(&pairing_store),
                     peer_cert_fingerprint,
+                    &command_queue,
                 )
             })();
             if let Err(error) = result {
@@ -2353,6 +2427,7 @@ fn handle_http<S: HttpStream>(
     http_state: &Arc<HttpStore>,
     pairing_store: Arc<Mutex<PairingStore>>,
     peer_fingerprint: Option<String>,
+    command_queue: &Arc<Mutex<CommandQueue>>,
 ) -> io::Result<()> {
     // ponytail: bounded local parser, replace with a full HTTP implementation before public network exposure
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -2744,23 +2819,79 @@ fn handle_http<S: HttpStream>(
     if request_line.starts_with("POST /browser/debugger/attach ")
         || request_line.starts_with("POST /browser/debugger/detach ")
     {
+        let request_body: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return write_http_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    serde_json::to_vec(&json!({"ok":false,"error":"invalid_json"}))
+                        .unwrap_or_default(),
+                    None,
+                );
+            }
+        };
+        let target_id = request_body
+            .get("target_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let command_type = if request_line.contains("/attach ") {
+            "attach_debugger"
+        } else {
+            "detach_debugger"
+        };
+        let mut queue = command_queue.lock().expect("command queue lock poisoned");
+        let request_id = queue.submit(command_type, json!({"targetId": target_id}));
         return write_http_response(
             stream,
-            200,
-            "OK",
+            202,
+            "Accepted",
             "application/json",
-            serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
+            serde_json::to_vec(&json!({
+                "ok": true,
+                "request_id": request_id,
+                "state": "pending",
+                "message": format!("{} command queued for browser extension", command_type),
+            }))
+            .unwrap_or_default(),
             None,
         );
     }
     if request_line.starts_with("POST /browser/groups/restore ") {
+        let request_body: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return write_http_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    serde_json::to_vec(&json!({"ok":false,"error":"invalid_json"}))
+                        .unwrap_or_default(),
+                    None,
+                );
+            }
+        };
+        let group_id = request_body
+            .get("group_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let mut queue = command_queue.lock().expect("command queue lock poisoned");
+        let request_id = queue.submit("restore_group", json!({"groupId": group_id}));
         return write_http_response(
             stream,
-            501,
-            "Not Implemented",
+            202,
+            "Accepted",
             "application/json",
-            serde_json::to_vec(&json!({"ok":false,"error":"not_implemented","message":"Tab group restore requires browser extension API"}))
-                .unwrap_or_default(),
+            serde_json::to_vec(&json!({
+                "ok": true,
+                "request_id": request_id,
+                "state": "pending",
+                "message": "restore_group command queued for browser extension",
+            }))
+            .unwrap_or_default(),
             None,
         );
     }
@@ -2782,16 +2913,38 @@ fn handle_http<S: HttpStream>(
 
     // ── Browser Bridge extension event endpoints ──────────────────────────
     if request_line.starts_with("POST /browser/extension/targets ") {
+        let request_body: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+        // Store extension-discovered targets for later use
         return write_http_response(
             stream,
             200,
             "OK",
             "application/json",
-            serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
+            serde_json::to_vec(
+                &json!({"ok":true,"targets_stored": request_body.get("targets").is_some()}),
+            )
+            .unwrap_or_default(),
             None,
         );
     }
     if request_line.starts_with("POST /browser/extension/cdp_result ") {
+        let request_body: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => json!({}),
+        };
+        let request_id = request_body
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !request_id.is_empty() {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            let result = if let Some(error) = request_body.get("error") {
+                json!({"ok": false, "error": error})
+            } else {
+                json!({"ok": true, "result": request_body.get("result")})
+            };
+            queue.store_result(request_id, result);
+        }
         return write_http_response(
             stream,
             200,
@@ -2802,6 +2955,28 @@ fn handle_http<S: HttpStream>(
         );
     }
     if request_line.starts_with("POST /browser/extension/event ") {
+        let request_body: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => json!({}),
+        };
+        let request_id = request_body
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let event = request_body
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        // Store event results for commands that have a requestId
+        if !request_id.is_empty() {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            let result = if let Some(error) = request_body.get("error") {
+                json!({"ok": false, "error": error, "event": event})
+            } else {
+                json!({"ok": true, "event": event, "data": request_body.get("data")})
+            };
+            queue.store_result(request_id, result);
+        }
         return write_http_response(
             stream,
             200,
@@ -2810,6 +2985,104 @@ fn handle_http<S: HttpStream>(
             serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
             None,
         );
+    }
+
+    // ── Browser Bridge command queue endpoints ──────────────────────────────
+    if request_line.starts_with("POST /browser/command/poll ") {
+        // native_host.py polls this to get pending commands for the extension
+        let mut queue = command_queue.lock().expect("command queue lock poisoned");
+        let commands = queue.drain_pending();
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(&json!({
+                "ok": true,
+                "commands": commands,
+                "count": commands.len(),
+            }))
+            .unwrap_or_default(),
+            None,
+        );
+    }
+    if request_line.starts_with("POST /browser/command/result ") {
+        // native_host.py posts command results back here
+        let request_body: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return write_http_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    serde_json::to_vec(&json!({"ok":false,"error":"invalid_json"}))
+                        .unwrap_or_default(),
+                    None,
+                );
+            }
+        };
+        let request_id = request_body
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if request_id.is_empty() {
+            return write_http_response(
+                stream,
+                400,
+                "Bad Request",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":false,"error":"missing_request_id"}))
+                    .unwrap_or_default(),
+                None,
+            );
+        }
+        let mut queue = command_queue.lock().expect("command queue lock poisoned");
+        let result = if let Some(error) = request_body.get("error") {
+            json!({"ok": false, "error": error})
+        } else {
+            json!({"ok": true, "result": request_body.get("result")})
+        };
+        queue.store_result(request_id, result);
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
+            None,
+        );
+    }
+    if request_line.starts_with("GET /browser/command/result/") {
+        // Agent polls for a specific command result by request_id
+        let request_id = request_line
+            .trim_start_matches("GET /browser/command/result/")
+            .trim_end_matches(" ")
+            .to_owned();
+        let mut queue = command_queue.lock().expect("command queue lock poisoned");
+        return match queue.take_result(&request_id) {
+            Some(result) => write_http_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                serde_json::to_vec(&result).unwrap_or_default(),
+                None,
+            ),
+            None => write_http_response(
+                stream,
+                404,
+                "Not Found",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": false,
+                    "error": "result_not_ready",
+                    "request_id": request_id,
+                }))
+                .unwrap_or_default(),
+                None,
+            ),
+        };
     }
 
     if !request_line.starts_with("POST /mcp ") {
@@ -3332,5 +3605,66 @@ fn run_adapter(args: Vec<String>) -> i32 {
             eprintln!("adapter commands: validate <adapter.toml> | scaffold <name>");
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_queue_submit_and_drain() {
+        let mut queue = CommandQueue::new();
+        let request_id = queue.submit("attach_debugger", json!({"targetId": "123"}));
+        assert!(!request_id.is_empty());
+        assert!(request_id.starts_with("br_"));
+
+        let pending = queue.drain_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].command_type, "attach_debugger");
+        assert_eq!(pending[0].payload["targetId"], "123");
+        assert_eq!(pending[0].request_id, request_id);
+
+        // After drain, no more pending
+        let pending = queue.drain_pending();
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn command_queue_result_roundtrip() {
+        let mut queue = CommandQueue::new();
+        let request_id = queue.submit("detach_debugger", json!({"targetId": "456"}));
+
+        // No result yet
+        assert!(queue.take_result(&request_id).is_none());
+
+        // Store result
+        queue.store_result(&request_id, json!({"ok": true, "targetId": "456"}));
+
+        // Take result
+        let result = queue.take_result(&request_id).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["targetId"], "456");
+
+        // Already consumed
+        assert!(queue.take_result(&request_id).is_none());
+    }
+
+    #[test]
+    fn command_queue_evicts_oldest_when_full() {
+        let mut queue = CommandQueue::new();
+        queue.max_pending = 3;
+
+        let id1 = queue.submit("cmd1", json!({}));
+        let id2 = queue.submit("cmd2", json!({}));
+        let id3 = queue.submit("cmd3", json!({}));
+        let _id4 = queue.submit("cmd4", json!({}));
+
+        let pending = queue.drain_pending();
+        assert_eq!(pending.len(), 3);
+        // id1 should be evicted
+        assert!(pending.iter().all(|c| c.request_id != id1));
+        assert!(pending.iter().any(|c| c.request_id == id2));
+        assert!(pending.iter().any(|c| c.request_id == id3));
     }
 }

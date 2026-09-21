@@ -67,4 +67,15 @@ jobs:
           name: v4-benchmark-results
           path: benchmark-results/v4-transport.json
           if-no-files-found: error
+      - name: V5 desktop benchmark matrix
+        run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/desktop_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-desktop.json
+      - name: V5 adapter benchmark matrix
+        run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/adapter_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-adapter.json
+      - name: V5 recovery benchmark matrix
+        run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/recovery_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-recovery.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v5-benchmark-results
+          path: bench/results/v5-*.json
+          if-no-files-found: error
       - run: python3 scripts/generate_homebrew_formula.py --version "$(cat VERSION)" --url https://example.invalid/comptrol.tar.gz --sha256 0000000000000000000000000000000000000000000000000000000000000000 --output /tmp/comptrol.rb

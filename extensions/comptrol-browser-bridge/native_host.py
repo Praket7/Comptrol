@@ -13,12 +13,19 @@ Message format (native messaging):
 Protocol (all fields are camelCase to match Chrome extension conventions):
 - Extension -> Host: {"type": "...", ...}
 - Host -> Extension: {"type": "...", ...}
+
+Command channel:
+- Host polls daemon for pending commands via POST /browser/command/poll
+- Host forwards commands to extension via native messaging
+- Extension sends results back through native messaging
+- Host posts results to daemon via POST /browser/command/result
 """
 
 import json
 import os
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +33,8 @@ import urllib.request
 LOCAL_DAEMON_URL = os.environ.get("COMPTROL_DAEMON_URL", "http://127.0.0.1:7317")
 PROTOCOL_VERSION = "comptrol.browser.bridge/0.1.0"
 NATIVE_HOST_ID = "comptrol_browser_bridge"
+POLL_INTERVAL_MS = 200
+POLL_INTERVAL_MAX_MS = 2000
 
 
 def read_message():
@@ -67,9 +76,71 @@ def daemon_post(endpoint, params=None):
         return {"ok": False, "error": "daemon_error", "details": str(e)}
 
 
+def command_poll_loop(native_port_ref):
+    """
+    Background thread that polls the daemon for pending commands
+    and forwards them to the extension via native messaging.
+    """
+    poll_interval = POLL_INTERVAL_MS / 1000.0
+
+    while True:
+        # Wait a bit before polling
+        time.sleep(poll_interval)
+
+        # Get the current native port
+        port = native_port_ref.get("port")
+        connected = native_port_ref.get("connected", False)
+        if not port or not connected:
+            continue
+
+        # Poll daemon for pending commands
+        response = daemon_post("/browser/command/poll")
+        if not response.get("ok"):
+            # Daemon unreachable or error; back off
+            poll_interval = min(poll_interval * 1.5, POLL_INTERVAL_MAX_MS / 1000.0)
+            continue
+
+        commands = response.get("commands", [])
+        if not commands:
+            # No commands; use minimum interval
+            poll_interval = POLL_INTERVAL_MS / 1000.0
+            continue
+
+        # Forward each command to the extension
+        for cmd in commands:
+            command_type = cmd.get("command_type", "")
+            request_id = cmd.get("request_id", "")
+            payload = cmd.get("payload", {})
+
+            # Map daemon command types to extension message types
+            extension_msg = {
+                "type": command_type,
+                "requestId": request_id,
+                **payload,
+            }
+
+            try:
+                port.postMessage(extension_msg)
+            except Exception as e:
+                # Failed to send; report error back to daemon
+                daemon_post("/browser/command/result", {
+                    "request_id": request_id,
+                    "error": {"type": "send_failed", "details": str(e)},
+                })
+
+
 def main():
     """Main loop: read from extension, forward to daemon, write response."""
     handshake_complete = False
+    native_port_ref = {"port": None, "connected": False}
+
+    # Start the command poll thread
+    poll_thread = threading.Thread(
+        target=command_poll_loop,
+        args=(native_port_ref,),
+        daemon=True,
+    )
+    poll_thread.start()
 
     while True:
         message = read_message()
@@ -81,7 +152,6 @@ def main():
             continue
 
         msg_type = message.get("type", "")
-        # Extension sends camelCase request_id
         request_id = message.get("requestId") or message.get("request_id")
 
         # Validate protocol only on handshake
@@ -90,6 +160,7 @@ def main():
                 write_message({"type": "error", "error": "invalid_protocol"})
                 continue
             handshake_complete = True
+            native_port_ref["connected"] = True
             write_message({
                 "type": "handshake_ack",
                 "protocol": PROTOCOL_VERSION,
@@ -104,7 +175,6 @@ def main():
 
         # Handle extension -> daemon message types (all camelCase fields)
         if msg_type == "targets_list":
-            # Extension reports its discovered targets
             result = daemon_post("/browser/extension/targets", {
                 "targets": message.get("targets", []),
             })
@@ -113,7 +183,6 @@ def main():
             write_message(result)
 
         elif msg_type == "cdp_command_result":
-            # Extension sends CDP command result back
             result = daemon_post("/browser/extension/cdp_result", {
                 "requestId": request_id,
                 "result": message.get("result"),
@@ -124,7 +193,6 @@ def main():
             write_message(result)
 
         elif msg_type == "debugger_event":
-            # Extension sends debugger event (attached, detached, etc.)
             result = daemon_post("/browser/extension/event", {
                 "event": message.get("event"),
                 "targetId": message.get("targetId"),
@@ -138,6 +206,7 @@ def main():
             result = daemon_post("/browser/extension/event", {
                 "event": "debugger_attached",
                 "targetId": message.get("targetId"),
+                "requestId": request_id,
             })
             if request_id:
                 result["requestId"] = request_id
@@ -148,44 +217,45 @@ def main():
                 "event": "debugger_detached",
                 "targetId": message.get("targetId"),
                 "reason": message.get("reason"),
+                "requestId": request_id,
             })
             if request_id:
                 result["requestId"] = request_id
             write_message(result)
 
         elif msg_type == "attach_debugger_result":
-            result = daemon_post("/browser/extension/event", {
-                "event": "attach_result",
-                "targetId": message.get("targetId"),
-                "ok": message.get("ok"),
-                "error": message.get("error"),
-            })
+            # Extension sends result for a command we forwarded from daemon
             if request_id:
-                result["requestId"] = request_id
-            write_message(result)
+                daemon_post("/browser/command/result", {
+                    "request_id": request_id,
+                    "result": {
+                        "ok": message.get("ok"),
+                        "targetId": message.get("targetId"),
+                    },
+                })
+            write_message({"ok": True})
 
         elif msg_type == "detach_debugger_result":
-            result = daemon_post("/browser/extension/event", {
-                "event": "detach_result",
-                "targetId": message.get("targetId"),
-                "ok": message.get("ok"),
-                "error": message.get("error"),
-            })
             if request_id:
-                result["requestId"] = request_id
-            write_message(result)
+                daemon_post("/browser/command/result", {
+                    "request_id": request_id,
+                    "result": {
+                        "ok": message.get("ok"),
+                        "targetId": message.get("targetId"),
+                    },
+                })
+            write_message({"ok": True})
 
         elif msg_type == "restore_group_result":
-            result = daemon_post("/browser/extension/event", {
-                "event": "restore_group_result",
-                "requestId": request_id,
-                "ok": message.get("ok"),
-                "restored": message.get("restored"),
-                "error": message.get("error"),
-            })
             if request_id:
-                result["requestId"] = request_id
-            write_message(result)
+                daemon_post("/browser/command/result", {
+                    "request_id": request_id,
+                    "result": {
+                        "ok": message.get("ok"),
+                        "restored": message.get("restored"),
+                    },
+                })
+            write_message({"ok": True})
 
         else:
             write_message({
