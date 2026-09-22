@@ -223,6 +223,7 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
             "POST",
             "/browser/extension/heartbeat",
             json!({"protocol": "comptrol.browser.bridge/0.1.0"}),
+            Some(token),
         );
         assert_eq!(status, 200, "{heartbeat}");
 
