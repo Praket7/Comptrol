@@ -1692,6 +1692,7 @@ pub fn compact_snapshot(
     let expression = format!(
         r#"(() => {{
             const limit = {limit};
+            const CACHE_KEY = '__comptrol_action_index_v2';
             const normalize = value => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 160);
             const roleOf = element => element.getAttribute('role') ||
                 (element.tagName === 'A' ? 'link' :
@@ -1721,12 +1722,36 @@ pub fn compact_snapshot(
                 element.innerText ||
                 element.textContent
             );
+            let state = globalThis[CACHE_KEY];
+            if (!state || !state.observer) {{
+                state = {{ dirty: true, cached: null, observed: new WeakSet(), observer: null, revision: 0 }};
+                state.observer = new MutationObserver(() => {{ state.dirty = true; }});
+                globalThis[CACHE_KEY] = state;
+            }}
+            const observeRoot = root => {{
+                if (!root || state.observed.has(root)) return;
+                try {{
+                    state.observer.observe(root, {{
+                        subtree: true,
+                        childList: true,
+                        attributes: true,
+                        characterData: true,
+                        attributeFilter: [
+                            'role','aria-label','aria-labelledby','aria-disabled','disabled','readonly',
+                            'hidden','style','class','id','data-testid','data-test-id','href','tabindex',
+                            'contenteditable','type','placeholder','title'
+                        ]
+                    }});
+                    state.observed.add(root);
+                }} catch (_) {{}}
+            }};
             const roots = () => {{
                 const pending = [document];
                 const seen = [];
                 while (pending.length) {{
                     const root = pending.shift();
                     seen.push(root);
+                    observeRoot(root);
                     for (const element of root.querySelectorAll('*')) {{
                         if (element.shadowRoot) pending.push(element.shadowRoot);
                         if (element.tagName === 'IFRAME') {{
@@ -1736,6 +1761,9 @@ pub fn compact_snapshot(
                 }}
                 return seen;
             }};
+            if (!state.dirty && state.cached && state.cached.limit === limit) {{
+                return {{ ...state.cached.value, cache_hit: true, action_index_revision: state.revision }};
+            }}
             const candidates = roots().flatMap(root => [...root.querySelectorAll(
                 'button, a, input, select, textarea, [contenteditable="true"], [role], [tabindex]'
             )]);
@@ -1757,13 +1785,19 @@ pub fn compact_snapshot(
                 editable: Boolean(element.isContentEditable || element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT'),
                 href_present: Boolean(element.href)
             }}));
-            return {{
-                title: normalize(document.title),
-                element_count: visible.length,
-                returned: elements.length,
-                truncated: visible.length > elements.length,
-                elements
+            state.revision += 1;
+            state.dirty = false;
+            state.cached = {{
+                limit,
+                value: {{
+                    title: normalize(document.title),
+                    element_count: visible.length,
+                    returned: elements.length,
+                    truncated: visible.length > elements.length,
+                    elements
+                }}
             }};
+            return {{ ...state.cached.value, cache_hit: false, action_index_revision: state.revision }};
         }})()"#
     );
     let data = cdp_call(

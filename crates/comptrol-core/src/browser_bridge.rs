@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
+#[cfg(test)]
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

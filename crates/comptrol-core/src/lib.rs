@@ -24,6 +24,7 @@ use comptrol_workflow::{Workflow, WorkflowExecutor, WorkflowNode};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -497,6 +498,65 @@ pub struct RoutePlan {
 const ROUTE_LATENCY_SAMPLE_CAP: usize = 256;
 
 #[derive(Clone, Debug, Default)]
+struct ProgressRecord {
+    fingerprint: String,
+    repeated: u32,
+}
+
+fn progress_records() -> &'static std::sync::Mutex<HashMap<String, ProgressRecord>> {
+    static RECORDS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ProgressRecord>>> =
+        std::sync::OnceLock::new();
+    RECORDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn progress_control_signal(request: &OperationRequest, result: &ActionResult) -> Value {
+    let target = request
+        .target
+        .as_ref()
+        .and_then(|target| target.id.as_deref().or(target.name.as_deref()))
+        .unwrap_or("default");
+    let key = format!("{}|{}", request.intent, target);
+    let selected_state = json!({
+        "verification": result.verification,
+        "effect": result.effect,
+        "error": result.error.as_ref().map(|error| error.code.as_str()),
+        "revision": result.data.get("revision"),
+        "snapshot_revision": result.data.get("snapshot_revision"),
+        "satisfied": result.data.get("satisfied"),
+        "done": result.data.get("done"),
+    });
+    let bytes = serde_json::to_vec(&selected_state).unwrap_or_default();
+    let fingerprint = format!("{:x}", Sha256::digest(bytes));
+    let milestone = result.error.is_none()
+        && result.verification == VerificationState::Verified
+        && matches!(result.effect, EffectState::Changed);
+    let mut records = match progress_records().lock() {
+        Ok(records) => records,
+        Err(_) => return json!({"stuck": false, "milestone": milestone}),
+    };
+    if records.len() > 256 && !records.contains_key(&key) {
+        records.clear();
+    }
+    let record = records.entry(key).or_default();
+    if milestone {
+        record.fingerprint = fingerprint;
+        record.repeated = 0;
+    } else if record.fingerprint == fingerprint {
+        record.repeated = record.repeated.saturating_add(1);
+    } else {
+        record.fingerprint = fingerprint;
+        record.repeated = 0;
+    }
+    let stuck = record.repeated >= 2 && !milestone;
+    json!({
+        "stuck": stuck,
+        "milestone": milestone,
+        "repeat_count": record.repeated,
+        "recommended": if stuck { "escalate_observation_or_replan" } else { "continue" },
+    })
+}
+
+#[derive(Clone, Debug, Default)]
 struct RouteHistory {
     attempts: u64,
     verified_successes: u64,
@@ -658,6 +718,7 @@ impl Default for Policy {
             max_risk: Risk::R0,
             allowed_intents: HashSet::from([
                 "system.ping".to_owned(),
+                "capability.search".to_owned(),
                 "desktop.observe".to_owned(),
                 "platform.broker.observe".to_owned(),
                 "browser.cdp.wait_for".to_owned(),
@@ -787,6 +848,7 @@ impl Policy {
             }
             policy.allowed_intents.extend([
                 "system.ping".to_owned(),
+                "capability.search".to_owned(),
                 "desktop.observe".to_owned(),
                 "platform.broker.observe".to_owned(),
                 "browser.cdp.wait_for".to_owned(),
@@ -1494,6 +1556,7 @@ impl Runtime {
         }
         let route_started = Instant::now();
         let result = match request.intent.as_str() {
+            "capability.search" => capability_search(&request, operation_id),
             "system.ping" => success(
                 &request,
                 operation_id,
@@ -1583,13 +1646,28 @@ impl Runtime {
                 },
             ),
         };
-        self.record_route_outcome(&result, route_started.elapsed().as_secs_f64() * 1_000.0);
+        let mut result = result;
+        let control = progress_control_signal(&request, &result);
+        if let Some(data) = result.data.as_object_mut() {
+            data.insert("control".to_owned(), control);
+        }
+        self.record_route_outcome(
+            &request,
+            &result,
+            route_started.elapsed().as_secs_f64() * 1_000.0,
+        );
         self.remember(&request, result.clone());
         result
     }
 
-    fn record_route_outcome(&mut self, result: &ActionResult, latency_ms: f64) {
-        let entry = self.route_history.entry(result.route.clone()).or_default();
+    fn record_route_outcome(
+        &mut self,
+        request: &OperationRequest,
+        result: &ActionResult,
+        latency_ms: f64,
+    ) {
+        let route_key = route_history_key(request, &result.route);
+        let entry = self.route_history.entry(route_key.clone()).or_default();
         entry.attempts = entry.attempts.saturating_add(1);
         let verified = result.verification == VerificationState::Verified && result.error.is_none();
         let dispatch_failed = matches!(
@@ -1983,9 +2061,11 @@ impl Runtime {
 
 fn classify(intent: &str) -> Risk {
     match intent {
-        "system.ping" | "desktop.observe" | "platform.broker.observe" | "workflow.execute" => {
-            Risk::R0
-        }
+        "system.ping"
+        | "capability.search"
+        | "desktop.observe"
+        | "platform.broker.observe"
+        | "workflow.execute" => Risk::R0,
         "app.launch" => Risk::R1,
         "app.resolve" | "app.list" | "permission.status" | "popup.inspect" => Risk::R0,
         "permission.request" | "software.search" | "software.describe" | "settings.get" => Risk::R1,
@@ -2516,6 +2596,21 @@ fn route_plan(request: &OperationRequest, policy: Option<&Policy>) -> RoutePlan 
     plan
 }
 
+fn route_history_key(request: &OperationRequest, route: &str) -> String {
+    let provider = request
+        .params
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    format!(
+        "{}|{}|{}|{}",
+        route,
+        request.intent,
+        std::env::consts::OS,
+        provider
+    )
+}
+
 fn route_plan_with_history(
     request: &OperationRequest,
     history: &HashMap<String, RouteHistory>,
@@ -2527,7 +2622,11 @@ fn route_plan_with_history(
             candidate.utility = None;
             continue;
         }
-        if let Some(stats) = history.get(&candidate.route) {
+        let contextual_key = route_history_key(request, &candidate.route);
+        if let Some(stats) = history
+            .get(&contextual_key)
+            .or_else(|| history.get(&candidate.route))
+        {
             candidate.historical_success = stats.success_rate();
             if let Some(latency) = stats.p95_latency_ms {
                 candidate.expected_p95_ms = Some(latency);
@@ -5513,26 +5612,13 @@ fn app_list(request: &OperationRequest, operation_id: String) -> ActionResult {
         .get("detail")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut entries = Vec::new();
-    let mut errors = Vec::new();
-    match comptrol_app_registry::registry::installed_entries() {
-        Ok(list) => entries.extend(list),
-        Err(error) => errors.push(error.to_string()),
-    }
-    if !query.trim().is_empty() {
-        let needle = query.to_lowercase();
-        entries.retain(|entry| {
-            entry.id.to_lowercase().contains(&needle)
-                || entry.display_name.to_lowercase().contains(&needle)
-        });
-    }
-    entries.sort_by(|a, b| a.id.cmp(&b.id));
-    entries.dedup_by(|a, b| a.id == b.id);
-    let total = entries.len();
+    let (entries, total, errors) =
+        match comptrol_app_registry::registry::search(query, offset, limit) {
+            Ok((entries, total)) => (entries, total, Vec::<String>::new()),
+            Err(error) => (Vec::new(), 0, vec![error.to_string()]),
+        };
     let apps = entries
         .into_iter()
-        .skip(offset)
-        .take(limit)
         .map(|entry| {
             if detail {
                 serde_json::to_value(entry).unwrap_or(Value::Null)
@@ -5562,6 +5648,75 @@ fn app_list(request: &OperationRequest, operation_id: String) -> ActionResult {
             "next_offset": next_offset,
             "compact": !detail,
             "provider_errors": errors,
+        }),
+    )
+}
+
+fn capability_search(request: &OperationRequest, operation_id: String) -> ActionResult {
+    let query = request
+        .params
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let offset = request
+        .params
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let limit = request
+        .params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(40)
+        .clamp(1, 160) as usize;
+    let detail = request
+        .params
+        .get("detail")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let filtered = capabilities()
+        .into_iter()
+        .filter(|capability| {
+            query.is_empty()
+                || capability.name.to_ascii_lowercase().contains(&query)
+                || capability.route.to_ascii_lowercase().contains(&query)
+        })
+        .collect::<Vec<_>>();
+    let total = filtered.len();
+    let capabilities = filtered
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|capability| {
+            if detail {
+                serde_json::to_value(capability).unwrap_or(Value::Null)
+            } else {
+                json!({
+                    "name": capability.name,
+                    "available": capability.available,
+                    "risk": capability.risk,
+                    "route": capability.route,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    let returned = capabilities.len();
+    success(
+        request,
+        operation_id,
+        "native",
+        EffectState::None,
+        VerificationState::Verified,
+        json!({
+            "capabilities": capabilities,
+            "count": total,
+            "returned": returned,
+            "offset": offset,
+            "limit": limit,
+            "next_offset": (offset + returned < total).then_some(offset + returned),
+            "compact": !detail,
         }),
     )
 }

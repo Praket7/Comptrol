@@ -46,6 +46,45 @@ const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(300);
 struct CachedEntries {
     observed_at: Instant,
     entries: Vec<AppEntry>,
+    by_id: BTreeMap<String, usize>,
+    by_name: BTreeMap<String, Vec<usize>>,
+}
+
+impl CachedEntries {
+    fn new(entries: Vec<AppEntry>) -> Self {
+        let mut by_id = BTreeMap::new();
+        let mut by_name = BTreeMap::<String, Vec<usize>>::new();
+        for (index, entry) in entries.iter().enumerate() {
+            by_id.insert(entry.id.to_ascii_lowercase(), index);
+            by_name
+                .entry(entry.display_name.to_ascii_lowercase())
+                .or_default()
+                .push(index);
+        }
+        Self {
+            observed_at: Instant::now(),
+            entries,
+            by_id,
+            by_name,
+        }
+    }
+
+    fn exact_matches(&self, query: &str) -> Vec<AppEntry> {
+        let lower = query.to_ascii_lowercase();
+        let mut indices = Vec::<usize>::new();
+        if let Some(index) = self.by_id.get(&lower) {
+            indices.push(*index);
+        }
+        if let Some(matches) = self.by_name.get(&lower) {
+            indices.extend(matches.iter().copied());
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+            .into_iter()
+            .filter_map(|index| self.entries.get(index).cloned())
+            .collect()
+    }
 }
 
 fn registry_cache() -> &'static RwLock<Option<CachedEntries>> {
@@ -71,10 +110,7 @@ pub fn installed_entries() -> Result<Vec<AppEntry>, RegistryError> {
     entries.dedup_by(|a, b| a.id == b.id);
 
     if let Ok(mut cache) = registry_cache().write() {
-        *cache = Some(CachedEntries {
-            observed_at: Instant::now(),
-            entries: entries.clone(),
-        });
+        *cache = Some(CachedEntries::new(entries.clone()));
     }
     Ok(entries)
 }
@@ -108,14 +144,69 @@ pub fn resolve(query: &str) -> Result<AppEntry, RegistryError> {
 
 /// All exact matches for `query` (id match or exact display-name match).
 pub fn resolve_all(query: &str) -> Result<Vec<AppEntry>, RegistryError> {
-    let lower = query.to_ascii_lowercase();
-    Ok(installed_entries()?
-        .into_iter()
-        .filter(|entry| {
-            entry.id.to_ascii_lowercase() == lower
-                || entry.display_name.to_ascii_lowercase() == lower
+    if let Ok(cache) = registry_cache().read()
+        && let Some(cached) = cache.as_ref()
+        && cached.observed_at.elapsed() <= REGISTRY_CACHE_TTL
+    {
+        return Ok(cached.exact_matches(query));
+    }
+    // Refresh once on the cold path, then use the index so warm resolution
+    // never clones and scans the complete application inventory.
+    let _ = installed_entries()?;
+    let cache = registry_cache()
+        .read()
+        .map_err(|_| std::io::Error::other("application registry cache lock poisoned"))?;
+    Ok(cache
+        .as_ref()
+        .map(|cached| cached.exact_matches(query))
+        .unwrap_or_default())
+}
+
+/// Search the warm application snapshot without cloning every entry. Results
+/// are deterministic and paginated so MCP callers can keep context bounded.
+pub fn search(
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<AppEntry>, usize), RegistryError> {
+    let stale = registry_cache()
+        .read()
+        .ok()
+        .and_then(|cache| {
+            cache
+                .as_ref()
+                .map(|cached| cached.observed_at.elapsed() > REGISTRY_CACHE_TTL)
         })
-        .collect())
+        .unwrap_or(true);
+    if stale {
+        let _ = installed_entries()?;
+    }
+    let cache = registry_cache()
+        .read()
+        .map_err(|_| std::io::Error::other("application registry cache lock poisoned"))?;
+    let Some(cached) = cache.as_ref() else {
+        return Ok((Vec::new(), 0));
+    };
+    let needle = query.trim().to_ascii_lowercase();
+    let matching = cached
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            needle.is_empty()
+                || entry.id.to_ascii_lowercase().contains(&needle)
+                || entry.display_name.to_ascii_lowercase().contains(&needle)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let total = matching.len();
+    let rows = matching
+        .into_iter()
+        .skip(offset)
+        .take(limit.max(1))
+        .filter_map(|index| cached.entries.get(index).cloned())
+        .collect();
+    Ok((rows, total))
 }
 
 /// Enumerate installed applications through the platform registration
