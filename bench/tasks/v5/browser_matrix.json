@@ -60,10 +60,26 @@
     },
     {
       "task_id": "v5.browser.dialog_handling",
-      "goal": "Handle a fixture JavaScript dialog command and verify the exact CDP dialog handling acknowledgement.",
+      "goal": "Trigger a pending fixture JavaScript dialog, dismiss it through the public browser intent, and verify the CDP dialog transition succeeds.",
       "iterations": 3,
       "verifier": "dialog_handled",
       "steps": [
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "browser.cdp.evaluate",
+              "params": {
+                "target_id": "comptrol-fixture-page",
+                "browser_context_id": "comptrol-fixture-context",
+                "revision": "fixture-revision-1",
+                "expression": "window.__comptrol_fixture_dialog__ = true"
+              },
+              "idempotency_key": "bench-browser-dlg-open-001"
+            }
+          }
+        },
         {
           "method": "tools/call",
           "params": {
