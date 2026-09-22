@@ -68,6 +68,36 @@ jobs:
           PY
       - name: Apply V6 optimizer patch
         run: python3 scripts/apply_v6_optimizer.py
+      - name: Repair generated compile details
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          core = Path('crates/comptrol-core/src/lib.rs')
+          text = core.read_text(encoding='utf-8')
+          bad = 'let route_key = route_history_key(request, &route_key);'
+          good = 'let route_key = route_history_key(request, &result.route);'
+          if text.count(bad) != 1:
+              raise SystemExit(f'expected one generated route-key defect, found {text.count(bad)}')
+          text = text.replace(bad, good, 1)
+          sha_import = 'use sha2::{Digest, Sha256};\n'
+          if sha_import not in text:
+              marker = 'use serde_json::{Value, json};\n'
+              if marker not in text:
+                  raise SystemExit('serde_json import marker missing')
+              text = text.replace(marker, marker + sha_import, 1)
+          core.write_text(text, encoding='utf-8')
+
+          bridge = Path('crates/comptrol-core/src/browser_bridge.rs')
+          text = bridge.read_text(encoding='utf-8')
+          plain = 'use std::thread;\n'
+          guarded = '#[cfg(test)]\nuse std::thread;\n'
+          if guarded not in text:
+              if text.count(plain) != 1:
+                  raise SystemExit(f'expected one thread import, found {text.count(plain)}')
+              text = text.replace(plain, guarded, 1)
+          bridge.write_text(text, encoding='utf-8')
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Compile workspace
