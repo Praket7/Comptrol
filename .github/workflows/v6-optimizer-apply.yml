@@ -81,10 +81,11 @@ jobs:
               raise SystemExit(f'expected one generated route-key defect, found {text.count(bad)}')
           text = text.replace(bad, good, 1)
           sha_import = 'use sha2::{Digest, Sha256};\n'
-          if sha_import not in text:
+          module_end = text.index('pub use adapters::{AdapterDescriptor, AdapterRegistry};')
+          if sha_import not in text[:module_end]:
               marker = 'use serde_json::{Value, json};\n'
-              if marker not in text:
-                  raise SystemExit('serde_json import marker missing')
+              if text.count(marker) != 1:
+                  raise SystemExit(f'expected one top-level serde_json import, found {text.count(marker)}')
               text = text.replace(marker, marker + sha_import, 1)
           core.write_text(text, encoding='utf-8')
 
