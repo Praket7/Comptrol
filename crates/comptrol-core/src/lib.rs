@@ -3711,8 +3711,15 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
                         VerificationState::Verified,
                         json!({
                             "navigated": false,
+                            "final_url": state.get("current_url").cloned().unwrap_or(Value::Null),
                             "reason": "requested state already live on the exact target",
                             "ensure_state": state,
+                            "verification": {
+                                "level": "surface_state",
+                                "source": "browser_target_state",
+                                "criterion": "final_url_matches_request",
+                                "passed": true
+                            },
                             "mouse": "untouched",
                             "clipboard": "untouched",
                         }),
