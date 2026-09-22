@@ -22,6 +22,22 @@ let listenersRegistered = false;
 
 // Debugger attachment state
 const attachedTargets = new Map(); // targetId -> { tabId, debuggerPort, generation }
+const inflightCommandIds = new Set();
+const COMMAND_CACHE_KEY = "comptrol_command_results";
+const COMMAND_CACHE_TTL_MS = 10 * 60 * 1000;
+const COMMAND_CACHE_MAX_ENTRIES = 256;
+const COMMAND_CACHE_MAX_RESULT_BYTES = 64 * 1024;
+const DEDUPED_COMMAND_TYPES = new Set([
+  "cdp_command",
+  "bridge_ping",
+  "open_tab",
+  "close_tab",
+  "history",
+  "download_file",
+  "attach_debugger",
+  "detach_debugger",
+  "restore_group"
+]);
 
 // Alarm for periodic health checks
 const HEALTH_CHECK_ALARM = "comptrol-health-check";
@@ -106,47 +122,116 @@ function scheduleReconnect() {
  * Handle messages from native host
  */
 function handleNativeMessage(message) {
+  void dispatchNativeMessage(message).catch(error => {
+    console.error("Native command dispatch failed:", error);
+    if (message?.requestId) {
+      void sendCommandResult({
+        type: `${message.type || "command"}_result`,
+        requestId: message.requestId,
+        ok: false,
+        error: error.message
+      });
+    }
+  });
+}
+
+async function readCachedCommandResult(requestId) {
+  if (!requestId) return null;
+  const stored = await chrome.storage.local.get(COMMAND_CACHE_KEY);
+  const entries = stored[COMMAND_CACHE_KEY] || {};
+  const entry = entries[requestId];
+  if (!entry) return null;
+  if (Date.now() - Number(entry.completedAt || 0) > COMMAND_CACHE_TTL_MS) {
+    delete entries[requestId];
+    await chrome.storage.local.set({ [COMMAND_CACHE_KEY]: entries });
+    return null;
+  }
+  return entry.response || null;
+}
+
+async function cacheCommandResult(response) {
+  const requestId = response?.requestId;
+  if (!requestId) return;
+  const encoded = JSON.stringify(response);
+  if (encoded.length > COMMAND_CACHE_MAX_RESULT_BYTES) return;
+
+  const stored = await chrome.storage.local.get(COMMAND_CACHE_KEY);
+  const entries = stored[COMMAND_CACHE_KEY] || {};
+  const now = Date.now();
+  for (const [id, entry] of Object.entries(entries)) {
+    if (now - Number(entry.completedAt || 0) > COMMAND_CACHE_TTL_MS) {
+      delete entries[id];
+    }
+  }
+  entries[requestId] = { completedAt: now, response };
+  const ordered = Object.entries(entries).sort(
+    (a, b) => Number(b[1].completedAt || 0) - Number(a[1].completedAt || 0)
+  );
+  const bounded = Object.fromEntries(ordered.slice(0, COMMAND_CACHE_MAX_ENTRIES));
+  await chrome.storage.local.set({ [COMMAND_CACHE_KEY]: bounded });
+}
+
+async function sendCommandResult(response) {
+  if (response?.requestId) {
+    await cacheCommandResult(response);
+    inflightCommandIds.delete(response.requestId);
+  }
+  sendToNative(response);
+}
+
+async function dispatchNativeMessage(message) {
+  const requestId = message?.requestId;
+  if (requestId && DEDUPED_COMMAND_TYPES.has(message.type)) {
+    const cached = await readCachedCommandResult(requestId);
+    if (cached) {
+      sendToNative(cached);
+      return;
+    }
+    if (inflightCommandIds.has(requestId)) return;
+    inflightCommandIds.add(requestId);
+  }
+
   switch (message.type) {
     case "handshake_ack":
-      // Handled in connectNative
       break;
     case "cdp_command":
-      handleCdpCommand(message);
+      await handleCdpCommand(message);
       break;
     case "bridge_ping":
-      handleBridgePing(message);
+      await handleBridgePing(message);
       break;
     case "open_tab":
-      handleOpenTab(message);
+      await handleOpenTab(message);
       break;
     case "close_tab":
-      handleCloseTab(message);
+      await handleCloseTab(message);
       break;
     case "history":
-      handleHistory(message);
+      await handleHistory(message);
       break;
     case "download_file":
-      handleDownloadFile(message);
+      await handleDownloadFile(message);
       break;
     case "get_targets":
-      sendTargetsToNative();
+      await sendTargetsToNative();
       break;
-    case "attach_debugger":
-      attachDebugger(message.targetId).then(result => {
-        sendToNative({ type: "attach_debugger_result", requestId: message.requestId, ...result });
-      });
+    case "attach_debugger": {
+      const result = await attachDebugger(message.targetId);
+      await sendCommandResult({ type: "attach_debugger_result", requestId, ...result });
       break;
-    case "detach_debugger":
-      detachDebugger(message.targetId).then(result => {
-        sendToNative({ type: "detach_debugger_result", requestId: message.requestId, ...result });
-      });
+    }
+    case "detach_debugger": {
+      const result = await detachDebugger(message.targetId);
+      await sendCommandResult({ type: "detach_debugger_result", requestId, ...result });
       break;
-    case "restore_group":
-      restoreClosedGroup(message.groupId).then(result => {
-        sendToNative({ type: "restore_group_result", requestId: message.requestId, ...result });
-      });
+    }
+    case "restore_group": {
+      const result = await restoreClosedGroup(message.groupId);
+      await sendCommandResult({ type: "restore_group_result", requestId, ...result });
       break;
+    }
     default:
+      if (requestId) inflightCommandIds.delete(requestId);
       console.warn("Unknown native message type:", message.type);
   }
 }
@@ -296,20 +381,20 @@ async function handleCdpCommand(message) {
   try {
     const tabId = parseInt(targetId, 10);
     if (Number.isNaN(tabId)) {
-      sendToNative({ type: "cdp_command_result", requestId, ok: false, error: "Invalid target ID" });
+      void sendCommandResult({ type: "cdp_command_result", requestId, ok: false, error: "Invalid target ID" });
       return;
     }
     if (!attachedTargets.has(targetId)) {
       const attached = await attachDebugger(targetId);
       if (!attached.ok) {
-        sendToNative({ type: "cdp_command_result", requestId, ok: false, error: attached.error || "debugger attach failed" });
+        void sendCommandResult({ type: "cdp_command_result", requestId, ok: false, error: attached.error || "debugger attach failed" });
         return;
       }
     }
     const result = await chrome.debugger.sendCommand({ tabId }, method, params || {});
-    sendToNative({ type: "cdp_command_result", requestId, ok: true, result });
+    void sendCommandResult({ type: "cdp_command_result", requestId, ok: true, result });
   } catch (error) {
-    sendToNative({ type: "cdp_command_result", requestId, ok: false, error: error.message });
+    void sendCommandResult({ type: "cdp_command_result", requestId, ok: false, error: error.message });
   }
 }
 
@@ -338,7 +423,7 @@ function waitForTabUpdate(tabId, predicate, timeoutMs = 5000) {
 }
 
 async function handleBridgePing(message) {
-  sendToNative({
+  void sendCommandResult({
     type: "bridge_ping_result",
     requestId: message.requestId,
     ok: true,
@@ -353,7 +438,7 @@ async function handleOpenTab(message) {
       active: !Boolean(message.background)
     });
     const targetId = String(tab.id);
-    sendToNative({
+    void sendCommandResult({
       type: "open_tab_result",
       requestId: message.requestId,
       ok: true,
@@ -376,7 +461,7 @@ async function handleOpenTab(message) {
     });
     await sendTargetsToNative();
   } catch (error) {
-    sendToNative({ type: "open_tab_result", requestId: message.requestId, ok: false, error: error.message });
+    void sendCommandResult({ type: "open_tab_result", requestId: message.requestId, ok: false, error: error.message });
   }
 }
 
@@ -386,7 +471,7 @@ async function handleCloseTab(message) {
     if (!Number.isInteger(tabId)) throw new Error("Invalid target ID");
     await chrome.tabs.remove(tabId);
     attachedTargets.delete(String(message.targetId));
-    sendToNative({
+    void sendCommandResult({
       type: "close_tab_result",
       requestId: message.requestId,
       ok: true,
@@ -400,7 +485,7 @@ async function handleCloseTab(message) {
     });
     await sendTargetsToNative();
   } catch (error) {
-    sendToNative({ type: "close_tab_result", requestId: message.requestId, ok: false, error: error.message });
+    void sendCommandResult({ type: "close_tab_result", requestId: message.requestId, ok: false, error: error.message });
   }
 }
 
@@ -441,7 +526,7 @@ async function handleHistory(message) {
     if (Number(observed?.currentIndex) !== destinationIndex) {
       throw new Error("Browser did not confirm history navigation");
     }
-    sendToNative({
+    void sendCommandResult({
       type: "history_result",
       requestId: message.requestId,
       ok: true,
@@ -456,7 +541,7 @@ async function handleHistory(message) {
     });
     await sendTargetsToNative();
   } catch (error) {
-    sendToNative({ type: "history_result", requestId: message.requestId, ok: false, error: error.message });
+    void sendCommandResult({ type: "history_result", requestId: message.requestId, ok: false, error: error.message });
   }
 }
 
@@ -507,7 +592,7 @@ async function handleDownloadFile(message) {
       conflictAction: "overwrite"
     });
     const item = await waitForDownload(downloadId);
-    sendToNative({
+    void sendCommandResult({
       type: "download_file_result",
       requestId: message.requestId,
       ok: true,
@@ -519,7 +604,7 @@ async function handleDownloadFile(message) {
       }
     });
   } catch (error) {
-    sendToNative({ type: "download_file_result", requestId: message.requestId, ok: false, error: error.message });
+    void sendCommandResult({ type: "download_file_result", requestId: message.requestId, ok: false, error: error.message });
   }
 }
 
