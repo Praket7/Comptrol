@@ -77,17 +77,17 @@ pub fn ensure_auth_token(state_dir: &Path) -> io::Result<String> {
             Ok(mut file) => {
                 writeln!(file, "{token}")?;
                 file.sync_all()?;
-                return Ok(token);
+                Ok(token)
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return auth_token(state_dir)?.ok_or_else(|| {
+                auth_token(state_dir)?.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         "browser bridge token is invalid",
                     )
-                });
+                })
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
     }
 
@@ -99,17 +99,17 @@ pub fn ensure_auth_token(state_dir: &Path) -> io::Result<String> {
             Ok(mut file) => {
                 writeln!(file, "{token}")?;
                 file.sync_all()?;
-                return Ok(token);
+                Ok(token)
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return auth_token(state_dir)?.ok_or_else(|| {
+                auth_token(state_dir)?.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         "browser bridge token is invalid",
                     )
-                });
+                })
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
     }
 }
@@ -225,15 +225,16 @@ pub fn verify_request_signature(
 }
 
 fn decode_hex(value: &str) -> io::Result<Vec<u8>> {
-    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    let bytes = value.as_bytes();
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() || !bytes.iter().all(u8::is_ascii_hexdigit) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid hexadecimal value",
         ));
     }
-    value
-        .as_bytes()
-        .chunks_exact(2)
+    pairs
+        .iter()
         .map(|pair| {
             let text = std::str::from_utf8(pair)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -719,7 +720,7 @@ mod tests {
         let state = temp_state("request-auth");
         let token = ensure_auth_token(&state).expect("token");
         let nonce = "00112233445566778899aabbccddeeff";
-        let body = br#"{"ok":true}"#;
+        let body = br#"{\"ok\":true}"#;
         let signature =
             request_signature(&token, "POST", "/browser/status", nonce, body).expect("signature");
         assert!(
@@ -732,7 +733,7 @@ mod tests {
                 "POST",
                 "/browser/status",
                 nonce,
-                br#"{"ok":false}"#,
+                br#"{\"ok\":false}"#,
                 &signature,
             )
             .expect("body mismatch")
