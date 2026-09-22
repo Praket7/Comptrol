@@ -172,6 +172,11 @@ jobs:
             fi
           done
           chmod +x packages/mcp/native/*/comptrol 2>/dev/null || true
+          rm -rf packages/mcp/browser-bridge
+          cp -R extensions/comptrol-browser-bridge packages/mcp/browser-bridge
+          test -f packages/mcp/browser-bridge/manifest.json
+          test -f packages/mcp/browser-bridge/src/service_worker.js
+          test -f packages/mcp/browser-bridge/native_host.py
           test -f packages/mcp/native/darwin-arm64/comptrol
           test -f packages/mcp/native/darwin-x64/comptrol
           test -f packages/mcp/native/linux-arm64/comptrol

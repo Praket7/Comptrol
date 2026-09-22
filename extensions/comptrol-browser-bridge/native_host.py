@@ -21,8 +21,11 @@ Command channel:
 - Host posts results to daemon via POST /browser/command/result
 """
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import struct
 import sys
 import threading
@@ -30,9 +33,38 @@ import time
 import urllib.error
 import urllib.request
 
-LOCAL_DAEMON_URL = os.environ.get("COMPTROL_DAEMON_URL", "http://127.0.0.1:7317")
+if os.name == "nt":
+    import msvcrt
+    msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+
+HOST_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HOST_DIR, "native_host_config.json")
+
+
+def load_host_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
+            value = json.load(config_file)
+            return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+HOST_CONFIG = load_host_config()
+STATE_DIR = os.environ.get(
+    "COMPTROL_STATE_DIR",
+    HOST_CONFIG.get("state_dir")
+    or os.path.join(os.path.expanduser("~"), ".comptrol"),
+)
+LOCAL_DAEMON_URL = os.environ.get(
+    "COMPTROL_DAEMON_URL",
+    HOST_CONFIG.get("daemon_url") or "http://127.0.0.1:7317",
+)
+BRIDGE_TOKEN_PATH = os.path.join(STATE_DIR, "browser-bridge.token")
 PROTOCOL_VERSION = "comptrol.browser.bridge/0.1.0"
 NATIVE_HOST_ID = "comptrol_browser_bridge"
+MAX_NATIVE_MESSAGE_BYTES = 1024 * 1024
 POLL_INTERVAL_MS = 200
 POLL_INTERVAL_MAX_MS = 2000
 
@@ -41,32 +73,78 @@ POLL_INTERVAL_MAX_MS = 2000
 stdout_lock = threading.Lock()
 
 def read_message():
-    """Read a length-prefixed JSON message from stdin."""
+    """Read one bounded length-prefixed JSON message from stdin."""
     raw_length = sys.stdin.buffer.read(4)
     if len(raw_length) == 0:
         return None
+    if len(raw_length) != 4:
+        raise ValueError("truncated native messaging length prefix")
     length = struct.unpack("<I", raw_length)[0]
-    message = sys.stdin.buffer.read(length).decode("utf-8")
-    return json.loads(message)
+    if length > MAX_NATIVE_MESSAGE_BYTES:
+        raise ValueError(
+            f"native messaging frame exceeds {MAX_NATIVE_MESSAGE_BYTES} bytes"
+        )
+    payload = sys.stdin.buffer.read(length)
+    if len(payload) != length:
+        raise ValueError("truncated native messaging payload")
+    return json.loads(payload.decode("utf-8"))
 
 
 def write_message(message):
-    """Write a length-prefixed JSON message to stdout with locking."""
+    """Write one bounded length-prefixed JSON message to stdout with locking."""
     encoded = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_NATIVE_MESSAGE_BYTES:
+        raise ValueError(
+            f"native messaging response exceeds {MAX_NATIVE_MESSAGE_BYTES} bytes"
+        )
     with stdout_lock:
         sys.stdout.buffer.write(struct.pack("<I", len(encoded)))
         sys.stdout.buffer.write(encoded)
         sys.stdout.buffer.flush()
 
 
-def daemon_post(endpoint, params=None):
-    """POST to daemon HTTP endpoint."""
+def load_bridge_token():
+    try:
+        with open(BRIDGE_TOKEN_PATH, "r", encoding="utf-8") as token_file:
+            token = token_file.read().strip()
+        if len(token) >= 64 and all(ch in "0123456789abcdefABCDEF" for ch in token):
+            return token
+    except OSError:
+        pass
+    return None
+
+
+_daemon_identity_lock = threading.Lock()
+
+
+def _daemon_post_raw(endpoint, params=None, token=None):
     url = f"{LOCAL_DAEMON_URL}{endpoint}"
-    data = json.dumps(params or {}).encode("utf-8")
+    data = json.dumps(params or {}, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        nonce = secrets.token_hex(32)
+        body_hash = hashlib.sha256(data).hexdigest()
+        signing_input = (
+            PROTOCOL_VERSION
+            + "\0POST\0"
+            + endpoint
+            + "\0"
+            + nonce
+            + "\0"
+            + body_hash
+            + "\0"
+        ).encode("ascii")
+        signature = hmac.new(
+            token.encode("ascii"),
+            signing_input,
+            hashlib.sha256,
+        ).hexdigest()
+        headers["X-Comptrol-Bridge-Nonce"] = nonce
+        headers["X-Comptrol-Bridge-Signature"] = signature
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -80,54 +158,89 @@ def daemon_post(endpoint, params=None):
         return {"ok": False, "error": "daemon_error", "details": str(e)}
 
 
+def verify_daemon_identity():
+    """Verify the process currently bound to the daemon port knows the secret."""
+    with _daemon_identity_lock:
+        token = load_bridge_token()
+        if not token:
+            return False
+        nonce = secrets.token_hex(32)
+        response = _daemon_post_raw("/browser-auth/challenge", {"nonce": nonce})
+        proof = response.get("proof") if isinstance(response, dict) else None
+        expected = hmac.new(
+            token.encode("ascii"),
+            (PROTOCOL_VERSION + "\0" + nonce).encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        return (
+            response.get("ok") is True
+            and response.get("protocol") == PROTOCOL_VERSION
+            and isinstance(proof, str)
+            and hmac.compare_digest(proof.lower(), expected.lower())
+        )
+
+
+def daemon_post(endpoint, params=None):
+    """POST only after the current local daemon proves knowledge of the secret."""
+    token = load_bridge_token()
+    if not token:
+        return {"ok": False, "error": "bridge_token_missing"}
+    if not verify_daemon_identity():
+        return {"ok": False, "error": "daemon_identity_unverified"}
+    return _daemon_post_raw(endpoint, params, token=token)
+
+
 def command_poll_loop(native_port_ref):
-    """
-    Background thread that polls the daemon for pending commands
-    and forwards them to the extension via native messaging.
-    """
+    """Poll leased daemon commands and keep the active bridge heartbeat fresh."""
     poll_interval = POLL_INTERVAL_MS / 1000.0
+    last_heartbeat = 0.0
 
     while True:
-        # Wait a bit before polling
         time.sleep(poll_interval)
-
-        connected = native_port_ref.get("connected", False)
-        if not connected:
+        if not native_port_ref.get("connected", False):
             continue
 
-        # Poll daemon for pending commands
+        now = time.monotonic()
+        if now - last_heartbeat >= 2.0:
+            heartbeat = daemon_post("/browser/extension/heartbeat", {
+                "protocol": PROTOCOL_VERSION,
+            })
+            if heartbeat.get("ok"):
+                last_heartbeat = now
+
         response = daemon_post("/browser/command/poll")
         if not response.get("ok"):
-            # Daemon unreachable or error; back off
-            poll_interval = min(poll_interval * 1.5, POLL_INTERVAL_MAX_MS / 1000.0)
+            poll_interval = min(
+                poll_interval * 1.5,
+                POLL_INTERVAL_MAX_MS / 1000.0,
+            )
             continue
 
         commands = response.get("commands", [])
         if not commands:
-            # No commands; use minimum interval
             poll_interval = POLL_INTERVAL_MS / 1000.0
             continue
 
-        # Forward each command to the extension
+        poll_interval = POLL_INTERVAL_MS / 1000.0
         for cmd in commands:
             command_type = cmd.get("command_type", "")
             request_id = cmd.get("request_id", "")
             payload = cmd.get("payload", {})
-
-            # Map daemon command types to extension message types
             extension_msg = {
                 "type": command_type,
                 "requestId": request_id,
                 **payload,
             }
-
             try:
                 write_message(extension_msg)
             except Exception as e:
-                # Failed to send; report error back to daemon
                 daemon_post("/browser/command/result", {
                     "request_id": request_id,
-                    "error": {"type": "send_failed", "details": str(e)},
+                    "ok": False,
+                    "error": {
+                        "type": "send_failed",
+                        "details": str(e),
+                    },
                 })
 
 
@@ -163,6 +276,9 @@ def main():
                 continue
             handshake_complete = True
             native_port_ref["connected"] = True
+            daemon_post("/browser/extension/heartbeat", {
+                "protocol": PROTOCOL_VERSION,
+            })
             write_message({
                 "type": "handshake_ack",
                 "protocol": PROTOCOL_VERSION,
@@ -235,39 +351,22 @@ def main():
                 result["requestId"] = request_id
             write_message(result)
 
-        elif msg_type == "attach_debugger_result":
-            # Extension sends result for a command we forwarded from daemon
-            if request_id:
-                daemon_post("/browser/command/result", {
-                    "request_id": request_id,
-                    "result": {
-                        "ok": message.get("ok"),
-                        "targetId": message.get("targetId"),
-                    },
-                })
-            write_message({"ok": True})
-
-        elif msg_type == "detach_debugger_result":
-            if request_id:
-                daemon_post("/browser/command/result", {
-                    "request_id": request_id,
-                    "result": {
-                        "ok": message.get("ok"),
-                        "targetId": message.get("targetId"),
-                    },
-                })
-            write_message({"ok": True})
-
-        elif msg_type == "restore_group_result":
-            if request_id:
-                daemon_post("/browser/command/result", {
-                    "request_id": request_id,
-                    "result": {
-                        "ok": message.get("ok"),
-                        "restored": message.get("restored"),
-                    },
-                })
-            write_message({"ok": True})
+        elif msg_type.endswith("_result") and request_id:
+            result_value = message.get("result")
+            if result_value is None:
+                # Preserve useful top-level fields for legacy command handlers.
+                result_value = {
+                    key: value
+                    for key, value in message.items()
+                    if key not in {"type", "requestId", "request_id", "error", "ok"}
+                }
+            daemon_post("/browser/command/result", {
+                "request_id": request_id,
+                "ok": message.get("ok", message.get("error") is None),
+                "result": result_value,
+                "error": message.get("error"),
+            })
+            write_message({"ok": True, "requestId": request_id})
 
         else:
             write_message({

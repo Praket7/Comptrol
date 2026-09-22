@@ -68,14 +68,17 @@ pub fn resolve(query: &str) -> Result<AppEntry, RegistryError> {
 /// All exact matches for `query` (id match or exact display-name match).
 pub fn resolve_all(query: &str) -> Result<Vec<AppEntry>, RegistryError> {
     let lower = query.to_ascii_lowercase();
-    let matches: Vec<AppEntry> = system_entries()?
+    let mut entries = system_entries()?;
+    entries.extend(path_entries()?);
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries.dedup_by(|a, b| a.id == b.id);
+    Ok(entries
         .into_iter()
         .filter(|entry| {
             entry.id.to_ascii_lowercase() == lower
                 || entry.display_name.to_ascii_lowercase() == lower
         })
-        .collect();
-    Ok(matches)
+        .collect())
 }
 
 /// Enumerate installed applications through the platform registration
@@ -527,12 +530,13 @@ fn linux_entries() -> Result<Vec<AppEntry>, RegistryError> {
 pub fn path_entries() -> Result<Vec<AppEntry>, RegistryError> {
     let mut seen = std::collections::BTreeSet::new();
     let mut entries = Vec::new();
-    for dir in std::env::var("PATH")
+    for dir in std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
         .unwrap_or_default()
-        .split(':')
-        .filter(|dir| !dir.is_empty())
+        .into_iter()
+        .filter(|dir| !dir.as_os_str().is_empty())
     {
-        let read = match std::fs::read_dir(dir) {
+        let read = match std::fs::read_dir(&dir) {
             Ok(read) => read,
             Err(_) => continue,
         };
@@ -580,6 +584,14 @@ mod tests {
     fn missing_apps_report_not_found() {
         let result = resolve("definitely-not-an-app-xyz");
         assert!(matches!(result, Err(RegistryError::NotFound(_))));
+    }
+
+    #[test]
+    fn listed_path_identity_is_resolvable() {
+        if let Some(entry) = path_entries().expect("entries").into_iter().next() {
+            let resolved = resolve(&entry.id).expect("listed PATH identity resolves");
+            assert_eq!(resolved.id, entry.id);
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "name": "comptrol",
-  "version": "0.1.63",
+  "version": "0.1.64",
   "private": true,
   "description": "Local first computer control runtime",
   "scripts": {
@@ -10,5 +10,7 @@
     "test:daemon-launcher": "node scripts/daemon_launcher_conformance.mjs",
     "benchmark:local": "python3 scripts/benchmark.py"
   },
-  "workspaces": ["packages/mcp"]
+  "workspaces": [
+    "packages/mcp"
+  ]
 }

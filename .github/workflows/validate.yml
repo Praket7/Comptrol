@@ -24,6 +24,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release
+      - name: Browser Bridge native messaging conformance
+        run: python scripts/browser_bridge_conformance.py
       - name: Windows real Chrome CDP conformance
         if: runner.os == 'Windows'
         run: python scripts/windows_chrome_conformance.py
@@ -49,6 +51,14 @@ jobs:
         env:
           COMPTROL_BIN: target/release/comptrol
       - run: npm run test:browser
+      - run: npm run test:launcher
+      - run: npm run test:daemon-launcher
+      - run: python3 scripts/browser_bridge_conformance.py
+      - name: Validate npm source bundle with Browser Bridge
+        run: |
+          rm -rf packages/mcp/browser-bridge
+          cp -R extensions/comptrol-browser-bridge packages/mcp/browser-bridge
+          python3 scripts/validate_npm_package.py --allow-missing-native
       - run: python3 scripts/client_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol
@@ -73,6 +83,8 @@ jobs:
         run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/browser_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-browser.json
       - name: V5 workflow benchmark matrix
         run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/workflow_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-workflow.json
+      - name: V5 first-party adapter catalog
+        run: python3 scripts/v5_adapter_catalog.py --binary target/release/comptrol
       - name: V5 adapter benchmark matrix
         run: python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/adapter_matrix.json --binary target/release/comptrol --iterations 3 --output bench/results/v5-adapter.json
       - name: V5 recovery benchmark matrix

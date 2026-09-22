@@ -1,38 +1,101 @@
 {
   "task_id": "v5.browser_matrix",
   "benchmark_suite": "browser",
-  "goal": "Verify browser-fixture tasks against the local fixture with independent verifiers.",
+  "goal": "Verify browser tasks against the deterministic local CDP fixture with independent MCP verifiers.",
   "timeout_ms": 60000,
-  "initial_state": "fresh Comptrol state directory with browser fixture loaded",
-  "required_capabilities": ["tools/call"],
+  "initial_state": "fresh Comptrol state directory with scripts/browser_fixture.mjs running",
+  "required_capabilities": [
+    "tools/call"
+  ],
   "tasks": [
     {
       "task_id": "v5.browser.ensure_state_reuse",
-      "goal": "Confirm repeated ensure_state calls reuse the existing session without a page reload.",
+      "goal": "Confirm ensure_state reuses the live target and independently verifies the requested state without navigation.",
       "iterations": 3,
       "verifier": "session_id_no_reload",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.ensure_state", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "action": "ensure_state"}, "idempotency_key": "bench-browser-ensure-001"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "browser.cdp.ensure_state",
+              "params": {
+                "target_id": "comptrol-fixture-page",
+                "browser_context_id": "comptrol-fixture-context",
+                "revision": "fixture-revision-1",
+                "url": "http://127.0.0.1:17417/",
+                "ready_expression": "document.readyState"
+              },
+              "idempotency_key": "bench-browser-ensure-001"
+            }
+          }
+        }
       ]
     },
     {
       "task_id": "v5.browser.spa_navigation",
-      "goal": "Navigate a single-page fixture and verify the DOM target updates without full reload.",
+      "goal": "Navigate the exact fixture target and verify the final URL from independent browser readback.",
       "iterations": 3,
       "verifier": "navigation_spa",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.ensure_state", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "action": "ensure_state"}, "idempotency_key": "bench-browser-nav-001"}}},
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "url": "fixture://browser/spa.html"}, "idempotency_key": "bench-browser-nav-002"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "browser.cdp.navigate",
+              "params": {
+                "target_id": "comptrol-fixture-page",
+                "browser_context_id": "comptrol-fixture-context",
+                "revision": "fixture-revision-1",
+                "url": "http://127.0.0.1:17417/spa.html",
+                "skip_if_current": false
+              },
+              "idempotency_key": "bench-browser-nav-002"
+            }
+          }
+        }
       ]
     },
     {
       "task_id": "v5.browser.dialog_handling",
-      "goal": "Open a fixture dialog and verify the dialog handler routes the alert correctly.",
+      "goal": "Trigger a pending fixture JavaScript dialog, dismiss it through the public browser intent, and verify the CDP dialog transition succeeds.",
       "iterations": 3,
       "verifier": "dialog_handled",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.ensure_state", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "action": "ensure_state"}, "idempotency_key": "bench-browser-dlg-001"}}},
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "browser.cdp.dialog", "params": {"target_id": "fixture://browser/index.html", "browser_context_id": "default", "dialog_type": "alert", "message": "test"}, "idempotency_key": "bench-browser-dlg-002"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "browser.cdp.evaluate",
+              "params": {
+                "target_id": "comptrol-fixture-page",
+                "browser_context_id": "comptrol-fixture-context",
+                "revision": "fixture-revision-1",
+                "expression": "window.__comptrol_fixture_dialog__ = true"
+              },
+              "idempotency_key": "bench-browser-dlg-open-001"
+            }
+          }
+        },
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "browser.cdp.dialog",
+              "params": {
+                "target_id": "comptrol-fixture-page",
+                "browser_context_id": "comptrol-fixture-context",
+                "revision": "fixture-revision-1",
+                "action": "dismiss"
+              },
+              "idempotency_key": "bench-browser-dlg-002"
+            }
+          }
+        }
       ]
     }
   ],

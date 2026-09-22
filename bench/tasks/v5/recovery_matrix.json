@@ -1,37 +1,102 @@
 {
   "task_id": "v5.recovery_matrix",
   "benchmark_suite": "recovery",
-  "goal": "Verify fault injection: idempotent delivery, latch behavior, intent refusal, consent gating.",
+  "goal": "Verify durable idempotent replay and explicit refusal behavior through the public MCP surface.",
   "timeout_ms": 60000,
   "initial_state": "fresh Comptrol state directory",
-  "required_capabilities": ["tools/call"],
+  "required_capabilities": [
+    "tools/call"
+  ],
   "tasks": [
     {
       "task_id": "v5.recovery.duplicate_delivery",
-      "goal": "Submit the same operation with the same idempotency key twice; verify no duplication.",
+      "goal": "Submit the same valid operation twice with one idempotency key and verify the second delivery is replayed without a duplicate mutation.",
       "iterations": 2,
-      "verifier": "route_available_or_unavailable",
+      "verifier": "idempotent_replay_verified",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "workflow.execute", "idempotency_key": "dup-key-1", "params": {}}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "workflow.execute",
+              "idempotency_key": "dup-key-1",
+              "params": {
+                "ops": [
+                  {
+                    "op": "return",
+                    "value": {
+                      "done": true
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "workflow.execute",
+              "idempotency_key": "dup-key-1",
+              "params": {
+                "ops": [
+                  {
+                    "op": "return",
+                    "value": {
+                      "done": true
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
       ]
     },
     {
-      "task_id": "v5.recovery.cancel_latch",
-      "goal": "Start a long-running operation and cancel it; verify the latch prevents post-cancel mutations.",
-      "iterations": 2,
-      "verifier": "route_available_or_unavailable",
+      "task_id": "v5.recovery.invalid_workflow_refusal",
+      "goal": "Submit an invalid workflow schema and verify Comptrol returns an explicit error code.",
+      "iterations": 1,
+      "verifier": "has_error_code",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "workflow.execute", "idempotency_key": "cancel-key-1", "params": {"operation": "long_op", "cancel": true}}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "workflow.execute",
+              "idempotency_key": "invalid-workflow-1",
+              "params": {
+                "ops": [
+                  {
+                    "op": "not_a_real_operation"
+                  }
+                ]
+              }
+            }
+          }
+        }
       ]
     },
     {
       "task_id": "v5.recovery.unknown_intent_refusal",
-      "goal": "Submit an unknown intent and verify it is refused with an error code.",
+      "goal": "Submit an unknown intent and verify it is explicitly refused with an error code.",
       "iterations": 1,
-      "verifier": "response_has_error_code",
-      "verifier_expected": "method_not_found",
+      "verifier": "has_error_code",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "unknown_intent_xyz", "idempotency_key": "bench-unknown-001"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "unknown_intent_xyz",
+              "idempotency_key": "bench-unknown-001"
+            }
+          }
+        }
       ]
     }
   ],

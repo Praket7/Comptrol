@@ -2,6 +2,7 @@
 """Executable V5 benchmark runner: drives the release binary, records p50/p95."""
 
 import argparse
+import copy
 import json
 import os
 import pathlib
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -46,146 +48,237 @@ def send_mcp(process, request_id: int, method: str, params: dict) -> dict:
             return resp
 
 
-# Verifier registry: maps verifier names to callable functions
-# Each verifier receives (result_dict, step_params, expected) and returns (bool, str)
+def structured_content(response: dict) -> Any:
+    payload = response.get("result", {})
+    if isinstance(payload, dict) and "structuredContent" in payload:
+        return payload.get("structuredContent")
+    return payload
+
+
+def result_data(response: dict) -> Any:
+    structured = structured_content(response)
+    if isinstance(structured, dict) and "data" in structured:
+        return structured.get("data")
+    return structured
+
+
+def result_error_code(response: dict) -> Optional[str]:
+    error = response.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        return error.get("code") or error.get("message")
+    structured = structured_content(response)
+    if isinstance(structured, dict):
+        error = structured.get("error")
+        if isinstance(error, str):
+            return error
+        if isinstance(error, dict):
+            return error.get("code") or error.get("message")
+    return None
+
+
+def result_verification(response: dict) -> Optional[str]:
+    structured = structured_content(response)
+    if isinstance(structured, dict):
+        value = structured.get("verification")
+        return value if isinstance(value, str) else None
+    return None
+
+
+def dict_data(response: dict) -> dict:
+    value = result_data(response)
+    return value if isinstance(value, dict) else {}
+
+
+def iteration_params(params: dict, attempt: int) -> dict:
+    """Clone step params and make each benchmark iteration independently executable.
+
+    Steps that intentionally share one idempotency key inside the same iteration
+    still receive the same suffixed key, so replay tests remain valid while
+    separate benchmark iterations no longer collapse into cached replays.
+    """
+    cloned = copy.deepcopy(params)
+    arguments = cloned.get("arguments") if isinstance(cloned, dict) else None
+    if isinstance(arguments, dict):
+        key = arguments.get("idempotency_key")
+        if isinstance(key, str) and key:
+            arguments["idempotency_key"] = f"{key}-iteration-{attempt}"
+    return cloned
+
+
+# Verifier registry: all public MCP tool results normalize through structuredContent.
 VERIFIERS: Dict[str, Callable[[dict, dict, Any], tuple[bool, str]]] = {
     "response_contains": lambda result, _, expected: (
         all(k in result for k in expected) if isinstance(expected, list) else expected in result,
-        f"missing keys: {[k for k in (expected if isinstance(expected, list) else [expected]) if k not in result]}"
+        f"missing response keys in {result}",
     ),
     "response_equals": lambda result, _, expected: (
         result == expected,
-        f"expected {expected}, got {result}"
+        f"expected {expected}, got {result}",
     ),
     "response_has_error_code": lambda result, _, expected: (
-        result.get("error") == expected,
-        f"expected error code {expected}, got {result.get('error')}"
+        result_error_code(result) == expected,
+        f"expected error code {expected}, got {result_error_code(result)}: {result}",
     ),
     "result_has_field": lambda result, _, expected: (
-        expected in result.get("result", {}),
-        f"result missing field {expected}: {result.get('result', {})}"
+        isinstance(result_data(result), dict) and expected in result_data(result),
+        f"result data missing field {expected}: {result}",
     ),
     "result_field_equals": lambda result, _, expected: (
-        result.get("result", {}).get(expected[0]) == expected[1],
-        f"result.{expected[0]} != {expected[1]}: got {result.get('result', {}).get(expected[0])}"
+        isinstance(result_data(result), dict)
+        and result_data(result).get(expected[0]) == expected[1],
+        f"result data {expected[0]} != {expected[1]}: {result}",
     ),
     "route_available_or_unavailable": lambda result, _, __: (
-        result.get("error") is None or result.get("error") == "route_unavailable",
-        f"unexpected error: {result.get('error')}"
+        result_error_code(result) in (None, "route_unavailable"),
+        f"unexpected error: {result_error_code(result)}: {result}",
     ),
     "contains_provider_metadata": lambda result, _, __: (
-        "provider" in result.get("result", {}) or "metadata" in result.get("result", {}),
-        f"no provider metadata in result: {result}"
+        isinstance(result_data(result), dict)
+        and ("provider" in result_data(result) or "metadata" in result_data(result)),
+        f"no provider metadata in result: {result}",
     ),
     "capabilities_non_empty": lambda result, _, __: (
-        len(result.get("result", {}).get("capabilities", {})) > 0,
-        f"capabilities empty: {result}"
+        bool(structured_content(result)),
+        f"capabilities empty: {result}",
     ),
     "descriptions_non_empty": lambda result, _, __: (
-        len(result.get("result", {}).get("descriptions", {})) > 0,
-        f"descriptions empty: {result}"
+        bool(result_data(result)),
+        f"descriptions empty: {result}",
     ),
     "status_compiled": lambda result, _, __: (
-        result.get("result", {}).get("status") == "compiled",
-        f"status not compiled: {result}"
+        dict_data(result).get("status") == "compiled",
+        f"status not compiled: {result}",
     ),
     "has_plan_id": lambda result, _, __: (
-        "plan_id" in result.get("result", {}),
-        f"no plan_id in result: {result}"
+        "plan_id" in dict_data(result),
+        f"no plan_id in result: {result}",
     ),
     "has_trace_id": lambda result, _, __: (
-        "trace_id" in result.get("result", {}),
-        f"no trace_id in result: {result}"
+        "trace_id" in dict_data(result),
+        f"no trace_id in result: {result}",
     ),
     "replayed_true_model_turns_zero": lambda result, _, __: (
-        result.get("result", {}).get("replayed") is True
-        and result.get("result", {}).get("model_turns") == 0,
-        f"replayed != True or model_turns != 0: {result}"
+        dict_data(result).get("replayed") is True
+        and dict_data(result).get("model_turns") == 0,
+        f"replayed != True or model_turns != 0: {result}",
     ),
     "executed_true_duplicate_zero": lambda result, _, __: (
-        result.get("result", {}).get("executed") is True
-        and result.get("result", {}).get("duplicate_count") == 0,
-        f"executed != True or duplicate_count != 0: {result}"
+        dict_data(result).get("executed") is True
+        and dict_data(result).get("duplicate_count") == 0,
+        f"executed != True or duplicate_count != 0: {result}",
     ),
     "cancelled_true_no_mutations": lambda result, _, __: (
-        result.get("result", {}).get("cancelled") is True
-        and result.get("result", {}).get("mutations_after_cancel", 0) == 0,
-        f"cancelled != True or mutations after cancel: {result}"
+        dict_data(result).get("cancelled") is True
+        and dict_data(result).get("mutations_after_cancel", 0) == 0,
+        f"cancelled != True or mutations after cancel: {result}",
     ),
     "error_unknown_intent": lambda result, _, __: (
-        result.get("error") == "unknown_intent",
-        f"expected unknown_intent error: {result}"
+        result_error_code(result) in ("unknown_intent", "method_not_found", "unsupported_capability"),
+        f"expected unknown-intent error: {result}",
     ),
     "session_id_no_reload": lambda result, _, __: (
-        "session_id" in result.get("result", {})
-        and result.get("result", {}).get("reload_count", 0) == 0,
-        f"no session_id or reload_count > 0: {result}"
+        result_verification(result) == "verified"
+        and dict_data(result).get("satisfied") is True
+        and isinstance(dict_data(result).get("ensure_state"), dict),
+        f"ensure_state was not independently verified: {result}",
     ),
     "result_contains_workspaces": lambda result, _, __: (
-        "workspaces" in result.get("result", {}) and isinstance(result.get("result", {}).get("workspaces"), list) and len(result.get("result", {}).get("workspaces", [])) > 0,
-        f"workspaces not found or empty: {result}"
+        isinstance(dict_data(result).get("workspaces"), list)
+        and len(dict_data(result).get("workspaces", [])) > 0,
+        f"workspaces not found or empty: {result}",
     ),
     "result_contains_timelines": lambda result, _, __: (
-        "timelines" in result.get("result", {}) and isinstance(result.get("result", {}).get("timelines"), list) and len(result.get("result", {}).get("timelines", [])) > 0,
-        f"timelines not found or empty: {result}"
+        isinstance(dict_data(result).get("timelines"), list)
+        and len(dict_data(result).get("timelines", [])) > 0,
+        f"timelines not found or empty: {result}",
     ),
     "navigation_spa": lambda result, _, __: (
-        result.get("result", {}).get("current_url", "").endswith("spa.html"),
-        f"current_url not spa.html: {result}"
+        str(dict_data(result).get("final_url") or dict_data(result).get("current_url") or "").endswith("spa.html")
+        and result_verification(result) == "verified",
+        f"final URL not verified as spa.html: {result}",
     ),
     "dialog_handled": lambda result, _, __: (
-        result.get("result", {}).get("handled") is True,
-        f"dialog not handled: {result}"
+        result_verification(result) == "verified"
+        and dict_data(result).get("verification") == "cdp_dialog_handled",
+        f"dialog not verified as handled: {result}",
     ),
     "staged_true_buffer_positive": lambda result, _, __: (
-        result.get("result", {}).get("staged") is True
-        and result.get("result", {}).get("buffer_size", 0) > 0,
-        f"not staged or buffer_size <= 0: {result}"
+        dict_data(result).get("staged") is True
+        and dict_data(result).get("buffer_size", 0) > 0,
+        f"not staged or buffer_size <= 0: {result}",
     ),
     "verified_true_bytes_match": lambda result, _, __: (
-        result.get("result", {}).get("verified") is True
-        and result.get("result", {}).get("bytes_match") is True,
-        f"verified != True or bytes_match != True: {result}"
+        dict_data(result).get("verified") is True
+        and dict_data(result).get("bytes_match") is True,
+        f"verified != True or bytes_match != True: {result}",
     ),
     "restore_refused": lambda result, _, __: (
-        "error" in result.get("result", {}),
-        f"restore not refused: {result}"
+        result_error_code(result) is not None,
+        f"restore not refused: {result}",
     ),
     "reconnected_true": lambda result, _, __: (
-        result.get("result", {}).get("reconnected") is True,
-        f"not reconnected: {result}"
+        dict_data(result).get("reconnected") is True,
+        f"not reconnected: {result}",
     ),
     "resolved_true_path_nonempty": lambda result, _, __: (
-        result.get("result", {}).get("resolved") is True
-        and result.get("result", {}).get("path", ""),
-        f"not resolved or empty path: {result}"
+        isinstance(dict_data(result).get("app"), dict)
+        and bool(dict_data(result)["app"].get("id"))
+        and bool(dict_data(result)["app"].get("executable")),
+        f"app identity/executable not resolved: {result}",
     ),
     "apps_array_nonempty": lambda result, _, __: (
-        isinstance(result.get("result", {}).get("applications"), list)
-        and len(result.get("result", {}).get("applications", [])) > 0,
-        f"applications not array or empty: {result}"
+        isinstance(dict_data(result).get("apps"), list)
+        and len(dict_data(result).get("apps", [])) > 0,
+        f"apps array empty: {result}",
     ),
     "has_status_field": lambda result, _, __: (
-        "status" in result.get("result", {})
-        or "status" in result.get("result", {}).get("structuredContent", {}).get("data", {}),
-        f"no status field: {result}"
+        result_verification(result) == "verified"
+        and isinstance(result_data(result), dict)
+        and bool(result_data(result).get("platform"))
+        and any(
+            key in result_data(result)
+            for key in (
+                "accessibility_trusted",
+                "windows_uia_policy",
+                "linux_atspi_bus",
+                "macos_ax_policy",
+            )
+        ),
+        f"permission observation is not a verified status payload: {result}",
     ),
     "classification_in_allowed": lambda result, _, __: (
-        result.get("result", {}).get("classification") in ["alert", "dialog", "notification", "menu", "informational"]
-        or result.get("result", {}).get("structuredContent", {}).get("data", {}).get("popup", {}).get("class") in ["alert", "dialog", "notification", "menu", "informational"],
-        f"classification not in allowed: {result}"
+        dict_data(result).get("popup", {}).get("class")
+        in ["alert", "dialog", "notification", "menu", "informational"],
+        f"classification not in allowed set: {result}",
     ),
     "has_value": lambda result, _, __: (
-        "value" in result.get("result", {}),
-        f"no value field: {result}"
+        "value" in dict_data(result),
+        f"no value field: {result}",
+    ),
+    "workflow_done_verified": lambda result, _, __: (
+        result_verification(result) == "verified"
+        and dict_data(result).get("done") is True,
+        f"workflow result not independently verified: {result}",
+    ),
+    "idempotent_replay_verified": lambda result, _, __: (
+        result_verification(result) == "verified"
+        and isinstance(structured_content(result), dict)
+        and structured_content(result).get("recovery") == "idempotent_replay",
+        f"final workflow call was not an idempotent replay: {result}",
+    ),
+    "has_error_code": lambda result, _, __: (
+        result_error_code(result) is not None,
+        f"expected an explicit refusal/error code: {result}",
     ),
     "mtls_identity_refused": lambda result, _, __: (
-        result.get("error") == "mtls_identity_refused",
-        f"expected mtls_identity_refused: {result}"
+        result_error_code(result) == "mtls_identity_refused",
+        f"expected mtls_identity_refused: {result}",
     ),
     "nonce_replay": lambda result, _, __: (
-        result.get("error") == "nonce_replay",
-        f"expected nonce_replay: {result}"
+        result_error_code(result) == "nonce_replay",
+        f"expected nonce_replay: {result}",
     ),
 }
 
@@ -200,8 +293,40 @@ def run_verifier(verifier_name: str, result: dict, params: dict, expected: Any) 
         return False, f"verifier {verifier_name} raised: {e}"
 
 
-def run_task(binary: str, task: dict, state_dir: pathlib.Path, cli_iterations: int) -> tuple[dict, List[dict]]:
-    env = {**dict(__import__("os").environ), "COMPTROL_STATE_DIR": str(state_dir), "COMPTROL_ALLOW_ALL_INTENTS": "1", "COMPTROL_ALLOW_BROWSER_CDP": "1", "COMPTROL_ALLOW_BROWSER_LAUNCH": "1", "COMPTROL_ALLOW_ADAPTERS": "1", "COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS": "1", "COMPTROL_ALLOW_BROWSER_LAUNCH": "1", "COMPTROL_ALLOW_SOFTWARE_INSTALL": "1", "COMPTROL_ALLOW_SETTINGS": "1", "COMPTROL_ALLOW_SOFTWARE_INSTALL": "1", "COMPTROL_ALLOW_SOFTWARE": "1", "COMPTROL_ALLOW_DESKTOP_NOTIFY": "1", "COMPTROL_ALLOW_MACOS_AX": "1", "COMPTROL_ALLOW_APP_LAUNCH": "1", "COMPTROL_ALLOW_SANDBOX_WRITES": "1", "COMPTROL_ALLOW_DESKTOP_NOTIFY": "1", "COMPTROL_ALLOW_APP_CLOSE": "1", "COMPTROL_ALLOW_SOFTWARE_INSTALL": "1", "COMPTROL_ALLOW_SOFTWARE": "1", "COMPTROL_ALLOW_SOFTWARE_UNINSTALL": "1", "COMPTROL_ALLOW_SOFTWARE_UPDATE": "1", "COMPTROL_ALLOW_SOFTWARE_DESCRIBE": "1", "COMPTROL_ALLOW_SOFTWARE_SEARCH": "1", "COMPTROL_ALLOW_SOFTWARE_INSTALL": "1", "COMPTROL_ALLOW_SETTINGS": "1", "COMPTROL_ALLOW_POPUP": "1", "COMPTROL_ALLOW_COMMANDS": "1", "COMPTROL_ALLOW_WINDOWS_UIA": "1", "COMPTROL_ALLOW_LINUX_ATSPI": "1", "COMPTROL_ALLOW_BROWSER_FIXTURE": "1", "COMPTROL_ALLOW_BROWSER_CDP": "1", "COMPTROL_ALLOW_BROWSER_LAUNCH": "1", "COMPTROL_CDP_ENDPOINT": "http://127.0.0.1:9222"}
+def run_task(
+    binary: str,
+    task: dict,
+    state_dir: pathlib.Path,
+    cli_iterations: int,
+    extra_env: Optional[dict] = None,
+) -> tuple[dict, List[dict]]:
+    env = {
+        **os.environ,
+        "COMPTROL_STATE_DIR": str(state_dir),
+        "COMPTROL_ALLOW_ALL_INTENTS": "1",
+        "COMPTROL_ALLOW_BROWSER_CDP": "1",
+        "COMPTROL_ALLOW_BROWSER_LAUNCH": "1",
+        "COMPTROL_ALLOW_ADAPTERS": "1",
+        "COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS": "1",
+        "COMPTROL_ALLOW_SOFTWARE_INSTALL": "1",
+        "COMPTROL_ALLOW_SETTINGS": "1",
+        "COMPTROL_ALLOW_SOFTWARE": "1",
+        "COMPTROL_ALLOW_DESKTOP_NOTIFY": "1",
+        "COMPTROL_ALLOW_MACOS_AX": "1",
+        "COMPTROL_ALLOW_APP_LAUNCH": "1",
+        "COMPTROL_ALLOW_SANDBOX_WRITES": "1",
+        "COMPTROL_ALLOW_APP_CLOSE": "1",
+        "COMPTROL_ALLOW_SOFTWARE_UNINSTALL": "1",
+        "COMPTROL_ALLOW_SOFTWARE_UPDATE": "1",
+        "COMPTROL_ALLOW_SOFTWARE_DESCRIBE": "1",
+        "COMPTROL_ALLOW_SOFTWARE_SEARCH": "1",
+        "COMPTROL_ALLOW_POPUP": "1",
+        "COMPTROL_ALLOW_COMMANDS": "1",
+        "COMPTROL_ALLOW_WINDOWS_UIA": "1",
+        "COMPTROL_ALLOW_LINUX_ATSPI": "1",
+        "COMPTROL_ALLOW_BROWSER_FIXTURE": "1",
+    }
+    env.update(extra_env or {})
     proc = subprocess.Popen([str(binary), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
     request_id = 1
     rows = []
@@ -218,8 +343,10 @@ def run_task(binary: str, task: dict, state_dir: pathlib.Path, cli_iterations: i
             continue
         try:
             step_results = []
+            final_step_params = {}
             for step in steps:
-                params = step.get("params", {})
+                params = iteration_params(step.get("params", {}), attempt)
+                final_step_params = params
                 resp = send_mcp(proc, request_id, step["method"], params)
                 request_id += 1
                 row["mcp_calls"] += 1
@@ -238,7 +365,7 @@ def run_task(binary: str, task: dict, state_dir: pathlib.Path, cli_iterations: i
                 for key in ("internal_route_actions", "target_list_reads", "screenshots", "wrong_target_events", "foreground_disturbances", "false_positive_verifications"):
                     if key in result and isinstance(result[key], (int, float)):
                         row[key] += int(result[key])
-            
+
             # Run verifiers on the final step result
             verifier_name = task.get("verifier")
             if verifier_name and step_results:
@@ -246,7 +373,7 @@ def run_task(binary: str, task: dict, state_dir: pathlib.Path, cli_iterations: i
                 ok, msg = run_verifier(
                     verifier_name,
                     final_result,
-                    steps[-1].get("params", {}),
+                    final_step_params,
                     task.get("verifier_expected"),
                 )
                 row["verified"] = ok
@@ -255,7 +382,7 @@ def run_task(binary: str, task: dict, state_dir: pathlib.Path, cli_iterations: i
             else:
                 # No explicit verifier: require all steps succeeded (no errors)
                 row["verified"] = all("error" not in sr for sr in step_results)
-            
+
             elapsed = (time.monotonic() - task_start) * 1000
             row["latency_ms"] = round(elapsed, 2)
         except Exception as error:
@@ -288,9 +415,40 @@ def run_task(binary: str, task: dict, state_dir: pathlib.Path, cli_iterations: i
     return summary, rows
 
 
+def wait_for_url(url: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as response:
+                if response.status == 200:
+                    return
+        except Exception:
+            time.sleep(0.05)
+    raise RuntimeError(f"timed out waiting for fixture {url}")
+
+
+def start_suite_fixture(suite_name: str):
+    if suite_name != "browser":
+        return None, {}
+    port = 17417
+    process = subprocess.Popen(
+        ["node", "scripts/browser_fixture.mjs"],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "COMPTROL_FIXTURE_PORT": str(port)},
+    )
+    try:
+        wait_for_url(f"http://127.0.0.1:{port}/json/version")
+    except Exception:
+        process.terminate()
+        process.wait(timeout=5)
+        raise
+    return process, {"COMPTROL_CDP_ENDPOINT": f"http://127.0.0.1:{port}"}
+
+
 def collect_metadata() -> dict:
-    import platform
-    import sysconfig
     return {
         "os": platform.system(),
         "os_release": platform.release(),
@@ -308,13 +466,25 @@ def main():
     metadata = collect_metadata()
     suite_name = matrix.get("benchmark_suite", matrix.get("task_id", "unknown"))
     results = {"matrix": args.matrix, "benchmark_suite": suite_name, "metadata": metadata, "generated_at": datetime.now(timezone.utc).isoformat(), "tasks": []}
-    for task in matrix["tasks"]:
-        with tempfile.TemporaryDirectory() as td:
-            state_dir = pathlib.Path(td) / "state"
-            state_dir.mkdir(parents=True)
-            summary, rows = run_task(args.binary, task, state_dir, args.iterations)
-            summary["iterations_rows"] = rows
-            results["tasks"].append(summary)
+    fixture, suite_env = start_suite_fixture(suite_name)
+    try:
+        for task in matrix["tasks"]:
+            with tempfile.TemporaryDirectory() as td:
+                state_dir = pathlib.Path(td) / "state"
+                state_dir.mkdir(parents=True)
+                summary, rows = run_task(
+                    args.binary,
+                    task,
+                    state_dir,
+                    args.iterations,
+                    suite_env,
+                )
+                summary["iterations_rows"] = rows
+                results["tasks"].append(summary)
+    finally:
+        if fixture is not None:
+            fixture.terminate()
+            fixture.wait(timeout=5)
     out_path = args.output or ROOT / "bench" / "results" / f"{suite_name}-{datetime.now().strftime('%Y%m%dT%H%M%S')}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")

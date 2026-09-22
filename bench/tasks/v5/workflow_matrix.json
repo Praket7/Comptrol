@@ -1,36 +1,130 @@
 {
   "task_id": "v5.workflow_matrix",
   "benchmark_suite": "workflow",
-  "goal": "Measure cold plan, trace compile, and warm replay with model-turn counting.",
+  "goal": "Verify the public bounded workflow VM, independent verification, idempotent replay, and assertion failure behavior.",
   "timeout_ms": 120000,
   "initial_state": "fresh Comptrol state directory",
-  "required_capabilities": ["tools/call"],
+  "required_capabilities": [
+    "tools/call"
+  ],
   "tasks": [
     {
-      "task_id": "v5.workflow.cold_plan",
-      "goal": "Execute a cold workflow plan and verify the plan is compiled.",
+      "task_id": "v5.workflow.execute_verified",
+      "goal": "Execute a bounded workflow and verify its returned application state.",
+      "iterations": 2,
+      "verifier": "workflow_done_verified",
+      "steps": [
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "workflow.execute",
+              "params": {
+                "ops": [
+                  {
+                    "op": "sense",
+                    "key": "ready",
+                    "value": true
+                  },
+                  {
+                    "op": "assert",
+                    "key": "ready",
+                    "equals": true
+                  },
+                  {
+                    "op": "return",
+                    "value": {
+                      "done": true
+                    }
+                  }
+                ]
+              },
+              "idempotency_key": "bench-workflow-execute-001"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "task_id": "v5.workflow.idempotent_replay",
+      "goal": "Repeat one workflow request with the same idempotency key and verify the second delivery is a replay rather than a duplicate execution.",
+      "iterations": 2,
+      "verifier": "idempotent_replay_verified",
+      "steps": [
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "workflow.execute",
+              "params": {
+                "ops": [
+                  {
+                    "op": "return",
+                    "value": {
+                      "done": true
+                    }
+                  }
+                ]
+              },
+              "idempotency_key": "bench-workflow-replay-001"
+            }
+          }
+        },
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "workflow.execute",
+              "params": {
+                "ops": [
+                  {
+                    "op": "return",
+                    "value": {
+                      "done": true
+                    }
+                  }
+                ]
+              },
+              "idempotency_key": "bench-workflow-replay-001"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "task_id": "v5.workflow.assertion_failure",
+      "goal": "Fail a workflow assertion and verify the failure is explicit rather than silently treated as success.",
       "iterations": 1,
-      "verifier": "has_plan_id",
+      "verifier": "response_has_error_code",
+      "verifier_expected": "verification_failed",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "workflow.execute", "params": {"plan": "test_plan", "mode": "cold"}, "idempotency_key": "bench-workflow-cold-001"}}}
-      ]
-    },
-    {
-      "task_id": "v5.workflow.trace_compile",
-      "goal": "Compile a verified trace from the plan and verify the trace ID.",
-      "iterations": 2,
-      "verifier": "has_trace_id",
-      "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "trace.compile", "params": {"plan_id": "test_plan"}, "idempotency_key": "bench-workflow-trace-001"}}}
-      ]
-    },
-    {
-      "task_id": "v5.workflow.warm_replay",
-      "goal": "Replay a compiled trace in warm mode with zero model turns by construction.",
-      "iterations": 2,
-      "verifier": "replayed_true_model_turns_zero",
-      "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "trace.replay", "params": {"trace_id": "compiled_trace", "mode": "warm"}, "idempotency_key": "bench-workflow-warm-001"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "workflow.execute",
+              "params": {
+                "ops": [
+                  {
+                    "op": "sense",
+                    "key": "ready",
+                    "value": false
+                  },
+                  {
+                    "op": "assert",
+                    "key": "ready",
+                    "equals": true
+                  }
+                ]
+              },
+              "idempotency_key": "bench-workflow-fail-001"
+            }
+          }
+        }
       ]
     }
   ],

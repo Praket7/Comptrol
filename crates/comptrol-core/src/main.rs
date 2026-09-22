@@ -1,8 +1,10 @@
 use comptrol::{
     CompiledWorkflow, MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime,
-    SERVER_VERSION, TraceMode, capabilities, compile_verified_trace, default_state_dir,
-    integration, mcp, pairing::PairingStore, privacy_network_endpoints, privacy_status, read_trace,
-    validate_compiled_workflow,
+    SERVER_VERSION, TraceMode,
+    browser_bridge::{BridgeStore, COMPANION_BRIDGE_ENDPOINT, DEFAULT_HEALTH_MAX_AGE},
+    capabilities, compile_verified_trace, default_state_dir, integration, mcp,
+    pairing::PairingStore,
+    privacy_network_endpoints, privacy_status, read_trace, validate_compiled_workflow,
 };
 use comptrol_adapter_sdk::AdapterManifest;
 #[allow(unused_imports)]
@@ -27,85 +29,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// A pending command in the Browser Bridge command queue.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PendingCommand {
-    request_id: String,
-    command_type: String,
-    payload: Value,
-    created_at: u128,
-}
-
-/// Bidirectional command queue for daemon ↔ native_host ↔ extension communication.
-///
-/// The daemon stores commands here. native_host.py polls for pending commands,
-/// forwards them to the extension, and posts results back.
-struct CommandQueue {
-    /// Commands waiting to be picked up by native_host.py
-    pending: VecDeque<PendingCommand>,
-    /// Results keyed by request_id, waiting to be consumed by the agent
-    results: HashMap<String, Value>,
-    /// Stored extension targets reported by browser extension
-    extension_targets: Vec<Value>,
-    /// Maximum pending commands before oldest is evicted
-    max_pending: usize,
-    /// Counter for unique request IDs
-    counter: AtomicUsize,
-}
-
-impl CommandQueue {
-    fn new() -> Self {
-        Self {
-            pending: VecDeque::new(),
-            results: HashMap::new(),
-            extension_targets: Vec::new(),
-            max_pending: 128,
-            counter: AtomicUsize::new(0),
-        }
-    }
-
-    fn store_targets(&mut self, targets: Vec<Value>) {
-        self.extension_targets = targets;
-    }
-
-    fn get_targets(&self) -> Vec<Value> {
-        self.extension_targets.clone()
-    }
-
-    /// Submit a command to be forwarded to the extension.
-    /// Returns the request_id for correlation.
-    fn submit(&mut self, command_type: &str, payload: Value) -> String {
-        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-        let request_id = format!("br_{}_{}", now_ms(), seq);
-        let cmd = PendingCommand {
-            request_id: request_id.clone(),
-            command_type: command_type.to_owned(),
-            payload,
-            created_at: now_ms(),
-        };
-        if self.pending.len() >= self.max_pending {
-            self.pending.pop_front();
-        }
-        self.pending.push_back(cmd);
-        request_id
-    }
-
-    /// Drain all pending commands (called by native_host.py poll).
-    fn drain_pending(&mut self) -> Vec<PendingCommand> {
-        self.pending.drain(..).collect()
-    }
-
-    /// Store a result from the extension (called by native_host.py).
-    fn store_result(&mut self, request_id: &str, result: Value) {
-        self.results.insert(request_id.to_owned(), result);
-    }
-
-    /// Consume a result by request_id (called by agent waiting for response).
-    fn take_result(&mut self, request_id: &str) -> Option<Value> {
-        self.results.remove(request_id)
-    }
-}
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -1756,7 +1679,17 @@ fn run_http(port: u16) -> i32 {
         }
     };
     let http_state = Arc::new(http_state);
-    let command_queue = Arc::new(Mutex::new(CommandQueue::new()));
+    if let Err(error) = comptrol::browser_bridge::ensure_auth_token(&default_state_dir()) {
+        eprintln!("browser bridge auth startup failed: {error}");
+        return 1;
+    }
+    let command_queue = match BridgeStore::open(&default_state_dir()) {
+        Ok(store) => Arc::new(Mutex::new(store)),
+        Err(error) => {
+            eprintln!("browser bridge state startup failed: {error}");
+            return 1;
+        }
+    };
     let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
@@ -1984,7 +1917,17 @@ fn run_mtls(port: u16) -> i32 {
             return 1;
         }
     };
-    let command_queue = Arc::new(Mutex::new(CommandQueue::new()));
+    if let Err(error) = comptrol::browser_bridge::ensure_auth_token(&default_state_dir()) {
+        eprintln!("browser bridge auth startup failed: {error}");
+        return 1;
+    }
+    let command_queue = match BridgeStore::open(&default_state_dir()) {
+        Ok(store) => Arc::new(Mutex::new(store)),
+        Err(error) => {
+            eprintln!("browser bridge state startup failed: {error}");
+            return 1;
+        }
+    };
     eprintln!("comptrol mutual-TLS HTTP listening on {bind}:{port}/mcp");
     let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
@@ -2438,7 +2381,7 @@ fn handle_http<S: HttpStream>(
     http_state: &Arc<HttpStore>,
     pairing_store: Arc<Mutex<PairingStore>>,
     peer_fingerprint: Option<String>,
-    command_queue: &Arc<Mutex<CommandQueue>>,
+    command_queue: &Arc<Mutex<BridgeStore>>,
 ) -> io::Result<()> {
     // ponytail: bounded local parser, replace with a full HTTP implementation before public network exposure
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -2665,6 +2608,143 @@ fn handle_http<S: HttpStream>(
         }
     }
     // ── Browser Bridge HTTP API (native messaging host → daemon) ──────────
+    // Prove daemon identity before a native host sends the bearer token. The
+    // challenge endpoint deliberately sits outside /browser/* authentication.
+    if request_line.starts_with("POST /browser-auth/challenge ") {
+        let request_body: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+        let nonce = request_body
+            .get("nonce")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        return match comptrol::browser_bridge::challenge_proof(&default_state_dir(), nonce) {
+            Ok(proof) => write_http_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": true,
+                    "protocol": comptrol::browser_bridge::BRIDGE_PROTOCOL_VERSION,
+                    "proof": proof
+                }))
+                .unwrap_or_default(),
+                None,
+            ),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => write_http_response(
+                stream,
+                400,
+                "Bad Request",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": false,
+                    "error": "invalid_browser_bridge_challenge",
+                    "message": error.to_string()
+                }))
+                .unwrap_or_default(),
+                None,
+            ),
+            Err(error) => write_http_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": false,
+                    "error": "browser_bridge_auth_unavailable",
+                    "message": error.to_string()
+                }))
+                .unwrap_or_default(),
+                None,
+            ),
+        };
+    }
+
+    let mut request_parts = request_line.split_whitespace();
+    let request_method = request_parts.next().unwrap_or("");
+    let request_path = request_parts.next().unwrap_or("");
+    let bridge_request = request_path.starts_with("/browser/");
+    if bridge_request {
+        let expected_token = match comptrol::browser_bridge::ensure_auth_token(&default_state_dir())
+        {
+            Ok(token) => token,
+            Err(error) => {
+                return write_http_response(
+                    stream,
+                    500,
+                    "Internal Server Error",
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "ok": false,
+                        "error": "browser_bridge_auth_unavailable",
+                        "message": error.to_string()
+                    }))
+                    .unwrap_or_default(),
+                    None,
+                );
+            }
+        };
+        let nonce = header_value("X-Comptrol-Bridge-Nonce").unwrap_or("");
+        let signature = header_value("X-Comptrol-Bridge-Signature").unwrap_or("");
+        let signature_valid = comptrol::browser_bridge::verify_request_signature(
+            &expected_token,
+            request_method,
+            request_path,
+            nonce,
+            body.as_bytes(),
+            signature,
+        )
+        .unwrap_or(false);
+        if !signature_valid {
+            return write_http_response(
+                stream,
+                403,
+                "Forbidden",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": false,
+                    "error": "browser_bridge_auth_required"
+                }))
+                .unwrap_or_default(),
+                None,
+            );
+        }
+        let nonce_claimed = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            queue.claim_auth_nonce(nonce)
+        };
+        match nonce_claimed {
+            Ok(true) => {}
+            Ok(false) => {
+                return write_http_response(
+                    stream,
+                    409,
+                    "Conflict",
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "ok": false,
+                        "error": "browser_bridge_replay"
+                    }))
+                    .unwrap_or_default(),
+                    None,
+                );
+            }
+            Err(error) => {
+                return write_http_response(
+                    stream,
+                    500,
+                    "Internal Server Error",
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "ok": false,
+                        "error": "browser_bridge_auth_unavailable",
+                        "message": error.to_string()
+                    }))
+                    .unwrap_or_default(),
+                    None,
+                );
+            }
+        }
+    }
     if request_line.starts_with("POST /browser/targets ") {
         let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
         if cdp_endpoint.is_empty() {
@@ -2713,7 +2793,19 @@ fn handle_http<S: HttpStream>(
         };
     }
     if request_line.starts_with("POST /browser/cdp/command ") {
-        let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
+        let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_else(|_| {
+            let active = command_queue
+                .lock()
+                .expect("command queue lock poisoned")
+                .health(DEFAULT_HEALTH_MAX_AGE)
+                .map(|health| health.active)
+                .unwrap_or(false);
+            if active {
+                COMPANION_BRIDGE_ENDPOINT.to_owned()
+            } else {
+                String::new()
+            }
+        });
         if cdp_endpoint.is_empty() {
             return write_http_response(
                 stream,
@@ -2853,8 +2945,27 @@ fn handle_http<S: HttpStream>(
         } else {
             "detach_debugger"
         };
-        let mut queue = command_queue.lock().expect("command queue lock poisoned");
-        let request_id = queue.submit(command_type, json!({"targetId": target_id}));
+        let request_id = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            match queue.submit(command_type, json!({"targetId": target_id})) {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    return write_http_response(
+                        stream,
+                        503,
+                        "Service Unavailable",
+                        "application/json",
+                        serde_json::to_vec(&json!({
+                            "ok": false,
+                            "error": "browser_bridge_queue_unavailable",
+                            "message": error.to_string(),
+                        }))
+                        .unwrap_or_default(),
+                        None,
+                    );
+                }
+            }
+        };
         return write_http_response(
             stream,
             202,
@@ -2889,8 +3000,27 @@ fn handle_http<S: HttpStream>(
             .get("group_id")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let mut queue = command_queue.lock().expect("command queue lock poisoned");
-        let request_id = queue.submit("restore_group", json!({"groupId": group_id}));
+        let request_id = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            match queue.submit("restore_group", json!({"groupId": group_id})) {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    return write_http_response(
+                        stream,
+                        503,
+                        "Service Unavailable",
+                        "application/json",
+                        serde_json::to_vec(&json!({
+                            "ok": false,
+                            "error": "browser_bridge_queue_unavailable",
+                            "message": error.to_string(),
+                        }))
+                        .unwrap_or_default(),
+                        None,
+                    );
+                }
+            }
+        };
         return write_http_response(
             stream,
             202,
@@ -2909,12 +3039,14 @@ fn handle_http<S: HttpStream>(
     if request_line.starts_with("POST /browser/status ") {
         let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
         let cdp_connected = !cdp_endpoint.is_empty()
-            && comptrol::browser::discover_cached_targets(&cdp_endpoint)
-                .map(|t| !t.is_empty())
-                .unwrap_or(false);
-        let extension_connected = {
+            && comptrol::browser::discover_cached_targets(&cdp_endpoint).is_ok();
+        let bridge_health = {
             let queue = command_queue.lock().expect("command queue lock poisoned");
-            !queue.get_targets().is_empty()
+            queue.health(DEFAULT_HEALTH_MAX_AGE)
+        };
+        let (extension_connected, last_heartbeat_ms, target_count) = match bridge_health {
+            Ok(health) => (health.active, health.last_heartbeat_ms, health.target_count),
+            Err(_) => (false, None, 0),
         };
         let connected = cdp_connected || extension_connected;
         return write_http_response(
@@ -2926,11 +3058,41 @@ fn handle_http<S: HttpStream>(
                 "ok": true,
                 "connected": connected,
                 "cdp_connected": cdp_connected,
-                "extension_connected": extension_connected
+                "extension_connected": extension_connected,
+                "last_heartbeat_ms": last_heartbeat_ms,
+                "target_count": target_count
             }))
             .unwrap_or_default(),
             None,
         );
+    }
+
+    if request_line.starts_with("POST /browser/extension/heartbeat ") {
+        let request_body: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+        let protocol = request_body.get("protocol").and_then(Value::as_str);
+        let result = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            queue.record_heartbeat(protocol)
+        };
+        return match result {
+            Ok(()) => write_http_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                serde_json::to_vec(&json!({"ok": true})).unwrap_or_default(),
+                None,
+            ),
+            Err(error) => write_http_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "application/json",
+                serde_json::to_vec(&json!({"ok": false, "error": error.to_string()}))
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
     }
 
     // ── Browser Bridge extension event endpoints ──────────────────────────
@@ -2941,20 +3103,32 @@ fn handle_http<S: HttpStream>(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let count = targets.len();
-        {
+        let result = {
             let mut queue = command_queue.lock().expect("command queue lock poisoned");
-            queue.store_targets(targets);
-        }
-        return write_http_response(
-            stream,
-            200,
-            "OK",
-            "application/json",
-            serde_json::to_vec(&json!({"ok": true, "targets_stored": true, "count": count}))
-                .unwrap_or_default(),
-            None,
-        );
+            let stored = queue.store_targets(&targets);
+            let heartbeat = queue.record_heartbeat(Some("comptrol.browser.bridge/0.1.0"));
+            stored.and_then(|count| heartbeat.map(|_| count))
+        };
+        return match result {
+            Ok(count) => write_http_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                serde_json::to_vec(&json!({"ok": true, "targets_stored": true, "count": count}))
+                    .unwrap_or_default(),
+                None,
+            ),
+            Err(error) => write_http_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "application/json",
+                serde_json::to_vec(&json!({"ok": false, "error": error.to_string()}))
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
     }
     if request_line.starts_with("POST /browser/extension/cdp_result ") {
         let request_body: Value = match serde_json::from_str(&body) {
@@ -2970,9 +3144,9 @@ fn handle_http<S: HttpStream>(
             let result = if let Some(error) = request_body.get("error").filter(|v| !v.is_null()) {
                 json!({"ok": false, "error": error})
             } else {
-                json!({"ok": true, "result": request_body.get("result")})
+                json!({"ok": true, "result": request_body.get("result").cloned().unwrap_or(Value::Null)})
             };
-            queue.store_result(request_id, result);
+            let _ = queue.store_result(request_id, result);
         }
         return write_http_response(
             stream,
@@ -2996,15 +3170,19 @@ fn handle_http<S: HttpStream>(
             .get("event")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        // Store event results for commands that have a requestId
-        if !request_id.is_empty() {
+        {
             let mut queue = command_queue.lock().expect("command queue lock poisoned");
-            let result = if let Some(error) = request_body.get("error").filter(|v| !v.is_null()) {
-                json!({"ok": false, "error": error, "event": event})
-            } else {
-                json!({"ok": true, "event": event, "data": request_body.get("data")})
-            };
-            queue.store_result(request_id, result);
+            let _ = queue.append_event(event, request_body.clone());
+            let _ = queue.record_heartbeat(Some("comptrol.browser.bridge/0.1.0"));
+            if !request_id.is_empty() {
+                let result = if let Some(error) = request_body.get("error").filter(|v| !v.is_null())
+                {
+                    json!({"ok": false, "error": error, "event": event})
+                } else {
+                    json!({"ok": true, "event": event, "data": request_body.get("data").cloned().unwrap_or(Value::Null)})
+                };
+                let _ = queue.store_result(request_id, result);
+            }
         }
         return write_http_response(
             stream,
@@ -3018,22 +3196,35 @@ fn handle_http<S: HttpStream>(
 
     // ── Browser Bridge command queue endpoints ──────────────────────────────
     if request_line.starts_with("POST /browser/command/poll ") {
-        // native_host.py polls this to get pending commands for the extension
-        let mut queue = command_queue.lock().expect("command queue lock poisoned");
-        let commands = queue.drain_pending();
-        return write_http_response(
-            stream,
-            200,
-            "OK",
-            "application/json",
-            serde_json::to_vec(&json!({
-                "ok": true,
-                "commands": commands,
-                "count": commands.len(),
-            }))
-            .unwrap_or_default(),
-            None,
-        );
+        let commands = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            let _ = queue.record_heartbeat(Some("comptrol.browser.bridge/0.1.0"));
+            queue.lease_pending(64, Duration::from_secs(60))
+        };
+        return match commands {
+            Ok(commands) => write_http_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": true,
+                    "commands": commands,
+                    "count": commands.len(),
+                }))
+                .unwrap_or_default(),
+                None,
+            ),
+            Err(error) => write_http_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "application/json",
+                serde_json::to_vec(&json!({"ok": false, "error": error.to_string()}))
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
     }
     if request_line.starts_with("POST /browser/command/result ") {
         // native_host.py posts command results back here
@@ -3066,21 +3257,47 @@ fn handle_http<S: HttpStream>(
                 None,
             );
         }
-        let mut queue = command_queue.lock().expect("command queue lock poisoned");
-        let result = if let Some(error) = request_body.get("error") {
+        let result = if let Some(error) = request_body.get("error").filter(|value| !value.is_null())
+        {
             json!({"ok": false, "error": error})
+        } else if request_body.get("ok").and_then(Value::as_bool) == Some(false) {
+            json!({"ok": false, "error": "extension_command_failed"})
         } else {
-            json!({"ok": true, "result": request_body.get("result")})
+            json!({"ok": true, "result": request_body.get("result").cloned().unwrap_or(Value::Null)})
         };
-        queue.store_result(request_id, result);
-        return write_http_response(
-            stream,
-            200,
-            "OK",
-            "application/json",
-            serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
-            None,
-        );
+        let stored = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            let _ = queue.record_heartbeat(Some("comptrol.browser.bridge/0.1.0"));
+            queue.store_result(request_id, result)
+        };
+        return match stored {
+            Ok(true) => write_http_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":true})).unwrap_or_default(),
+                None,
+            ),
+            Ok(false) => write_http_response(
+                stream,
+                404,
+                "Not Found",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":false,"error":"unknown_request_id"}))
+                    .unwrap_or_default(),
+                None,
+            ),
+            Err(error) => write_http_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":false,"error":error.to_string()}))
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
     }
     if request_line.starts_with("GET /browser/command/result/") {
         // Agent polls for a specific command result by request_id.
@@ -3091,9 +3308,12 @@ fn handle_http<S: HttpStream>(
             .strip_prefix("/browser/command/result/")
             .unwrap_or(path)
             .to_owned();
-        let mut queue = command_queue.lock().expect("command queue lock poisoned");
-        return match queue.take_result(&request_id) {
-            Some(result) => write_http_response(
+        let result = {
+            let queue = command_queue.lock().expect("command queue lock poisoned");
+            queue.result(&request_id)
+        };
+        return match result {
+            Ok(Some(result)) => write_http_response(
                 stream,
                 200,
                 "OK",
@@ -3101,7 +3321,7 @@ fn handle_http<S: HttpStream>(
                 serde_json::to_vec(&result).unwrap_or_default(),
                 None,
             ),
-            None => write_http_response(
+            Ok(None) => write_http_response(
                 stream,
                 404,
                 "Not Found",
@@ -3112,6 +3332,15 @@ fn handle_http<S: HttpStream>(
                     "request_id": request_id,
                 }))
                 .unwrap_or_default(),
+                None,
+            ),
+            Err(error) => write_http_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":false,"error":error.to_string()}))
+                    .unwrap_or_default(),
                 None,
             ),
         };
@@ -3654,66 +3883,5 @@ fn run_adapter(args: Vec<String>) -> i32 {
             eprintln!("adapter commands: validate <adapter.toml> | scaffold <name>");
             2
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn command_queue_submit_and_drain() {
-        let mut queue = CommandQueue::new();
-        let request_id = queue.submit("attach_debugger", json!({"targetId": "123"}));
-        assert!(!request_id.is_empty());
-        assert!(request_id.starts_with("br_"));
-
-        let pending = queue.drain_pending();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].command_type, "attach_debugger");
-        assert_eq!(pending[0].payload["targetId"], "123");
-        assert_eq!(pending[0].request_id, request_id);
-
-        // After drain, no more pending
-        let pending = queue.drain_pending();
-        assert_eq!(pending.len(), 0);
-    }
-
-    #[test]
-    fn command_queue_result_roundtrip() {
-        let mut queue = CommandQueue::new();
-        let request_id = queue.submit("detach_debugger", json!({"targetId": "456"}));
-
-        // No result yet
-        assert!(queue.take_result(&request_id).is_none());
-
-        // Store result
-        queue.store_result(&request_id, json!({"ok": true, "targetId": "456"}));
-
-        // Take result
-        let result = queue.take_result(&request_id).unwrap();
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["targetId"], "456");
-
-        // Already consumed
-        assert!(queue.take_result(&request_id).is_none());
-    }
-
-    #[test]
-    fn command_queue_evicts_oldest_when_full() {
-        let mut queue = CommandQueue::new();
-        queue.max_pending = 3;
-
-        let id1 = queue.submit("cmd1", json!({}));
-        let id2 = queue.submit("cmd2", json!({}));
-        let id3 = queue.submit("cmd3", json!({}));
-        let _id4 = queue.submit("cmd4", json!({}));
-
-        let pending = queue.drain_pending();
-        assert_eq!(pending.len(), 3);
-        // id1 should be evicted
-        assert!(pending.iter().all(|c| c.request_id != id1));
-        assert!(pending.iter().any(|c| c.request_id == id2));
-        assert!(pending.iter().any(|c| c.request_id == id3));
     }
 }

@@ -2,10 +2,11 @@
 //!
 //! The launcher never shells out through an intermediate shell. It
 //! spawns the resolved executable directly (or the platform open
-//! surface for URLs/deep links), records the spawned process identity,
-//! and verifies the process is still alive after a bounded settle
-//! window. The settle window is an event-free liveness check, not a
-//! sleep-based UI wait.
+//! surface for URLs/deep links). Direct executable routes may verify the
+//! destination process identity after a bounded settle window. Platform
+//! helper routes such as open, xdg-open, or explorer only prove dispatch
+//! and deliberately remain unverified until the destination identity is
+//! observed independently.
 
 use crate::registry::AppEntry;
 use crate::{Resource, Resource as OpenResource};
@@ -19,6 +20,8 @@ pub enum LaunchError {
     Io(#[from] std::io::Error),
     #[error("registry failed: {0}")]
     Registry(#[from] crate::RegistryError),
+    #[error("no exact resource launch route is available for {0}")]
+    ExactResourceRouteUnavailable(String),
 }
 
 /// What was launched and what identity was observed.
@@ -122,71 +125,53 @@ unsafe fn probe_liveness(pid: i32) -> i32 {
     unsafe { kill(pid, 0) }
 }
 
-/// Launch the resolved app. URL/deep-link resources route through the
-/// platform open surface (which resolves the user's default handler);
-/// file and no-resource launches spawn the resolved executable.
+/// Launch the exact resolved app and optional resource.
+///
+/// Executable-backed applications receive resources directly as argv. macOS
+/// application bundles use LaunchServices through `open -a <bundle>`, which
+/// preserves exact app selection but returns only the helper PID. Routes that
+/// cannot preserve the resolved app identity refuse rather than silently
+/// delegating the resource to the OS default handler.
 pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
     let settle = std::time::Duration::from_millis(request.settle_ms.max(50));
     let mut metadata = BTreeMap::new();
     metadata.insert("background".to_owned(), request.background.to_string());
 
+    #[cfg(target_os = "macos")]
+    if request.app.platform == "macos"
+        && let Some(bundle) = request
+            .app
+            .executable
+            .as_deref()
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("app"))
+    {
+        let resource = match &request.resource {
+            Resource::File { path } => Some(path.as_str()),
+            Resource::Url { url } => Some(url.as_str()),
+            Resource::DeepLink { uri } => Some(uri.as_str()),
+            Resource::None => None,
+        };
+        let child = open_macos_bundle(bundle, resource, request.background, &request.args)?;
+        let pid = child.id();
+        std::thread::sleep(settle);
+        return Ok(LaunchOutcome {
+            app_id: request.app.id.clone(),
+            route: "macos_launchservices".to_owned(),
+            pid: Some(pid),
+            resource: request.resource.clone(),
+            metadata,
+        });
+    }
+
     match &request.resource {
-        Resource::Url { url } => {
-            let child = open_native(url, request.background)?;
-            let pid = child.id();
-            std::thread::sleep(settle);
-            Ok(LaunchOutcome {
-                app_id: request.app.id.clone(),
-                route: "native_open".to_owned(),
-                pid: Some(pid),
-                resource: request.resource.clone(),
-                metadata,
-            })
-        }
-        Resource::DeepLink { uri } => {
-            let child = open_native(uri, request.background)?;
-            let pid = child.id();
-            std::thread::sleep(settle);
-            Ok(LaunchOutcome {
-                app_id: request.app.id.clone(),
-                route: "native_open".to_owned(),
-                pid: Some(pid),
-                resource: request.resource.clone(),
-                metadata,
-            })
-        }
         Resource::File { path } => {
-            let executable = request
-                .app
-                .executable
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from(&request.app.id));
-            let mut command = std::process::Command::new(executable);
-            command.arg(path).stdin(Stdio::null()).stdout(Stdio::null());
-            if request.background {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    command.process_group(0);
-                }
-            }
-            command
-                .args(&request.args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null());
-            let child = command.spawn()?;
-            let pid = child.id();
-            std::thread::sleep(settle);
-            Ok(LaunchOutcome {
-                app_id: request.app.id.clone(),
-                route: "executable_argv".to_owned(),
-                pid: Some(pid),
-                resource: request.resource.clone(),
-                metadata,
-            })
+            launch_executable(request, Some(path.as_str()), metadata, settle)
+        }
+        Resource::Url { url } => launch_executable(request, Some(url.as_str()), metadata, settle),
+        Resource::DeepLink { uri } => {
+            launch_executable(request, Some(uri.as_str()), metadata, settle)
         }
         Resource::None => {
-            // On Windows, detect AUMID (AppUserModelID) patterns and use shell:AppsFolder
             #[cfg(windows)]
             {
                 let app_id = &request.app.id;
@@ -209,43 +194,91 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
                     });
                 }
             }
-            let executable = request
-                .app
-                .executable
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from(&request.app.id));
-            let mut command = std::process::Command::new(executable);
-            command
-                .args(&request.args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null());
-            if request.background {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    command.process_group(0);
-                }
-            }
-            let child = command.spawn()?;
-            let pid = child.id();
-            std::thread::sleep(settle);
-            Ok(LaunchOutcome {
-                app_id: request.app.id.clone(),
-                route: "executable_argv".to_owned(),
-                pid: Some(pid),
-                resource: request.resource.clone(),
-                metadata,
-            })
+            launch_executable(request, None, metadata, settle)
         }
     }
 }
 
-/// Launch and then verify, per the V5 rule that a spawned process is
-/// delivery, not verification.
+fn launch_executable(
+    request: &LaunchRequest,
+    resource: Option<&str>,
+    metadata: BTreeMap<String, String>,
+    settle: std::time::Duration,
+) -> Result<LaunchOutcome, LaunchError> {
+    let Some(executable) = request.app.executable.clone() else {
+        return Err(LaunchError::ExactResourceRouteUnavailable(
+            request.app.id.clone(),
+        ));
+    };
+    if executable.is_dir() {
+        return Err(LaunchError::ExactResourceRouteUnavailable(
+            request.app.id.clone(),
+        ));
+    }
+    let mut command = std::process::Command::new(executable);
+    if let Some(resource) = resource {
+        command.arg(resource);
+    }
+    command
+        .args(&request.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    if request.background {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+    }
+    let child = command.spawn()?;
+    let pid = child.id();
+    std::thread::sleep(settle);
+    Ok(LaunchOutcome {
+        app_id: request.app.id.clone(),
+        route: "executable_argv".to_owned(),
+        pid: Some(pid),
+        resource: request.resource.clone(),
+        metadata,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_bundle(
+    bundle: &std::path::Path,
+    resource: Option<&str>,
+    background: bool,
+    args: &[String],
+) -> Result<std::process::Child, LaunchError> {
+    let mut command = std::process::Command::new("/usr/bin/open");
+    if background {
+        command.arg("-g");
+    }
+    command.arg("-a").arg(bundle);
+    if let Some(resource) = resource {
+        command.arg(resource);
+    }
+    if !args.is_empty() {
+        command.arg("--args").args(args);
+    }
+    Ok(command.stdin(Stdio::null()).stdout(Stdio::null()).spawn()?)
+}
+
+fn route_pid_is_destination(route: &str) -> bool {
+    matches!(route, "executable_argv")
+}
+
+/// Launch and then verify, per the V5 rule that delivery is not verification.
+///
+/// Only direct executable routes bind the returned PID to the destination app.
+/// Native open helpers and Windows AUMID shell dispatch return Unavailable
+/// rather than accidentally verifying open, xdg-open, or explorer.exe.
 pub fn launch_verified(
     request: &LaunchRequest,
 ) -> Result<(LaunchOutcome, LaunchVerification), LaunchError> {
     let outcome = launch(request)?;
+    if !route_pid_is_destination(&outcome.route) {
+        return Ok((outcome, LaunchVerification::Unavailable));
+    }
     let Some(pid) = outcome.pid else {
         return Ok((outcome, LaunchVerification::Unavailable));
     };
@@ -253,52 +286,6 @@ pub fn launch_verified(
         Ok(true) => Ok((outcome, LaunchVerification::Verified)),
         Ok(false) => Ok((outcome, LaunchVerification::ExitedEarly)),
         Err(_) => Ok((outcome, LaunchVerification::Unavailable)),
-    }
-}
-
-/// Open a URL or deep link through the platform's default-handler
-/// surface without an intermediate shell.
-fn open_native(target: &str, background: bool) -> Result<std::process::Child, LaunchError> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut cmd = std::process::Command::new("/usr/bin/open");
-        if background {
-            cmd.arg("-g"); // Don't bring to front
-        }
-        Ok(cmd
-            .arg(target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn()?)
-    }
-    #[cfg(windows)]
-    {
-        // Use explorer.exe for URL/deep-link opening
-        let mut cmd = std::process::Command::new("explorer");
-        cmd.arg(target);
-        if background {
-            // On Windows, we can't easily background explorer.exe
-        }
-        Ok(cmd.stdin(Stdio::null()).stdout(Stdio::null()).spawn()?)
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let mut cmd = std::process::Command::new("xdg-open");
-        if background {
-            // Create a new process group so the child doesn't receive
-            // signals from the parent's terminal. Uses process_group(0)
-            // instead of calling setsid() in the parent process.
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                cmd.process_group(0);
-            }
-        }
-        Ok(cmd
-            .arg(target)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn()?)
     }
 }
 
@@ -315,6 +302,14 @@ pub fn launcher_probe(pid: u32) -> LaunchVerification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_launcher_pids_are_not_destination_verification() {
+        assert!(!route_pid_is_destination("native_open"));
+        assert!(!route_pid_is_destination("aumid_shell"));
+        assert!(!route_pid_is_destination("macos_launchservices"));
+        assert!(route_pid_is_destination("executable_argv"));
+    }
 
     #[test]
     fn launcher_probe_reports_unavailable_on_unknown_pid() {

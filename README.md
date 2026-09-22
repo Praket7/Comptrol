@@ -4,7 +4,7 @@ Comptrol is a local first control layer for computer using agents.
 
 It gives an MCP client one bounded operation surface with explicit policy, stable operation identity, audit records, recovery state, and honest verification.
 
-The first release is a small foundation. It runs on macOS, Windows, and Linux. Basic platform observation is available on the current machine. Browser CDP control is available only for an explicitly configured local endpoint. macOS semantic mutation is available only with Accessibility permission and explicit policy. Windows UI Automation and Linux AT SPI semantic mutation routes are implemented behind persistent platform workers and explicit local policy. They are exercised by conformance harnesses but still need live validation on real Windows and Linux hosts; event-driven target caches now back the browser and popup paths, and native accessibility event caching is tracked work.
+The first release is a small foundation. It runs on macOS, Windows, and Linux. Basic platform observation is available on the current machine. Browser protocol control can use either an explicitly configured local CDP endpoint or the optional Browser Bridge extension for an existing signed-in Chrome profile. macOS semantic mutation is available only with Accessibility permission and explicit policy. Windows UI Automation and Linux AT SPI semantic mutation routes are implemented behind persistent platform workers and explicit local policy. They are exercised by conformance harnesses but still need live validation on real Windows and Linux hosts; event-driven target caches now back the browser and popup paths, and native accessibility event caching is tracked work.
 
 ## What V5 adds
 
@@ -51,6 +51,16 @@ npm install comptrolling
 npx comptrolling
 ```
 
+The npm release also bundles the optional Browser Bridge for controlling already-open signed-in Chrome tabs without copying a browser profile. Chrome requires the human to load/approve the extension and assigns the extension ID, so Comptrol does not silently install it during `npm install`. To set it up:
+
+```text
+npx comptrol-browser-setup --print-extension-path
+# Load that folder with Chrome's "Load unpacked", copy the displayed extension ID, then:
+npx comptrol-browser-setup --extension-id <EXTENSION_ID>
+```
+
+The setup command registers the native messaging host for the exact extension origin. Browser Bridge health is based on a live heartbeat and command round-trip, not merely the presence of a manifest or stale target list.
+
 The Homebrew formula is generated for macOS Apple Silicon, macOS Intel, Linux ARM64, and Linux x64 when those native release archives exist. The current private release contains Apple Silicon and Intel macOS archives. Linux archives will be attached after native Linux CI runs. A public Homebrew install requires a public tap or public release assets. The private release formula is available as `comptrolling.rb` to authorized repository users.
 
 ## Release trust
@@ -67,13 +77,13 @@ The runtime refuses unsupported routes. It does not pretend that a platform back
 
 Basic observation and the policy core are implemented and tested.
 
-The macOS observer can use the public System Events accessibility surface when permission is available. Exact application launch is available through LaunchServices with process verification on macOS. Windows UI Automation and Linux AT SPI semantic routes are implemented behind persistent platform workers with the same semantic matching contract, while live acceptance on physical Windows and Linux hosts is still pending. Other platforms use best effort process observation.
+The macOS observer can use the public System Events accessibility surface when permission is available. Exact macOS application and resource launch uses LaunchServices for `.app` bundles; because `open` is a helper process, that route reports delivery without falsely claiming destination-process verification. Direct executable routes can verify the destination PID. Windows UI Automation and Linux AT SPI semantic routes are implemented behind persistent platform workers with the same semantic matching contract, while live acceptance on physical Windows and Linux hosts is still pending. Other platforms use best effort process observation.
 
 The runtime includes bounded event history, file checkpoints, fixture trace replay, exact browser target discovery, and a loopback diagnostics dashboard.
 
 Privacy is local by default. `comptrol privacy status` reports telemetry and redaction defaults. The privacy network endpoint report lists optional routes. MCP and browser protocol messages are bounded to one mebibyte.
 
-With explicit local app launch policy, macOS, Windows, and Linux can open an exact app through their native launcher. With explicit browser launcher policy, Chrome can open a foreground tab in the existing default browser profile. With a local DevTools endpoint, browser tabs can also be opened in the existing Chrome profile, moved through history, and exact live tabs can be closed. These routes do not synthesize mouse input or touch the clipboard.
+With explicit local app launch policy, macOS, Windows, and Linux can open an exact app through their native launcher. With explicit browser launcher policy, Chrome can open a foreground tab in the existing default browser profile. With a local DevTools endpoint or a healthy Browser Bridge session, browser tabs can be controlled through exact target identities. The bridge persists target snapshots locally, leases commands for crash recovery, and reports active health only while the extension/native-host connection is fresh. These routes do not synthesize mouse input or touch the clipboard.
 
 Supported browser operations can request strict background posture. Routes that cannot prove that posture refuse instead of activating another application or silently taking control of the foreground.
 

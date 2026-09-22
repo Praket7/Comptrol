@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import shutil
+import secrets
 import sys
 try:
     import winreg
@@ -64,7 +65,8 @@ def main():
     )
     parser.add_argument(
         "--extension-id",
-        help="Chrome extension ID (default: not set, use for development)",
+        required=True,
+        help="Exact Chrome extension ID authorized to connect to the native host",
     )
     args = parser.parse_args()
 
@@ -80,19 +82,61 @@ def main():
         print(f"Error: native_host.py not found at {host_path}", file=sys.stderr)
         sys.exit(1)
 
+    state_dir = os.environ.get(
+        "COMPTROL_STATE_DIR",
+        os.path.join(os.path.expanduser("~"), ".comptrol"),
+    )
+    os.makedirs(state_dir, exist_ok=True)
+    token_path = os.path.join(state_dir, "browser-bridge.token")
+    if not os.path.exists(token_path):
+        with open(token_path, "x", encoding="utf-8") as token_file:
+            token_file.write(secrets.token_hex(32) + "\n")
+        try:
+            os.chmod(token_path, 0o600)
+        except OSError:
+            pass
+
+    config_path = os.path.join(os.path.dirname(host_path), "native_host_config.json")
+    with open(config_path, "w", encoding="utf-8") as config_file:
+        json.dump(
+            {
+                "state_dir": os.path.abspath(state_dir),
+                "daemon_url": os.environ.get(
+                    "COMPTROL_DAEMON_URL",
+                    "http://127.0.0.1:7317",
+                ),
+            },
+            config_file,
+            indent=2,
+        )
+        config_file.write("\n")
+
+    manifest_host_path = host_path
+    if platform.system() == "Windows":
+        launcher_path = os.path.join(os.path.dirname(host_path), "native_host.bat")
+        with open(launcher_path, "w", newline="") as launcher:
+            launcher.write("@echo off\r\n")
+            launcher.write(f'"{sys.executable}" "{host_path}" %*\r\n')
+        manifest_host_path = launcher_path
+    else:
+        try:
+            os.chmod(host_path, os.stat(host_path).st_mode | 0o111)
+        except OSError as error:
+            print(f"Error: could not make native host executable: {error}", file=sys.stderr)
+            sys.exit(1)
+
     # Build manifest
     manifest = {
         "name": "comptrol_browser_bridge",
         "description": "Comptrol Browser Bridge Native Messaging Host",
-        "path": host_path,
+        "path": manifest_host_path,
         "type": "stdio",
         "allowed_origins": [],
     }
 
-    if args.extension_id:
-        manifest["allowed_origins"].append(
-            f"chrome-extension://{args.extension_id}/"
-        )
+    manifest["allowed_origins"].append(
+        f"chrome-extension://{args.extension_id}/"
+    )
 
     # Install to each browser's directory
     installed = 0
@@ -132,11 +176,6 @@ def main():
         sys.exit(1)
 
     print(f"\nInstalled to {installed} browser(s)")
-    if not args.extension_id:
-        print(
-            "\nNote: No extension ID specified. "
-            "Add --extension-id to allow the extension to connect."
-        )
 
 
 if __name__ == "__main__":

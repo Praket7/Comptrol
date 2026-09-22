@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "comptrol-adapter-host",
  "comptrol-adapter-sdk",
@@ -310,6 +310,7 @@ dependencies = [
  "comptrol-verification",
  "comptrol-workflow",
  "getrandom 0.3.4",
+ "hmac",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
@@ -324,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-adapter-host"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "comptrol-adapter-sdk",
  "getrandom 0.3.4",
@@ -334,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-adapter-sdk"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde",
  "serde_json",
@@ -343,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-app-registry"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde",
  "serde_json",
@@ -353,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-browser"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "dirs",
  "futures-util",
@@ -368,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-consent"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde",
  "serde_json",
@@ -378,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-platform-linux"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "atspi",
  "serde_json",
@@ -388,14 +389,14 @@ dependencies = [
 
 [[package]]
 name = "comptrol-platform-macos"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "comptrol-platform-windows"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde_json",
  "windows",
@@ -403,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-popup"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde",
  "serde_json",
@@ -412,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-settings"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde",
  "serde_json",
@@ -421,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-software"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde",
  "serde_json",
@@ -430,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-verification"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde",
  "serde_json",
@@ -438,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-workflow"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "serde",
  "serde_json",
@@ -526,6 +527,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -882,6 +884,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"

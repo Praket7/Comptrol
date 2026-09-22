@@ -147,12 +147,25 @@ pub fn get(key: &SettingKey) -> Result<SettingObservation, SettingsError> {
 }
 
 /// Write a setting, then verify with an independent readback. Human-gated
-/// settings open the exact OS surface and report `HumanActionRequired`
-/// instead of writing.
+/// settings open an exact OS surface only when the provider declares one;
+/// otherwise the request refuses rather than inventing a generic approval route.
 pub fn set(key: &SettingKey, value: SettingValue) -> Result<SettingObservation, SettingsError> {
     if key.human_gated() {
         let provider = provider_for()?;
+        let capabilities = provider.capabilities(key);
+        if !capabilities.human_surface_available {
+            return Err(SettingsError::UnsupportedPlatform {
+                key: key.name(),
+                reason: "no exact documented human settings surface is wired for this protected setting on this platform".to_owned(),
+            });
+        }
         let surface = provider.human_surface(key);
+        if surface.is_empty() {
+            return Err(SettingsError::UnsupportedPlatform {
+                key: key.name(),
+                reason: "the provider declared no exact human settings surface for this protected setting".to_owned(),
+            });
+        }
         return Err(SettingsError::HumanActionRequired {
             key: key.name(),
             surface,

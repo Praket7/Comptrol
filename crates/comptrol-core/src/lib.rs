@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod browser;
+pub mod browser_bridge;
 pub mod checkpoints;
 pub mod events;
 pub mod geometry;
@@ -23,7 +24,7 @@ use comptrol_workflow::{Workflow, WorkflowExecutor, WorkflowNode};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -44,7 +45,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.63";
+pub const SERVER_VERSION: &str = "0.1.64";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -486,6 +487,8 @@ pub struct RoutePlan {
     pub rationale: String,
 }
 
+const ROUTE_LATENCY_SAMPLE_CAP: usize = 256;
+
 #[derive(Clone, Debug, Default)]
 struct RouteHistory {
     attempts: u64,
@@ -494,9 +497,7 @@ struct RouteHistory {
     dispatch_failures: u64,
     disturbance_events: u64,
     ewma_latency_ms: Option<f64>,
-    // Note: this is a running maximum latency, not a true p95 quantile.
-    // A true p95 would require storing all samples. The running max is
-    // more conservative (always >= p95) and suitable for routing decisions.
+    latency_samples_ms: VecDeque<f64>,
     p95_latency_ms: Option<f64>,
     last_success_at_ms: Option<u128>,
 }
@@ -509,6 +510,24 @@ impl RouteHistory {
             (self.verified_successes as f64 / self.attempts as f64).clamp(0.0, 1.0)
         }
     }
+
+    fn record_latency(&mut self, latency_ms: f64) {
+        self.latency_samples_ms.push_back(latency_ms);
+        while self.latency_samples_ms.len() > ROUTE_LATENCY_SAMPLE_CAP {
+            self.latency_samples_ms.pop_front();
+        }
+        self.p95_latency_ms = percentile_95(&self.latency_samples_ms);
+    }
+}
+
+fn percentile_95(samples: &VecDeque<f64>) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+    sorted.sort_by(f64::total_cmp);
+    let nearest_rank = ((sorted.len() as f64) * 0.95).ceil() as usize;
+    sorted.get(nearest_rank.saturating_sub(1)).copied()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1170,7 +1189,14 @@ impl Runtime {
                    ewma_latency_ms REAL,
                    p95_latency_ms REAL,
                    last_success_at_ms INTEGER
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS route_latency_samples (
+                   sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   route_key TEXT NOT NULL,
+                   latency_ms REAL NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS route_latency_samples_route
+                   ON route_latency_samples(route_key, sample_id);",
             )
             .map_err(|error| io::Error::other(format!("route stats schema: {error}")))?;
         for column in [
@@ -1199,6 +1225,7 @@ impl Runtime {
                             dispatch_failures: row.get::<_, i64>(4)?.max(0) as u64,
                             disturbance_events: row.get::<_, i64>(5)?.max(0) as u64,
                             ewma_latency_ms: row.get(6)?,
+                            latency_samples_ms: VecDeque::new(),
                             p95_latency_ms: row.get(7)?,
                             last_success_at_ms: row
                                 .get::<_, Option<i64>>(8)?
@@ -1211,6 +1238,39 @@ impl Runtime {
                 let (route, stats) =
                     row.map_err(|error| io::Error::other(format!("route stats row: {error}")))?;
                 route_history.insert(route, stats);
+            }
+        }
+        {
+            let mut statement = route_stats_db
+                .prepare(
+                    "SELECT route_key, latency_ms
+                     FROM route_latency_samples
+                     ORDER BY route_key ASC, sample_id ASC",
+                )
+                .map_err(|error| {
+                    io::Error::other(format!("route latency samples read: {error}"))
+                })?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })
+                .map_err(|error| {
+                    io::Error::other(format!("route latency samples rows: {error}"))
+                })?;
+            for row in rows {
+                let (route, latency_ms) = row.map_err(|error| {
+                    io::Error::other(format!("route latency sample row: {error}"))
+                })?;
+                let stats = route_history.entry(route).or_default();
+                stats.latency_samples_ms.push_back(latency_ms);
+                while stats.latency_samples_ms.len() > ROUTE_LATENCY_SAMPLE_CAP {
+                    stats.latency_samples_ms.pop_front();
+                }
+            }
+            for stats in route_history.values_mut() {
+                if !stats.latency_samples_ms.is_empty() {
+                    stats.p95_latency_ms = percentile_95(&stats.latency_samples_ms);
+                }
             }
         }
         let mut idempotent = HashMap::new();
@@ -1545,11 +1605,23 @@ impl Runtime {
             Some(previous) => (previous * 0.8) + (latency_ms * 0.2),
             None => latency_ms,
         });
-        // Running maximum (not true p95 quantile - see field doc comment).
-        entry.p95_latency_ms = Some(match entry.p95_latency_ms {
-            Some(previous) => previous.max(latency_ms),
-            None => latency_ms,
-        });
+        entry.record_latency(latency_ms);
+        let _ = self.route_stats_db.execute(
+            "INSERT INTO route_latency_samples(route_key, latency_ms) VALUES (?1, ?2)",
+            params![result.route, latency_ms],
+        );
+        let _ = self.route_stats_db.execute(
+            "DELETE FROM route_latency_samples
+             WHERE route_key = ?1
+               AND sample_id NOT IN (
+                 SELECT sample_id
+                 FROM route_latency_samples
+                 WHERE route_key = ?1
+                 ORDER BY sample_id DESC
+                 LIMIT 256
+               )",
+            params![result.route],
+        );
         let _ = self.route_stats_db.execute(
             "INSERT INTO route_stats(route_key, attempts, verified_successes, verification_failures, dispatch_failures, disturbance_events, ewma_latency_ms, p95_latency_ms, last_success_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -1625,15 +1697,49 @@ impl Runtime {
                     .collect::<Vec<_>>()
             }),
             "platform" => platform_diagnostics(),
-            "browser" => match std::env::var("COMPTROL_CDP_ENDPOINT") {
-                Ok(endpoint) => match browser::discover(&endpoint) {
-                    Ok(targets) => json!({ "endpoint": endpoint, "targets": targets }),
-                    Err(error) => json!({ "endpoint": endpoint, "error": error }),
-                },
-                Err(_) => {
-                    json!({ "available": false, "reason": "COMPTROL_CDP_ENDPOINT is not configured" })
+            "browser" => {
+                if let Ok(endpoint) = std::env::var("COMPTROL_CDP_ENDPOINT") {
+                    match browser::discover(&endpoint) {
+                        Ok(targets) => {
+                            json!({ "endpoint": endpoint, "targets": targets, "transport": "direct_cdp" })
+                        }
+                        Err(error) => {
+                            json!({ "endpoint": endpoint, "error": error, "transport": "direct_cdp" })
+                        }
+                    }
+                } else {
+                    let health = browser_bridge::BridgeStore::open(&default_state_dir())
+                        .and_then(|store| store.health(browser_bridge::DEFAULT_HEALTH_MAX_AGE));
+                    match health {
+                        Ok(health) if health.active => {
+                            match browser::discover(browser_bridge::COMPANION_BRIDGE_ENDPOINT) {
+                                Ok(targets) => json!({
+                                    "endpoint": browser_bridge::COMPANION_BRIDGE_ENDPOINT,
+                                    "transport": "companion_extension",
+                                    "targets": targets,
+                                    "bridge_health": health,
+                                }),
+                                Err(error) => json!({
+                                    "endpoint": browser_bridge::COMPANION_BRIDGE_ENDPOINT,
+                                    "transport": "companion_extension",
+                                    "error": error,
+                                    "bridge_health": health,
+                                }),
+                            }
+                        }
+                        Ok(health) => json!({
+                            "available": false,
+                            "transport": "companion_extension",
+                            "reason": "no direct CDP endpoint and the companion bridge heartbeat is stale or absent",
+                            "bridge_health": health,
+                        }),
+                        Err(error) => json!({
+                            "available": false,
+                            "reason": format!("browser bridge state unavailable: {error}"),
+                        }),
+                    }
                 }
-            },
+            }
             "desktop" | "system" => {
                 desktop_observe(
                     &OperationRequest {
@@ -2617,12 +2723,18 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
                 && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some(),
             "First party application adapters require an explicit policy and adapter root",
         )),
+        "browser.cdp.frame_evaluate" => Some((
+            "browser_protocol",
+            std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
+            "Frame-scoped CDP requires the direct event-maintained frame graph; the companion bridge intentionally refuses this route until it can prove a stable frame binding",
+        )),
         value if value.starts_with("browser.cdp.") => Some((
             "browser_protocol",
             (std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                || comptrol_browser::select_provider(true).is_ok())
+                || browser_bridge::bridge_is_active())
                 && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
-            "Persistent local CDP requires an endpoint or companion extension and explicit policy",
+            "Browser protocol control requires a direct CDP endpoint or a live companion bridge heartbeat and explicit policy",
         )),
         _ => None,
     };
@@ -3049,14 +3161,18 @@ fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> A
 }
 
 fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> ActionResult {
-    let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") else {
+    let endpoint = if let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") {
+        endpoint
+    } else if browser_bridge::bridge_is_active() {
+        std::ffi::OsString::from(browser_bridge::COMPANION_BRIDGE_ENDPOINT)
+    } else {
         return ActionResult::refused(
             request,
             operation_id,
             ComptrolError {
                 code: "browser_unavailable".to_owned(),
-                message: "COMPTROL_CDP_ENDPOINT is not configured".to_owned(),
-                recovery: Some("Configure a local browser DevTools endpoint".to_owned()),
+                message: "Neither COMPTROL_CDP_ENDPOINT nor a live companion extension bridge is available".to_owned(),
+                recovery: Some("Configure local Chrome DevTools or connect the Browser Bridge extension".to_owned()),
             },
         );
     };
@@ -6513,8 +6629,8 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
             let ext_session = sessions
                 .iter()
                 .find(|s| s.provider == comptrol_browser::SessionProvider::CompanionExtension);
-            let available = ext_session.map(|s| s.available).unwrap_or(false);
-            if !available {
+            let registered = ext_session.map(|s| s.available).unwrap_or(false);
+            if !registered {
                 return ActionResult::refused(
                     request,
                     operation_id,
@@ -6528,18 +6644,87 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                     },
                 );
             }
-            success(
-                request,
-                operation_id,
-                "companion_extension",
-                EffectState::None,
-                VerificationState::Unverified,
-                json!({
-                    "provider": "companion_extension",
-                    "status": "connected_via_companion_extension",
-                    "note": "Native bridge registered; waiting for extension handshake and active target round-trip"
-                }),
-            )
+            let mut store = match browser_bridge::BridgeStore::open(&default_state_dir()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "route_unavailable".to_owned(),
+                            message: format!("companion bridge state unavailable: {error}"),
+                            recovery: Some("Start the Comptrol daemon and reconnect the Browser Bridge extension".to_owned()),
+                        },
+                    );
+                }
+            };
+            let health = store
+                .health(browser_bridge::DEFAULT_HEALTH_MAX_AGE)
+                .unwrap_or(browser_bridge::BridgeHealth {
+                    active: false,
+                    last_heartbeat_ms: None,
+                    target_count: 0,
+                });
+            if !health.active {
+                return success(
+                    request,
+                    operation_id,
+                    "companion_extension",
+                    EffectState::None,
+                    VerificationState::Unverified,
+                    json!({
+                        "provider": "companion_extension",
+                        "status": "registered_but_inactive",
+                        "bridge_health": health,
+                        "note": "Native host registration exists, but no recent extension heartbeat proves an active session"
+                    }),
+                );
+            }
+            let round_trip = store
+                .submit("bridge_ping", json!({"timestamp_ms": now_ms()}))
+                .and_then(|request_id| store.wait_result(&request_id, Duration::from_secs(2)));
+            match round_trip {
+                Ok(result) if result.get("ok").and_then(Value::as_bool) == Some(true) => success(
+                    request,
+                    operation_id,
+                    "companion_extension",
+                    EffectState::None,
+                    VerificationState::Verified,
+                    json!({
+                        "provider": "companion_extension",
+                        "status": "connected_via_companion_extension",
+                        "bridge_health": health,
+                        "round_trip": result,
+                        "note": "Native host registration, fresh heartbeat, and an extension command round-trip were verified"
+                    }),
+                ),
+                Ok(result) => success(
+                    request,
+                    operation_id,
+                    "companion_extension",
+                    EffectState::None,
+                    VerificationState::Unverified,
+                    json!({
+                        "provider": "companion_extension",
+                        "status": "bridge_round_trip_unverified",
+                        "bridge_health": health,
+                        "round_trip": result,
+                    }),
+                ),
+                Err(error) => success(
+                    request,
+                    operation_id,
+                    "companion_extension",
+                    EffectState::None,
+                    VerificationState::Unverified,
+                    json!({
+                        "provider": "companion_extension",
+                        "status": "bridge_round_trip_failed",
+                        "bridge_health": health,
+                        "error": error.to_string(),
+                    }),
+                ),
+            }
         }
         _ => ActionResult::refused(
             request,
@@ -8617,6 +8802,10 @@ fn state_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home).join(".comptrol");
     }
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(profile).join(".comptrol");
+    }
     PathBuf::from(".comptrol")
 }
 
@@ -8684,6 +8873,22 @@ mod tests {
     use std::time::Duration;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn route_p95_uses_nearest_rank_percentile() {
+        let samples = (1..=20).map(|value| value as f64).collect::<VecDeque<_>>();
+        assert_eq!(percentile_95(&samples), Some(19.0));
+    }
+
+    #[test]
+    fn route_latency_samples_are_bounded() {
+        let mut history = RouteHistory::default();
+        for value in 0..(ROUTE_LATENCY_SAMPLE_CAP + 10) {
+            history.record_latency(value as f64);
+        }
+        assert_eq!(history.latency_samples_ms.len(), ROUTE_LATENCY_SAMPLE_CAP);
+        assert!(history.p95_latency_ms.is_some());
+    }
 
     fn runtime() -> Runtime {
         let suffix = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);

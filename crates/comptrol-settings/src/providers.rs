@@ -1,8 +1,8 @@
 //! Platform setting providers.
 //!
 //! Providers use documented surfaces only: `ms-settings:` URIs and public
-//! configuration APIs on Windows, GSettings on GNOME, supported preference
-//! surfaces on macOS. There is intentionally no generic "write this
+//! configuration APIs on Windows, XDG desktop contracts on Linux, and
+//! supported preference surfaces on macOS. There is intentionally no generic "write this
 //! registry key / defaults domain" escape hatch.
 
 use crate::{SettingKey, SettingObservation, SettingValue, SettingsError};
@@ -49,45 +49,54 @@ pub struct WindowsProvider;
 impl SettingProvider for WindowsProvider {
     fn supports(&self, key: &SettingKey) -> bool {
         // Windows has no programmatic read or write surfaces wired in this
-        // build. All operations return UnsupportedPlatform/WriteRefused.
-        // Only human_surface() is available for opening the Settings page.
+        // build. Human surfaces are reported independently in capabilities().
         let _ = key;
         false
     }
 
     fn capabilities(&self, key: &SettingKey) -> SettingCapabilities {
-        let _ = key;
+        let human_surface_available = matches!(
+            key,
+            SettingKey::BluetoothEnabled
+                | SettingKey::AudioOutputDevice
+                | SettingKey::DisplayBrightness
+                | SettingKey::NotificationsAppEnabled { .. }
+                | SettingKey::DefaultBrowser
+                | SettingKey::PrivacyMicrophoneAppStatus { .. }
+        );
         SettingCapabilities {
             readable: false,
             writable: false,
-            human_surface_available: true,
+            human_surface_available,
             readback_verifiable: false,
         }
     }
 
     fn human_surface(&self, key: &SettingKey) -> String {
         match key {
-            SettingKey::AccessibilityComptrolStatus => {
-                "ms-settings:privacy-accessibility".to_owned()
-            }
             SettingKey::BluetoothEnabled => "ms-settings:bluetooth".to_owned(),
-            _ => "ms-settings:apps-defaults".to_owned(),
+            SettingKey::AudioOutputDevice => "ms-settings:sound".to_owned(),
+            SettingKey::DisplayBrightness => "ms-settings:display".to_owned(),
+            SettingKey::NotificationsAppEnabled { .. } => "ms-settings:notifications".to_owned(),
+            SettingKey::DefaultBrowser => "ms-settings:defaultapps".to_owned(),
+            SettingKey::PrivacyMicrophoneAppStatus { .. } => {
+                "ms-settings:privacy-microphone".to_owned()
+            }
+            SettingKey::AccessibilityComptrolStatus => String::new(),
         }
     }
 
     fn read(&self, key: &SettingKey) -> Result<SettingObservation, SettingsError> {
         Err(SettingsError::UnsupportedPlatform {
             key: key.name(),
-            reason: "Windows programmatic read for this setting is not wired in this build; use the ms-settings: surface".to_owned(),
+            reason: "Windows programmatic read for this setting is not wired in this build; use a documented Settings surface when one is available".to_owned(),
         })
     }
 
     fn write(&self, key: &SettingKey, _value: &SettingValue) -> Result<(), SettingsError> {
-        // Security-sensitive registry values are never written directly even
-        // when they exist. UI-gated settings go through human_surface.
         Err(SettingsError::WriteRefused {
             key: key.name(),
-            reason: "no official programmatic write surface is wired for this setting; open the exact Settings page for the user".to_owned(),
+            reason: "no official programmatic write surface is wired for this setting; use a documented Settings page when available".to_owned(),
         })
     }
 }
@@ -96,33 +105,25 @@ pub struct MacosProvider;
 
 impl SettingProvider for MacosProvider {
     fn supports(&self, key: &SettingKey) -> bool {
-        // Only DefaultBrowser can be read programmatically via LaunchServices
-        // defaults read. All other settings have no wired read/write surface.
-        matches!(key, SettingKey::DefaultBrowser)
+        // Do not parse the private LSHandlers preferences database as if it
+        // were an authoritative default-browser API. A safe Launch Services
+        // framework binding is not wired in this crate yet.
+        let _ = key;
+        false
     }
 
     fn capabilities(&self, key: &SettingKey) -> SettingCapabilities {
-        match key {
-            SettingKey::DefaultBrowser => SettingCapabilities {
-                readable: true,
-                writable: false,
-                human_surface_available: true,
-                readback_verifiable: true,
-            },
+        let human_surface_available = matches!(
+            key,
             SettingKey::BluetoothEnabled
-            | SettingKey::AccessibilityComptrolStatus
-            | SettingKey::PrivacyMicrophoneAppStatus { .. } => SettingCapabilities {
-                readable: false,
-                writable: false,
-                human_surface_available: true,
-                readback_verifiable: false,
-            },
-            _ => SettingCapabilities {
-                readable: false,
-                writable: false,
-                human_surface_available: false,
-                readback_verifiable: false,
-            },
+                | SettingKey::AccessibilityComptrolStatus
+                | SettingKey::PrivacyMicrophoneAppStatus { .. }
+        );
+        SettingCapabilities {
+            readable: false,
+            writable: false,
+            human_surface_available,
+            readback_verifiable: false,
         }
     }
 
@@ -139,115 +140,67 @@ impl SettingProvider for MacosProvider {
             SettingKey::BluetoothEnabled => {
                 "x-apple.systempreferences:com.apple.preference.bluetooth".to_owned()
             }
-            _ => "x-apple.systempreferences:".to_owned(),
+            _ => String::new(),
         }
     }
 
     fn read(&self, key: &SettingKey) -> Result<SettingObservation, SettingsError> {
-        match key {
-            SettingKey::DefaultBrowser => {
-                // LaunchServices default http handler via `defaults` read of
-                // the documented plist domain (read-only).
-                match run("defaults", &["read", "com.apple.LaunchServices/com.apple.launchservices.secure", "LSHandlers"]) {
-                    Ok(text) => Ok(SettingObservation {
-                        key: key.clone(),
-                        value: SettingValue::Text {
-                            value: text.lines().next().unwrap_or("").to_owned(),
-                        },
-                        route: "macos_launchservices_read".to_owned(),
-                        readback_verified: false,
-                    }),
-                    Err(_) => Err(SettingsError::UnsupportedPlatform {
-                        key: key.name(),
-                        reason: "default browser could not be read on this macOS version".to_owned(),
-                    }),
-                }
-            }
-            _ => Err(SettingsError::UnsupportedPlatform {
-                key: key.name(),
-                reason: "macOS read for this setting needs a supported framework call not wired in this build".to_owned(),
-            }),
-        }
+        Err(SettingsError::UnsupportedPlatform {
+            key: key.name(),
+            reason: match key {
+                SettingKey::DefaultBrowser => "the authoritative Launch Services default-handler API is not safely bound in this build; private LSHandlers preferences are intentionally not parsed".to_owned(),
+                _ => "macOS read for this setting needs a supported framework call not wired in this build".to_owned(),
+            },
+        })
     }
 
     fn write(&self, key: &SettingKey, _value: &SettingValue) -> Result<(), SettingsError> {
-        // The TCC database is never written. Ever.
         Err(SettingsError::WriteRefused {
             key: key.name(),
-            reason: "macOS writes go through supported prompts and System Settings with the user; direct writes are refused".to_owned(),
+            reason: "macOS writes go through supported prompts and System Settings with the user; direct private-preference writes are refused".to_owned(),
         })
     }
 }
 
-pub struct LinuxProvider {
-    desktop: String,
-}
+pub struct LinuxProvider;
 
 impl LinuxProvider {
     #[cfg(target_os = "linux")]
     fn detect() -> Self {
-        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
-            .or_else(|_| std::env::var("DESKTOP_SESSION"))
-            .unwrap_or_default()
-            .to_lowercase();
-        Self { desktop }
-    }
-
-    fn gsettings_get(&self, schema: &str, key: &str) -> Result<String, SettingsError> {
-        run("gsettings", &["get", schema, key])
-    }
-
-    fn gsettings_set(&self, schema: &str, key: &str, value: &str) -> Result<(), SettingsError> {
-        run("gsettings", &["set", schema, key, value]).map(|_| ())
+        Self
     }
 }
 
 impl SettingProvider for LinuxProvider {
     fn supports(&self, key: &SettingKey) -> bool {
-        if !(self.desktop.contains("gnome")
-            || self.desktop.contains("unity")
-            || self.desktop.is_empty())
-        {
-            return false;
-        }
-        // DisplayBrightness is readable and writable via GSettings.
-        // DefaultBrowser is readable via GSettings (read-only).
-        // All other settings have no wired surface on Linux.
-        matches!(
-            key,
-            SettingKey::DisplayBrightness | SettingKey::DefaultBrowser
-        )
+        // xdg-settings is the desktop contract for the default browser.
+        // DisplayBrightness is intentionally not mapped to GNOME
+        // idle-brightness: that key controls dimming policy, not panel brightness.
+        matches!(key, SettingKey::DefaultBrowser)
     }
 
     fn capabilities(&self, key: &SettingKey) -> SettingCapabilities {
-        if !(self.desktop.contains("gnome")
-            || self.desktop.contains("unity")
-            || self.desktop.is_empty())
-        {
-            return SettingCapabilities {
-                readable: false,
-                writable: false,
-                human_surface_available: true,
-                readback_verifiable: false,
-            };
-        }
         match key {
-            SettingKey::DisplayBrightness => SettingCapabilities {
-                readable: true,
-                writable: true,
-                human_surface_available: true,
-                readback_verifiable: false,
-            },
             SettingKey::DefaultBrowser => SettingCapabilities {
                 readable: true,
                 writable: false,
-                human_surface_available: true,
-                readback_verifiable: false,
+                human_surface_available: false,
+                readback_verifiable: true,
             },
-            _ => SettingCapabilities {
+            SettingKey::BluetoothEnabled
+            | SettingKey::AudioOutputDevice
+            | SettingKey::DisplayBrightness
+            | SettingKey::NotificationsAppEnabled { .. } => SettingCapabilities {
                 readable: false,
                 writable: false,
                 human_surface_available: true,
+                readback_verifiable: false,
+            },
+            SettingKey::AccessibilityComptrolStatus
+            | SettingKey::PrivacyMicrophoneAppStatus { .. } => SettingCapabilities {
+                readable: false,
+                writable: false,
+                human_surface_available: false,
                 readback_verifiable: false,
             },
         }
@@ -256,69 +209,56 @@ impl SettingProvider for LinuxProvider {
     fn human_surface(&self, key: &SettingKey) -> String {
         match key {
             SettingKey::BluetoothEnabled => "gnome-control-center bluetooth".to_owned(),
-            _ => "gnome-control-center".to_owned(),
+            SettingKey::AudioOutputDevice => "gnome-control-center sound".to_owned(),
+            SettingKey::DisplayBrightness => "gnome-control-center display".to_owned(),
+            SettingKey::NotificationsAppEnabled { .. } => {
+                "gnome-control-center notifications".to_owned()
+            }
+            _ => String::new(),
         }
     }
 
     fn read(&self, key: &SettingKey) -> Result<SettingObservation, SettingsError> {
-        let unsupported = |reason: &str| SettingsError::UnsupportedPlatform {
-            key: key.name(),
-            reason: reason.to_owned(),
-        };
         match key {
-            SettingKey::DisplayBrightness => {
-                let text = self
-                    .gsettings_get("org.gnome.settings-daemon.plugins.power", "idle-brightness")
-                    .map_err(|_| {
-                        unsupported("GNOME GSettings brightness is unavailable in this session")
-                    })?;
-                Ok(SettingObservation {
-                    key: key.clone(),
-                    value: SettingValue::Integer {
-                        value: text.parse().unwrap_or(0),
-                    },
-                    route: "gnome_gsettings_read".to_owned(),
-                    readback_verified: false,
-                })
-            }
             SettingKey::DefaultBrowser => {
-                let text = self
-                    .gsettings_get("org.gnome.desktop.default-applications", "browser")
-                    .or_else(|_| {
-                        // Fallback: try the older schema path
-                        self.gsettings_get(
-                            "org.gnome.desktop.default-applications.internet",
-                            "browser",
-                        )
-                    })
-                    .map_err(|_| unsupported("GNOME default browser lookup failed"))?;
+                let value = run("xdg-settings", &["get", "default-web-browser"]).map_err(|error| {
+                    SettingsError::UnsupportedPlatform {
+                        key: key.name(),
+                        reason: format!("xdg-settings default browser lookup is unavailable: {error}"),
+                    }
+                })?;
+                if value.is_empty() {
+                    return Err(SettingsError::UnsupportedPlatform {
+                        key: key.name(),
+                        reason: "xdg-settings returned no default web browser".to_owned(),
+                    });
+                }
                 Ok(SettingObservation {
                     key: key.clone(),
-                    value: SettingValue::Text { value: text },
-                    route: "gnome_gsettings_read".to_owned(),
-                    readback_verified: false,
+                    value: SettingValue::Text { value },
+                    route: "linux_xdg_settings_read".to_owned(),
+                    readback_verified: true,
                 })
             }
-            _ => Err(unsupported(
-                "no stable documented read surface is wired for this setting on this desktop",
-            )),
+            SettingKey::DisplayBrightness => Err(SettingsError::UnsupportedPlatform {
+                key: key.name(),
+                reason: "panel brightness requires an exact backlight/display identity; GNOME idle-brightness is a dimming-policy value and is intentionally not used".to_owned(),
+            }),
+            _ => Err(SettingsError::UnsupportedPlatform {
+                key: key.name(),
+                reason: "no stable documented read surface is wired for this setting on this desktop".to_owned(),
+            }),
         }
     }
 
-    fn write(&self, key: &SettingKey, value: &SettingValue) -> Result<(), SettingsError> {
-        match (key, value) {
-            (SettingKey::DisplayBrightness, SettingValue::Integer { value }) => {
-                self.gsettings_set(
-                    "org.gnome.settings-daemon.plugins.power",
-                    "idle-brightness",
-                    &value.to_string(),
-                )
-            }
-            _ => Err(SettingsError::WriteRefused {
-                key: key.name(),
-                reason: "no stable documented write surface is wired for this setting on this desktop; use the Settings UI route".to_owned(),
-            }),
-        }
+    fn write(&self, key: &SettingKey, _value: &SettingValue) -> Result<(), SettingsError> {
+        Err(SettingsError::WriteRefused {
+            key: key.name(),
+            reason: match key {
+                SettingKey::DisplayBrightness => "no exact panel/backlight identity is present in this setting request, so writing a sysfs backlight or dimming-policy key would be ambiguous".to_owned(),
+                _ => "no stable documented write surface is wired for this setting on this desktop; use an exact Settings UI route when one is available".to_owned(),
+            },
+        })
     }
 }
 
