@@ -8791,6 +8791,10 @@ fn state_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home).join(".comptrol");
     }
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(profile).join(".comptrol");
+    }
     PathBuf::from(".comptrol")
 }
 
