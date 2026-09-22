@@ -11,7 +11,7 @@ pub use comptrol_browser::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -1789,6 +1789,153 @@ pub fn compact_snapshot(
         "pixels_included": false,
         "verified": true
     }))
+}
+
+#[derive(Clone)]
+struct CompactDeltaCacheEntry {
+    snapshot_revision: u64,
+    elements: BTreeMap<String, Value>,
+}
+
+fn compact_delta_cache() -> &'static Mutex<HashMap<String, CompactDeltaCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CompactDeltaCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn compact_element_map(elements: &[Value]) -> BTreeMap<String, Value> {
+    let mut seen = HashMap::<String, usize>::new();
+    let mut mapped = BTreeMap::new();
+    for element in elements {
+        let text = |key: &str| element.get(key).and_then(Value::as_str).unwrap_or("");
+        let base = if !text("test_id").is_empty() {
+            format!("test:{}", text("test_id"))
+        } else if !text("id").is_empty() {
+            format!("id:{}", text("id"))
+        } else {
+            format!(
+                "{}|{}|{}|{}|{}",
+                text("tag"),
+                text("role"),
+                text("name"),
+                text("type"),
+                element
+                    .get("href_present")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            )
+        };
+        let ordinal = seen.entry(base.clone()).or_insert(0);
+        let key = format!("{base}#{ordinal}");
+        *ordinal += 1;
+        mapped.insert(key, element.clone());
+    }
+    mapped
+}
+
+/// Return a compact baseline or, when the caller supplies the immediately
+/// previous snapshot revision, only semantic element changes. This reduces
+/// model context growth while preserving the full compact snapshot as a
+/// recovery path when the baseline is missing or stale.
+pub fn compact_snapshot_delta(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+    since_snapshot_revision: Option<u64>,
+    limit: usize,
+) -> Result<Value, ComptrolError> {
+    let mut full = compact_snapshot(endpoint, target_id, browser_context_id, revision, limit)?;
+    let elements = full
+        .get("snapshot")
+        .and_then(|snapshot| snapshot.get("elements"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let current = compact_element_map(&elements);
+    let cache_key = format!("{endpoint}\0{target_id}\0{browser_context_id}");
+    let mut cache = compact_delta_cache().lock().map_err(|_| ComptrolError {
+        code: "browser_protocol_error".to_owned(),
+        message: "Compact snapshot cache lock was poisoned".to_owned(),
+        recovery: Some("Retry with a fresh compact snapshot".to_owned()),
+    })?;
+    if cache.len() > 128 && !cache.contains_key(&cache_key) {
+        cache.clear();
+    }
+    let previous = cache.get(&cache_key).cloned();
+    let next_revision = previous
+        .as_ref()
+        .map(|entry| entry.snapshot_revision.saturating_add(1))
+        .unwrap_or(1);
+
+    let can_delta = previous
+        .as_ref()
+        .zip(since_snapshot_revision)
+        .is_some_and(|(entry, requested)| entry.snapshot_revision == requested);
+    if can_delta {
+        let previous = previous.as_ref().expect("checked above");
+        let added = current
+            .iter()
+            .filter(|(key, _)| !previous.elements.contains_key(*key))
+            .map(|(key, value)| json!({"key": key, "element": value}))
+            .collect::<Vec<_>>();
+        let removed = previous
+            .elements
+            .iter()
+            .filter(|(key, _)| !current.contains_key(*key))
+            .map(|(key, value)| json!({"key": key, "element": value}))
+            .collect::<Vec<_>>();
+        let changed = current
+            .iter()
+            .filter_map(|(key, value)| {
+                previous
+                    .elements
+                    .get(key)
+                    .filter(|old| *old != value)
+                    .map(|old| json!({"key": key, "before": old, "after": value}))
+            })
+            .collect::<Vec<_>>();
+        let unchanged = current.len().saturating_sub(added.len() + changed.len());
+        cache.insert(
+            cache_key,
+            CompactDeltaCacheEntry {
+                snapshot_revision: next_revision,
+                elements: current,
+            },
+        );
+        return Ok(json!({
+            "target_id": target_id,
+            "browser_context_id": browser_context_id,
+            "revision": revision,
+            "snapshot_revision": next_revision,
+            "previous_snapshot_revision": since_snapshot_revision,
+            "observation": "compact_actionable_delta",
+            "delta": true,
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+            "unchanged_count": unchanged,
+            "typed_values_included": false,
+            "pixels_included": false,
+            "verified": true
+        }));
+    }
+
+    cache.insert(
+        cache_key,
+        CompactDeltaCacheEntry {
+            snapshot_revision: next_revision,
+            elements: current,
+        },
+    );
+    full["snapshot_revision"] = json!(next_revision);
+    full["previous_snapshot_revision"] = json!(since_snapshot_revision);
+    full["delta"] = json!(false);
+    full["baseline_reason"] = json!(if since_snapshot_revision.is_some() {
+        "requested baseline missing or stale"
+    } else {
+        "initial baseline"
+    });
+    Ok(full)
 }
 
 pub fn cdp_upload(

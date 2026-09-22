@@ -3441,13 +3441,48 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             .and_then(Value::as_u64)
             .unwrap_or(64)
             .clamp(1, 160) as usize;
-        return match browser::compact_snapshot(
-            &endpoint.to_string_lossy(),
-            target_id,
-            browser_context_id,
-            revision,
-            limit,
-        ) {
+        let mode = request
+            .params
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("auto");
+        if !matches!(mode, "auto" | "compact" | "delta") {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Compact browser observation mode must be auto, compact, or delta"
+                        .to_owned(),
+                    recovery: Some(
+                        "Use auto unless a full compact baseline is explicitly needed".to_owned(),
+                    ),
+                },
+            );
+        }
+        let since = request
+            .params
+            .get("since_snapshot_revision")
+            .and_then(Value::as_u64);
+        let observed = if mode == "compact" {
+            browser::compact_snapshot(
+                &endpoint.to_string_lossy(),
+                target_id,
+                browser_context_id,
+                revision,
+                limit,
+            )
+        } else {
+            browser::compact_snapshot_delta(
+                &endpoint.to_string_lossy(),
+                target_id,
+                browser_context_id,
+                revision,
+                since,
+                limit,
+            )
+        };
+        return match observed {
             Ok(data) => success(
                 request,
                 operation_id,
@@ -4319,7 +4354,7 @@ fn browser_cdp_workflow(
         "browser_protocol",
         EffectState::Changed,
         VerificationState::Verified,
-        json!({"steps": completed, "step_count": completed.len(), "verified": true}),
+        json!({"steps": completed, "step_count": completed.len(), "verified": true, "local_execution": true, "model_turns": 0}),
     )
 }
 
@@ -5462,6 +5497,22 @@ fn app_list(request: &OperationRequest, operation_id: String) -> ActionResult {
         .get("query")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let offset = request
+        .params
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let limit = request
+        .params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 200) as usize;
+    let detail = request
+        .params
+        .get("detail")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut entries = Vec::new();
     let mut errors = Vec::new();
     match comptrol_app_registry::registry::installed_entries() {
@@ -5477,13 +5528,41 @@ fn app_list(request: &OperationRequest, operation_id: String) -> ActionResult {
     }
     entries.sort_by(|a, b| a.id.cmp(&b.id));
     entries.dedup_by(|a, b| a.id == b.id);
+    let total = entries.len();
+    let apps = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|entry| {
+            if detail {
+                serde_json::to_value(entry).unwrap_or(Value::Null)
+            } else {
+                json!({
+                    "id": entry.id,
+                    "name": entry.display_name,
+                    "platform": entry.platform,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    let returned = apps.len();
+    let next_offset = (offset + returned < total).then_some(offset + returned);
     success(
         request,
         operation_id,
         "app_registry_read",
         EffectState::None,
         VerificationState::Verified,
-        json!({ "apps": entries, "count": entries.len(), "provider_errors": errors }),
+        json!({
+            "apps": apps,
+            "count": total,
+            "returned": returned,
+            "offset": offset,
+            "limit": limit,
+            "next_offset": next_offset,
+            "compact": !detail,
+            "provider_errors": errors,
+        }),
     )
 }
 

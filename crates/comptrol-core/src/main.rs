@@ -3196,10 +3196,16 @@ fn handle_http<S: HttpStream>(
 
     // ── Browser Bridge command queue endpoints ──────────────────────────────
     if request_line.starts_with("POST /browser/command/poll ") {
+        let request_body: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+        let wait_ms = request_body
+            .get("wait_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(5_000);
         let commands = {
             let mut queue = command_queue.lock().expect("command queue lock poisoned");
             let _ = queue.record_heartbeat(Some("comptrol.browser.bridge/0.1.0"));
-            queue.lease_pending(64, Duration::from_secs(60))
+            queue.wait_pending(64, Duration::from_secs(60), Duration::from_millis(wait_ms))
         };
         return match commands {
             Ok(commands) => write_http_response(
@@ -3211,6 +3217,7 @@ fn handle_http<S: HttpStream>(
                     "ok": true,
                     "commands": commands,
                     "count": commands.len(),
+                    "wait_ms": wait_ms,
                 }))
                 .unwrap_or_default(),
                 None,

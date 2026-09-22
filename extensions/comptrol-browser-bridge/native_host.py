@@ -65,8 +65,9 @@ BRIDGE_TOKEN_PATH = os.path.join(STATE_DIR, "browser-bridge.token")
 PROTOCOL_VERSION = "comptrol.browser.bridge/0.1.0"
 NATIVE_HOST_ID = "comptrol_browser_bridge"
 MAX_NATIVE_MESSAGE_BYTES = 1024 * 1024
-POLL_INTERVAL_MS = 200
-POLL_INTERVAL_MAX_MS = 2000
+LONG_POLL_MS = 1000
+ERROR_BACKOFF_MS = 50
+DAEMON_IDENTITY_CACHE_SECONDS = 5.0
 
 
 # Shared lock for stdout writes to prevent interleaved messages
@@ -115,6 +116,8 @@ def load_bridge_token():
 
 
 _daemon_identity_lock = threading.Lock()
+_daemon_identity_verified_until = 0.0
+_daemon_identity_token_digest = None
 
 
 def _daemon_post_raw(endpoint, params=None, token=None):
@@ -159,11 +162,19 @@ def _daemon_post_raw(endpoint, params=None, token=None):
 
 
 def verify_daemon_identity():
-    """Verify the process currently bound to the daemon port knows the secret."""
+    """Verify the loopback daemon, reusing a short-lived successful proof."""
+    global _daemon_identity_verified_until, _daemon_identity_token_digest
     with _daemon_identity_lock:
         token = load_bridge_token()
         if not token:
             return False
+        token_digest = hashlib.sha256(token.encode("ascii")).digest()
+        now = time.monotonic()
+        if (
+            _daemon_identity_token_digest == token_digest
+            and now < _daemon_identity_verified_until
+        ):
+            return True
         nonce = secrets.token_hex(32)
         response = _daemon_post_raw("/browser-auth/challenge", {"nonce": nonce})
         proof = response.get("proof") if isinstance(response, dict) else None
@@ -172,12 +183,19 @@ def verify_daemon_identity():
             (PROTOCOL_VERSION + "\0" + nonce).encode("ascii"),
             hashlib.sha256,
         ).hexdigest()
-        return (
+        verified = (
             response.get("ok") is True
             and response.get("protocol") == PROTOCOL_VERSION
             and isinstance(proof, str)
             and hmac.compare_digest(proof.lower(), expected.lower())
         )
+        if verified:
+            _daemon_identity_token_digest = token_digest
+            _daemon_identity_verified_until = now + DAEMON_IDENTITY_CACHE_SECONDS
+        else:
+            _daemon_identity_token_digest = None
+            _daemon_identity_verified_until = 0.0
+        return verified
 
 
 def daemon_post(endpoint, params=None):
@@ -191,13 +209,12 @@ def daemon_post(endpoint, params=None):
 
 
 def command_poll_loop(native_port_ref):
-    """Poll leased daemon commands and keep the active bridge heartbeat fresh."""
-    poll_interval = POLL_INTERVAL_MS / 1000.0
+    """Long-poll commands and keep the active bridge heartbeat fresh."""
     last_heartbeat = 0.0
 
     while True:
-        time.sleep(poll_interval)
         if not native_port_ref.get("connected", False):
+            time.sleep(0.05)
             continue
 
         now = time.monotonic()
@@ -208,20 +225,25 @@ def command_poll_loop(native_port_ref):
             if heartbeat.get("ok"):
                 last_heartbeat = now
 
-        response = daemon_post("/browser/command/poll")
+        # The daemon blocks this request on an in-process queue signal. The
+        # request returns immediately when a command is submitted and after a
+        # bounded timeout when idle, eliminating the old 200 ms pickup tax.
+        response = daemon_post(
+            "/browser/command/poll",
+            {"wait_ms": LONG_POLL_MS},
+        )
         if not response.get("ok"):
-            poll_interval = min(
-                poll_interval * 1.5,
-                POLL_INTERVAL_MAX_MS / 1000.0,
-            )
+            time.sleep(ERROR_BACKOFF_MS / 1000.0)
             continue
 
         commands = response.get("commands", [])
         if not commands:
-            poll_interval = POLL_INTERVAL_MS / 1000.0
+            # Old daemons/probe servers can return immediately instead of long
+            # polling. Avoid a busy loop while retaining a fast compatibility
+            # path.
+            time.sleep(0.01)
             continue
 
-        poll_interval = POLL_INTERVAL_MS / 1000.0
         for cmd in commands:
             command_type = cmd.get("command_type", "")
             request_id = cmd.get("request_id", "")

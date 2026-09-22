@@ -313,6 +313,13 @@ def main() -> None:
         raise SystemExit(f"native host did not HMAC-authenticate to verified daemon: {good_seen}")
     if any(item["token"] for item in good_seen):
         raise SystemExit(f"native host sent legacy bearer token: {good_seen}")
+    polls = [item for item in good_seen if item["path"] == "/browser/command/poll"]
+    if not polls or not any(item["body"].get("wait_ms", 0) >= 500 for item in polls):
+        raise SystemExit(f"native host did not request bounded long polling: {good_seen}")
+    challenges = [item for item in good_seen if item["path"] == "/browser-auth/challenge"]
+    signed_bridge = [item for item in good_seen if item["path"].startswith("/browser/") and item["signature_valid"]]
+    if len(signed_bridge) > 1 and len(challenges) >= len(signed_bridge):
+        raise SystemExit(f"daemon identity proof was not reused: {good_seen}")
 
     print(
         json.dumps(
@@ -324,6 +331,8 @@ def main() -> None:
                 "native_messaging_frame_bound": "passed",
                 "rogue_daemon_token_leak": "blocked",
                 "verified_daemon_hmac_authentication": "passed",
+                "bounded_long_poll": "passed",
+                "daemon_identity_proof_cache": "passed",
             },
             sort_keys=True,
         )

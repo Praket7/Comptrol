@@ -8,6 +8,7 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,22 @@ const EVENT_RETENTION_MS: i64 = 10 * 60 * 1000;
 const AUTH_NONCE_RETENTION_MS: i64 = 5 * 60 * 1000;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Process-local wakeup channel for the durable browser bridge queue. SQLite
+/// remains the source of truth across crashes, while active daemon threads use
+/// this signal to avoid fixed-interval polling on the hot path.
+fn bridge_signal() -> &'static (Mutex<u64>, Condvar) {
+    static SIGNAL: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+    SIGNAL.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+fn notify_bridge_waiters() {
+    let (generation, changed) = bridge_signal();
+    if let Ok(mut value) = generation.lock() {
+        *value = value.wrapping_add(1);
+        changed.notify_all();
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeCommand {
@@ -355,6 +372,7 @@ impl BridgeStore {
                 params![request_id, command_type, payload, now_ms()],
             )
             .map_err(|error| sqlite_error("enqueue browser bridge command", error))?;
+        notify_bridge_waiters();
         Ok(request_id)
     }
 
@@ -438,6 +456,9 @@ impl BridgeStore {
                 params![request_id, encoded, now_ms()],
             )
             .map_err(|error| sqlite_error("store browser bridge result", error))?;
+        if changed > 0 {
+            notify_bridge_waiters();
+        }
         Ok(changed > 0)
     }
 
@@ -467,13 +488,77 @@ impl BridgeStore {
             if let Some(result) = self.result(request_id)? {
                 return Ok(result);
             }
-            if std::time::Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("browser bridge command {request_id} timed out"),
                 ));
             }
-            thread::sleep(Duration::from_millis(25));
+
+            // Capture the generation before the second result read so a result
+            // written between the DB query and the wait cannot be missed.
+            let (generation, changed) = bridge_signal();
+            let observed = *generation
+                .lock()
+                .map_err(|_| io::Error::other("browser bridge signal lock poisoned"))?;
+            if let Some(result) = self.result(request_id)? {
+                return Ok(result);
+            }
+            let guard = generation
+                .lock()
+                .map_err(|_| io::Error::other("browser bridge signal lock poisoned"))?;
+            if *guard != observed {
+                continue;
+            }
+            let (_guard, wait) = changed
+                .wait_timeout(guard, remaining)
+                .map_err(|_| io::Error::other("browser bridge signal lock poisoned"))?;
+            if wait.timed_out() && self.result(request_id)?.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("browser bridge command {request_id} timed out"),
+                ));
+            }
+        }
+    }
+
+    /// Lease commands immediately when present, otherwise sleep on the
+    /// process-local queue signal until a submit wakes us or the bounded long
+    /// poll expires. This keeps SQLite durable without putting fixed sleeps on
+    /// every browser command.
+    pub fn wait_pending(
+        &mut self,
+        limit: usize,
+        lease_duration: Duration,
+        timeout: Duration,
+    ) -> io::Result<Vec<BridgeCommand>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let (generation, changed) = bridge_signal();
+            let observed = *generation
+                .lock()
+                .map_err(|_| io::Error::other("browser bridge signal lock poisoned"))?;
+            let commands = self.lease_pending(limit, lease_duration)?;
+            if !commands.is_empty() || timeout.is_zero() {
+                return Ok(commands);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(Vec::new());
+            }
+            let guard = generation
+                .lock()
+                .map_err(|_| io::Error::other("browser bridge signal lock poisoned"))?;
+            if *guard != observed {
+                continue;
+            }
+            let (_guard, wait) = changed
+                .wait_timeout(guard, remaining)
+                .map_err(|_| io::Error::other("browser bridge signal lock poisoned"))?;
+            if wait.timed_out() {
+                return Ok(Vec::new());
+            }
         }
     }
 

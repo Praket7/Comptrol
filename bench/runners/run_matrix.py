@@ -293,6 +293,16 @@ def run_verifier(verifier_name: str, result: dict, params: dict, expected: Any) 
         return False, f"verifier {verifier_name} raised: {e}"
 
 
+
+def percentile_nearest_rank(values: List[float], percentile: float) -> float:
+    """Empirical nearest-rank percentile, bounded by observed samples."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = max(1, min(len(ordered), int((len(ordered) * percentile + 0.9999999999))))
+    return ordered[rank - 1]
+
+
 def run_task(
     binary: str,
     task: dict,
@@ -401,8 +411,13 @@ def run_task(
         "verified_success": len(verified) == len(rows) and len(rows) > 0,
         "total_latency_ms": round(total_wall, 2),
         "iterations": len(rows),
+        "sample_count": len(rows),
+        "min_latency_ms": round(min([r["latency_ms"] for r in rows]), 2) if rows else 0,
         "p50_latency_ms": round(statistics.median([r["latency_ms"] for r in rows]), 2) if rows else 0,
-        "p95_latency_ms": round(statistics.quantiles([r["latency_ms"] for r in rows], n=20)[18] if len(rows) >= 2 else (rows[0]["latency_ms"] if rows else 0), 2),
+        "p90_latency_ms": round(percentile_nearest_rank([r["latency_ms"] for r in rows], 0.90), 2),
+        "p95_latency_ms": round(percentile_nearest_rank([r["latency_ms"] for r in rows], 0.95), 2),
+        "p99_latency_ms": round(percentile_nearest_rank([r["latency_ms"] for r in rows], 0.99), 2),
+        "max_latency_ms": round(max([r["latency_ms"] for r in rows]), 2) if rows else 0,
         "mcp_calls_per_iteration": round(statistics.median([r["mcp_calls"] for r in rows]), 1) if rows else 0,
         "internal_route_actions_per_iteration": round(statistics.median([r["internal_route_actions"] for r in rows]), 1) if rows else 0,
         "screenshots_per_iteration": round(statistics.median([r["screenshots"] for r in rows]), 1) if rows else 0,
