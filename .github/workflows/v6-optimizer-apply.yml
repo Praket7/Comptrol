@@ -54,49 +54,17 @@ jobs:
               raise SystemExit('capability allowlist patch block not found')
           path.write_text(text.replace(old, new, 1), encoding='utf-8')
           PY
-      - name: Align contextual route patch with current scorer
+      - name: Align route scoring line with current implementation
         run: |
           python3 - <<'PY'
           from pathlib import Path
           path = Path('scripts/apply_v6_optimizer.py')
           text = path.read_text(encoding='utf-8')
-          old = '''replace_once(
-              core,
-              """        if let Some(stats) = history.get(&candidate.route) {
-                  candidate.historical_success = stats.success_rate();
-                  candidate.expected_p95_ms = stats.p95_latency_ms.or(candidate.expected_p95_ms);
-          """,
-              """        let contextual_key = route_history_key(request, &candidate.route);
-                  if let Some(stats) = history
-                      .get(&contextual_key)
-                      .or_else(|| history.get(&candidate.route))
-                  {
-                      candidate.historical_success = stats.success_rate();
-                      candidate.expected_p95_ms = stats.p95_latency_ms.or(candidate.expected_p95_ms);
-          """,
-          )'''
-          new = '''replace_once(
-              core,
-              """        if let Some(stats) = history.get(&candidate.route) {
-                  candidate.historical_success = stats.success_rate();
-                  if let Some(latency) = stats.p95_latency_ms {
-                      candidate.expected_p95_ms = Some(latency);
-                  }
-          """,
-              """        let contextual_key = route_history_key(request, &candidate.route);
-                  if let Some(stats) = history
-                      .get(&contextual_key)
-                      .or_else(|| history.get(&candidate.route))
-                  {
-                      candidate.historical_success = stats.success_rate();
-                      if let Some(latency) = stats.p95_latency_ms {
-                          candidate.expected_p95_ms = Some(latency);
-                      }
-          """,
-          )'''
-          if old not in text:
-              raise SystemExit('route history scoring patch block not found')
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          stale = '            candidate.expected_p95_ms = stats.p95_latency_ms.or(candidate.expected_p95_ms);'
+          current = '            if let Some(latency) = stats.p95_latency_ms {\n                candidate.expected_p95_ms = Some(latency);\n            }'
+          if text.count(stale) != 2:
+              raise SystemExit(f'expected two stale route scoring lines, found {text.count(stale)}')
+          path.write_text(text.replace(stale, current), encoding='utf-8')
           PY
       - name: Apply V6 optimizer patch
         run: python3 scripts/apply_v6_optimizer.py
