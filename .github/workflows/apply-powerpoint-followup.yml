@@ -1,0 +1,38 @@
+name: apply-powerpoint-followup
+
+on:
+  push:
+    branches:
+      - research/computer-use-speed-reliability-20260922
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/computer-use-speed-reliability-20260922
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply PowerPoint follow-up
+        run: python3 scripts/apply_powerpoint_followup.py
+      - name: Compile adapter
+        run: python3 -m py_compile adapters/powerpoint-windows/src/adapter.py
+      - name: Format Rust
+        run: cargo fmt --all
+      - name: Check workspace
+        run: cargo check --workspace
+      - name: Commit PowerPoint follow-up
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/comptrol-core/src/lib.rs adapters/powerpoint-windows
+          git diff --cached --check
+          git commit -m "Expand native PowerPoint editing controls"
+          git push origin HEAD:research/computer-use-speed-reliability-20260922
