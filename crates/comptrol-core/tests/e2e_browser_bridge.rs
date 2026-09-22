@@ -1,13 +1,16 @@
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static AUTH_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct Daemon {
     child: Child,
@@ -74,7 +77,38 @@ fn http_request(
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("read timeout");
     let bridge_header = bridge_token
-        .map(|token| format!("X-Comptrol-Bridge-Token: {token}\r\n"))
+        .map(|token| {
+            let sequence = AUTH_NONCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let nonce = format!(
+                "{:032x}{:032x}",
+                std::process::id(),
+                sequence
+            );
+            let body_hash = Sha256::digest(&encoded)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("hmac key");
+            for part in [
+                "comptrol.browser.bridge/0.1.0",
+                method,
+                path,
+                nonce.as_str(),
+                body_hash.as_str(),
+            ] {
+                mac.update(part.as_bytes());
+                mac.update(b"\0");
+            }
+            let signature = mac
+                .finalize()
+                .into_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!(
+                "X-Comptrol-Bridge-Nonce: {nonce}\r\nX-Comptrol-Bridge-Signature: {signature}\r\n"
+            )
+        })
         .unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nMCP-Protocol-Version: 2026-07-28\r\nContent-Type: application/json\r\n{bridge_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
