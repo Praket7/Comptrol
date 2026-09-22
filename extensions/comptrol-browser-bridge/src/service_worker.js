@@ -9,8 +9,9 @@
 // Protocol version for native messaging handshake
 const PROTOCOL_VERSION = "comptrol.browser.bridge/0.1.0";
 const NATIVE_HOST_NAME = "comptrol_browser_bridge";
-const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 60000;
+const RECONNECT_MAX_EXPONENT = 6;
 
 // Native messaging port
 let nativePort = null;
@@ -107,18 +108,18 @@ async function connectNative() {
 }
 
 /**
- * Schedule reconnection with exponential backoff
+ * Schedule reconnection with capped exponential backoff. The bridge never
+ * gives up permanently: Chrome may start long before the Comptrol sidecar.
  */
 function scheduleReconnect() {
-  if (isConnected || reconnectTimer || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      console.error("Max reconnect attempts reached");
-    }
-    return;
-  }
+  if (isConnected || reconnectTimer) return;
 
-  const delay = RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempts);
-  reconnectAttempts++;
+  const exponent = Math.min(reconnectAttempts, RECONNECT_MAX_EXPONENT);
+  const delay = Math.min(
+    RECONNECT_BASE_DELAY_MS * Math.pow(2, exponent),
+    RECONNECT_MAX_DELAY_MS
+  );
+  reconnectAttempts = Math.min(reconnectAttempts + 1, RECONNECT_MAX_EXPONENT);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connectNative().catch(error => {
