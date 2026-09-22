@@ -83,7 +83,7 @@ def main():
 
     manifest_host_path = host_path
     if platform.system() == "Windows":
-        launcher_path = os.path.join(os.path.dirname(host_path), "native_host.cmd")
+        launcher_path = os.path.join(os.path.dirname(host_path), "native_host.bat")
         with open(launcher_path, "w", newline="") as launcher:
             launcher.write("@echo off\r\n")
             launcher.write(f'"{sys.executable}" "{host_path}" %*\r\n')
