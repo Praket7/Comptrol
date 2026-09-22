@@ -19,6 +19,7 @@ MACRO_KEYS = {"macro", "macros", "vba", "vba_macro", "run_macro", "execute_macro
 
 PP_FIXED_FORMAT_PDF = 2
 PP_LAYOUT_BLANK = 12
+MAX_BATCH_OPS = 64
 
 
 def comtypes_available():
@@ -409,6 +410,60 @@ def do_export_pdf(app, payload):
     }
 
 
+def do_batch_edit(app, payload):
+    ops = payload.get("ops")
+    if not isinstance(ops, list) or not 1 <= len(ops) <= MAX_BATCH_OPS:
+        raise ValueError("ops must contain between 1 and %d operations" % MAX_BATCH_OPS)
+    presentation_path = payload.get("presentation_path", payload.get("path"))
+    handlers = {
+        "slide.create": do_slide_create,
+        "slide.delete": do_slide_delete,
+        "slide.reorder": do_slide_reorder,
+        "shape.text.set": do_shape_text_set,
+        "save": do_save,
+    }
+    results = []
+    for index, raw in enumerate(ops):
+        if not isinstance(raw, dict):
+            raise ValueError("batch operation %d must be an object" % index)
+        kind = raw.get("op")
+        func = handlers.get(kind)
+        if func is None:
+            raise ValueError("unsupported batch operation: %s" % kind)
+        params = dict(raw)
+        params.pop("op", None)
+        if presentation_path and "presentation_path" not in params and "path" not in params:
+            params["presentation_path"] = presentation_path
+        reject_macro_requests(params)
+        result = func(app, params)
+        if not result.get("verified"):
+            raise ValueError("batch operation %d was not verified" % index)
+        results.append({
+            "index": index,
+            "op": kind,
+            "verified": True,
+            "slide_count": result.get("slide_count"),
+            "slide_count_after": result.get("slide_count_after"),
+            "saved_path": result.get("saved_path"),
+        })
+    bound = bind_presentation(
+        app,
+        {"presentation_path": presentation_path} if presentation_path else {},
+    )
+    if bound is None:
+        raise ValueError("presentation_not_open: exact deck is no longer open")
+    state = presentation_state(bound)
+    return {
+        **state,
+        "applied": len(results),
+        "results": results,
+        "backend": "windows-com",
+        "macros_executed": False,
+        "verified": True,
+        "verification": "application_state_batch_readback",
+    }
+
+
 def handler(request):
     method = request.get("method")
     available = comtypes_available()
@@ -436,6 +491,7 @@ def handler(request):
                 "comtypes_available": available,
                 "intents": [
                     "presentation.desktop.open",
+                    "presentation.desktop.batch_edit",
                     "presentation.slide.create",
                     "presentation.slide.delete",
                     "presentation.slide.reorder",
@@ -461,6 +517,8 @@ def handler(request):
         app = get_app()
         if intent == "presentation.desktop.open":
             result = do_open(app, payload)
+        elif intent == "presentation.desktop.batch_edit":
+            result = do_batch_edit(app, payload)
         elif intent == "presentation.slide.create":
             result = do_slide_create(app, payload)
         elif intent == "presentation.slide.delete":

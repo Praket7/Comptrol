@@ -65,6 +65,12 @@ background = "supported"
 verification = "application_state"
 
 [[capabilities]]
+intent = "design.batch_edit"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
 intent = "design.export"
 risk = "R1"
 background = "supported"

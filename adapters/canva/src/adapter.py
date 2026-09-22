@@ -70,6 +70,7 @@ MAX_PAGE_LIMIT = 200
 MAX_EXPORT_PAGES = 100
 MAX_GROUP_ELEMENTS = 50
 MAX_CREATE_PARAMS_BYTES = 8192
+MAX_BATCH_OPS = 32
 
 INTENTS = (
     "design.list",
@@ -81,6 +82,7 @@ INTENTS = (
     "design.element.create",
     "design.element.delete",
     "design.element.group",
+    "design.batch_edit",
     "design.export",
 )
 
@@ -686,6 +688,64 @@ def handle_element_group(request: dict, payload: dict, token: str) -> dict:
     })
 
 
+def handle_batch_edit(request: dict, payload: dict, token: str) -> dict:
+    design_id = _req_design_id(payload)
+    ops = payload.get("ops")
+    if not isinstance(ops, list) or not 1 <= len(ops) <= MAX_BATCH_OPS:
+        raise ValueError("ops must contain between 1 and %d operations" % MAX_BATCH_OPS)
+    design = _bind_exact(design_id, token)
+    revision = _design_revision(design)
+    _refuse_if_stale(_opt_revision(payload), revision)
+    validated = []
+    for index, raw in enumerate(ops):
+        if not isinstance(raw, dict):
+            raise ValueError("batch operation %d must be an object" % index)
+        op = raw.get("op")
+        item = {"op": op}
+        if op == "text.update":
+            item.update({
+                "element_id": _req_element_id(raw),
+                "page_id": _opt_page_id(raw),
+                "text": _req_str(raw, "text", MAX_TEXT_CHARS),
+            })
+        elif op == "image.insert":
+            image_url = _req_https_url(raw, "image_url") if "image_url" in raw else None
+            asset_id = _req_asset_id(raw) if "asset_id" in raw else None
+            if image_url is None and asset_id is None:
+                raise ValueError("image.insert requires image_url or asset_id")
+            item.update({
+                "page_id": _opt_page_id(raw),
+                "image_url": image_url,
+                "asset_id": asset_id,
+                "alt_text": _opt_str(raw, "alt_text", MAX_ALT_CHARS),
+            })
+        elif op == "element.create":
+            item.update({
+                "page_id": _opt_page_id(raw),
+                "element_type": _req_element_type(raw),
+                "params": _req_create_params(raw),
+            })
+        elif op == "element.delete":
+            item.update({
+                "element_id": _req_element_id(raw),
+                "page_id": _opt_page_id(raw),
+            })
+        elif op == "element.group":
+            item.update({
+                "element_ids": _req_element_ids(raw),
+                "page_id": _opt_page_id(raw),
+            })
+        else:
+            raise ValueError("unsupported batch operation: %s" % op)
+        validated.append(item)
+    return _need_app(request, "design.batch_edit", {
+        "design_id": design_id,
+        "revision_before": revision,
+        "ops": validated,
+        "op_count": len(validated),
+    })
+
+
 # ---------------------------------------------------------------- export
 
 
@@ -839,6 +899,7 @@ _DISPATCH_BRIDGE = {
     "design.element.create": handle_element_create,
     "design.element.delete": handle_element_delete,
     "design.element.group": handle_element_group,
+    "design.batch_edit": handle_batch_edit,
 }
 
 

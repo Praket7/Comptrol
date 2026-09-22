@@ -111,6 +111,7 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "presentation.read",
     "presentation.batch_edit",
     "presentation.desktop.open",
+    "presentation.desktop.batch_edit",
     "presentation.shape.text.set",
     "presentation.save",
     "presentation.export_pdf",
@@ -137,6 +138,7 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "design.element.create",
     "design.element.delete",
     "design.element.group",
+    "design.batch_edit",
     "design.export",
 ];
 
@@ -811,6 +813,8 @@ impl Policy {
                 "browser.cdp.history_back".to_owned(),
                 "browser.cdp.history_forward".to_owned(),
                 "browser.cdp.semantic_click".to_owned(),
+                "browser.cdp.semantic_fill".to_owned(),
+                "browser.cdp.compact_snapshot".to_owned(),
                 "browser.cdp.workflow".to_owned(),
                 "browser.cdp.screenshot".to_owned(),
                 "browser.cdp.coordinate_click".to_owned(),
@@ -1553,6 +1557,8 @@ impl Runtime {
             | "browser.cdp.history_back"
             | "browser.cdp.history_forward"
             | "browser.cdp.semantic_click"
+            | "browser.cdp.semantic_fill"
+            | "browser.cdp.compact_snapshot"
             | "browser.cdp.workflow"
             | "browser.cdp.screenshot"
             | "browser.cdp.coordinate_click"
@@ -2014,8 +2020,9 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.history_back"
         | "browser.cdp.history_forward"
         | "browser.cdp.semantic_click"
+        | "browser.cdp.semantic_fill"
         | "browser.cdp.coordinate_click" => Risk::R2,
-        "browser.cdp.screenshot" => Risk::R0,
+        "browser.cdp.screenshot" | "browser.cdp.compact_snapshot" => Risk::R0,
         "browser.cdp.workflow" => Risk::R2,
         "obs.recording.start" | "obs.recording.stop" => Risk::R3,
         "discord.message.delete" | "mail.send" | "message.send" => Risk::R3,
@@ -2844,6 +2851,8 @@ fn route_catalog() -> Vec<RoutePlan> {
         "browser.cdp.open_tab",
         "browser.cdp.frame_evaluate",
         "browser.cdp.semantic_click",
+        "browser.cdp.semantic_fill",
+        "browser.cdp.compact_snapshot",
         "browser.cdp.screenshot",
         "browser.cdp.coordinate_click",
         "browser.cdp.dialog",
@@ -3308,6 +3317,9 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
     if request.intent == "browser.cdp.semantic_click" {
         return browser_cdp_semantic_click(request, operation_id, &endpoint);
     }
+    if request.intent == "browser.cdp.semantic_fill" {
+        return browser_cdp_semantic_fill(request, operation_id, &endpoint);
+    }
     if request.intent == "browser.cdp.dialog" {
         return browser_cdp_dialog(request, operation_id, &endpoint);
     }
@@ -3413,6 +3425,31 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
                 EffectState::None,
                 VerificationState::Verified,
                 json!({ "snapshot": data, "depth": depth, "verified": true }),
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
+    if request.intent == "browser.cdp.compact_snapshot" {
+        let limit = request
+            .params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(64)
+            .clamp(1, 160) as usize;
+        return match browser::compact_snapshot(
+            &endpoint.to_string_lossy(),
+            target_id,
+            browser_context_id,
+            revision,
+            limit,
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::None,
+                VerificationState::Verified,
+                data,
             ),
             Err(error) => browser_failure(request, operation_id, error),
         };
@@ -3872,6 +3909,94 @@ fn browser_cdp_semantic_click(
     }
 }
 
+fn browser_cdp_semantic_fill(
+    request: &OperationRequest,
+    operation_id: String,
+    endpoint: &std::ffi::OsStr,
+) -> ActionResult {
+    let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Semantic browser fills need a target id".to_owned(),
+                recovery: Some("Inspect browser targets before the semantic action".to_owned()),
+            },
+        );
+    };
+    let browser_context_id = request
+        .params
+        .get("browser_context_id")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+    let Some(locator) = request.params.get("locator") else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Semantic browser fills need a locator object".to_owned(),
+                recovery: Some(
+                    "Provide role/name, text, test_id, href_contains, or selector".to_owned(),
+                ),
+            },
+        );
+    };
+    let Some(value) = request.params.get("value").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Semantic browser fills need a string value".to_owned(),
+                recovery: None,
+            },
+        );
+    };
+    let revision = request.params.get("revision").and_then(Value::as_str);
+    let timeout = request
+        .params
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(3_000)
+        .min(30_000);
+    match browser::semantic_fill(
+        &endpoint.to_string_lossy(),
+        target_id,
+        browser_context_id,
+        revision,
+        locator,
+        value,
+        timeout,
+    ) {
+        Ok(data) => {
+            let verified = data.get("verified").and_then(Value::as_bool) == Some(true);
+            success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                if verified {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                json!({
+                    "dispatch": data,
+                    "value_length": value.chars().count(),
+                    "verification": if verified {
+                        "semantic_value_readback"
+                    } else {
+                        "unverified"
+                    }
+                }),
+            )
+        }
+        Err(error) => browser_failure(request, operation_id, error),
+    }
+}
+
 /// Handle a JavaScript dialog (`alert`, `confirm`, `prompt`,
 /// `beforeunload`) on one exact target via `Page.handleJavaScriptDialog`.
 ///
@@ -3971,6 +4096,12 @@ enum BrowserWorkflowStep {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    Fill {
+        locator: Value,
+        value: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
     WaitUrl {
         contains: String,
         #[serde(default)]
@@ -4018,7 +4149,7 @@ fn browser_cdp_workflow(
             ComptrolError {
                 code: "invalid_input".to_owned(),
                 message: "Browser workflows need a steps array".to_owned(),
-                recovery: Some("Use navigate, click, and wait_url steps".to_owned()),
+                recovery: Some("Use navigate, click, fill, and wait_url steps".to_owned()),
             },
         );
     };
@@ -4071,29 +4202,55 @@ fn browser_cdp_workflow(
                 if let Err(error) = browser::validate_url(url) {
                     return browser_failure(request, operation_id, error);
                 }
-                match browser::cdp_call(
+                let live = browser::ensure_state(
                     &endpoint,
                     target_id,
                     Some(browser_context_id),
                     revision.as_deref(),
-                    "Page.navigate",
-                    json!({"url": url}),
-                ) {
-                    Ok(data) => {
-                        if let Some(expected) = url_contains
-                            && let Err(error) = browser_wait_for_url(
-                                &endpoint,
-                                target_id,
-                                browser_context_id,
-                                expected,
-                                timeout_ms.unwrap_or(2_000),
-                            )
-                        {
-                            return browser_failure(request, operation_id, error);
+                    Some(url),
+                    url_contains.as_deref(),
+                    None,
+                );
+                if let Ok(state) = live
+                    && state.get("satisfied").and_then(Value::as_bool) == Some(true)
+                {
+                    Ok(json!({
+                        "action": "navigate",
+                        "url": url,
+                        "navigated": false,
+                        "reason": "requested state already live",
+                        "ensure_state": state
+                    }))
+                } else {
+                    match browser::cdp_call(
+                        &endpoint,
+                        target_id,
+                        Some(browser_context_id),
+                        revision.as_deref(),
+                        "Page.navigate",
+                        json!({"url": url}),
+                    ) {
+                        Ok(data) => {
+                            if let Some(expected) = url_contains
+                                && let Err(error) = browser_wait_for_url(
+                                    &endpoint,
+                                    target_id,
+                                    browser_context_id,
+                                    expected,
+                                    timeout_ms.unwrap_or(2_000),
+                                )
+                            {
+                                return browser_failure(request, operation_id, error);
+                            }
+                            Ok(json!({
+                                "action":"navigate",
+                                "url": url,
+                                "navigated": true,
+                                "protocol": data
+                            }))
                         }
-                        Ok(json!({"action":"navigate", "url": url, "protocol": data}))
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
                 }
             }
             BrowserWorkflowStep::Click {
@@ -4105,6 +4262,19 @@ fn browser_cdp_workflow(
                 browser_context_id,
                 revision.as_deref(),
                 locator,
+                timeout_ms.unwrap_or(1_500).clamp(100, 10_000),
+            ),
+            BrowserWorkflowStep::Fill {
+                locator,
+                value,
+                timeout_ms,
+            } => browser::semantic_fill(
+                &endpoint,
+                target_id,
+                browser_context_id,
+                revision.as_deref(),
+                locator,
+                value,
                 timeout_ms.unwrap_or(1_500).clamp(100, 10_000),
             ),
             BrowserWorkflowStep::WaitUrl {
@@ -5177,6 +5347,12 @@ fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult 
     };
     let mut launch_request = comptrol_app_registry::LaunchRequest::new(resolved);
     launch_request.resource = resource;
+    launch_request.settle_ms = request
+        .params
+        .get("settle_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(300)
+        .clamp(200, 2_000);
     launch_request.background = request.background.as_deref() == Some("prefer_background");
     match comptrol_app_registry::launch_verified(&launch_request) {
         Ok((outcome, verification)) => {
@@ -5276,11 +5452,7 @@ fn app_list(request: &OperationRequest, operation_id: String) -> ActionResult {
         .unwrap_or("");
     let mut entries = Vec::new();
     let mut errors = Vec::new();
-    match comptrol_app_registry::registry::system_entries() {
-        Ok(list) => entries.extend(list),
-        Err(error) => errors.push(error.to_string()),
-    }
-    match comptrol_app_registry::registry::path_entries() {
+    match comptrol_app_registry::registry::installed_entries() {
         Ok(list) => entries.extend(list),
         Err(error) => errors.push(error.to_string()),
     }
@@ -5399,6 +5571,12 @@ fn app_launch_with_resource(
     };
     let mut launch_request = comptrol_app_registry::LaunchRequest::new(resolved);
     launch_request.resource = resource;
+    launch_request.settle_ms = request
+        .params
+        .get("settle_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(300)
+        .clamp(200, 2_000);
     launch_request.background = request.background.as_deref() == Some("prefer_background");
     match comptrol_app_registry::launch_verified(&launch_request) {
         Ok((outcome, verification)) => {

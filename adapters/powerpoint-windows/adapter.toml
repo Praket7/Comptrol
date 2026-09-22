@@ -17,6 +17,12 @@ background = "supported"
 verification = "application_state"
 
 [[capabilities]]
+intent = "presentation.desktop.batch_edit"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
 intent = "presentation.slide.create"
 risk = "R2"
 background = "supported"
