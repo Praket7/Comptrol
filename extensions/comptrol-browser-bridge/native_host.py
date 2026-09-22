@@ -101,7 +101,6 @@ def load_bridge_token():
     return None
 
 
-_daemon_identity_verified_until = 0.0
 _daemon_identity_lock = threading.Lock()
 
 
@@ -128,16 +127,11 @@ def _daemon_post_raw(endpoint, params=None, token=None):
         return {"ok": False, "error": "daemon_error", "details": str(e)}
 
 
-def verify_daemon_identity(force=False):
-    """Verify the local daemon knows the shared secret without transmitting it."""
-    global _daemon_identity_verified_until
-    now = time.monotonic()
+def verify_daemon_identity():
+    """Verify the process currently bound to the daemon port knows the secret."""
     with _daemon_identity_lock:
-        if not force and now < _daemon_identity_verified_until:
-            return True
         token = load_bridge_token()
         if not token:
-            _daemon_identity_verified_until = 0.0
             return False
         nonce = secrets.token_hex(32)
         response = _daemon_post_raw("/browser-auth/challenge", {"nonce": nonce})
@@ -147,28 +141,22 @@ def verify_daemon_identity(force=False):
             (PROTOCOL_VERSION + "\0" + nonce).encode("ascii"),
             hashlib.sha256,
         ).hexdigest()
-        verified = (
+        return (
             response.get("ok") is True
             and response.get("protocol") == PROTOCOL_VERSION
             and isinstance(proof, str)
             and hmac.compare_digest(proof.lower(), expected.lower())
         )
-        _daemon_identity_verified_until = now + 5.0 if verified else 0.0
-        return verified
 
 
 def daemon_post(endpoint, params=None):
-    """POST only after the local daemon proves knowledge of the install secret."""
-    global _daemon_identity_verified_until
+    """POST only after the current local daemon proves knowledge of the secret."""
     token = load_bridge_token()
     if not token:
         return {"ok": False, "error": "bridge_token_missing"}
     if not verify_daemon_identity():
         return {"ok": False, "error": "daemon_identity_unverified"}
-    response = _daemon_post_raw(endpoint, params, token=token)
-    if response.get("error") in {"daemon_http_403", "daemon_unreachable"}:
-        _daemon_identity_verified_until = 0.0
-    return response
+    return _daemon_post_raw(endpoint, params, token=token)
 
 
 def command_poll_loop(native_port_ref):
