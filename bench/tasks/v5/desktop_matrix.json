@@ -4,7 +4,9 @@
   "goal": "Measure app resolution, permission, and popup classification tasks against local fixtures and live macOS where safe.",
   "timeout_ms": 60000,
   "initial_state": "fresh Comptrol state directory",
-  "required_capabilities": ["tools/call"],
+  "required_capabilities": [
+    "tools/call"
+  ],
   "tasks": [
     {
       "task_id": "v5.desktop.app_resolve",
@@ -12,7 +14,19 @@
       "iterations": 3,
       "verifier": "resolved_true_path_nonempty",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "app.resolve", "params": {"app": "path.sh"}, "idempotency_key": "bench-desktop-resolve-001"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "app.resolve",
+              "params": {
+                "app": "path.sh"
+              },
+              "idempotency_key": "bench-desktop-resolve-001"
+            }
+          }
+        }
       ]
     },
     {
@@ -21,7 +35,17 @@
       "iterations": 2,
       "verifier": "apps_array_nonempty",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "app.list", "params": {}, "idempotency_key": "bench-desktop-list-001"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "app.list",
+              "params": {},
+              "idempotency_key": "bench-desktop-list-001"
+            }
+          }
+        }
       ]
     },
     {
@@ -30,16 +54,42 @@
       "iterations": 1,
       "verifier": "has_status_field",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "permission.status", "params": {"permission": "accessibility"}, "idempotency_key": "bench-desktop-perm-001"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "permission.status",
+              "params": {
+                "permission": "accessibility"
+              },
+              "idempotency_key": "bench-desktop-perm-001"
+            }
+          }
+        }
       ]
     },
     {
       "task_id": "v5.desktop.popup_classify",
-      "goal": "Classify a fixture popup window and verify the classification is one of the expected types.",
+      "goal": "Classify deterministic accessible popup signals and verify the informational class.",
       "iterations": 2,
       "verifier": "classification_in_allowed",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "popup.inspect", "params": {"window_id": "fixture-popup-1"}, "idempotency_key": "bench-desktop-popup-001"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "popup.inspect",
+              "params": {
+                "role": "dialog",
+                "name": "Tip of the day",
+                "text": "Informational notification about a new feature"
+              },
+              "idempotency_key": "bench-desktop-popup-001"
+            }
+          }
+        }
       ]
     }
   ],
