@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { spawn } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import { existsSync } from "node:fs"
 
 const startedAt = performance.now()
@@ -91,6 +91,8 @@ try {
     assert.equal(frameClick.result.structuredContent.verification, "verified", JSON.stringify(frameClick))
     const dynamicWait = await response(46, { jsonrpc: "2.0", id: 46, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.wait_for", idempotency_key: "semantic-click-dynamic-ready", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, selector: "#dynamic-node", property: "textContent", contains: "dynamic ready" } } } })
     assert.equal(dynamicWait.result.structuredContent.verification, "verified", JSON.stringify(dynamicWait))
+    const pageReady = await response(55, { jsonrpc: "2.0", id: 55, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.wait_for", idempotency_key: "page-ready-complete", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, selector: "document", property: "readyState", equals: "complete", timeout_ms: 1000 } } } })
+    assert.equal(pageReady.result.structuredContent.verification, "verified", JSON.stringify(pageReady))
     const workflow = await response(47, { jsonrpc: "2.0", id: 47, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.workflow", idempotency_key: "browser-workflow", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, steps: [{ action: "click", locator: { role: "button", name: "Add dynamic node" }, timeout_ms: 1000 }] } } } })
     assert.equal(workflow.result.structuredContent.verification, "verified", JSON.stringify(workflow))
     assert.equal(workflow.result.structuredContent.data.step_count, 1)
@@ -138,6 +140,13 @@ try {
     assert.equal(metrics.pageWebsocketConnections, 0, JSON.stringify(metrics))
     assert.equal(metrics.browserWebsocketConnections, 1, JSON.stringify(metrics))
     comptrol.kill("SIGTERM")
+    const openedByCli = JSON.parse(execFileSync(binary, ["open", `http://127.0.0.1:${port}/cli-ready`], {
+      encoding: "utf8",
+      env: { ...process.env, COMPTROL_CDP_ENDPOINT: `http://127.0.0.1:${port}`, COMPTROL_ALLOW_BROWSER_CDP: "1", COMPTROL_STATE_DIR: `/tmp/comptrol-open-${process.pid}-${Date.now()}` },
+      timeout: 35_000,
+    }))
+    assert.equal(openedByCli.verified, true, JSON.stringify(openedByCli))
+    assert.equal(openedByCli.page_load.verification, "verified")
     console.log(JSON.stringify({
       suite: "browser_fixture_verified_task",
       verified_success: true,

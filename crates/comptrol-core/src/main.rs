@@ -832,6 +832,101 @@ fn now_ms() -> u128 {
         .unwrap_or_default()
 }
 
+fn run_open(args: Vec<String>) -> i32 {
+    let Some(target) = args.first() else {
+        eprintln!("open needs an app name or URL");
+        return 2;
+    };
+    if args.len() != 1 {
+        eprintln!("open accepts one exact app name or URL");
+        return 2;
+    }
+    let mut runtime = match Runtime::new(default_state_dir()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("startup failed: {error}");
+            return 1;
+        }
+    };
+    let is_url = target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("about:");
+    if !is_url {
+        let result = runtime.operate(OperationRequest {
+            intent: "app.launch".to_owned(),
+            target: None,
+            params: json!({"app": target}),
+            postcondition: None,
+            risk: None,
+            idempotency_key: None,
+            dry_run: false,
+            background: Some("foreground_allowed".to_owned()),
+        });
+        return print_open_result(result);
+    }
+
+    let can_verify = std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1")
+        && (std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            || comptrol::browser_bridge::bridge_is_active());
+    let result = runtime.operate(OperationRequest {
+        intent: if can_verify {
+            "browser.cdp.open_tab"
+        } else {
+            "browser.chrome.open_tab"
+        }
+        .to_owned(),
+        target: None,
+        params: json!({"url": target, "background": false}),
+        postcondition: None,
+        risk: None,
+        idempotency_key: None,
+        dry_run: false,
+        background: Some("foreground_allowed".to_owned()),
+    });
+    if result.error.is_some() || !can_verify {
+        return print_open_result(result);
+    }
+    let opened = result.data.clone();
+    let target_info = &opened["target"];
+    let (Some(target_id), Some(context_id), Some(revision)) = (
+        target_info["id"].as_str(),
+        target_info["browser_context_id"].as_str(),
+        target_info["revision"].as_str(),
+    ) else {
+        return print_open_result(result);
+    };
+    let wait = runtime.operate(OperationRequest {
+        intent: "browser.cdp.wait_for".to_owned(),
+        target: None,
+        params: json!({
+            "target_id": target_id,
+            "browser_context_id": context_id,
+            "revision": revision,
+            "selector": "document",
+            "property": "readyState",
+            "equals": "complete",
+            "timeout_ms": 30_000
+        }),
+        postcondition: None,
+        risk: None,
+        idempotency_key: None,
+        dry_run: false,
+        background: Some("foreground_allowed".to_owned()),
+    });
+    print_json(json!({
+        "open": result,
+        "page_load": wait,
+        "verified": wait.error.is_none() && wait.verification == comptrol::VerificationState::Verified
+    }))
+}
+
+fn print_open_result(result: comptrol::ActionResult) -> i32 {
+    let success = result.error.is_none();
+    let value = serde_json::to_value(result).unwrap_or(Value::Null);
+    print_json(value);
+    if success { 0 } else { 1 }
+}
+
 fn main() {
     let result = match env::args().nth(1).as_deref() {
         None | Some("mcp") => {
@@ -853,6 +948,7 @@ fn main() {
             result
         }
         Some("doctor") => run_doctor(env::args().skip(2).collect()),
+        Some("open") => run_open(env::args().skip(2).collect()),
         Some("status") => print_json(run_inspect("status")),
         Some("capabilities") => print_json(json!(capabilities())),
         Some("stop") => change_stop(true),
@@ -886,7 +982,7 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor status capabilities stop resume serve-http serve-mtls daemon daemon-health record replay workflow adapter integrate pair privacy version"
+                "commands are mcp doctor open status capabilities stop resume serve-http serve-mtls daemon daemon-health record replay workflow adapter integrate pair privacy version"
             );
             2
         }

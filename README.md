@@ -54,6 +54,15 @@ npm install comptrolling
 npx comptrolling
 ```
 
+Open an exact installed app or a URL in one command:
+
+```text
+comptrol open Blender
+comptrol open https://www.espn.com/
+```
+
+App opening needs `COMPTROL_ALLOW_APP_LAUNCH=1`. Browser opening needs `COMPTROL_ALLOW_BROWSER_LAUNCH=1`; it uses the existing default Chrome profile and clearly reports that browser-page loading is unverified unless a local DevTools connection or Browser Bridge is enabled. When either browser connection is available and `COMPTROL_ALLOW_BROWSER_CDP=1` is set, the same URL command waits for the page's `document.readyState` to reach `complete`.
+
 The npm release also bundles the optional Browser Bridge for controlling already-open signed-in Chrome tabs without copying a browser profile. Chrome requires the human to load/approve the extension and assigns the extension ID, so Comptrol does not silently install it during `npm install`. To set it up:
 
 ```text

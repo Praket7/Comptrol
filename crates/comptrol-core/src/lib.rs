@@ -4467,90 +4467,21 @@ fn browser_cdp_dom_action(
             )
         }
         "browser.cdp.wait_for" => {
-            let Some(selector) = request.params.get("selector").and_then(Value::as_str) else {
-                return ActionResult::refused(
-                    request,
-                    operation_id,
-                    ComptrolError {
-                        code: "invalid_input".to_owned(),
-                        message: "Browser wait needs a selector".to_owned(),
-                        recovery: None,
-                    },
-                );
-            };
-            let property = request
-                .params
-                .get("property")
-                .and_then(Value::as_str)
-                .unwrap_or("textContent");
-            if !matches!(
-                property,
-                "textContent" | "value" | "title" | "href" | "checked" | "disabled"
-            ) {
-                return ActionResult::refused(
-                    request,
-                    operation_id,
-                    ComptrolError {
-                        code: "invalid_input".to_owned(),
-                        message: "Browser wait property is not allowlisted".to_owned(),
-                        recovery: None,
-                    },
-                );
-            }
-            let condition = if let Some(expected) = request.params.get("equals") {
-                let Ok(expected) = serde_json::to_string(expected) else {
+            let expression = match browser_wait_expression(&request.params) {
+                Ok(expression) => expression,
+                Err(message) => {
                     return ActionResult::refused(
                         request,
                         operation_id,
                         ComptrolError {
                             code: "invalid_input".to_owned(),
-                            message: "Browser wait value is not serializable".to_owned(),
+                            message: message.to_owned(),
                             recovery: None,
                         },
                     );
-                };
-                format!("JSON.stringify(element[{property:?}]) === JSON.stringify({expected})")
-            } else if let Some(expected) = request.params.get("contains").and_then(Value::as_str) {
-                let Ok(expected) = serde_json::to_string(expected) else {
-                    return ActionResult::refused(
-                        request,
-                        operation_id,
-                        ComptrolError {
-                            code: "invalid_input".to_owned(),
-                            message: "Browser wait value is not serializable".to_owned(),
-                            recovery: None,
-                        },
-                    );
-                };
-                format!("String(element[{property:?}] ?? '').includes({expected})")
-            } else {
-                return ActionResult::refused(
-                    request,
-                    operation_id,
-                    ComptrolError {
-                        code: "invalid_input".to_owned(),
-                        message: "Browser wait needs equals or contains".to_owned(),
-                        recovery: None,
-                    },
-                );
+                }
             };
-            let Ok(selector) = serde_json::to_string(selector) else {
-                return ActionResult::refused(
-                    request,
-                    operation_id,
-                    ComptrolError {
-                        code: "invalid_input".to_owned(),
-                        message: "Browser selector is not serializable".to_owned(),
-                        recovery: None,
-                    },
-                );
-            };
-            (
-                format!(
-                    "(() => {{ const element = document.querySelector({selector}); return Boolean(element) && {condition}; }})()"
-                ),
-                true,
-            )
+            (expression, true)
         }
         _ => unreachable!(),
     };
@@ -4642,6 +4573,50 @@ fn browser_cdp_dom_action(
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn browser_wait_expression(params: &Value) -> Result<String, &'static str> {
+    let selector = params
+        .get("selector")
+        .and_then(Value::as_str)
+        .ok_or("Browser wait needs a selector")?;
+    let property = params
+        .get("property")
+        .and_then(Value::as_str)
+        .unwrap_or("textContent");
+    if property == "readyState" {
+        if selector != "document" {
+            return Err("Browser readyState wait requires selector document");
+        }
+        let expected = params
+            .get("equals")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "interactive" | "complete"))
+            .ok_or("Browser readyState wait needs equals interactive or complete")?;
+        return Ok(format!("document.readyState === {expected:?}"));
+    }
+    if !matches!(
+        property,
+        "textContent" | "value" | "title" | "href" | "checked" | "disabled"
+    ) {
+        return Err("Browser wait property is not allowlisted");
+    }
+    let condition = if let Some(expected) = params.get("equals") {
+        let expected = serde_json::to_string(expected)
+            .map_err(|_| "Browser wait value is not serializable")?;
+        format!("JSON.stringify(element[{property:?}]) === JSON.stringify({expected})")
+    } else if let Some(expected) = params.get("contains").and_then(Value::as_str) {
+        let expected = serde_json::to_string(expected)
+            .map_err(|_| "Browser wait value is not serializable")?;
+        format!("String(element[{property:?}] ?? '').includes({expected})")
+    } else {
+        return Err("Browser wait needs equals or contains");
+    };
+    let selector =
+        serde_json::to_string(selector).map_err(|_| "Browser selector is not serializable")?;
+    Ok(format!(
+        "(() => {{ const element = document.querySelector({selector}); return Boolean(element) && {condition}; }})()"
+    ))
 }
 
 fn browser_cdp_upload(
@@ -9068,6 +9043,35 @@ mod tests {
     fn route_p95_uses_nearest_rank_percentile() {
         let samples = (1..=20).map(|value| value as f64).collect::<VecDeque<_>>();
         assert_eq!(percentile_95(&samples), Some(19.0));
+    }
+
+    #[test]
+    fn browser_wait_supports_bounded_document_readiness_checks() {
+        assert_eq!(
+            browser_wait_expression(&json!({
+                "selector": "document",
+                "property": "readyState",
+                "equals": "complete"
+            }))
+            .expect("valid readyState wait"),
+            "document.readyState === \"complete\""
+        );
+        assert!(
+            browser_wait_expression(&json!({
+                "selector": "#page",
+                "property": "readyState",
+                "equals": "complete"
+            }))
+            .is_err()
+        );
+        assert!(
+            browser_wait_expression(&json!({
+                "selector": "document",
+                "property": "readyState",
+                "equals": "loaded"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
