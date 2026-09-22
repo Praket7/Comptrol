@@ -3,6 +3,7 @@ if (process.env.COMPTROL_DAEMON === "1") {
   require("./comptrol-daemon-mcp.js");
 } else {
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
@@ -19,49 +20,84 @@ process.env.COMPTROL_STATE_DIR ||= path.join(os.homedir(), ".comptrol");
 const bridgeMarker = path.join(process.env.COMPTROL_STATE_DIR, "browser-bridge.enabled");
 let bridgeSidecar;
 
-function browserBridgeReady(port) {
-  const tokenPath = path.join(process.env.COMPTROL_STATE_DIR, "browser-bridge.token");
-  let token;
-  try {
-    token = fs.readFileSync(tokenPath, "utf8").trim();
-  } catch {
-    return Promise.resolve(false);
-  }
-  if (!/^[0-9a-fA-F]{64,}$/.test(token)) return Promise.resolve(false);
-
+function postJson(port, endpoint, body, headers = {}) {
+  const encoded = Buffer.from(JSON.stringify(body));
   return new Promise(resolve => {
     const request = http.request({
       host: "127.0.0.1",
       port,
-      path: "/browser/status",
+      path: endpoint,
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Content-Length": "2",
-        "X-Comptrol-Bridge-Token": token,
+        "Content-Length": String(encoded.length),
+        ...headers,
       },
-      timeout: 300,
+      timeout: 350,
     }, response => {
-      let body = "";
+      let responseBody = "";
       response.setEncoding("utf8");
-      response.on("data", chunk => { body += chunk; });
+      response.on("data", chunk => { responseBody += chunk; });
       response.on("end", () => {
-        if (response.statusCode !== 200) return resolve(false);
         try {
-          const value = JSON.parse(body);
-          resolve(value?.ok === true);
+          resolve({ status: response.statusCode || 0, body: JSON.parse(responseBody) });
         } catch {
-          resolve(false);
+          resolve({ status: response.statusCode || 0, body: null });
         }
       });
     });
     request.once("timeout", () => {
       request.destroy();
-      resolve(false);
+      resolve({ status: 0, body: null });
     });
-    request.once("error", () => resolve(false));
-    request.end("{}");
+    request.once("error", () => resolve({ status: 0, body: null }));
+    request.end(encoded);
   });
+}
+
+async function browserBridgeReady(port) {
+  const tokenPath = path.join(process.env.COMPTROL_STATE_DIR, "browser-bridge.token");
+  let token;
+  try {
+    token = fs.readFileSync(tokenPath, "utf8").trim();
+  } catch {
+    return false;
+  }
+  if (!/^[0-9a-fA-F]{64,}$/.test(token)) return false;
+
+  const nonce = crypto.randomBytes(32).toString("hex");
+  const challenge = await postJson(port, "/browser-auth/challenge", { nonce });
+  if (
+    challenge.status !== 200 ||
+    challenge.body?.ok !== true ||
+    challenge.body?.protocol !== "comptrol.browser.bridge/0.1.0" ||
+    typeof challenge.body?.proof !== "string"
+  ) {
+    return false;
+  }
+  const expected = crypto
+    .createHmac("sha256", token)
+    .update("comptrol.browser.bridge/0.1.0")
+    .update(Buffer.from([0]))
+    .update(nonce)
+    .digest();
+  let received;
+  try {
+    received = Buffer.from(challenge.body.proof, "hex");
+  } catch {
+    return false;
+  }
+  if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) {
+    return false;
+  }
+
+  const status = await postJson(
+    port,
+    "/browser/status",
+    {},
+    { "X-Comptrol-Bridge-Token": token },
+  );
+  return status.status === 200 && status.body?.ok === true;
 }
 
 async function ensureBrowserBridgeSidecar() {
