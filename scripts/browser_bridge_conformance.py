@@ -69,10 +69,37 @@ class ProbeHandler(http.server.BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except ValueError:
             body = {}
+        nonce = self.headers.get("X-Comptrol-Bridge-Nonce")
+        signature = self.headers.get("X-Comptrol-Bridge-Signature")
+        signature_valid = False
+        if nonce and signature:
+            body_hash = hashlib.sha256(raw).hexdigest()
+            signing_input = (
+                PROTOCOL
+                + "\0POST\0"
+                + self.path
+                + "\0"
+                + nonce
+                + "\0"
+                + body_hash
+                + "\0"
+            ).encode("ascii")
+            expected_signature = hmac.new(
+                self.server.token.encode("ascii"),
+                signing_input,
+                hashlib.sha256,
+            ).hexdigest()
+            signature_valid = hmac.compare_digest(
+                signature.lower(),
+                expected_signature.lower(),
+            )
         self.server.seen.append(
             {
                 "path": self.path,
                 "token": self.headers.get("X-Comptrol-Bridge-Token"),
+                "nonce": nonce,
+                "signature": signature,
+                "signature_valid": signature_valid,
                 "body": body,
             }
         )
@@ -92,7 +119,7 @@ class ProbeHandler(http.server.BaseHTTPRequestHandler):
             )
             return
 
-        if self.headers.get("X-Comptrol-Bridge-Token") != self.server.token:
+        if not signature_valid:
             self._reply(403, {"ok": False, "error": "browser_bridge_auth_required"})
             return
 
@@ -217,7 +244,16 @@ def main() -> None:
         raise SystemExit("native host did not challenge the loopback daemon")
     leaked = [item for item in bad_seen if item["token"]]
     if leaked:
-        raise SystemExit(f"native host leaked Browser Bridge token before identity proof: {leaked}")
+        raise SystemExit(f"native host leaked Browser Bridge bearer token: {leaked}")
+    premature_signed = [
+        item
+        for item in bad_seen
+        if item["path"].startswith("/browser/") and item["signature"]
+    ]
+    if premature_signed:
+        raise SystemExit(
+            f"native host sent bridge traffic before daemon identity proof: {premature_signed}"
+        )
 
     # A listener with the correct HMAC proof receives authenticated bridge
     # traffic after proof succeeds.
@@ -225,10 +261,14 @@ def main() -> None:
     authenticated = [
         item
         for item in good_seen
-        if item["path"] == "/browser/extension/heartbeat" and item["token"] == "ab" * 32
+        if item["path"] == "/browser/extension/heartbeat"
+        and item["signature_valid"] is True
+        and item["token"] is None
     ]
     if not authenticated:
-        raise SystemExit(f"native host did not authenticate to verified daemon: {good_seen}")
+        raise SystemExit(f"native host did not HMAC-authenticate to verified daemon: {good_seen}")
+    if any(item["token"] for item in good_seen):
+        raise SystemExit(f"native host sent legacy bearer token: {good_seen}")
 
     print(
         json.dumps(
@@ -238,7 +278,7 @@ def main() -> None:
                 "python": "syntax_clean",
                 "native_messaging_handshake": "passed",
                 "rogue_daemon_token_leak": "blocked",
-                "verified_daemon_authentication": "passed",
+                "verified_daemon_hmac_authentication": "passed",
             },
             sort_keys=True,
         )
