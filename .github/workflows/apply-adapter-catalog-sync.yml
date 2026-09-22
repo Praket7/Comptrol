@@ -1,0 +1,40 @@
+name: apply-adapter-catalog-sync
+
+on:
+  push:
+    branches:
+      - research/computer-use-speed-reliability-20260922
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/computer-use-speed-reliability-20260922
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Synchronize compiled adapter catalog
+        run: python3 scripts/apply_adapter_catalog_sync.py
+      - name: Format and check workspace
+        run: |
+          cargo fmt --all
+          cargo check --workspace
+      - name: Build release binary and verify catalog
+        run: |
+          cargo build --release
+          python3 scripts/v5_adapter_catalog.py --binary target/release/comptrol
+      - name: Commit product catalog fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/comptrol-core/src/adapters.rs
+          git diff --cached --check
+          git commit -m "Synchronize first-party adapter capability catalog"
+          git push origin HEAD:research/computer-use-speed-reliability-20260922
