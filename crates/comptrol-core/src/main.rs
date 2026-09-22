@@ -2607,6 +2607,54 @@ fn handle_http<S: HttpStream>(
         }
     }
     // ── Browser Bridge HTTP API (native messaging host → daemon) ──────────
+    // Prove daemon identity before a native host sends the bearer token. The
+    // challenge endpoint deliberately sits outside /browser/* authentication.
+    if request_line.starts_with("POST /browser-auth/challenge ") {
+        let request_body: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+        let nonce = request_body.get("nonce").and_then(Value::as_str).unwrap_or("");
+        return match comptrol::browser_bridge::challenge_proof(&default_state_dir(), nonce) {
+            Ok(proof) => write_http_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": true,
+                    "protocol": comptrol::browser_bridge::BRIDGE_PROTOCOL_VERSION,
+                    "proof": proof
+                }))
+                .unwrap_or_default(),
+                None,
+            ),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => write_http_response(
+                stream,
+                400,
+                "Bad Request",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": false,
+                    "error": "invalid_browser_bridge_challenge",
+                    "message": error.to_string()
+                }))
+                .unwrap_or_default(),
+                None,
+            ),
+            Err(error) => write_http_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": false,
+                    "error": "browser_bridge_auth_unavailable",
+                    "message": error.to_string()
+                }))
+                .unwrap_or_default(),
+                None,
+            ),
+        };
+    }
+
     let bridge_request = request_line
         .split_whitespace()
         .nth(1)
