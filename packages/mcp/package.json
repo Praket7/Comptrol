@@ -5,10 +5,20 @@
   "bin": {
     "comptrolling": "bin/comptrol-mcp.js",
     "comptrol-mcp": "bin/comptrol-mcp.js",
-    "comptrol-http": "bin/comptrol-http.js"
+    "comptrol-http": "bin/comptrol-http.js",
+    "comptrol-browser-setup": "bin/comptrol-browser-setup.js"
   },
-  "files": ["bin", "native"],
-  "engines": { "node": ">=18" },
-  "repository": { "type": "git", "url": "git+https://github.com/Praket7/Comptrol.git" },
+  "files": [
+    "bin",
+    "native",
+    "browser-bridge"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Praket7/Comptrol.git"
+  },
   "license": "Apache-2.0"
 }
