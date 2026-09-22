@@ -187,20 +187,28 @@ pub fn verify_request_signature(
     body: &[u8],
     signature_hex: &str,
 ) -> io::Result<bool> {
-    let expected = request_signature(token, method, path, nonce, body)?;
-    let expected_bytes = decode_hex(&expected)?;
-    let provided_bytes = match decode_hex(signature_hex) {
+    if nonce.len() < 32
+        || nonce.len() > 256
+        || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(false);
+    }
+    let provided = match decode_hex(signature_hex) {
         Ok(value) => value,
         Err(_) => return Ok(false),
     };
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"constant-time-compare")
-        .map_err(|error| io::Error::other(format!("initialize comparison HMAC: {error}")))?;
-    mac.update(&expected_bytes);
-    let expected_tag = mac.clone().finalize().into_bytes();
-    let mut provided_mac = Hmac::<Sha256>::new_from_slice(b"constant-time-compare")
-        .map_err(|error| io::Error::other(format!("initialize comparison HMAC: {error}")))?;
-    provided_mac.update(&provided_bytes);
-    Ok(provided_mac.verify_slice(&expected_tag).is_ok())
+    let body_hash = Sha256::digest(body);
+    let body_hash_hex = body_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes())
+        .map_err(|error| io::Error::other(format!("initialize browser bridge request HMAC: {error}")))?;
+    for part in [BRIDGE_PROTOCOL_VERSION, method, path, nonce, body_hash_hex.as_str()] {
+        mac.update(part.as_bytes());
+        mac.update(b"\0");
+    }
+    Ok(mac.verify_slice(&provided).is_ok())
 }
 
 fn decode_hex(value: &str) -> io::Result<Vec<u8>> {
