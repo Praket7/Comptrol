@@ -45,7 +45,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.65";
+pub const SERVER_VERSION: &str = "0.1.66";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -900,6 +900,10 @@ impl Policy {
                 policy.allowed_intents.insert("mail.send".to_owned());
                 policy.allowed_intents.insert("message.send".to_owned());
             }
+        }
+        if env_enabled("COMPTROL_ALLOW_MAIL_SEND") && env_enabled("COMPTROL_ALLOW_ADAPTERS") {
+            policy.max_risk = Risk::R3;
+            policy.allowed_intents.insert("mail.send".to_owned());
         }
         if env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS") {
             policy.max_risk = policy.max_risk.max(Risk::R2);
@@ -8805,8 +8809,14 @@ pub fn capabilities() -> Vec<Capability> {
                 || (env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS")
                     && is_creative_adapter_intent(intent)))
                 && adapter_root().is_dir()
-                && (!matches!(*intent, "obs.recording.start" | "obs.recording.stop")
-                    || env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS")),
+                && match *intent {
+                    "mail.send" => env_enabled("COMPTROL_ALLOW_MAIL_SEND"),
+                    "obs.recording.start"
+                    | "obs.recording.stop"
+                    | "discord.message.delete"
+                    | "message.send" => env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS"),
+                    _ => true,
+                },
             risk: classify(intent),
             route: "isolated_adapter".to_owned(),
             note: "Runs through a bounded out of process first party adapter and requires application state verification".to_owned(),

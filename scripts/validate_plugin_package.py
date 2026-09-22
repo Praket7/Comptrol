@@ -37,9 +37,13 @@ def main():
         "command": "comptrol",
         "args": ["mcp"],
         "env": {
+            "COMPTROL_ALLOW_ADAPTERS": "1",
+            "COMPTROL_ALLOW_MAIL_SEND": "1",
+            "COMPTROL_ALLOW_BROWSER_CDP": "1",
             "COMPTROL_ALLOW_CREATIVE_ADAPTERS": "1",
             "COMPTROL_ALLOW_APP_LAUNCH": "1",
             "COMPTROL_ALLOW_MACOS_AX": "1",
+            "COMPTROL_ALLOW_SETTINGS": "1",
         },
     }:
         fail("plugin must launch the local stdio runtime with the documented local app policy")

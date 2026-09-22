@@ -29,7 +29,7 @@ All adapters run out of process with loopback-only network and declared filesyst
 
 ### Creative application coverage
 
-The Codex plugin launches a local stdio MCP process and opts into the Blender, Resolve, Canva, and presentation adapter intent families with `COMPTROL_ALLOW_CREATIVE_ADAPTERS=1`. It also enables app launching and the macOS Accessibility route; macOS TCC permissions still apply. The runtime discovers the adapter bundle beside the executable or under its local Comptrol state directory. Email, messaging, and recording adapter intents remain outside this plugin's opt-in.
+The Codex plugin launches a local stdio MCP process and opts into routine first-party adapter intents with `COMPTROL_ALLOW_ADAPTERS=1`, Gmail send with `COMPTROL_ALLOW_MAIL_SEND=1`, Blender/Resolve/Canva/presentation intents with `COMPTROL_ALLOW_CREATIVE_ADAPTERS=1`, browser CDP with `COMPTROL_ALLOW_BROWSER_CDP=1`, app launching, macOS Accessibility, and typed settings. This enables only `mail.send` among the R3 adapter actions; Discord message deletion and recording remain gated by `COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS`. macOS TCC permissions still apply, and browser actions require an active Comptrol browser session or configured CDP endpoint. Gmail API and Discord Bot API credentials are never extracted from signed-in apps or stored by the plugin. The Gmail API route needs `COMPTROL_GMAIL_ACCESS_TOKEN`; the Discord API route needs a bot token in `COMPTROL_DISCORD_BOT_TOKEN`, and intentionally refuses user tokens and self-bot behavior. For signed-in personal accounts, use the local browser/app UI route.
 
 | App | Current typed editing surface | Required live/runtime dependencies | Known ceiling |
 |---|---|---|---|

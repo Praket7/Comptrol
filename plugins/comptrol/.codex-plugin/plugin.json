@@ -1,19 +1,19 @@
 {
   "name": "comptrol",
-  "version": "0.1.65",
-  "description": "Local Codex computer control with isolated creative application adapters and verified routes.",
+  "version": "0.1.66",
+  "description": "Local Codex computer control with verified browser, desktop, settings, and application routes.",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Comptrol",
-    "shortDescription": "Verified local control for creative apps.",
-    "longDescription": "Start Comptrol locally from Codex and use its isolated Blender, DaVinci Resolve, Canva, and PowerPoint adapters.",
+    "shortDescription": "Verified local computer control.",
+    "longDescription": "Start Comptrol locally from Codex to control supported browser, desktop, mail, Discord, settings, and creative app routes.",
     "developerName": "Local developer",
     "category": "Productivity",
-    "capabilities": [],
-    "defaultPrompt": "Use the local Comptrol MCP for bounded computer work. Inspect its available creative app capabilities before editing, then verify the changed application or saved artifact."
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": "Use the local Comptrol MCP for bounded computer work. Inspect available capabilities and permissions before acting, then verify the changed application or saved artifact."
   },
   "mcpServers": "./.mcp.json",
   "apps": "./.app.json"
