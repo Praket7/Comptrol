@@ -16,6 +16,7 @@ let targetListRequests = 0
 let protocolEvents = 0
 let fixtureHistoryIndex = 1
 let fixtureUrl = `http://127.0.0.1:${port}/`
+let fixtureDialogOpen = false
 const fixtureHistory = [
   { id: 1, url: "http://127.0.0.1:17417/previous" },
   { id: 2, url: "http://127.0.0.1:17417/" },
@@ -196,6 +197,22 @@ server.on("upgrade", (request, socket) => {
       socket.write(websocketFrame(JSON.stringify({ id: message.id, result: { sessionId: `session-${attachedId}` } })))
       return
     }
+    if (message.method === "Page.handleJavaScriptDialog") {
+      if (!fixtureDialogOpen) {
+        const responseEnvelope = {
+          id: message.id,
+          error: { code: -32000, message: "No dialog is showing" }
+        }
+        if (message.sessionId) responseEnvelope.sessionId = message.sessionId
+        socket.write(websocketFrame(JSON.stringify(responseEnvelope)))
+        return
+      }
+      fixtureDialogOpen = false
+      const responseEnvelope = { id: message.id, result: { handled: true } }
+      if (message.sessionId) responseEnvelope.sessionId = message.sessionId
+      socket.write(websocketFrame(JSON.stringify(responseEnvelope)))
+      return
+    }
     const result = browserSocket && message.method === "Target.createTarget"
       ? (() => {
           const id = `comptrol-opened-${openedTabs.size + 1}`
@@ -209,7 +226,22 @@ server.on("upgrade", (request, socket) => {
       : message.method === "Accessibility.getFullAXTree"
         ? { nodes: [{ nodeId: "fixture-root", role: { value: "RootWebArea" }, name: { value: "Comptrol browser fixture" } }] }
       : message.method === "Runtime.evaluate"
-        ? message.params.expression === "location.href"
+        ? message.params.expression === "window.__comptrol_fixture_dialog__ = true"
+          ? (() => {
+              fixtureDialogOpen = true
+              protocolEvents += 1
+              socket.write(websocketFrame(JSON.stringify({
+                method: "Page.javascriptDialogOpening",
+                params: {
+                  url: fixtureUrl,
+                  message: "Comptrol V5 fixture dialog",
+                  type: "alert",
+                  hasBrowserHandler: true
+                }
+              })))
+              return { result: { type: "boolean", value: true } }
+            })()
+          : message.params.expression === "location.href"
           ? { result: { type: "string", value: fixtureUrl } }
           : message.params.expression === "document.title"
           ? { result: { type: "string", value: "Comptrol browser fixture" } }
