@@ -109,7 +109,25 @@ def _daemon_post_raw(endpoint, params=None, token=None):
     data = json.dumps(params or {}, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if token:
-        headers["X-Comptrol-Bridge-Token"] = token
+        nonce = secrets.token_hex(32)
+        body_hash = hashlib.sha256(data).hexdigest()
+        signing_input = (
+            PROTOCOL_VERSION
+            + "\0POST\0"
+            + endpoint
+            + "\0"
+            + nonce
+            + "\0"
+            + body_hash
+            + "\0"
+        ).encode("ascii")
+        signature = hmac.new(
+            token.encode("ascii"),
+            signing_input,
+            hashlib.sha256,
+        ).hexdigest()
+        headers["X-Comptrol-Bridge-Nonce"] = nonce
+        headers["X-Comptrol-Bridge-Signature"] = signature
     req = urllib.request.Request(
         url,
         data=data,
