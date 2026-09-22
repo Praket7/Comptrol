@@ -1,0 +1,45 @@
+name: V6 FastPath Apply
+
+on:
+  push:
+    branches:
+      - perf/v6-fastpath-20260922
+
+permissions:
+  contents: write
+
+concurrency:
+  group: comptrol-v6-fastpath-apply
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/v6-fastpath-20260922
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply V6 patch
+        run: python3 scripts/apply_v6_fastpath.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Compile workspace
+        run: cargo check --workspace
+      - name: Run focused bridge conformance
+        run: python3 scripts/browser_bridge_conformance.py
+      - name: Run workspace tests
+        run: cargo test --workspace
+      - name: Remove temporary patch machinery
+        run: rm scripts/apply_v6_fastpath.py .github/workflows/v6-fastpath-apply.yml
+      - name: Commit V6 FastPath
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 1
+          git commit -m "Implement V6 FastPath performance architecture"
+          git push origin HEAD:perf/v6-fastpath-20260922
