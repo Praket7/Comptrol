@@ -1,3 +1,5 @@
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
@@ -112,6 +114,32 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
         let token = fs::read_to_string(state_dir.join("browser-bridge.token"))
             .expect("read browser bridge auth token");
         let token = token.trim();
+
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let (status, challenge) = http_request(
+            daemon.port,
+            "POST",
+            "/browser-auth/challenge",
+            json!({"nonce": nonce}),
+            None,
+        );
+        assert_eq!(status, 200, "{challenge}");
+        assert_eq!(challenge["ok"], true);
+        assert_eq!(
+            challenge["protocol"],
+            "comptrol.browser.bridge/0.1.0"
+        );
+        let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("hmac key");
+        mac.update(b"comptrol.browser.bridge/0.1.0");
+        mac.update(b"\0");
+        mac.update(nonce.as_bytes());
+        let expected = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(challenge["proof"], expected);
 
         let (status, unauthorized) = http_request(
             daemon.port,
