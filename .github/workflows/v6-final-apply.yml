@@ -23,6 +23,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Repair final-pass driver against current skill text
+        run: python3 scripts/repair_v6_final_driver.py
       - name: Apply V6 final execution pass
         run: python3 scripts/apply_v6_final.py
       - name: Format
@@ -42,7 +44,7 @@ jobs:
       - name: Workspace tests
         run: cargo test --workspace
       - name: Remove temporary final-pass machinery
-        run: rm scripts/apply_v6_final.py .github/workflows/v6-final-apply.yml
+        run: rm scripts/apply_v6_final.py scripts/repair_v6_final_driver.py .github/workflows/v6-final-apply.yml
       - name: Commit V6 final execution pass
         run: |
           git config user.name "github-actions[bot]"
