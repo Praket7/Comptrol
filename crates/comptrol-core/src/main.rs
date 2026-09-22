@@ -2655,10 +2655,10 @@ fn handle_http<S: HttpStream>(
         };
     }
 
-    let bridge_request = request_line
-        .split_whitespace()
-        .nth(1)
-        .is_some_and(|path| path.starts_with("/browser/"));
+    let mut request_parts = request_line.split_whitespace();
+    let request_method = request_parts.next().unwrap_or("");
+    let request_path = request_parts.next().unwrap_or("");
+    let bridge_request = request_path.starts_with("/browser/");
     if bridge_request {
         let expected_token = match comptrol::browser_bridge::ensure_auth_token(&default_state_dir()) {
             Ok(token) => token,
@@ -2678,7 +2678,18 @@ fn handle_http<S: HttpStream>(
                 );
             }
         };
-        if header_value("X-Comptrol-Bridge-Token") != Some(expected_token.as_str()) {
+        let nonce = header_value("X-Comptrol-Bridge-Nonce").unwrap_or("");
+        let signature = header_value("X-Comptrol-Bridge-Signature").unwrap_or("");
+        let signature_valid = comptrol::browser_bridge::verify_request_signature(
+            &expected_token,
+            request_method,
+            request_path,
+            nonce,
+            body.as_bytes(),
+            signature,
+        )
+        .unwrap_or(false);
+        if !signature_valid {
             return write_http_response(
                 stream,
                 403,
@@ -2691,6 +2702,42 @@ fn handle_http<S: HttpStream>(
                 .unwrap_or_default(),
                 None,
             );
+        }
+        let nonce_claimed = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            queue.claim_auth_nonce(nonce)
+        };
+        match nonce_claimed {
+            Ok(true) => {}
+            Ok(false) => {
+                return write_http_response(
+                    stream,
+                    409,
+                    "Conflict",
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "ok": false,
+                        "error": "browser_bridge_replay"
+                    }))
+                    .unwrap_or_default(),
+                    None,
+                );
+            }
+            Err(error) => {
+                return write_http_response(
+                    stream,
+                    500,
+                    "Internal Server Error",
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "ok": false,
+                        "error": "browser_bridge_auth_unavailable",
+                        "message": error.to_string()
+                    }))
+                    .unwrap_or_default(),
+                    None,
+                );
+            }
         }
     }
     if request_line.starts_with("POST /browser/targets ") {
