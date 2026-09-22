@@ -4,7 +4,9 @@
   "goal": "Verify all 14 adapters respond to handshake, capabilities, and describe-class commands via the public MCP interface.",
   "timeout_ms": 60000,
   "initial_state": "fresh Comptrol state directory",
-  "required_capabilities": ["tools/call"],
+  "required_capabilities": [
+    "tools/call"
+  ],
   "tasks": [
     {
       "task_id": "v5.adapter.vscode_workspace_list",
@@ -12,7 +14,16 @@
       "iterations": 2,
       "verifier": "route_available_or_unavailable",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "vscode.workspace.list", "idempotency_key": "bench-vscode-ws-001"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "vscode.workspace.list",
+              "idempotency_key": "bench-vscode-ws-001"
+            }
+          }
+        }
       ]
     },
     {
@@ -21,16 +32,31 @@
       "iterations": 2,
       "verifier": "route_available_or_unavailable",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "video.timeline.list", "idempotency_key": "bench-resolve-tl-001"}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "operate",
+            "arguments": {
+              "intent": "video.timeline.list",
+              "idempotency_key": "bench-resolve-tl-001"
+            }
+          }
+        }
       ]
     },
     {
       "task_id": "v5.adapter.capabilities_all",
-      "goal": "Request capabilities from all adapters and verify non-empty result.",
+      "goal": "Request the public Comptrol capabilities tool and verify a non-empty capability catalog.",
       "iterations": 1,
       "verifier": "capabilities_non_empty",
       "steps": [
-        {"method": "tools/call", "params": {"name": "operate", "arguments": {"intent": "inspect", "params": {"kind": "capabilities"}}}}
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "capabilities",
+            "arguments": {}
+          }
+        }
       ]
     }
   ],
