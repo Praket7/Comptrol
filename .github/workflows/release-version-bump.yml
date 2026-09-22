@@ -1,0 +1,88 @@
+name: release-version-bump
+
+on:
+  push:
+    branches:
+      - codex/browser-bridge-release-hardening
+    paths:
+      - .github/workflows/release-version-bump.yml
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/browser-bridge-release-hardening
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Bump release candidate to 0.1.64
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import re
+
+          old = "0.1.63"
+          new = "0.1.64"
+
+          Path("VERSION").write_text(new + "\n", encoding="utf-8")
+
+          cargo = Path("Cargo.toml")
+          text = cargo.read_text(encoding="utf-8")
+          replaced, count = re.subn(r'(?m)^(version\s*=\s*)"0\.1\.63"$', rf'\1"{new}"', text, count=1)
+          if count != 1:
+              raise SystemExit("workspace version pattern not found exactly once")
+          cargo.write_text(replaced, encoding="utf-8")
+
+          for relative in [
+              "package.json",
+              "packages/mcp/package.json",
+              "plugins/comptrol/plugin.json",
+              "plugins/comptrol/.codex-plugin/plugin.json",
+          ]:
+              path = Path(relative)
+              obj = json.loads(path.read_text(encoding="utf-8"))
+              if obj.get("version") != old:
+                  raise SystemExit(f"{relative}: expected version {old}, found {obj.get('version')!r}")
+              obj["version"] = new
+              path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+
+          lib = Path("crates/comptrol-core/src/lib.rs")
+          text = lib.read_text(encoding="utf-8")
+          needle = 'pub const SERVER_VERSION: &str = "0.1.63";'
+          if text.count(needle) != 1:
+              raise SystemExit("SERVER_VERSION pattern not found exactly once")
+          lib.write_text(text.replace(needle, 'pub const SERVER_VERSION: &str = "0.1.64";', 1), encoding="utf-8")
+          PY
+
+          # Cargo owns the lockfile. Let it rewrite workspace package versions
+          # rather than text-replacing unrelated third-party package versions.
+          cargo check --workspace
+          cargo fmt --all -- --check
+          python3 scripts/check_versions.py
+
+          # The old release tag already exists; the new candidate tag must not.
+          if git rev-parse -q --verify refs/tags/v0.1.64 >/dev/null; then
+            echo "v0.1.64 already exists; refusing to reuse a release version" >&2
+            exit 1
+          fi
+
+          # This workflow is one-shot release machinery and must not remain in main.
+          git rm .github/workflows/release-version-bump.yml
+
+      - name: Commit verified version bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add VERSION Cargo.toml Cargo.lock package.json packages/mcp/package.json plugins/comptrol/plugin.json plugins/comptrol/.codex-plugin/plugin.json crates/comptrol-core/src/lib.rs .github/workflows/release-version-bump.yml
+          git diff --cached --check
+          git commit -m "chore: bump release candidate to 0.1.64"
+          git push origin HEAD:codex/browser-bridge-release-hardening
