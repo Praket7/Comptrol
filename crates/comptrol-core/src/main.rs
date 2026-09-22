@@ -1678,6 +1678,10 @@ fn run_http(port: u16) -> i32 {
         }
     };
     let http_state = Arc::new(http_state);
+    if let Err(error) = comptrol::browser_bridge::ensure_auth_token(&default_state_dir()) {
+        eprintln!("browser bridge auth startup failed: {error}");
+        return 1;
+    }
     let command_queue = match BridgeStore::open(&default_state_dir()) {
         Ok(store) => Arc::new(Mutex::new(store)),
         Err(error) => {
@@ -1912,6 +1916,10 @@ fn run_mtls(port: u16) -> i32 {
             return 1;
         }
     };
+    if let Err(error) = comptrol::browser_bridge::ensure_auth_token(&default_state_dir()) {
+        eprintln!("browser bridge auth startup failed: {error}");
+        return 1;
+    }
     let command_queue = match BridgeStore::open(&default_state_dir()) {
         Ok(store) => Arc::new(Mutex::new(store)),
         Err(error) => {
