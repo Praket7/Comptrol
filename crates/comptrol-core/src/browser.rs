@@ -294,7 +294,10 @@ pub fn ensure_state(
     // navigate verification criteria so a skipped navigation proves the
     // same postcondition a performed one would have.
     let url_satisfied = match (url, url_contains) {
-        (Some(expected), _) => current_url == expected,
+        (Some(expected), Some(fragment)) => {
+            current_url == expected || current_url.contains(fragment)
+        }
+        (Some(expected), None) => current_url == expected,
         (None, Some(fragment)) => current_url.contains(fragment),
         (None, None) => true,
     };
@@ -1288,8 +1291,24 @@ pub fn semantic_click(
             const locator = {locator_json};
             const deadline = performance.now() + {timeout_ms};
             const normalize = value => String(value || '').replace(/\\s+/g, ' ').trim();
+            const labelledByText = element => normalize(
+                (element.getAttribute('aria-labelledby') || '')
+                    .split(/\s+/).filter(Boolean)
+                    .map(id => element.ownerDocument.getElementById(id))
+                    .filter(Boolean)
+                    .map(node => node.innerText || node.textContent || '')
+                    .join(' ')
+            );
+            const labelsText = element => normalize(
+                element.labels
+                    ? [...element.labels].map(label => label.innerText || label.textContent || '').join(' ')
+                    : ''
+            );
             const nameOf = element => normalize(
                 element.getAttribute('aria-label') ||
+                labelledByText(element) ||
+                labelsText(element) ||
+                element.getAttribute('placeholder') ||
                 element.getAttribute('title') ||
                 element.innerText ||
                 element.textContent
@@ -1480,8 +1499,24 @@ pub fn semantic_fill(
             const desired = {value_json};
             const deadline = performance.now() + {timeout_ms};
             const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+            const labelledByText = element => normalize(
+                (element.getAttribute('aria-labelledby') || '')
+                    .split(/\s+/).filter(Boolean)
+                    .map(id => element.ownerDocument.getElementById(id))
+                    .filter(Boolean)
+                    .map(node => node.innerText || node.textContent || '')
+                    .join(' ')
+            );
+            const labelsText = element => normalize(
+                element.labels
+                    ? [...element.labels].map(label => label.innerText || label.textContent || '').join(' ')
+                    : ''
+            );
             const nameOf = element => normalize(
                 element.getAttribute('aria-label') ||
+                labelledByText(element) ||
+                labelsText(element) ||
+                element.getAttribute('placeholder') ||
                 element.getAttribute('title') ||
                 element.innerText ||
                 element.textContent
@@ -1571,6 +1606,7 @@ pub fn semantic_fill(
                         element.focus();
                         setNativeValue(element, desired);
                         await Promise.resolve();
+                        await new Promise(requestAnimationFrame);
                         const verified = readValue(element) === desired;
                         return {{
                             filled: verified,
@@ -1663,10 +1699,25 @@ pub fn compact_snapshot(
                  element.tagName === 'TEXTAREA' ? 'textbox' :
                  element.tagName === 'INPUT' ? 'textbox' :
                  element.tagName === 'SELECT' ? 'combobox' : '');
+            const labelledByText = element => normalize(
+                (element.getAttribute('aria-labelledby') || '')
+                    .split(/\s+/).filter(Boolean)
+                    .map(id => element.ownerDocument.getElementById(id))
+                    .filter(Boolean)
+                    .map(node => node.innerText || node.textContent || '')
+                    .join(' ')
+            );
+            const labelsText = element => normalize(
+                element.labels
+                    ? [...element.labels].map(label => label.innerText || label.textContent || '').join(' ')
+                    : ''
+            );
             const nameOf = element => normalize(
                 element.getAttribute('aria-label') ||
-                element.getAttribute('title') ||
+                labelledByText(element) ||
+                labelsText(element) ||
                 element.getAttribute('placeholder') ||
+                element.getAttribute('title') ||
                 element.innerText ||
                 element.textContent
             );
