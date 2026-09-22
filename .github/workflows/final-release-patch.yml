@@ -1,0 +1,39 @@
+name: final-release-patch
+
+on:
+  push:
+    branches: [codex/browser-bridge-release-hardening]
+    paths:
+      - scripts/final_release_patch.py
+
+permissions:
+  contents: write
+
+concurrency:
+  group: comptrol-final-release-patch
+  cancel-in-progress: true
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/browser-bridge-release-hardening
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: python3 scripts/final_release_patch.py
+      - run: cargo fmt --all
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Commit verified final patch and remove helper
+        run: |
+          rm .github/workflows/final-release-patch.yml scripts/final_release_patch.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "fix: remove undocumented Windows accessibility settings route"
+          git push origin HEAD:codex/browser-bridge-release-hardening
