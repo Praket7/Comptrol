@@ -1,8 +1,13 @@
 {
   "mcpServers": {
     "comptrol-local": {
-      "type": "streamable-http",
-      "url": "http://127.0.0.1:7317/mcp"
+      "command": "comptrol",
+      "args": ["mcp"],
+      "env": {
+        "COMPTROL_ALLOW_CREATIVE_ADAPTERS": "1",
+        "COMPTROL_ALLOW_APP_LAUNCH": "1",
+        "COMPTROL_ALLOW_MACOS_AX": "1"
+      }
     }
   }
 }

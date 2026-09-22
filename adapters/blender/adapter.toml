@@ -29,6 +29,12 @@ background = "supported"
 verification = "application_state"
 
 [[capabilities]]
+intent = "blender.scene.object.delete"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
 intent = "blender.project.save"
 risk = "R2"
 background = "supported"
@@ -39,4 +45,3 @@ intent = "blender.render"
 risk = "R2"
 background = "supported"
 verification = "persisted_artifact"
-

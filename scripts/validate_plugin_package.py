@@ -20,6 +20,7 @@ def main():
     plugin = root / "plugins" / "comptrol"
     manifest = load(plugin / "plugin.json")
     mcp = load(plugin / "mcp.json")
+    codex_mcp = load(plugin / ".mcp.json")
     compatibility = load(plugin / ".codex-plugin" / "plugin.json")
     marketplace = load(root / ".agents" / "plugins" / "marketplace.json")
 
@@ -32,8 +33,18 @@ def main():
     if not isinstance(manifest.get("extensions", {}).get("com.openai", {}).get("interface"), dict):
         fail("OpenAI interface metadata is missing")
     server = mcp.get("mcpServers", {}).get("comptrol-local")
-    if server != {"type": "streamable-http", "url": "http://127.0.0.1:7317/mcp"}:
-        fail("local Streamable HTTP MCP mapping is not explicit")
+    if server != {
+        "command": "comptrol",
+        "args": ["mcp"],
+        "env": {
+            "COMPTROL_ALLOW_CREATIVE_ADAPTERS": "1",
+            "COMPTROL_ALLOW_APP_LAUNCH": "1",
+            "COMPTROL_ALLOW_MACOS_AX": "1",
+        },
+    }:
+        fail("plugin must launch the local stdio runtime with the documented local app policy")
+    if codex_mcp.get("mcpServers", {}).get("comptrol-local") != server:
+        fail("Codex plugin and portable MCP launch configs differ")
     if not (plugin / "skills" / "comptrol-verified-control" / "SKILL.md").is_file():
         fail("verified control skill is missing")
     entries = [entry for entry in marketplace.get("plugins", []) if entry.get("name") == "comptrol"]
@@ -44,7 +55,7 @@ def main():
         fail("marketplace source path is not repo relative")
     if entry.get("policy", {}).get("installation") != "AVAILABLE":
         fail("marketplace installation policy is not explicit")
-    print(json.dumps({"plugin": manifest["name"], "version": manifest["version"], "mcp_server": server["url"], "marketplace": True}, sort_keys=True))
+    print(json.dumps({"plugin": manifest["name"], "version": manifest["version"], "mcp_command": server["command"], "marketplace": True}, sort_keys=True))
 
 
 if __name__ == "__main__":

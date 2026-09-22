@@ -58,6 +58,8 @@ jobs:
         run: |
           rm -rf packages/mcp/browser-bridge
           cp -R extensions/comptrol-browser-bridge packages/mcp/browser-bridge
+          rm -rf packages/mcp/adapters
+          cp -R adapters packages/mcp/adapters
           python3 scripts/validate_npm_package.py --allow-missing-native
       - run: python3 scripts/client_conformance.py
         env:

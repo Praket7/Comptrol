@@ -34,6 +34,11 @@ for checksum_path in checksums:
             raise SystemExit(f"release archive must contain exactly one Comptrol binary: {archive}")
         if package.getinfo(binaries[0]).file_size == 0:
             raise SystemExit(f"empty release binary in {archive}")
+        for adapter in ("blender", "davinci-resolve", "canva", "powerpoint"):
+            manifest = f"comptrol/adapters/{adapter}/adapter.toml"
+            source = f"comptrol/adapters/{adapter}/src/adapter.py"
+            if manifest not in members or source not in members:
+                raise SystemExit(f"creative adapter bundle missing from {archive}: {adapter}")
 
 sboms = sorted(args.directory.glob("*.sbom.json"))
 if len(sboms) != len(checksums):

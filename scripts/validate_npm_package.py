@@ -57,6 +57,8 @@ def main():
         raise SystemExit("npm package must include the native artifact directory")
     if "browser-bridge" not in files:
         raise SystemExit("npm package must include Browser Bridge assets")
+    if "adapters" not in files:
+        raise SystemExit("npm package must include the isolated first-party adapters")
 
     result = subprocess.run(
         [npm, "pack", "--json", "--dry-run"],
@@ -87,6 +89,19 @@ def main():
         raise SystemExit(
             f"npm dry-run is missing Browser Bridge assets: {sorted(missing_bridge)}"
         )
+    required_adapters = {
+        "adapters/blender/adapter.toml",
+        "adapters/blender/src/adapter.py",
+        "adapters/davinci-resolve/adapter.toml",
+        "adapters/davinci-resolve/src/adapter.py",
+        "adapters/canva/adapter.toml",
+        "adapters/canva/src/adapter.py",
+        "adapters/powerpoint/adapter.toml",
+        "adapters/powerpoint/src/adapter.py",
+    }
+    missing_adapters = required_adapters - names
+    if missing_adapters:
+        raise SystemExit(f"npm dry-run is missing creative adapters: {sorted(missing_adapters)}")
     if "bin/comptrol-browser-setup.js" not in names:
         raise SystemExit("npm dry-run is missing the Browser Bridge setup command")
     if any("closed-groups" in path or path.startswith("extensions/") for path in names):

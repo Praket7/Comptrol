@@ -1,4 +1,3 @@
 # Support boundary
 
-Typed scene inspection, object creation, transforms, save, and render are the initial scope. Arbitrary Python, add-on installation, network rendering, credential access, and unbounded filesystem traversal are unsupported.
-
+Typed scene inspection, mesh primitive creation (cube, UV/ico sphere, cylinder, cone, torus, and plane), location/rotation/scale edits, Principled material color/metallic/roughness edits, object deletion, project save, and still/frame rendering are supported through the live main-thread bridge. Offline creation, transform, and delete operations require an exact input `.blend` and a separate `output_path`; they persist to and verify the output artifact. Text/curve modeling, mesh topology editing, node graph composition, rigging, animation, compositor, simulation, video-sequence editing, and arbitrary Python remain unsupported by typed intents. Arbitrary Python, add-on installation, network rendering, credential access, and unbounded filesystem traversal are also unsupported.

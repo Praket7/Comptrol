@@ -1,6 +1,6 @@
 {
   "name": "comptrolling",
-  "version": "0.1.64",
+  "version": "0.1.65",
   "description": "Comptrol MCP launcher with bundled native binaries",
   "bin": {
     "comptrolling": "bin/comptrol-mcp.js",
@@ -11,7 +11,8 @@
   "files": [
     "bin",
     "native",
-    "browser-bridge"
+    "browser-bridge",
+    "adapters"
   ],
   "engines": {
     "node": ">=18"

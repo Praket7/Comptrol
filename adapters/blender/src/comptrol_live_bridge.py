@@ -9,6 +9,7 @@ import os
 import queue
 import socket
 import threading
+import math
 
 import bpy
 
@@ -36,27 +37,80 @@ def _execute(request):
     payload = request.get("payload", {})
     intent = payload.get("intent")
     if intent == "blender.scene.object.list":
-        return {"objects": [obj.name for obj in bpy.context.scene.objects], "mode": "live"}
+        return {"objects": [{"name": obj.name, "type": obj.type, "location": list(obj.location), "rotation": list(obj.rotation_euler), "scale": list(obj.scale)} for obj in bpy.context.scene.objects], "mode": "live", "verified": True}
     if intent == "blender.scene.object.create":
         name = str(payload.get("name", ""))
         if not name or len(name) > 120 or any(c in name for c in "\r\n\x00"):
             raise ValueError("invalid object name")
-        bpy.ops.mesh.primitive_cube_add()
+        operators = {"cube": "primitive_cube_add", "uv_sphere": "primitive_uv_sphere_add", "ico_sphere": "primitive_ico_sphere_add", "cylinder": "primitive_cylinder_add", "cone": "primitive_cone_add", "torus": "primitive_torus_add", "plane": "primitive_plane_add"}
+        shape = payload.get("shape", "cube")
+        if shape not in operators:
+            raise ValueError("unsupported shape")
+        def vector(key, default):
+            value = payload.get(key, default)
+            if not isinstance(value, list) or len(value) != 3 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or abs(v) > 1_000_000 for v in value):
+                raise ValueError(key + " must be three finite numbers within +/-1000000")
+            return tuple(value)
+        getattr(bpy.ops.mesh, operators[shape])(location=vector("location", [0, 0, 0]), rotation=vector("rotation", [0, 0, 0]))
         obj = bpy.context.object
         obj.name = name
-        return {"created": obj.name, "mode": "live"}
+        obj.scale = vector("scale", [1, 1, 1])
+        if "base_color" in payload:
+            rgba = payload["base_color"]
+            if not isinstance(rgba, list) or len(rgba) not in (3, 4) or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1 for v in rgba):
+                raise ValueError("base_color must contain 3 or 4 channels from 0 to 1")
+            rgba = tuple(rgba) if len(rgba) == 4 else (*rgba, 1.0)
+            metallic, roughness = payload.get("metallic", 0.0), payload.get("roughness", 0.5)
+            for key, value in (("metallic", metallic), ("roughness", roughness)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+                    raise ValueError(key + " must be from 0 to 1")
+            material = bpy.data.materials.new(name=name + " Material")
+            material.diffuse_color = rgba
+            material.use_nodes = True
+            bsdf = material.node_tree.nodes.get("Principled BSDF")
+            bsdf.inputs["Base Color"].default_value = rgba
+            bsdf.inputs["Metallic"].default_value = float(metallic)
+            bsdf.inputs["Roughness"].default_value = float(roughness)
+            obj.data.materials.append(material)
+        return {"created": obj.name, "type": obj.type, "location": list(obj.location), "rotation": list(obj.rotation_euler), "scale": list(obj.scale), "verified": True, "mode": "live"}
     if intent == "blender.scene.object.transform":
         name = str(payload.get("name", ""))
-        location = payload.get("location")
-        if not name or not isinstance(location, list) or len(location) != 3:
-            raise ValueError("name and three-element location are required")
-        if not all(isinstance(value, (int, float)) for value in location):
-            raise ValueError("location must be numeric")
+        if not name:
+            raise ValueError("name is required")
         obj = bpy.data.objects.get(name)
         if obj is None:
             raise ValueError("object missing")
-        obj.location = tuple(location)
-        return {"name": obj.name, "location": list(obj.location), "mode": "live"}
+        for key, prop, default in (("location", "location", [0, 0, 0]), ("rotation", "rotation_euler", [0, 0, 0]), ("scale", "scale", [1, 1, 1])):
+            if key in payload:
+                value = payload[key]
+                if not isinstance(value, list) or len(value) != 3 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or abs(v) > 1_000_000 for v in value):
+                    raise ValueError(key + " must be three finite numbers within +/-1000000")
+                setattr(obj, prop, tuple(value))
+        if "base_color" in payload:
+            rgba = payload["base_color"]
+            if not isinstance(rgba, list) or len(rgba) not in (3, 4) or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1 for v in rgba):
+                raise ValueError("base_color must contain 3 or 4 channels from 0 to 1")
+            rgba = tuple(rgba) if len(rgba) == 4 else (*rgba, 1.0)
+            material = bpy.data.materials.get(name + " Material") or bpy.data.materials.new(name=name + " Material")
+            material.diffuse_color = rgba
+            material.use_nodes = True
+            bsdf = material.node_tree.nodes.get("Principled BSDF")
+            bsdf.inputs["Base Color"].default_value = rgba
+            for key in ("metallic", "roughness"):
+                value = payload.get(key, 0.0 if key == "metallic" else 0.5)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+                    raise ValueError(key + " must be from 0 to 1")
+                bsdf.inputs["Metallic" if key == "metallic" else "Roughness"].default_value = float(value)
+            obj.data.materials.clear()
+            obj.data.materials.append(material)
+        return {"name": obj.name, "location": list(obj.location), "rotation": list(obj.rotation_euler), "scale": list(obj.scale), "verified": True, "mode": "live"}
+    if intent == "blender.scene.object.delete":
+        name = str(payload.get("name", ""))
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            raise ValueError("object missing")
+        bpy.data.objects.remove(obj, do_unlink=True)
+        return {"deleted": name, "verified": bpy.data.objects.get(name) is None, "mode": "live"}
     if intent == "blender.project.save":
         path = str(payload.get("path", ""))
         if not path.lower().endswith(".blend"):

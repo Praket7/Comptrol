@@ -45,7 +45,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.64";
+pub const SERVER_VERSION: &str = "0.1.65";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -69,6 +69,7 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "blender.scene.object.list",
     "blender.scene.object.create",
     "blender.scene.object.transform",
+    "blender.scene.object.delete",
     "blender.project.save",
     "blender.render",
     "video.project.list",
@@ -149,6 +150,55 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
 
 fn is_first_party_adapter_intent(intent: &str) -> bool {
     FIRST_PARTY_ADAPTER_INTENTS.contains(&intent)
+}
+
+fn adapter_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("COMPTROL_ADAPTER_ROOT") {
+        return PathBuf::from(root);
+    }
+    // Release archives and the npm package place `adapters/` beside the
+    // executable or at a nearby package root. Find the shipped bundle so an
+    // installed MCP does not depend on its current working directory.
+    if let Ok(executable) = std::env::current_exe() {
+        for parent in executable.ancestors().skip(1).take(5) {
+            let candidate = parent.join("adapters");
+            if candidate.join("blender").join("adapter.toml").is_file() {
+                return candidate;
+            }
+        }
+    }
+    let state_bundle = default_state_dir().join("adapters");
+    if state_bundle.join("blender").join("adapter.toml").is_file() {
+        return state_bundle;
+    }
+    PathBuf::from("adapters")
+}
+
+fn adapter_python() -> PathBuf {
+    if let Some(python) = std::env::var_os("COMPTROL_ADAPTER_PYTHON") {
+        return PathBuf::from(python);
+    }
+    let local_venv = default_state_dir().join(if cfg!(windows) {
+        "venv/Scripts/python.exe"
+    } else {
+        "venv/bin/python"
+    });
+    if local_venv.is_file() {
+        local_venv
+    } else {
+        PathBuf::from(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        })
+    }
+}
+
+fn is_creative_adapter_intent(intent: &str) -> bool {
+    intent.starts_with("blender.")
+        || intent.starts_with("video.")
+        || intent.starts_with("design.")
+        || intent.starts_with("presentation.")
 }
 
 fn adapter_id_for_intent(intent: &str, provider: Option<&str>) -> Result<&'static str, String> {
@@ -849,6 +899,14 @@ impl Policy {
                     .insert("discord.message.delete".to_owned());
                 policy.allowed_intents.insert("mail.send".to_owned());
                 policy.allowed_intents.insert("message.send".to_owned());
+            }
+        }
+        if env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            for intent in FIRST_PARTY_ADAPTER_INTENTS {
+                if is_creative_adapter_intent(intent) && classify(intent) <= Risk::R2 {
+                    policy.allowed_intents.insert((*intent).to_owned());
+                }
             }
         }
         policy
@@ -2080,9 +2138,7 @@ fn execute_adapter_request(
             );
         }
     };
-    let root = std::env::var_os("COMPTROL_ADAPTER_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("adapters"));
+    let root = adapter_root();
     let manifest_path = root.join(adapter_name).join("adapter.toml");
     let manifest_text = match fs::read_to_string(&manifest_path) {
         Ok(text) => text,
@@ -2129,15 +2185,7 @@ fn execute_adapter_request(
     };
     let isolation_dimensions = manifest.isolation.dimensions();
     if !runtime.adapter_hosts.contains_key(adapter_name) {
-        let python = std::env::var_os("COMPTROL_ADAPTER_PYTHON")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(if cfg!(windows) {
-                    "python.exe"
-                } else {
-                    "python3"
-                })
-            });
+        let python = adapter_python();
         let script = root.join(adapter_name).join("src").join("adapter.py");
         let config = AdapterHostConfig {
             manifest,
@@ -2727,9 +2775,11 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
         )),
         value if is_first_party_adapter_intent(value) => Some((
             "isolated_adapter",
-            env_enabled("COMPTROL_ALLOW_ADAPTERS")
-                && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some(),
-            "First party application adapters require an explicit policy and adapter root",
+            (env_enabled("COMPTROL_ALLOW_ADAPTERS")
+                || (env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS")
+                    && is_creative_adapter_intent(value)))
+                && adapter_root().is_dir(),
+            "First party application adapters require an explicit policy and a shipped adapter bundle",
         )),
         "browser.cdp.frame_evaluate" => Some((
             "browser_protocol",
@@ -8751,8 +8801,10 @@ pub fn capabilities() -> Vec<Capability> {
     for intent in FIRST_PARTY_ADAPTER_INTENTS {
         result.push(Capability {
             name: (*intent).to_owned(),
-            available: env_enabled("COMPTROL_ALLOW_ADAPTERS")
-                && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some()
+            available: (env_enabled("COMPTROL_ALLOW_ADAPTERS")
+                || (env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS")
+                    && is_creative_adapter_intent(intent)))
+                && adapter_root().is_dir()
                 && (!matches!(*intent, "obs.recording.start" | "obs.recording.stop")
                     || env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS")),
             risk: classify(intent),
