@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod browser;
+pub mod browser_bridge;
 pub mod checkpoints;
 pub mod events;
 pub mod geometry;
@@ -1625,13 +1626,41 @@ impl Runtime {
                     .collect::<Vec<_>>()
             }),
             "platform" => platform_diagnostics(),
-            "browser" => match std::env::var("COMPTROL_CDP_ENDPOINT") {
-                Ok(endpoint) => match browser::discover(&endpoint) {
-                    Ok(targets) => json!({ "endpoint": endpoint, "targets": targets }),
-                    Err(error) => json!({ "endpoint": endpoint, "error": error }),
-                },
-                Err(_) => {
-                    json!({ "available": false, "reason": "COMPTROL_CDP_ENDPOINT is not configured" })
+            "browser" => {
+                if let Ok(endpoint) = std::env::var("COMPTROL_CDP_ENDPOINT") {
+                    match browser::discover(&endpoint) {
+                        Ok(targets) => json!({ "endpoint": endpoint, "targets": targets, "transport": "direct_cdp" }),
+                        Err(error) => json!({ "endpoint": endpoint, "error": error, "transport": "direct_cdp" }),
+                    }
+                } else {
+                    let health = browser_bridge::BridgeStore::open(&default_state_dir())
+                        .and_then(|store| store.health(browser_bridge::DEFAULT_HEALTH_MAX_AGE));
+                    match health {
+                        Ok(health) if health.active => match browser::discover(browser_bridge::COMPANION_BRIDGE_ENDPOINT) {
+                            Ok(targets) => json!({
+                                "endpoint": browser_bridge::COMPANION_BRIDGE_ENDPOINT,
+                                "transport": "companion_extension",
+                                "targets": targets,
+                                "bridge_health": health,
+                            }),
+                            Err(error) => json!({
+                                "endpoint": browser_bridge::COMPANION_BRIDGE_ENDPOINT,
+                                "transport": "companion_extension",
+                                "error": error,
+                                "bridge_health": health,
+                            }),
+                        },
+                        Ok(health) => json!({
+                            "available": false,
+                            "transport": "companion_extension",
+                            "reason": "no direct CDP endpoint and the companion bridge heartbeat is stale or absent",
+                            "bridge_health": health,
+                        }),
+                        Err(error) => json!({
+                            "available": false,
+                            "reason": format!("browser bridge state unavailable: {error}"),
+                        }),
+                    }
                 }
             },
             "desktop" | "system" => {
@@ -2620,9 +2649,9 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
         value if value.starts_with("browser.cdp.") => Some((
             "browser_protocol",
             (std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                || comptrol_browser::select_provider(true).is_ok())
+                || browser_bridge::bridge_is_active())
                 && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
-            "Persistent local CDP requires an endpoint or companion extension and explicit policy",
+            "Browser protocol control requires a direct CDP endpoint or a live companion bridge heartbeat and explicit policy",
         )),
         _ => None,
     };
@@ -3049,14 +3078,18 @@ fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> A
 }
 
 fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> ActionResult {
-    let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") else {
+    let endpoint = if let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") {
+        endpoint
+    } else if browser_bridge::bridge_is_active() {
+        std::ffi::OsString::from(browser_bridge::COMPANION_BRIDGE_ENDPOINT)
+    } else {
         return ActionResult::refused(
             request,
             operation_id,
             ComptrolError {
                 code: "browser_unavailable".to_owned(),
-                message: "COMPTROL_CDP_ENDPOINT is not configured".to_owned(),
-                recovery: Some("Configure a local browser DevTools endpoint".to_owned()),
+                message: "Neither COMPTROL_CDP_ENDPOINT nor a live companion extension bridge is available".to_owned(),
+                recovery: Some("Configure local Chrome DevTools or connect the Browser Bridge extension".to_owned()),
             },
         );
     };
@@ -6513,8 +6546,8 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
             let ext_session = sessions
                 .iter()
                 .find(|s| s.provider == comptrol_browser::SessionProvider::CompanionExtension);
-            let available = ext_session.map(|s| s.available).unwrap_or(false);
-            if !available {
+            let registered = ext_session.map(|s| s.available).unwrap_or(false);
+            if !registered {
                 return ActionResult::refused(
                     request,
                     operation_id,
@@ -6528,18 +6561,87 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                     },
                 );
             }
-            success(
-                request,
-                operation_id,
-                "companion_extension",
-                EffectState::None,
-                VerificationState::Unverified,
-                json!({
-                    "provider": "companion_extension",
-                    "status": "connected_via_companion_extension",
-                    "note": "Native bridge registered; waiting for extension handshake and active target round-trip"
-                }),
-            )
+            let mut store = match browser_bridge::BridgeStore::open(&default_state_dir()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "route_unavailable".to_owned(),
+                            message: format!("companion bridge state unavailable: {error}"),
+                            recovery: Some("Start the Comptrol daemon and reconnect the Browser Bridge extension".to_owned()),
+                        },
+                    );
+                }
+            };
+            let health = store
+                .health(browser_bridge::DEFAULT_HEALTH_MAX_AGE)
+                .unwrap_or(browser_bridge::BridgeHealth {
+                    active: false,
+                    last_heartbeat_ms: None,
+                    target_count: 0,
+                });
+            if !health.active {
+                return success(
+                    request,
+                    operation_id,
+                    "companion_extension",
+                    EffectState::None,
+                    VerificationState::Unverified,
+                    json!({
+                        "provider": "companion_extension",
+                        "status": "registered_but_inactive",
+                        "bridge_health": health,
+                        "note": "Native host registration exists, but no recent extension heartbeat proves an active session"
+                    }),
+                );
+            }
+            let round_trip = store
+                .submit("bridge_ping", json!({"timestamp_ms": now_ms()}))
+                .and_then(|request_id| store.wait_result(&request_id, Duration::from_secs(2)));
+            match round_trip {
+                Ok(result) if result.get("ok").and_then(Value::as_bool) == Some(true) => success(
+                    request,
+                    operation_id,
+                    "companion_extension",
+                    EffectState::None,
+                    VerificationState::Verified,
+                    json!({
+                        "provider": "companion_extension",
+                        "status": "connected_via_companion_extension",
+                        "bridge_health": health,
+                        "round_trip": result,
+                        "note": "Native host registration, fresh heartbeat, and an extension command round-trip were verified"
+                    }),
+                ),
+                Ok(result) => success(
+                    request,
+                    operation_id,
+                    "companion_extension",
+                    EffectState::None,
+                    VerificationState::Unverified,
+                    json!({
+                        "provider": "companion_extension",
+                        "status": "bridge_round_trip_unverified",
+                        "bridge_health": health,
+                        "round_trip": result,
+                    }),
+                ),
+                Err(error) => success(
+                    request,
+                    operation_id,
+                    "companion_extension",
+                    EffectState::None,
+                    VerificationState::Unverified,
+                    json!({
+                        "provider": "companion_extension",
+                        "status": "bridge_round_trip_failed",
+                        "bridge_health": health,
+                        "error": error.to_string(),
+                    }),
+                ),
+            }
         }
         _ => ActionResult::refused(
             request,
