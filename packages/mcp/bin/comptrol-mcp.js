@@ -4,6 +4,8 @@ if (process.env.COMPTROL_DAEMON === "1") {
 } else {
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 const { ensureChromeCdp, closeOwnedChrome } = require("./chrome-cdp.js");
 
@@ -13,6 +15,51 @@ function bundledBinary() {
 }
 
 const binary = process.env.COMPTROL_BIN || (fs.existsSync(bundledBinary()) ? bundledBinary() : undefined);
+process.env.COMPTROL_STATE_DIR ||= path.join(os.homedir(), ".comptrol");
+const bridgeMarker = path.join(process.env.COMPTROL_STATE_DIR, "browser-bridge.enabled");
+let bridgeSidecar;
+
+function portOpen(port) {
+  return new Promise(resolve => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.setTimeout(250);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+}
+
+async function ensureBrowserBridgeSidecar() {
+  if (!fs.existsSync(bridgeMarker)) return false;
+  process.env.COMPTROL_AUTO_START_CHROME_CDP = "0";
+  const port = Number(process.env.COMPTROL_DAEMON_PORT || 7317);
+  if (await portOpen(port)) return true;
+  bridgeSidecar = spawn(binary, ["serve-http", String(port)], {
+    stdio: ["ignore", "ignore", "inherit"],
+    env: process.env,
+    windowsHide: true,
+    shell: process.platform === "win32" && binary.toLowerCase().endsWith(".cmd"),
+  });
+  bridgeSidecar.on("error", error => {
+    console.error(`Comptrol Browser Bridge sidecar failed to start: ${error.message}`);
+  });
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (await portOpen(port)) return true;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  bridgeSidecar.kill();
+  bridgeSidecar = undefined;
+  console.error(`Comptrol Browser Bridge sidecar did not become ready on 127.0.0.1:${port}`);
+  return false;
+}
+
 if (!binary) {
   console.error(`Comptrol native binary is missing for ${process.platform}-${process.arch}; reinstall the package or set COMPTROL_BIN`);
   process.exitCode = 1;
@@ -104,9 +151,16 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     clearTimeout(restartTimer);
     process.stdin.destroy();
     child?.kill(signal);
+    bridgeSidecar?.kill(signal);
     closeOwnedChrome();
   });
 }
 
-ensureChromeCdp().finally(() => start());
+ensureBrowserBridgeSidecar()
+  .catch(error => {
+    console.error(`Comptrol Browser Bridge sidecar setup failed: ${error.message}`);
+    return false;
+  })
+  .then(() => ensureChromeCdp())
+  .finally(() => start());
 }
