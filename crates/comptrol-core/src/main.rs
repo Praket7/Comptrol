@@ -3053,7 +3053,7 @@ fn handle_http<S: HttpStream>(
         let commands = {
             let mut queue = command_queue.lock().expect("command queue lock poisoned");
             let _ = queue.record_heartbeat(Some("comptrol.browser.bridge/0.1.0"));
-            queue.lease_pending(64, Duration::from_secs(5))
+            queue.lease_pending(64, Duration::from_secs(60))
         };
         return match commands {
             Ok(commands) => write_http_response(
