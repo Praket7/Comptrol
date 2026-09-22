@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const bridgeDir = path.join(__dirname, "..", "browser-bridge");
@@ -52,5 +53,15 @@ for (const [python, prefix] of pythonCandidates) {
 if (!result || result.error) {
   console.error("Python 3 is required to register the Browser Bridge native host.");
   process.exit(1);
+}
+if ((result.status ?? 1) === 0) {
+  const stateDir = process.env.COMPTROL_STATE_DIR || path.join(os.homedir(), ".comptrol");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "browser-bridge.enabled"),
+    JSON.stringify({ enabled: true, extensionId, configuredAt: new Date().toISOString() }) + "\n",
+    { mode: 0o600 }
+  );
+  console.error("Browser Bridge is enabled for Comptrol. Normal comptrolling startup will manage the loopback bridge sidecar.");
 }
 process.exit(result.status ?? 1);
