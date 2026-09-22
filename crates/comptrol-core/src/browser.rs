@@ -1,4 +1,7 @@
-use crate::{BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_target};
+use crate::{
+    BrowserTarget, ComptrolError, MAX_PROTOCOL_BYTES, bind_browser_target,
+    browser_bridge::{BridgeStore, COMPANION_BRIDGE_ENDPOINT, DEFAULT_HEALTH_MAX_AGE},
+};
 // Compatibility facade: new browser callers should use the async persistent
 // multiplexer. The event-only compatibility helpers below are retained while
 // their predicates are moved onto the browser EventHub.
@@ -28,7 +31,135 @@ fn target_caches() -> &'static Mutex<TargetCaches> {
     CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn is_companion_bridge(endpoint: &str) -> bool {
+    endpoint == COMPANION_BRIDGE_ENDPOINT
+}
+
+fn open_bridge_store() -> Result<BridgeStore, ComptrolError> {
+    BridgeStore::open(&crate::default_state_dir()).map_err(|error| ComptrolError {
+        code: "browser_bridge_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Start the Comptrol daemon and reconnect the Browser Bridge extension".to_owned()),
+    })
+}
+
+fn bridge_command(
+    command_type: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<Value, ComptrolError> {
+    let mut store = open_bridge_store()?;
+    let health = store
+        .health(DEFAULT_HEALTH_MAX_AGE)
+        .map_err(|error| ComptrolError {
+            code: "browser_bridge_unavailable".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Reconnect the Browser Bridge extension".to_owned()),
+        })?;
+    if !health.active {
+        return Err(ComptrolError {
+            code: "browser_bridge_unavailable".to_owned(),
+            message: "The Browser Bridge has no recent extension heartbeat".to_owned(),
+            recovery: Some("Open Chrome with the Comptrol Browser Bridge extension enabled".to_owned()),
+        });
+    }
+    let request_id = store.submit(command_type, payload).map_err(|error| ComptrolError {
+        code: if error.kind() == io::ErrorKind::WouldBlock {
+            "browser_bridge_busy"
+        } else {
+            "browser_bridge_unavailable"
+        }
+        .to_owned(),
+        message: error.to_string(),
+        recovery: Some("Retry after the bridge drains pending commands".to_owned()),
+    })?;
+    let response = store
+        .wait_result(&request_id, timeout)
+        .map_err(|error| ComptrolError {
+            code: if error.kind() == io::ErrorKind::TimedOut {
+                "browser_bridge_timeout"
+            } else {
+                "browser_bridge_unavailable"
+            }
+            .to_owned(),
+            message: error.to_string(),
+            recovery: Some("Verify the Browser Bridge extension is connected and retry".to_owned()),
+        })?;
+    if response.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(ComptrolError {
+            code: "browser_protocol_error".to_owned(),
+            message: response
+                .get("error")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "Browser Bridge command failed".to_owned()),
+            recovery: Some("Inspect the exact browser target and retry".to_owned()),
+        })
+    }
+}
+
+fn bridge_targets() -> Result<Vec<BrowserTarget>, ComptrolError> {
+    let store = open_bridge_store()?;
+    let values = store.targets().map_err(|error| ComptrolError {
+        code: "browser_bridge_unavailable".to_owned(),
+        message: error.to_string(),
+        recovery: Some("Wait for the extension to publish a fresh target snapshot".to_owned()),
+    })?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| {
+            let id = value
+                .get("id")
+                .or_else(|| value.get("targetId"))
+                .and_then(Value::as_str)?
+                .to_owned();
+            let url = value.get("url").and_then(Value::as_str).map(str::to_owned);
+            let revision = value
+                .get("revision")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| Some(format!("bridge:{id}:{}", url.as_deref().unwrap_or_default())));
+            Some(BrowserTarget {
+                id,
+                target_type: Some(
+                    value
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("page")
+                        .to_owned(),
+                ),
+                browser_context_id: Some(
+                    value
+                        .get("browserContextId")
+                        .or_else(|| value.get("browser_context_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("default")
+                        .to_owned(),
+                ),
+                url,
+                title: value.get("title").and_then(Value::as_str).map(str::to_owned),
+                revision,
+                web_socket_url: None,
+            })
+        })
+        .collect())
+}
+
 pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
+    if is_companion_bridge(endpoint) {
+        let targets = bridge_targets()?;
+        if let Ok(mut caches) = target_caches().lock() {
+            caches.insert(
+                endpoint.to_owned(),
+                TargetCacheEntry {
+                    observed_at: Instant::now(),
+                    targets: targets.clone(),
+                },
+            );
+        }
+        return Ok(targets);
+    }
     let value = get_json(endpoint, "/json/list").map_err(|error| ComptrolError {
         code: "browser_unavailable".to_owned(),
         message: error.to_string(),
@@ -52,6 +183,9 @@ pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
 }
 
 fn discover_cached(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
+    if is_companion_bridge(endpoint) {
+        return discover(endpoint);
+    }
     if let Ok(caches) = target_caches().lock()
         && let Some(entry) = caches.get(endpoint)
         && entry.observed_at.elapsed() <= Duration::from_secs(2)
@@ -92,6 +226,21 @@ pub fn live_target_state(
     endpoint: &str,
     target_id: &str,
 ) -> Result<Option<comptrol_browser::TargetRecord>, ComptrolError> {
+    if is_companion_bridge(endpoint) {
+        let target = discover(endpoint)?.into_iter().find(|target| target.id == target_id);
+        return Ok(target.map(|target| comptrol_browser::TargetRecord {
+            id: target.id,
+            target_type: target.target_type.unwrap_or_else(|| "page".to_owned()),
+            browser_context_id: target.browser_context_id,
+            session_id: None,
+            url: target.url,
+            title: target.title,
+            opener_id: None,
+            attached: true,
+            generation: 0,
+            revision: target.revision.unwrap_or_else(|| "bridge:unknown".to_owned()),
+        }));
+    }
     let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
     bridge()
         .target_state(&browser_web_socket_url, target_id)
@@ -256,6 +405,17 @@ pub fn open_tab(
     browser_context_id: Option<&str>,
 ) -> Result<Value, ComptrolError> {
     validate_url(url)?;
+    if is_companion_bridge(endpoint) {
+        return bridge_command(
+            "open_tab",
+            json!({
+                "url": url,
+                "background": background,
+                "browserContextId": browser_context_id.unwrap_or("default"),
+            }),
+            Duration::from_secs(10),
+        );
+    }
     if !background && browser_context_id.is_none() {
         let path = format!("/json/new?{}", encode_new_tab_url(url));
         let (status, value) =
@@ -427,6 +587,21 @@ pub fn close_tab(
     revision: &str,
 ) -> Result<Value, ComptrolError> {
     let targets = discover_cached(endpoint)?;
+    if is_companion_bridge(endpoint) {
+        let target = crate::bind_browser_target(
+            &targets,
+            target_id,
+            Some(browser_context_id),
+            Some(revision),
+        )?;
+        let result = bridge_command(
+            "close_tab",
+            json!({"targetId": target.id}),
+            Duration::from_secs(10),
+        )?;
+        invalidate_target_cache(endpoint);
+        return Ok(result);
+    }
     let target = crate::bind_browser_target(
         &targets,
         target_id,
@@ -488,6 +663,21 @@ pub fn history(
     forward: bool,
 ) -> Result<Value, ComptrolError> {
     let targets = discover_cached(endpoint)?;
+    if is_companion_bridge(endpoint) {
+        let target = crate::bind_browser_target(
+            &targets,
+            target_id,
+            Some(browser_context_id),
+            Some(revision),
+        )?;
+        let result = bridge_command(
+            "history",
+            json!({"targetId": target.id, "forward": forward}),
+            Duration::from_secs(10),
+        )?;
+        invalidate_target_cache(endpoint);
+        return Ok(result);
+    }
     let target = crate::bind_browser_target(
         &targets,
         target_id,
@@ -606,6 +796,37 @@ pub fn wait_for_url(
             message: "URL postconditions must contain non-control text".to_owned(),
             recovery: None,
         });
+    }
+    if is_companion_bridge(endpoint) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let targets = discover(endpoint)?;
+            let target = crate::bind_browser_target(
+                &targets,
+                target_id,
+                Some(browser_context_id),
+                None,
+            )?;
+            if target
+                .url
+                .as_deref()
+                .is_some_and(|url| url.contains(contains))
+            {
+                return Ok(json!({
+                    "url": target.url,
+                    "wait": "bridge_target_snapshot",
+                    "verified": true,
+                }));
+            }
+            if Instant::now() >= deadline {
+                return Err(ComptrolError {
+                    code: "verification_failed".to_owned(),
+                    message: format!("Browser URL did not contain {contains}"),
+                    recovery: Some("Inspect the target and retry with a bounded postcondition".to_owned()),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, Some(browser_context_id), None)?;
@@ -912,6 +1133,22 @@ pub fn cdp_call(
     params: Value,
 ) -> Result<Value, ComptrolError> {
     let targets = discover_cached(endpoint)?;
+    if is_companion_bridge(endpoint) {
+        let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
+        let result = bridge_command(
+            "cdp_command",
+            json!({
+                "targetId": target.id,
+                "method": method,
+                "params": params,
+            }),
+            Duration::from_secs(15),
+        )?;
+        if matches!(method, "Page.navigate" | "Page.navigateToHistoryEntry") {
+            invalidate_target_cache(endpoint);
+        }
+        return Ok(result);
+    }
     let target = match crate::bind_browser_target(&targets, target_id, browser_context_id, revision)
     {
         Ok(target) => target,
@@ -955,6 +1192,15 @@ pub fn cdp_frame_call(
     method: &str,
     params: Value,
 ) -> Result<Value, ComptrolError> {
+    if is_companion_bridge(endpoint) {
+        return Err(ComptrolError {
+            code: "route_unavailable".to_owned(),
+            message: format!(
+                "Frame-scoped {method} requires the direct CDP frame graph; the companion bridge does not expose a stable frame-to-tab binding"
+            ),
+            recovery: Some("Use a direct CDP endpoint for frame-scoped evaluation".to_owned()),
+        });
+    }
     let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
     bridge()
         .frame_command(
@@ -1312,6 +1558,41 @@ pub fn cdp_download(
         });
     }
     fs_create_dir(download_dir)?;
+    if is_companion_bridge(endpoint) {
+        let targets = discover_cached(endpoint)?;
+        let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
+        let result = bridge_command(
+            "download_file",
+            json!({
+                "targetId": target.id,
+                "selector": selector,
+                "fileName": expected_name,
+            }),
+            Duration::from_secs(30),
+        )?;
+        let source = result
+            .get("path")
+            .and_then(Value::as_str)
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| ComptrolError {
+                code: "browser_protocol_invalid".to_owned(),
+                message: "The Browser Bridge download result did not include a file path".to_owned(),
+                recovery: Some("Inspect Chrome downloads and retry".to_owned()),
+            })?;
+        let destination = download_dir.join(expected_name);
+        std::fs::copy(&source, &destination).map_err(|error| ComptrolError {
+            code: "browser_download_failed".to_owned(),
+            message: format!("failed to copy verified browser download into sandbox: {error}"),
+            recovery: Some("Verify the browser download completed and retry".to_owned()),
+        })?;
+        return Ok(json!({
+            "guid": result.get("downloadId").cloned().unwrap_or(Value::Null),
+            "path": destination,
+            "file_name": expected_name,
+            "verified": destination.is_file(),
+            "source": "companion_extension",
+        }));
+    }
     let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
     let target_revision = target.revision.clone();
