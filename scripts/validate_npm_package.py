@@ -28,17 +28,27 @@ def main():
     files = manifest.get("files", [])
     if "native" not in files:
         raise SystemExit("npm package must include the native artifact directory")
-    if not (ROOT / "experiments" / "chrome-closed-groups-extension").is_dir():
-        raise SystemExit("experimental Chrome extension comparison directory is missing")
-        raise SystemExit("experimental Chrome extension comparison directory is missing")
+    if "browser-bridge" not in files:
+        raise SystemExit("npm package must include Browser Bridge assets")
     with tempfile.TemporaryDirectory(prefix="comptrol-npm-pack-") as directory:
         result = subprocess.run([npm, "pack", "--json", "--dry-run"], cwd=PACKAGE, capture_output=True, text=True, check=True)
         packed = json.loads(result.stdout)[0]
         names = {item["path"] for item in packed["files"]}
         if not any(path.startswith("native/") for path in names):
             raise SystemExit("npm dry-run contains no native artifact")
+        required_bridge = {
+            "browser-bridge/manifest.json",
+            "browser-bridge/native_host.py",
+            "browser-bridge/install.py",
+            "browser-bridge/src/service_worker.js",
+        }
+        missing_bridge = required_bridge - names
+        if missing_bridge:
+            raise SystemExit(f"npm dry-run is missing Browser Bridge assets: {sorted(missing_bridge)}")
+        if "bin/comptrol-browser-setup.js" not in names:
+            raise SystemExit("npm dry-run is missing the Browser Bridge setup command")
         if any("closed-groups" in path or path.startswith("extensions/") for path in names):
-            raise SystemExit("npm dry-run contains experimental Chrome extension files")
+            raise SystemExit("npm dry-run contains experimental or repository extension paths")
     print(json.dumps({"package": manifest["name"], "version": manifest["version"], "validated": True}))
 
 
