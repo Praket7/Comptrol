@@ -81,53 +81,56 @@ def daemon_post(endpoint, params=None):
 
 
 def command_poll_loop(native_port_ref):
-    """
-    Background thread that polls the daemon for pending commands
-    and forwards them to the extension via native messaging.
-    """
+    """Poll leased daemon commands and keep the active bridge heartbeat fresh."""
     poll_interval = POLL_INTERVAL_MS / 1000.0
+    last_heartbeat = 0.0
 
     while True:
-        # Wait a bit before polling
         time.sleep(poll_interval)
-
-        connected = native_port_ref.get("connected", False)
-        if not connected:
+        if not native_port_ref.get("connected", False):
             continue
 
-        # Poll daemon for pending commands
+        now = time.monotonic()
+        if now - last_heartbeat >= 2.0:
+            heartbeat = daemon_post("/browser/extension/heartbeat", {
+                "protocol": PROTOCOL_VERSION,
+            })
+            if heartbeat.get("ok"):
+                last_heartbeat = now
+
         response = daemon_post("/browser/command/poll")
         if not response.get("ok"):
-            # Daemon unreachable or error; back off
-            poll_interval = min(poll_interval * 1.5, POLL_INTERVAL_MAX_MS / 1000.0)
+            poll_interval = min(
+                poll_interval * 1.5,
+                POLL_INTERVAL_MAX_MS / 1000.0,
+            )
             continue
 
         commands = response.get("commands", [])
         if not commands:
-            # No commands; use minimum interval
             poll_interval = POLL_INTERVAL_MS / 1000.0
             continue
 
-        # Forward each command to the extension
+        poll_interval = POLL_INTERVAL_MS / 1000.0
         for cmd in commands:
             command_type = cmd.get("command_type", "")
             request_id = cmd.get("request_id", "")
             payload = cmd.get("payload", {})
-
-            # Map daemon command types to extension message types
             extension_msg = {
                 "type": command_type,
                 "requestId": request_id,
                 **payload,
             }
-
             try:
                 write_message(extension_msg)
             except Exception as e:
-                # Failed to send; report error back to daemon
                 daemon_post("/browser/command/result", {
                     "request_id": request_id,
-                    "error": {"type": "send_failed", "details": str(e)},
+                    "ok": False,
+                    "error": {
+                        "type": "send_failed",
+                        "details": str(e),
+                    },
                 })
 
 
@@ -163,6 +166,9 @@ def main():
                 continue
             handshake_complete = True
             native_port_ref["connected"] = True
+            daemon_post("/browser/extension/heartbeat", {
+                "protocol": PROTOCOL_VERSION,
+            })
             write_message({
                 "type": "handshake_ack",
                 "protocol": PROTOCOL_VERSION,
@@ -235,39 +241,22 @@ def main():
                 result["requestId"] = request_id
             write_message(result)
 
-        elif msg_type == "attach_debugger_result":
-            # Extension sends result for a command we forwarded from daemon
-            if request_id:
-                daemon_post("/browser/command/result", {
-                    "request_id": request_id,
-                    "result": {
-                        "ok": message.get("ok"),
-                        "targetId": message.get("targetId"),
-                    },
-                })
-            write_message({"ok": True})
-
-        elif msg_type == "detach_debugger_result":
-            if request_id:
-                daemon_post("/browser/command/result", {
-                    "request_id": request_id,
-                    "result": {
-                        "ok": message.get("ok"),
-                        "targetId": message.get("targetId"),
-                    },
-                })
-            write_message({"ok": True})
-
-        elif msg_type == "restore_group_result":
-            if request_id:
-                daemon_post("/browser/command/result", {
-                    "request_id": request_id,
-                    "result": {
-                        "ok": message.get("ok"),
-                        "restored": message.get("restored"),
-                    },
-                })
-            write_message({"ok": True})
+        elif msg_type.endswith("_result") and request_id:
+            result_value = message.get("result")
+            if result_value is None:
+                # Preserve useful top-level fields for legacy command handlers.
+                result_value = {
+                    key: value
+                    for key, value in message.items()
+                    if key not in {"type", "requestId", "request_id", "error", "ok"}
+                }
+            daemon_post("/browser/command/result", {
+                "request_id": request_id,
+                "ok": message.get("ok", message.get("error") is None),
+                "result": result_value,
+                "error": message.get("error"),
+            })
+            write_message({"ok": True, "requestId": request_id})
 
         else:
             write_message({
