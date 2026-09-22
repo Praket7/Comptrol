@@ -101,6 +101,21 @@ function handleNativeMessage(message) {
     case "cdp_command":
       handleCdpCommand(message);
       break;
+    case "bridge_ping":
+      handleBridgePing(message);
+      break;
+    case "open_tab":
+      handleOpenTab(message);
+      break;
+    case "close_tab":
+      handleCloseTab(message);
+      break;
+    case "history":
+      handleHistory(message);
+      break;
+    case "download_file":
+      handleDownloadFile(message);
+      break;
     case "get_targets":
       sendTargetsToNative();
       break;
@@ -143,16 +158,23 @@ function sendToNative(message) {
 async function sendTargetsToNative() {
   try {
     const targets = await chrome.tabs.query({});
-    const targetList = targets.map(tab => ({
-      id: tab.id.toString(),
-      url: tab.url,
-      title: tab.title,
-      windowId: tab.windowId,
-      index: tab.index,
-      pinned: tab.pinned,
-      groupId: tab.groupId,
-      status: tab.status
-    }));
+    const targetList = targets.map(tab => {
+      const targetId = tab.id.toString();
+      const attachment = attachedTargets.get(targetId);
+      return {
+        id: targetId,
+        type: "page",
+        browserContextId: "default",
+        url: tab.url || "",
+        title: tab.title || "",
+        windowId: tab.windowId,
+        index: tab.index,
+        pinned: tab.pinned,
+        groupId: tab.groupId,
+        status: tab.status,
+        revision: `bridge:${targetId}:${attachment?.generation || 0}:${tab.url || ""}`
+      };
+    });
     sendToNative({ type: "targets_list", targets: targetList });
   } catch (error) {
     console.error("Failed to get targets:", error);
@@ -190,10 +212,6 @@ async function attachDebugger(targetId) {
       attachedAt: Date.now(),
       generation: 0
     });
-    
-    // Listen for debugger events
-    chrome.debugger.onEvent.addListener(handleDebuggerEvent);
-    chrome.debugger.onDetach.addListener(handleDebuggerDetach);
     
     return { ok: true };
   } catch (error) {
@@ -263,18 +281,208 @@ function handleDebuggerDetach(source, reason) {
  */
 async function handleCdpCommand(message) {
   const { requestId, targetId, method, params } = message;
-  
   try {
     const tabId = parseInt(targetId, 10);
-    if (isNaN(tabId)) {
+    if (Number.isNaN(tabId)) {
       sendToNative({ type: "cdp_command_result", requestId, ok: false, error: "Invalid target ID" });
       return;
     }
-    
+    if (!attachedTargets.has(targetId)) {
+      const attached = await attachDebugger(targetId);
+      if (!attached.ok) {
+        sendToNative({ type: "cdp_command_result", requestId, ok: false, error: attached.error || "debugger attach failed" });
+        return;
+      }
+    }
     const result = await chrome.debugger.sendCommand({ tabId }, method, params || {});
     sendToNative({ type: "cdp_command_result", requestId, ok: true, result });
   } catch (error) {
     sendToNative({ type: "cdp_command_result", requestId, ok: false, error: error.message });
+  }
+}
+
+function waitForTabUpdate(tabId, predicate, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const tick = async () => {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (predicate(tab)) {
+          resolve(tab);
+          return;
+        }
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        reject(new Error("Timed out waiting for tab state"));
+        return;
+      }
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+}
+
+async function handleBridgePing(message) {
+  sendToNative({
+    type: "bridge_ping_result",
+    requestId: message.requestId,
+    ok: true,
+    result: { pong: true, timestamp: Date.now() }
+  });
+}
+
+async function handleOpenTab(message) {
+  try {
+    const tab = await chrome.tabs.create({
+      url: message.url,
+      active: !Boolean(message.background)
+    });
+    const targetId = String(tab.id);
+    sendToNative({
+      type: "open_tab_result",
+      requestId: message.requestId,
+      ok: true,
+      result: {
+        target: {
+          id: targetId,
+          type: "page",
+          browser_context_id: "default",
+          url: tab.url || message.url,
+          title: tab.title || "",
+          revision: `bridge:${targetId}:0:${tab.url || message.url}`
+        },
+        visibility: message.background ? "background" : "foreground",
+        profile: "attached_existing_browser",
+        account_state: "same_browser_profile",
+        mouse: "untouched",
+        clipboard: "untouched",
+        verified: true
+      }
+    });
+    await sendTargetsToNative();
+  } catch (error) {
+    sendToNative({ type: "open_tab_result", requestId: message.requestId, ok: false, error: error.message });
+  }
+}
+
+async function handleCloseTab(message) {
+  try {
+    const tabId = Number(message.targetId);
+    if (!Number.isInteger(tabId)) throw new Error("Invalid target ID");
+    await chrome.tabs.remove(tabId);
+    attachedTargets.delete(String(message.targetId));
+    sendToNative({
+      type: "close_tab_result",
+      requestId: message.requestId,
+      ok: true,
+      result: {
+        closed: true,
+        target_id: String(message.targetId),
+        mouse: "untouched",
+        clipboard: "untouched",
+        verified: true
+      }
+    });
+    await sendTargetsToNative();
+  } catch (error) {
+    sendToNative({ type: "close_tab_result", requestId: message.requestId, ok: false, error: error.message });
+  }
+}
+
+async function handleHistory(message) {
+  try {
+    const targetId = String(message.targetId);
+    const tabId = Number(targetId);
+    if (!Number.isInteger(tabId)) throw new Error("Invalid target ID");
+    const before = await chrome.tabs.get(tabId);
+    if (message.forward) await chrome.tabs.goForward(tabId);
+    else await chrome.tabs.goBack(tabId);
+    const after = await waitForTabUpdate(
+      tabId,
+      tab => (tab.url || "") !== (before.url || "") || tab.status === "complete",
+      5000
+    );
+    sendToNative({
+      type: "history_result",
+      requestId: message.requestId,
+      ok: true,
+      result: {
+        direction: message.forward ? "forward" : "back",
+        url: after.url || "",
+        verified: true,
+        mouse: "untouched",
+        clipboard: "untouched"
+      }
+    });
+    await sendTargetsToNative();
+  } catch (error) {
+    sendToNative({ type: "history_result", requestId: message.requestId, ok: false, error: error.message });
+  }
+}
+
+function waitForDownload(downloadId, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.downloads.onChanged.removeListener(listener);
+      reject(new Error("Timed out waiting for browser download"));
+    }, timeoutMs);
+    const listener = delta => {
+      if (delta.id !== downloadId || delta.state?.current !== "complete") return;
+      clearTimeout(timer);
+      chrome.downloads.onChanged.removeListener(listener);
+      chrome.downloads.search({ id: downloadId }).then(items => {
+        if (!items.length || !items[0].filename) reject(new Error("Completed download has no file path"));
+        else resolve(items[0]);
+      }, reject);
+    };
+    chrome.downloads.onChanged.addListener(listener);
+  });
+}
+
+async function handleDownloadFile(message) {
+  try {
+    const targetId = String(message.targetId);
+    const tabId = Number(targetId);
+    if (!Number.isInteger(tabId)) throw new Error("Invalid target ID");
+    if (!attachedTargets.has(targetId)) {
+      const attached = await attachDebugger(targetId);
+      if (!attached.ok) throw new Error(attached.error || "debugger attach failed");
+    }
+    const selector = JSON.stringify(message.selector || "#download");
+    const hrefResult = await chrome.debugger.sendCommand(
+      { tabId },
+      "Runtime.evaluate",
+      {
+        expression: `(() => { const node = document.querySelector(${selector}); return node ? node.href || node.getAttribute('href') : null; })()`,
+        returnByValue: true,
+        awaitPromise: true
+      }
+    );
+    const href = hrefResult?.result?.value;
+    if (!href) throw new Error("Download target did not expose a URL");
+    const downloadId = await chrome.downloads.download({
+      url: href,
+      filename: message.fileName || undefined,
+      saveAs: false,
+      conflictAction: "overwrite"
+    });
+    const item = await waitForDownload(downloadId);
+    sendToNative({
+      type: "download_file_result",
+      requestId: message.requestId,
+      ok: true,
+      result: {
+        downloadId,
+        path: item.filename,
+        fileName: message.fileName || "",
+        verified: true
+      }
+    });
+  } catch (error) {
+    sendToNative({ type: "download_file_result", requestId: message.requestId, ok: false, error: error.message });
   }
 }
 
@@ -354,6 +562,10 @@ async function initialize() {
     scheduleReconnect();
   }
   
+  // Register debugger listeners once for the service worker lifetime.
+  chrome.debugger.onEvent.addListener(handleDebuggerEvent);
+  chrome.debugger.onDetach.addListener(handleDebuggerDetach);
+
   // Set up alarms
   chrome.alarms.create(HEALTH_CHECK_ALARM, { periodInMinutes: 1 });
   chrome.alarms.create(GROUP_OBSERVE_ALARM, { periodInMinutes: 1 });
