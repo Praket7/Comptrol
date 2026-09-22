@@ -38,6 +38,16 @@ const DEDUPED_COMMAND_TYPES = new Set([
   "detach_debugger",
   "restore_group"
 ]);
+let commandLedgerTail = Promise.resolve();
+
+function withCommandLedgerLock(callback) {
+  const run = commandLedgerTail.then(callback, callback);
+  commandLedgerTail = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
 
 // Alarm for periodic health checks
 const HEALTH_CHECK_ALARM = "comptrol-health-check";
@@ -165,69 +175,75 @@ async function writeBoundedCommandLedger(entries) {
 }
 
 async function beginDedupedCommand(message) {
-  const requestId = message?.requestId;
-  if (!requestId || !DEDUPED_COMMAND_TYPES.has(message.type)) {
-    return { execute: true };
-  }
-  if (inflightCommandIds.has(requestId)) {
-    return { execute: false };
-  }
-
-  const entries = await readCommandLedger();
-  const entry = entries[requestId];
-  if (entry?.status === "completed") {
-    if (entry.response) {
-      sendToNative(entry.response);
-    } else {
+  return withCommandLedgerLock(async () => {
+    const requestId = message?.requestId;
+    if (!requestId || !DEDUPED_COMMAND_TYPES.has(message.type)) {
+      return { execute: true };
+    }
+    if (inflightCommandIds.has(requestId)) {
+      return { execute: false };
+    }
+  
+    const entries = await readCommandLedger();
+    const entry = entries[requestId];
+    if (entry?.status === "completed") {
+      if (entry.response) {
+        sendToNative(entry.response);
+      } else {
+        sendToNative({
+          type: `${message.type}_result`,
+          requestId,
+          ok: false,
+          error: {
+            code: "requires_reconciliation",
+            message: "The prior command completed but its response exceeded the durable cache limit. Inspect current browser state before issuing a new mutation."
+          }
+        });
+      }
+      return { execute: false };
+    }
+    if (entry?.status === "inflight") {
       sendToNative({
         type: `${message.type}_result`,
         requestId,
         ok: false,
         error: {
           code: "requires_reconciliation",
-          message: "The prior command completed but its response exceeded the durable cache limit. Inspect current browser state before issuing a new mutation."
+          message: "This command was already dispatched before the extension restarted. Comptrol will not repeat a potentially completed browser mutation without reconciliation."
         }
       });
+      return { execute: false };
     }
-    return { execute: false };
+  
+    entries[requestId] = {
+      status: "inflight",
+      startedAt: Date.now(),
+      commandType: message.type
+    };
+    await writeBoundedCommandLedger(entries);
+    inflightCommandIds.add(requestId);
+    return { execute: true };
   }
-  if (entry?.status === "inflight") {
-    sendToNative({
-      type: `${message.type}_result`,
-      requestId,
-      ok: false,
-      error: {
-        code: "requires_reconciliation",
-        message: "This command was already dispatched before the extension restarted. Comptrol will not repeat a potentially completed browser mutation without reconciliation."
-      }
-    });
-    return { execute: false };
-  }
-
-  entries[requestId] = {
-    status: "inflight",
-    startedAt: Date.now(),
-    commandType: message.type
-  };
-  await writeBoundedCommandLedger(entries);
-  inflightCommandIds.add(requestId);
-  return { execute: true };
+  
+  });
 }
-
 async function cacheCommandResult(response) {
-  const requestId = response?.requestId;
-  if (!requestId) return;
-  const encoded = JSON.stringify(response);
-  const entries = await readCommandLedger();
-  entries[requestId] = {
-    status: "completed",
-    completedAt: Date.now(),
-    response: encoded.length <= COMMAND_CACHE_MAX_RESULT_BYTES ? response : null,
-    responseTooLarge: encoded.length > COMMAND_CACHE_MAX_RESULT_BYTES
-  };
-  await writeBoundedCommandLedger(entries);
+  return withCommandLedgerLock(async () => {
+    const requestId = response?.requestId;
+    if (!requestId) return;
+    const encoded = JSON.stringify(response);
+    const entries = await readCommandLedger();
+    entries[requestId] = {
+      status: "completed",
+      completedAt: Date.now(),
+      response: encoded.length <= COMMAND_CACHE_MAX_RESULT_BYTES ? response : null,
+      responseTooLarge: encoded.length > COMMAND_CACHE_MAX_RESULT_BYTES
+    };
+    await writeBoundedCommandLedger(entries);
+  }
+  
+  });
 }
-
 async function sendCommandResult(response) {
   if (response?.requestId) {
     await cacheCommandResult(response);
