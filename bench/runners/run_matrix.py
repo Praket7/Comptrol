@@ -2,6 +2,7 @@
 """Executable V5 benchmark runner: drives the release binary, records p50/p95."""
 
 import argparse
+import copy
 import json
 import os
 import pathlib
@@ -88,6 +89,22 @@ def result_verification(response: dict) -> Optional[str]:
 def dict_data(response: dict) -> dict:
     value = result_data(response)
     return value if isinstance(value, dict) else {}
+
+
+def iteration_params(params: dict, attempt: int) -> dict:
+    """Clone step params and make each benchmark iteration independently executable.
+
+    Steps that intentionally share one idempotency key inside the same iteration
+    still receive the same suffixed key, so replay tests remain valid while
+    separate benchmark iterations no longer collapse into cached replays.
+    """
+    cloned = copy.deepcopy(params)
+    arguments = cloned.get("arguments") if isinstance(cloned, dict) else None
+    if isinstance(arguments, dict):
+        key = arguments.get("idempotency_key")
+        if isinstance(key, str) and key:
+            arguments["idempotency_key"] = f"{key}-iteration-{attempt}"
+    return cloned
 
 
 # Verifier registry: all public MCP tool results normalize through structuredContent.
@@ -326,8 +343,10 @@ def run_task(
             continue
         try:
             step_results = []
+            final_step_params = {}
             for step in steps:
-                params = step.get("params", {})
+                params = iteration_params(step.get("params", {}), attempt)
+                final_step_params = params
                 resp = send_mcp(proc, request_id, step["method"], params)
                 request_id += 1
                 row["mcp_calls"] += 1
@@ -346,7 +365,7 @@ def run_task(
                 for key in ("internal_route_actions", "target_list_reads", "screenshots", "wrong_target_events", "foreground_disturbances", "false_positive_verifications"):
                     if key in result and isinstance(result[key], (int, float)):
                         row[key] += int(result[key])
-            
+
             # Run verifiers on the final step result
             verifier_name = task.get("verifier")
             if verifier_name and step_results:
@@ -354,7 +373,7 @@ def run_task(
                 ok, msg = run_verifier(
                     verifier_name,
                     final_result,
-                    steps[-1].get("params", {}),
+                    final_step_params,
                     task.get("verifier_expected"),
                 )
                 row["verified"] = ok
@@ -363,7 +382,7 @@ def run_task(
             else:
                 # No explicit verifier: require all steps succeeded (no errors)
                 row["verified"] = all("error" not in sr for sr in step_results)
-            
+
             elapsed = (time.monotonic() - task_start) * 1000
             row["latency_ms"] = round(elapsed, 2)
         except Exception as error:
@@ -430,8 +449,6 @@ def start_suite_fixture(suite_name: str):
 
 
 def collect_metadata() -> dict:
-    import platform
-    import sysconfig
     return {
         "os": platform.system(),
         "os_release": platform.release(),
