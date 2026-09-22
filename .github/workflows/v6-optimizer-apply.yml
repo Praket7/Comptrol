@@ -23,6 +23,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Make capability allowlist patch explicit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/apply_v6_optimizer.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''# Policy/default allow list and dispatch for capability.search.
+          replace_once(
+              core,
+              '                "system.ping".to_owned(),\\n                "desktop.observe".to_owned(),',
+              '                "system.ping".to_owned(),\\n                "capability.search".to_owned(),\\n                "desktop.observe".to_owned(),',
+          )
+          # COMPTROL_ALLOW_ALL_INTENTS has a second system.ping entry.
+          text = read(core)
+          needle = '                "system.ping".to_owned(),\\n                "desktop.observe".to_owned(),'
+          if needle in text:
+              text = text.replace(needle, '                "system.ping".to_owned(),\\n                "capability.search".to_owned(),\\n                "desktop.observe".to_owned(),', 1)
+          write(core, text)
+          '''
+          new = '''# Policy/default allow lists and dispatch for capability.search.
+          text = read(core)
+          needle = '                "system.ping".to_owned(),\\n                "desktop.observe".to_owned(),'
+          replacement = '                "system.ping".to_owned(),\\n                "capability.search".to_owned(),\\n                "desktop.observe".to_owned(),'
+          if text.count(needle) != 2:
+              raise RuntimeError(f"expected two capability policy allowlists, found {text.count(needle)}")
+          write(core, text.replace(needle, replacement, 2))
+          '''
+          if old not in text:
+              raise SystemExit('capability allowlist patch block not found')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
       - name: Apply V6 optimizer patch
         run: python3 scripts/apply_v6_optimizer.py
       - name: Format
