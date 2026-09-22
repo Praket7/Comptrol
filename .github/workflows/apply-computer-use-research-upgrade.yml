@@ -28,8 +28,8 @@ jobs:
         run: |
           python3 -m py_compile adapters/canva/src/adapter.py
           python3 -m py_compile adapters/powerpoint-windows/src/adapter.py
-      - name: Check changed Rust crates
-        run: cargo check -p comptrol-core -p comptrol-app-registry
+      - name: Check Rust workspace
+        run: cargo check --workspace
       - name: Commit upgraded sources
         run: |
           git config user.name "github-actions[bot]"
