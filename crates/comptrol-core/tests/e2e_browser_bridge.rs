@@ -55,7 +55,13 @@ fn start_daemon(state_dir: &PathBuf) -> Daemon {
     panic!("Comptrol HTTP daemon did not become ready");
 }
 
-fn http_request(port: u16, method: &str, path: &str, body: Value) -> (u16, Value) {
+fn http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Value,
+    bridge_token: Option<&str>,
+) -> (u16, Value) {
     let encoded = if body.is_null() {
         Vec::new()
     } else {
@@ -65,8 +71,11 @@ fn http_request(port: u16, method: &str, path: &str, body: Value) -> (u16, Value
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("read timeout");
+    let bridge_header = bridge_token
+        .map(|token| format!("X-Comptrol-Bridge-Token: {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nMCP-Protocol-Version: 2026-07-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nMCP-Protocol-Version: 2026-07-28\r\nContent-Type: application/json\r\n{bridge_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         encoded.len()
     );
     stream.write_all(request.as_bytes()).expect("write headers");
@@ -100,12 +109,26 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
 
     {
         let daemon = start_daemon(&state_dir);
+        let token = fs::read_to_string(state_dir.join("browser-bridge.token"))
+            .expect("read browser bridge auth token");
+        let token = token.trim();
+
+        let (status, unauthorized) = http_request(
+            daemon.port,
+            "POST",
+            "/browser/status",
+            json!({}),
+            None,
+        );
+        assert_eq!(status, 403, "{unauthorized}");
+        assert_eq!(unauthorized["error"], "browser_bridge_auth_required");
 
         let (status, heartbeat) = http_request(
             daemon.port,
             "POST",
             "/browser/extension/heartbeat",
             json!({"protocol": "comptrol.browser.bridge/0.1.0"}),
+            Some(token),
         );
         assert_eq!(status, 200, "{heartbeat}");
         assert_eq!(heartbeat["ok"], true);
@@ -115,6 +138,7 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
             "POST",
             "/browser/debugger/attach",
             json!({"target_id": "123"}),
+            Some(token),
         );
         assert_eq!(status, 202, "{accepted}");
         let request_id = accepted["request_id"]
@@ -122,8 +146,13 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
             .expect("queued request id")
             .to_owned();
 
-        let (status, polled) =
-            http_request(daemon.port, "POST", "/browser/command/poll", json!({}));
+        let (status, polled) = http_request(
+            daemon.port,
+            "POST",
+            "/browser/command/poll",
+            json!({}),
+            Some(token),
+        );
         assert_eq!(status, 200, "{polled}");
         let command = polled["commands"]
             .as_array()
@@ -146,6 +175,7 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
                 "ok": true,
                 "result": {"attached": true, "targetId": "123"}
             }),
+            Some(token),
         );
         assert_eq!(status, 200, "{stored}");
 
@@ -155,6 +185,7 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
                 "GET",
                 &format!("/browser/command/result/{request_id}"),
                 Value::Null,
+                Some(token),
             );
             assert_eq!(status, 200, "{result}");
             assert_eq!(result["ok"], true);
@@ -176,6 +207,7 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
                     "revision": "bridge:123:0:https://example.test/"
                 }]
             }),
+            Some(token),
         );
         assert_eq!(status, 200, "{targets}");
         assert_eq!(targets["count"], 1);
@@ -183,6 +215,9 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
 
     {
         let daemon = start_daemon(&state_dir);
+        let token = fs::read_to_string(state_dir.join("browser-bridge.token"))
+            .expect("read browser bridge auth token after restart");
+        let token = token.trim();
         let (status, heartbeat) = http_request(
             daemon.port,
             "POST",
@@ -191,8 +226,13 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
         );
         assert_eq!(status, 200, "{heartbeat}");
 
-        let (status, health) =
-            http_request(daemon.port, "POST", "/browser/status", json!({}));
+        let (status, health) = http_request(
+            daemon.port,
+            "POST",
+            "/browser/status",
+            json!({}),
+            Some(token),
+        );
         assert_eq!(status, 200, "{health}");
         assert_eq!(health["extension_connected"], true);
         assert_eq!(health["target_count"], 1);
