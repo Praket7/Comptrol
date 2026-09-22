@@ -46,6 +46,8 @@ struct CommandQueue {
     pending: VecDeque<PendingCommand>,
     /// Results keyed by request_id, waiting to be consumed by the agent
     results: HashMap<String, Value>,
+    /// Stored extension targets reported by browser extension
+    extension_targets: Vec<Value>,
     /// Maximum pending commands before oldest is evicted
     max_pending: usize,
     /// Counter for unique request IDs
@@ -57,9 +59,18 @@ impl CommandQueue {
         Self {
             pending: VecDeque::new(),
             results: HashMap::new(),
+            extension_targets: Vec::new(),
             max_pending: 128,
             counter: AtomicUsize::new(0),
         }
+    }
+
+    fn store_targets(&mut self, targets: Vec<Value>) {
+        self.extension_targets = targets;
+    }
+
+    fn get_targets(&self) -> Vec<Value> {
+        self.extension_targets.clone()
     }
 
     /// Submit a command to be forwarded to the extension.
@@ -2897,16 +2908,27 @@ fn handle_http<S: HttpStream>(
     }
     if request_line.starts_with("POST /browser/status ") {
         let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
-        let connected = !cdp_endpoint.is_empty()
+        let cdp_connected = !cdp_endpoint.is_empty()
             && comptrol::browser::discover_cached_targets(&cdp_endpoint)
                 .map(|t| !t.is_empty())
                 .unwrap_or(false);
+        let extension_connected = {
+            let queue = command_queue.lock().expect("command queue lock poisoned");
+            !queue.get_targets().is_empty()
+        };
+        let connected = cdp_connected || extension_connected;
         return write_http_response(
             stream,
             200,
             "OK",
             "application/json",
-            serde_json::to_vec(&json!({"ok":true,"connected":connected})).unwrap_or_default(),
+            serde_json::to_vec(&json!({
+                "ok": true,
+                "connected": connected,
+                "cdp_connected": cdp_connected,
+                "extension_connected": extension_connected
+            }))
+            .unwrap_or_default(),
             None,
         );
     }
@@ -2914,16 +2936,23 @@ fn handle_http<S: HttpStream>(
     // ── Browser Bridge extension event endpoints ──────────────────────────
     if request_line.starts_with("POST /browser/extension/targets ") {
         let request_body: Value = serde_json::from_str(&body).unwrap_or(json!({}));
-        // Store extension-discovered targets for later use
+        let targets = request_body
+            .get("targets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let count = targets.len();
+        {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            queue.store_targets(targets);
+        }
         return write_http_response(
             stream,
             200,
             "OK",
             "application/json",
-            serde_json::to_vec(
-                &json!({"ok":true,"targets_stored": request_body.get("targets").is_some()}),
-            )
-            .unwrap_or_default(),
+            serde_json::to_vec(&json!({"ok": true, "targets_stored": true, "count": count}))
+                .unwrap_or_default(),
             None,
         );
     }

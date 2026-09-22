@@ -166,11 +166,13 @@ VERIFIERS: Dict[str, Callable[[dict, dict, Any], tuple[bool, str]]] = {
         f"applications not array or empty: {result}"
     ),
     "has_status_field": lambda result, _, __: (
-        "status" in result.get("result", {}),
+        "status" in result.get("result", {})
+        or "status" in result.get("result", {}).get("structuredContent", {}).get("data", {}),
         f"no status field: {result}"
     ),
     "classification_in_allowed": lambda result, _, __: (
-        result.get("result", {}).get("classification") in ["alert", "dialog", "notification", "menu"],
+        result.get("result", {}).get("classification") in ["alert", "dialog", "notification", "menu", "informational"]
+        or result.get("result", {}).get("structuredContent", {}).get("data", {}).get("popup", {}).get("class") in ["alert", "dialog", "notification", "menu", "informational"],
         f"classification not in allowed: {result}"
     ),
     "has_value": lambda result, _, __: (

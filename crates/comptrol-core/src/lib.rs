@@ -2619,9 +2619,10 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
         )),
         value if value.starts_with("browser.cdp.") => Some((
             "browser_protocol",
-            std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            (std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                || comptrol_browser::select_provider(true).is_ok())
                 && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
-            "Persistent local CDP requires an endpoint and explicit policy",
+            "Persistent local CDP requires an endpoint or companion extension and explicit policy",
         )),
         _ => None,
     };
@@ -6507,18 +6508,39 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                 }),
             )
         }
-        "companion_extension" => success(
-            request,
-            operation_id,
-            "companion_extension",
-            EffectState::None,
-            VerificationState::Verified,
-            json!({
-                "provider": "companion_extension",
-                "status": "connected_via_companion_extension",
-                "note": "CDP commands route through the daemon; extension provides browser discovery and signed-in access"
-            }),
-        ),
+        "companion_extension" => {
+            let sessions = comptrol_browser::list_sessions();
+            let ext_session = sessions
+                .iter()
+                .find(|s| s.provider == comptrol_browser::SessionProvider::CompanionExtension);
+            let available = ext_session.map(|s| s.available).unwrap_or(false);
+            if !available {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "route_unavailable".to_owned(),
+                        message: "companion extension native host is not registered".to_owned(),
+                        recovery: Some(
+                            "Install the Browser Bridge extension and register the native messaging host"
+                                .to_owned(),
+                        ),
+                    },
+                );
+            }
+            success(
+                request,
+                operation_id,
+                "companion_extension",
+                EffectState::None,
+                VerificationState::Unverified,
+                json!({
+                    "provider": "companion_extension",
+                    "status": "connected_via_companion_extension",
+                    "note": "Native bridge registered; waiting for extension handshake and active target round-trip"
+                }),
+            )
+        }
         _ => ActionResult::refused(
             request,
             operation_id,
@@ -9903,8 +9925,8 @@ mod tests {
         // CompanionExtension no longer requires COMPTROL_CDP_ENDPOINT;
         // it routes through the daemon's native bridge instead.
         assert_eq!(
-            unavailable.error, None,
-            "CompanionExtension should not return route_unavailable when CDP endpoint is absent"
+            unavailable.error.as_ref().map(|e| e.code.as_str()),
+            Some("route_unavailable")
         );
     }
 }
