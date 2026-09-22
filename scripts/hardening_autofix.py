@@ -15,11 +15,16 @@ replacements = [
     ),
 ]
 
+changed = False
 for old, new in replacements:
-    count = text.count(old)
-    if count == 0:
-        raise SystemExit(f"expected hardening pattern not found:\n{old[:180]}")
-    text = text.replace(old, new)
+    if old in text:
+        text = text.replace(old, new)
+        changed = True
+    elif new not in text:
+        raise SystemExit(f"neither old nor fixed hardening pattern found:\n{old[:180]}")
 
-path.write_text(text, encoding="utf-8")
-print("Applied Browser Bridge Rust 1.98 clippy fixes")
+if changed:
+    path.write_text(text, encoding="utf-8")
+    print("Applied Browser Bridge Rust 1.98 clippy fixes")
+else:
+    print("Browser Bridge Rust 1.98 clippy fixes already applied")
