@@ -18,5 +18,23 @@ skill = skill.replace(skill_marker, skill_guidance + skill_marker, 1)
 write(skill_path, skill)
 
 '''
-path.write_text(text[:start] + replacement + text[end:], encoding="utf-8")
+text = text[:start] + replacement + text[end:]
+
+# The legacy persistence regression asserted the old global route key. V6 route
+# statistics are intentionally contextual, so accept the contextual native key
+# while retaining compatibility with stores produced by the previous version.
+final_write = 'write(core_path, core)\nprint("V6 final execution pass applied")\n'
+if text.count(final_write) != 1:
+    raise RuntimeError(f"final core write marker: expected one match, found {text.count(final_write)}")
+test_patch = '''legacy_lookup = '.and_then(|routes| routes.iter().find(|route| route["route"] == "native"))'
+contextual_lookup = '.and_then(|routes| {\\n                routes.iter().find(|route| {\\n                    route["route"].as_str().is_some_and(|key| {\\n                        key == "native" || key.starts_with("native|")\\n                    })\\n                })\\n            })'
+if core.count(legacy_lookup) != 1:
+    raise RuntimeError(f"legacy route history lookup: expected one match, found {core.count(legacy_lookup)}")
+core = core.replace(legacy_lookup, contextual_lookup, 1)
+
+write(core_path, core)
+print("V6 final execution pass applied")
+'''
+text = text.replace(final_write, test_patch, 1)
+path.write_text(text, encoding="utf-8")
 print("repaired V6 final driver")
