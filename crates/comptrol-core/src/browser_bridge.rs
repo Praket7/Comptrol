@@ -1,6 +1,6 @@
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -18,6 +18,7 @@ const BRIDGE_TOKEN_FILE: &str = "browser-bridge.token";
 const COMMAND_CAPACITY: i64 = 256;
 const COMPLETED_RETENTION_MS: i64 = 10 * 60 * 1000;
 const EVENT_RETENTION_MS: i64 = 10 * 60 * 1000;
+const AUTH_NONCE_RETENTION_MS: i64 = 5 * 60 * 1000;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -146,6 +147,78 @@ pub fn challenge_proof(state_dir: &Path, nonce: &str) -> io::Result<String> {
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+
+pub fn request_signature(
+    token: &str,
+    method: &str,
+    path: &str,
+    nonce: &str,
+    body: &[u8],
+) -> io::Result<String> {
+    if nonce.len() < 32
+        || nonce.len() > 256
+        || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "browser bridge request nonce must be 32-256 hexadecimal characters",
+        ));
+    }
+    let body_hash = Sha256::digest(body);
+    let body_hash_hex = body_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes())
+        .map_err(|error| io::Error::other(format!("initialize browser bridge request HMAC: {error}")))?;
+    for part in [BRIDGE_PROTOCOL_VERSION, method, path, nonce, body_hash_hex.as_str()] {
+        mac.update(part.as_bytes());
+        mac.update(b"\0");
+    }
+    let digest = mac.finalize().into_bytes();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub fn verify_request_signature(
+    token: &str,
+    method: &str,
+    path: &str,
+    nonce: &str,
+    body: &[u8],
+    signature_hex: &str,
+) -> io::Result<bool> {
+    let expected = request_signature(token, method, path, nonce, body)?;
+    let expected_bytes = decode_hex(&expected)?;
+    let provided_bytes = match decode_hex(signature_hex) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"constant-time-compare")
+        .map_err(|error| io::Error::other(format!("initialize comparison HMAC: {error}")))?;
+    mac.update(&expected_bytes);
+    let expected_tag = mac.clone().finalize().into_bytes();
+    let mut provided_mac = Hmac::<Sha256>::new_from_slice(b"constant-time-compare")
+        .map_err(|error| io::Error::other(format!("initialize comparison HMAC: {error}")))?;
+    provided_mac.update(&provided_bytes);
+    Ok(provided_mac.verify_slice(&expected_tag).is_ok())
+}
+
+fn decode_hex(value: &str) -> io::Result<Vec<u8>> {
+    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid hexadecimal value"));
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            u8::from_str_radix(text, 16)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .collect()
+}
+
 impl BridgeStore {
     pub fn open(state_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(state_dir)?;
@@ -185,10 +258,46 @@ impl BridgeStore {
                    created_at_ms INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS bridge_events_created
-                   ON bridge_events(created_at_ms);",
+                   ON bridge_events(created_at_ms);
+                 CREATE TABLE IF NOT EXISTS bridge_auth_nonces (
+                   nonce TEXT PRIMARY KEY,
+                   seen_at_ms INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS bridge_auth_nonces_seen
+                   ON bridge_auth_nonces(seen_at_ms);",
             )
             .map_err(|error| sqlite_error("initialize browser bridge database", error))?;
         Ok(Self { connection })
+    }
+
+    pub fn claim_auth_nonce(&mut self, nonce: &str) -> io::Result<bool> {
+        if nonce.len() < 32
+            || nonce.len() > 256
+            || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Ok(false);
+        }
+        let now = now_ms();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| sqlite_error("begin browser bridge auth nonce claim", error))?;
+        transaction
+            .execute(
+                "DELETE FROM bridge_auth_nonces WHERE seen_at_ms < ?1",
+                params![now.saturating_sub(AUTH_NONCE_RETENTION_MS)],
+            )
+            .map_err(|error| sqlite_error("prune browser bridge auth nonces", error))?;
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO bridge_auth_nonces(nonce, seen_at_ms) VALUES (?1, ?2)",
+                params![nonce, now],
+            )
+            .map_err(|error| sqlite_error("claim browser bridge auth nonce", error))?;
+        transaction
+            .commit()
+            .map_err(|error| sqlite_error("commit browser bridge auth nonce", error))?;
+        Ok(inserted == 1)
     }
 
     pub fn submit(&mut self, command_type: &str, payload: Value) -> io::Result<String> {
@@ -535,6 +644,12 @@ impl BridgeStore {
             )
             .map_err(|error| sqlite_error("prune browser bridge events", error))?;
         transaction
+            .execute(
+                "DELETE FROM bridge_auth_nonces WHERE seen_at_ms < ?1",
+                params![now.saturating_sub(AUTH_NONCE_RETENTION_MS)],
+            )
+            .map_err(|error| sqlite_error("prune browser bridge auth nonces", error))?;
+        transaction
             .commit()
             .map_err(|error| sqlite_error("commit browser bridge cleanup", error))
     }
@@ -573,6 +688,42 @@ mod tests {
             std::process::id(),
             REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn signed_request_is_body_bound_and_nonce_claim_is_single_use() {
+        let state = temp_state("request-auth");
+        let token = ensure_auth_token(&state).expect("token");
+        let nonce = "00112233445566778899aabbccddeeff";
+        let body = br#"{"ok":true}"#;
+        let signature = request_signature(&token, "POST", "/browser/status", nonce, body)
+            .expect("signature");
+        assert!(
+            verify_request_signature(
+                &token,
+                "POST",
+                "/browser/status",
+                nonce,
+                body,
+                &signature,
+            )
+            .expect("verify")
+        );
+        assert!(
+            !verify_request_signature(
+                &token,
+                "POST",
+                "/browser/status",
+                nonce,
+                br#"{"ok":false}"#,
+                &signature,
+            )
+            .expect("body mismatch")
+        );
+        let mut store = BridgeStore::open(&state).expect("store");
+        assert!(store.claim_auth_nonce(nonce).expect("first claim"));
+        assert!(!store.claim_auth_nonce(nonce).expect("replay claim"));
+        let _ = fs::remove_dir_all(state);
     }
 
     #[test]
