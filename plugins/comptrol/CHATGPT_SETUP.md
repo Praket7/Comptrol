@@ -4,12 +4,14 @@ This guide connects the Comptrol process on your Mac to a private developer-mode
 
 ## Requirements
 
-- ChatGPT Plus with Developer mode available on the web.
+- A ChatGPT web account/workspace that allows custom MCP apps. OpenAI's current help page lists Business and Enterprise/Edu for custom apps and full MCP; it says Pro is limited to read/fetch. Plus is not listed. Comptrol exposes write tools, so a Plus Developer mode toggle alone may not be enough to connect it.
 - Access to OpenAI Platform Tunnels and Runtime API keys.
 - A local `comptrol` executable. Build it from the repository with `cargo build --release`, or use an installed Comptrol release.
 - The official [`tunnel-client`](https://github.com/openai/tunnel-client) binary.
 
-The ChatGPT plan and Platform tunnel permissions are separate. Platform access must let you create or use a tunnel and create a Restricted runtime key with Tunnels **Read** and **Use** permissions. Do not use an admin key as the long-running runtime key.
+The ChatGPT plan and Platform tunnel permissions are separate. Creating or editing a tunnel requires Tunnels **Read** and **Manage**; running it and selecting it in ChatGPT requires **Read** and **Use**. Create a Restricted runtime key with **Read** and **Use** only. Do not use an admin key as the long-running runtime key.
+
+OpenAI bills ChatGPT and API Platform separately. I found no published Secure MCP Tunnel price, so do not assume tunnel access is free; creating a key itself does not make a model API request. Do not add API billing or buy credits unless you accept any Platform charges shown for your account.
 
 ## Install the official tunnel client
 
@@ -22,7 +24,7 @@ tunnel-client --version
 
 ## Create the tunnel and restricted runtime key
 
-In the [OpenAI Platform Tunnels settings](https://platform.openai.com/settings/organization/tunnels), create a tunnel and copy its ID. In [Runtime API keys](https://platform.openai.com/settings/organization/api-keys), create a **Restricted** key with Tunnels **Read** and **Use** only. The tunnel ID is an identifier; the runtime API key is a secret.
+In the [OpenAI Platform Tunnels settings](https://platform.openai.com/settings/organization/tunnels), select your personal Platform organization, create a tunnel, and copy its ID. Associate it with the ChatGPT workspace you intend to use. In [API keys](https://platform.openai.com/settings/organization/api-keys), create a **Restricted** runtime key with Tunnels **Read** and **Use** only. The tunnel ID is an identifier; the runtime API key is a secret.
 
 If the Platform UI does not offer these controls to your account, stop here and ask an organization owner/admin to grant access. Do not work around the restriction with a broad admin key.
 
