@@ -41,7 +41,37 @@ background = "supported"
 verification = "application_state"
 
 [[capabilities]]
+intent = "presentation.slide.duplicate"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
 intent = "presentation.shape.text.set"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.shape.textbox.create"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.shape.image.insert"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.shape.delete"
+risk = "R2"
+background = "supported"
+verification = "application_state"
+
+[[capabilities]]
+intent = "presentation.shape.geometry.set"
 risk = "R2"
 background = "supported"
 verification = "application_state"
