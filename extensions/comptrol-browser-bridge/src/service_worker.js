@@ -223,8 +223,6 @@ async function beginDedupedCommand(message) {
     await writeBoundedCommandLedger(entries);
     inflightCommandIds.add(requestId);
     return { execute: true };
-  }
-  
   });
 }
 async function cacheCommandResult(response) {
@@ -240,8 +238,6 @@ async function cacheCommandResult(response) {
       responseTooLarge: encoded.length > COMMAND_CACHE_MAX_RESULT_BYTES
     };
     await writeBoundedCommandLedger(entries);
-  }
-  
   });
 }
 async function sendCommandResult(response) {
