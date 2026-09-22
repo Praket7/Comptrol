@@ -64,6 +64,7 @@ LOCAL_DAEMON_URL = os.environ.get(
 BRIDGE_TOKEN_PATH = os.path.join(STATE_DIR, "browser-bridge.token")
 PROTOCOL_VERSION = "comptrol.browser.bridge/0.1.0"
 NATIVE_HOST_ID = "comptrol_browser_bridge"
+MAX_NATIVE_MESSAGE_BYTES = 1024 * 1024
 POLL_INTERVAL_MS = 200
 POLL_INTERVAL_MAX_MS = 2000
 
@@ -72,18 +73,30 @@ POLL_INTERVAL_MAX_MS = 2000
 stdout_lock = threading.Lock()
 
 def read_message():
-    """Read a length-prefixed JSON message from stdin."""
+    """Read one bounded length-prefixed JSON message from stdin."""
     raw_length = sys.stdin.buffer.read(4)
     if len(raw_length) == 0:
         return None
+    if len(raw_length) != 4:
+        raise ValueError("truncated native messaging length prefix")
     length = struct.unpack("<I", raw_length)[0]
-    message = sys.stdin.buffer.read(length).decode("utf-8")
-    return json.loads(message)
+    if length > MAX_NATIVE_MESSAGE_BYTES:
+        raise ValueError(
+            f"native messaging frame exceeds {MAX_NATIVE_MESSAGE_BYTES} bytes"
+        )
+    payload = sys.stdin.buffer.read(length)
+    if len(payload) != length:
+        raise ValueError("truncated native messaging payload")
+    return json.loads(payload.decode("utf-8"))
 
 
 def write_message(message):
-    """Write a length-prefixed JSON message to stdout with locking."""
+    """Write one bounded length-prefixed JSON message to stdout with locking."""
     encoded = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_NATIVE_MESSAGE_BYTES:
+        raise ValueError(
+            f"native messaging response exceeds {MAX_NATIVE_MESSAGE_BYTES} bytes"
+        )
     with stdout_lock:
         sys.stdout.buffer.write(struct.pack("<I", len(encoded)))
         sys.stdout.buffer.write(encoded)
