@@ -49,6 +49,11 @@ jobs:
         env:
           COMPTROL_BIN: target/release/comptrol
       - run: npm run test:browser
+      - name: Validate npm bundle with Browser Bridge
+        run: |
+          rm -rf packages/mcp/browser-bridge
+          cp -R extensions/comptrol-browser-bridge packages/mcp/browser-bridge
+          python3 scripts/validate_npm_package.py
       - run: python3 scripts/client_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol
