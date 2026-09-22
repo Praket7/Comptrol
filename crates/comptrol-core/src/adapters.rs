@@ -293,10 +293,7 @@ impl AdapterRegistry {
                     name: "comptrol.apple-messages".to_owned(),
                     version: "0.1.0".to_owned(),
                     platforms: vec!["macos".to_owned()],
-                    capabilities: vec![
-                        "message.draft".to_owned(),
-                        "message.send".to_owned(),
-                    ],
+                    capabilities: vec!["message.draft".to_owned(), "message.send".to_owned()],
                     route: "isolated_apple_messages".to_owned(),
                     risk: Risk::R3,
                     isolation: isolated.clone(),

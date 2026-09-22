@@ -79,14 +79,13 @@ pub fn ensure_auth_token(state_dir: &Path) -> io::Result<String> {
                 file.sync_all()?;
                 Ok(token)
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                auth_token(state_dir)?.ok_or_else(|| {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => auth_token(state_dir)?
+                .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         "browser bridge token is invalid",
                     )
-                })
-            }
+                }),
             Err(error) => Err(error),
         }
     }
@@ -101,14 +100,13 @@ pub fn ensure_auth_token(state_dir: &Path) -> io::Result<String> {
                 file.sync_all()?;
                 Ok(token)
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                auth_token(state_dir)?.ok_or_else(|| {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => auth_token(state_dir)?
+                .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         "browser bridge token is invalid",
                     )
-                })
-            }
+                }),
             Err(error) => Err(error),
         }
     }
