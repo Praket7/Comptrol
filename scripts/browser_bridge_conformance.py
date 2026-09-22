@@ -18,6 +18,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BRIDGE = ROOT / "extensions" / "comptrol-browser-bridge"
 PROTOCOL = "comptrol.browser.bridge/0.1.0"
+MAX_NATIVE_MESSAGE_BYTES = 1024 * 1024
 
 
 def require(path: pathlib.Path) -> None:
@@ -25,17 +26,49 @@ def require(path: pathlib.Path) -> None:
         raise SystemExit(f"missing Browser Bridge asset: {path.relative_to(ROOT)}")
 
 
-def send_native_message(process: subprocess.Popen, value: dict) -> dict:
-    encoded = json.dumps(value, separators=(",", ":")).encode("utf-8")
-    assert process.stdin is not None
+def read_native_response(process: subprocess.Popen) -> dict:
     assert process.stdout is not None
-    process.stdin.write(struct.pack("<I", len(encoded)) + encoded)
-    process.stdin.flush()
     raw_length = process.stdout.read(4)
     if len(raw_length) != 4:
         raise RuntimeError("native host did not emit a framed response")
     length = struct.unpack("<I", raw_length)[0]
-    return json.loads(process.stdout.read(length).decode("utf-8"))
+    if length > MAX_NATIVE_MESSAGE_BYTES:
+        raise RuntimeError(f"native host emitted oversized frame: {length}")
+    payload = process.stdout.read(length)
+    if len(payload) != length:
+        raise RuntimeError("native host emitted a truncated response")
+    return json.loads(payload.decode("utf-8"))
+
+
+def send_native_message(process: subprocess.Popen, value: dict) -> dict:
+    encoded = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_NATIVE_MESSAGE_BYTES:
+        raise ValueError("test message exceeds native messaging bound")
+    assert process.stdin is not None
+    process.stdin.write(struct.pack("<I", len(encoded)) + encoded)
+    process.stdin.flush()
+    return read_native_response(process)
+
+
+def exercise_invalid_frame(native_host: pathlib.Path, prefix: bytes) -> dict:
+    env = {**os.environ, "COMPTROL_DAEMON_URL": "http://127.0.0.1:1"}
+    process = subprocess.Popen(
+        [sys.executable, str(native_host)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    assert process.stdin is not None
+    process.stdin.write(prefix)
+    process.stdin.flush()
+    if len(prefix) < 4:
+        process.stdin.close()
+    response = read_native_response(process)
+    if process.stdin and not process.stdin.closed:
+        process.stdin.close()
+    process.wait(timeout=5)
+    return response
 
 
 class ProbeServer(http.server.ThreadingHTTPServer):
@@ -237,6 +270,17 @@ def main() -> None:
     process.stdin.close()
     process.wait(timeout=5)
 
+    oversized = exercise_invalid_frame(
+        native_host,
+        struct.pack("<I", MAX_NATIVE_MESSAGE_BYTES + 1),
+    )
+    if oversized.get("type") != "error" or "exceeds" not in oversized.get("error", ""):
+        raise SystemExit(f"oversized native messaging frame was not rejected: {oversized}")
+
+    truncated = exercise_invalid_frame(native_host, b"\x01\x00")
+    if truncated.get("type") != "error" or "truncated" not in truncated.get("error", ""):
+        raise SystemExit(f"truncated native messaging prefix was not rejected: {truncated}")
+
     # A listener that cannot prove possession of the install secret must never
     # receive the bearer token.
     bad_seen = exercise_host_against_probe(native_host, valid_proof=False)
@@ -277,6 +321,7 @@ def main() -> None:
                 "javascript": "syntax_clean",
                 "python": "syntax_clean",
                 "native_messaging_handshake": "passed",
+                "native_messaging_frame_bound": "passed",
                 "rogue_daemon_token_leak": "blocked",
                 "verified_daemon_hmac_authentication": "passed",
             },
