@@ -1,6 +1,6 @@
 {
   "name": "comptrolling",
-  "version": "0.1.63",
+  "version": "0.1.64",
   "description": "Comptrol MCP launcher with bundled native binaries",
   "bin": {
     "comptrolling": "bin/comptrol-mcp.js",
