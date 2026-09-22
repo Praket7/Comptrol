@@ -209,7 +209,9 @@ server.on("upgrade", (request, socket) => {
       : message.method === "Accessibility.getFullAXTree"
         ? { nodes: [{ nodeId: "fixture-root", role: { value: "RootWebArea" }, name: { value: "Comptrol browser fixture" } }] }
       : message.method === "Runtime.evaluate"
-        ? message.params.expression === "document.title"
+        ? message.params.expression === "location.href"
+          ? { result: { type: "string", value: fixtureUrl } }
+          : message.params.expression === "document.title"
           ? { result: { type: "string", value: "Comptrol browser fixture" } }
           : message.params.expression.includes("Add dynamic node")
             ? { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Add dynamic node" } } }
