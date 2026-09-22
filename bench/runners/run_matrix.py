@@ -240,6 +240,21 @@ VERIFIERS: Dict[str, Callable[[dict, dict, Any], tuple[bool, str]]] = {
         "value" in dict_data(result),
         f"no value field: {result}",
     ),
+    "workflow_done_verified": lambda result, _, __: (
+        result_verification(result) == "verified"
+        and dict_data(result).get("done") is True,
+        f"workflow result not independently verified: {result}",
+    ),
+    "idempotent_replay_verified": lambda result, _, __: (
+        result_verification(result) == "verified"
+        and isinstance(structured_content(result), dict)
+        and structured_content(result).get("recovery") == "idempotent_replay",
+        f"final workflow call was not an idempotent replay: {result}",
+    ),
+    "has_error_code": lambda result, _, __: (
+        result_error_code(result) is not None,
+        f"expected an explicit refusal/error code: {result}",
+    ),
     "mtls_identity_refused": lambda result, _, __: (
         result_error_code(result) == "mtls_identity_refused",
         f"expected mtls_identity_refused: {result}",
