@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -10,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const COMPANION_BRIDGE_ENDPOINT: &str = "comptrol+bridge://local";
 pub const DEFAULT_HEALTH_MAX_AGE: Duration = Duration::from_secs(15);
+const BRIDGE_TOKEN_FILE: &str = "browser-bridge.token";
 const COMMAND_CAPACITY: i64 = 256;
 const COMPLETED_RETENTION_MS: i64 = 10 * 60 * 1000;
 const EVENT_RETENTION_MS: i64 = 10 * 60 * 1000;
@@ -42,6 +44,83 @@ pub struct BridgeEvent {
 
 pub struct BridgeStore {
     connection: Connection,
+}
+
+pub fn ensure_auth_token(state_dir: &Path) -> io::Result<String> {
+    fs::create_dir_all(state_dir)?;
+    let path = state_dir.join(BRIDGE_TOKEN_FILE);
+    if let Ok(token) = fs::read_to_string(&path) {
+        let token = token.trim().to_owned();
+        if token.len() >= 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(token);
+        }
+    }
+
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| io::Error::other(format!("generate browser bridge token: {error}")))?;
+    let token = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{token}")?;
+                file.sync_all()?;
+                return Ok(token);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return auth_token(state_dir)?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "browser bridge token is invalid")
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{token}")?;
+                file.sync_all()?;
+                return Ok(token);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return auth_token(state_dir)?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "browser bridge token is invalid")
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub fn auth_token(state_dir: &Path) -> io::Result<Option<String>> {
+    let path = state_dir.join(BRIDGE_TOKEN_FILE);
+    match fs::read_to_string(path) {
+        Ok(token) => {
+            let token = token.trim().to_owned();
+            if token.len() >= 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                Ok(Some(token))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "browser bridge token is invalid",
+                ))
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 impl BridgeStore {
