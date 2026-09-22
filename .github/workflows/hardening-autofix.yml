@@ -1,0 +1,43 @@
+name: hardening-autofix
+
+on:
+  push:
+    branches: [codex/browser-bridge-release-hardening]
+    paths:
+      - scripts/hardening_autofix.py
+
+permissions:
+  contents: write
+
+concurrency:
+  group: comptrol-hardening-autofix
+  cancel-in-progress: true
+
+jobs:
+  autofix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/browser-bridge-release-hardening
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: python3 scripts/hardening_autofix.py
+      - run: cargo fmt --all
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Commit verified autofix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/comptrol-core/src/browser_bridge.rs
+          if git diff --cached --quiet; then
+            echo "No autofix changes to commit"
+            exit 0
+          fi
+          git commit -m "fix: satisfy Rust 1.98 Browser Bridge clippy"
+          git push origin HEAD:codex/browser-bridge-release-hardening
