@@ -1,0 +1,49 @@
+name: V6 Adaptive Optimizer Apply
+
+on:
+  push:
+    branches:
+      - perf/v6-fastpath-20260922
+
+permissions:
+  contents: write
+
+concurrency:
+  group: comptrol-v6-optimizer-apply
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/v6-fastpath-20260922
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply V6 optimizer patch
+        run: python3 scripts/apply_v6_optimizer.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Compile workspace
+        run: cargo check --workspace
+      - name: Clippy workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Browser Bridge conformance
+        run: python3 scripts/browser_bridge_conformance.py
+      - name: Browser test suite
+        run: npm run test:browser
+      - name: Workspace tests
+        run: cargo test --workspace
+      - name: Remove temporary optimizer machinery
+        run: rm scripts/apply_v6_optimizer.py .github/workflows/v6-optimizer-apply.yml
+      - name: Commit V6 adaptive optimizer
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 1
+          git commit -m "Implement V6 adaptive optimizer"
+          git push origin HEAD:perf/v6-fastpath-20260922
