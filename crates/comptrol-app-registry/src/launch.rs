@@ -2,10 +2,11 @@
 //!
 //! The launcher never shells out through an intermediate shell. It
 //! spawns the resolved executable directly (or the platform open
-//! surface for URLs/deep links), records the spawned process identity,
-//! and verifies the process is still alive after a bounded settle
-//! window. The settle window is an event-free liveness check, not a
-//! sleep-based UI wait.
+//! surface for URLs/deep links). Direct executable routes may verify the
+//! destination process identity after a bounded settle window. Platform
+//! helper routes such as open, xdg-open, or explorer only prove dispatch
+//! and deliberately remain unverified until the destination identity is
+//! observed independently.
 
 use crate::registry::AppEntry;
 use crate::{Resource, Resource as OpenResource};
@@ -240,12 +241,22 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
     }
 }
 
-/// Launch and then verify, per the V5 rule that a spawned process is
-/// delivery, not verification.
+fn route_pid_is_destination(route: &str) -> bool {
+    matches!(route, "executable_argv")
+}
+
+/// Launch and then verify, per the V5 rule that delivery is not verification.
+///
+/// Only direct executable routes bind the returned PID to the destination app.
+/// Native open helpers and Windows AUMID shell dispatch return Unavailable
+/// rather than accidentally verifying open, xdg-open, or explorer.exe.
 pub fn launch_verified(
     request: &LaunchRequest,
 ) -> Result<(LaunchOutcome, LaunchVerification), LaunchError> {
     let outcome = launch(request)?;
+    if !route_pid_is_destination(&outcome.route) {
+        return Ok((outcome, LaunchVerification::Unavailable));
+    }
     let Some(pid) = outcome.pid else {
         return Ok((outcome, LaunchVerification::Unavailable));
     };
@@ -315,6 +326,13 @@ pub fn launcher_probe(pid: u32) -> LaunchVerification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_launcher_pids_are_not_destination_verification() {
+        assert!(!route_pid_is_destination("native_open"));
+        assert!(!route_pid_is_destination("aumid_shell"));
+        assert!(route_pid_is_destination("executable_argv"));
+    }
 
     #[test]
     fn launcher_probe_reports_unavailable_on_unknown_pid() {
