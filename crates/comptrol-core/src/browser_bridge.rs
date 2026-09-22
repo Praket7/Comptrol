@@ -576,6 +576,22 @@ mod tests {
     }
 
     #[test]
+    fn hmac_challenge_proof_is_nonce_bound() {
+        let state = temp_state("challenge");
+        let first_nonce = "0123456789abcdef0123456789abcdef";
+        let second_nonce = "fedcba9876543210fedcba9876543210";
+        let first = challenge_proof(&state, first_nonce).expect("first proof");
+        let repeat = challenge_proof(&state, first_nonce).expect("repeat proof");
+        let second = challenge_proof(&state, second_nonce).expect("second proof");
+        assert_eq!(first, repeat);
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(challenge_proof(&state, "not-hex").is_err());
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
     fn lease_expiry_requeues_command() {
         let state = temp_state("lease");
         let mut store = BridgeStore::open(&state).expect("store");
