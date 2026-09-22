@@ -654,8 +654,8 @@ impl Default for Policy {
         Self {
             allow_sandbox_writes: false,
             allow_desktop_notify: false,
-            allow_app_launch: false,
-            max_risk: Risk::R0,
+            allow_app_launch: true,
+            max_risk: Risk::R2,
             allowed_intents: HashSet::from([
                 "system.ping".to_owned(),
                 "desktop.observe".to_owned(),
@@ -666,6 +666,8 @@ impl Default for Policy {
                 "workflow.execute".to_owned(),
                 "app.resolve".to_owned(),
                 "app.list".to_owned(),
+                "app.launch".to_owned(),
+                "browser.chrome.open_tab".to_owned(),
                 "permission.status".to_owned(),
                 "popup.inspect".to_owned(),
                 "browser.session.list".to_owned(),
@@ -826,12 +828,6 @@ impl Policy {
                 "browser.cdp.dialog".to_owned(),
                 "browser.session.connect".to_owned(),
             ]);
-        }
-        if std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1") {
-            policy.max_risk = policy.max_risk.max(Risk::R2);
-            policy
-                .allowed_intents
-                .insert("browser.chrome.open_tab".to_owned());
         }
         if env_enabled("COMPTROL_ALLOW_ADAPTERS") {
             policy.max_risk = policy.max_risk.max(Risk::R2);
@@ -2693,8 +2689,8 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
                 target_os = "windows",
                 target_os = "macos",
                 target_os = "linux"
-            )) && env_enabled("COMPTROL_ALLOW_BROWSER_LAUNCH"),
-            "Default-profile browser launch requires an explicit local policy",
+            )),
+            "Opens a URL in the existing default browser profile; page verification needs a local browser connection",
         )),
         "browser.chrome.restore_recent" | "browser.chrome.reopen_closed_group" => Some((
             "chrome_restore",
@@ -8580,13 +8576,14 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.chrome.open_tab".to_owned(),
-            available: (cfg!(target_os = "macos")
-                || cfg!(target_os = "windows")
-                || cfg!(target_os = "linux"))
-                && std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1"),
+            available: cfg!(any(
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "linux"
+            )),
             risk: Risk::R2,
             route: "browser_launcher".to_owned(),
-            note: "Opens a foreground Chrome tab in the existing default browser profile and reports launcher acceptance only".to_owned(),
+            note: "Opens a foreground Chrome tab in the existing default browser profile without an environment toggle; reports launcher acceptance unless a browser connection verifies page load".to_owned(),
         },
         Capability {
             name: "browser.chrome.restore_recent".to_owned(),
@@ -9108,6 +9105,58 @@ mod tests {
             Some("policy_denied")
         );
         assert!(matches!(result.delivery, DeliveryState::Refused));
+    }
+
+    #[test]
+    fn default_policy_allows_opening_apps_and_urls_without_broad_control() {
+        let policy = Policy::default();
+        assert!(policy.allow_app_launch);
+        assert!(policy.authorize("app.launch", Risk::R1).is_ok());
+        assert!(
+            policy
+                .authorize("browser.chrome.open_tab", Risk::R2)
+                .is_ok()
+        );
+        assert!(policy.authorize("app.open_resource", Risk::R2).is_err());
+        assert!(policy.authorize("desktop.open_app", Risk::R2).is_err());
+        assert!(policy.authorize("browser.cdp.navigate", Risk::R2).is_err());
+        assert!(
+            route_plan_for_intent("browser.chrome.open_tab", Value::Null, None).candidates[0]
+                .feasible
+        );
+    }
+
+    #[test]
+    fn default_policy_routes_open_requests_without_environment_toggles() {
+        let mut runtime = runtime();
+        runtime.policy = Policy::default();
+        for (intent, params, risk, expected_route) in [
+            (
+                "app.launch",
+                json!({"app":"Blender"}),
+                Risk::R1,
+                "app_registry_launch",
+            ),
+            (
+                "browser.chrome.open_tab",
+                json!({"url":"https://example.test"}),
+                Risk::R2,
+                "browser_launcher",
+            ),
+        ] {
+            let result = runtime.operate(OperationRequest {
+                intent: intent.to_owned(),
+                target: None,
+                params,
+                postcondition: None,
+                risk: Some(risk),
+                idempotency_key: None,
+                dry_run: true,
+                background: Some("foreground_allowed".to_owned()),
+            });
+            assert_eq!(result.preflight, "passed", "{intent}: {:?}", result.error);
+            assert_eq!(result.route, expected_route);
+        }
     }
 
     #[test]

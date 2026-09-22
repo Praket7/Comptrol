@@ -61,7 +61,7 @@ comptrol open Blender
 comptrol open https://www.espn.com/
 ```
 
-App opening needs `COMPTROL_ALLOW_APP_LAUNCH=1`. Browser opening needs `COMPTROL_ALLOW_BROWSER_LAUNCH=1`; it uses the existing default Chrome profile and clearly reports that browser-page loading is unverified unless a local DevTools connection or Browser Bridge is enabled. When either browser connection is available and `COMPTROL_ALLOW_BROWSER_CDP=1` is set, the same URL command waits for the page's `document.readyState` to reach `complete`.
+App launch and Chrome URL opening are enabled by default as individual operations; no environment flags are needed. Chrome opens in the existing default profile. If a local DevTools endpoint or Browser Bridge is already connected, the same command also verifies that the page reaches `document.readyState === "complete"`; otherwise it reports that the browser accepted the URL without claiming page-load verification.
 
 The npm release also bundles the optional Browser Bridge for controlling already-open signed-in Chrome tabs without copying a browser profile. Chrome requires the human to load/approve the extension and assigns the extension ID, so Comptrol does not silently install it during `npm install`. To set it up:
 
@@ -95,7 +95,7 @@ The runtime includes bounded event history, file checkpoints, fixture trace repl
 
 Privacy is local by default. `comptrol privacy status` reports telemetry and redaction defaults. The privacy network endpoint report lists optional routes. MCP and browser protocol messages are bounded to one mebibyte.
 
-With explicit local app launch policy, macOS, Windows, and Linux can open an exact app through their native launcher. With explicit browser launcher policy, Chrome can open a foreground tab in the existing default browser profile. With a local DevTools endpoint or a healthy Browser Bridge session, browser tabs can be controlled through exact target identities. The bridge persists target snapshots locally, leases commands for crash recovery, and reports active health only while the extension/native-host connection is fresh. These routes do not synthesize mouse input or touch the clipboard.
+By default, macOS, Windows, and Linux can open an exact app through the native launcher, and Chrome can open a foreground tab in the existing default browser profile. These two allowlisted open actions do not grant general desktop input, app-resource access, or browser page mutation. With a local DevTools endpoint or a healthy Browser Bridge session, browser tabs can be controlled through exact target identities. The bridge persists target snapshots locally, leases commands for crash recovery, and reports active health only while the extension/native-host connection is fresh. These routes do not synthesize mouse input or touch the clipboard.
 
 Supported browser operations can request strict background posture. Routes that cannot prove that posture refuse instead of activating another application or silently taking control of the foreground.
 
