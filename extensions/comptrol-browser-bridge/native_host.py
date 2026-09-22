@@ -35,7 +35,30 @@ if os.name == "nt":
     msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
     msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
 
-LOCAL_DAEMON_URL = os.environ.get("COMPTROL_DAEMON_URL", "http://127.0.0.1:7317")
+HOST_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HOST_DIR, "native_host_config.json")
+
+
+def load_host_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
+            value = json.load(config_file)
+            return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+HOST_CONFIG = load_host_config()
+STATE_DIR = os.environ.get(
+    "COMPTROL_STATE_DIR",
+    HOST_CONFIG.get("state_dir")
+    or os.path.join(os.path.expanduser("~"), ".comptrol"),
+)
+LOCAL_DAEMON_URL = os.environ.get(
+    "COMPTROL_DAEMON_URL",
+    HOST_CONFIG.get("daemon_url") or "http://127.0.0.1:7317",
+)
+BRIDGE_TOKEN_PATH = os.path.join(STATE_DIR, "browser-bridge.token")
 PROTOCOL_VERSION = "comptrol.browser.bridge/0.1.0"
 NATIVE_HOST_ID = "comptrol_browser_bridge"
 POLL_INTERVAL_MS = 200
@@ -64,14 +87,29 @@ def write_message(message):
         sys.stdout.buffer.flush()
 
 
+def load_bridge_token():
+    try:
+        with open(BRIDGE_TOKEN_PATH, "r", encoding="utf-8") as token_file:
+            token = token_file.read().strip()
+        if len(token) >= 64 and all(ch in "0123456789abcdefABCDEF" for ch in token):
+            return token
+    except OSError:
+        pass
+    return None
+
+
 def daemon_post(endpoint, params=None):
-    """POST to daemon HTTP endpoint."""
+    """POST to authenticated daemon Browser Bridge endpoint."""
     url = f"{LOCAL_DAEMON_URL}{endpoint}"
     data = json.dumps(params or {}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    token = load_bridge_token()
+    if token:
+        headers["X-Comptrol-Bridge-Token"] = token
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
