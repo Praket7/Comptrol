@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import shutil
+import secrets
 import sys
 try:
     import winreg
@@ -80,6 +81,35 @@ def main():
     if not os.path.exists(host_path):
         print(f"Error: native_host.py not found at {host_path}", file=sys.stderr)
         sys.exit(1)
+
+    state_dir = os.environ.get(
+        "COMPTROL_STATE_DIR",
+        os.path.join(os.path.expanduser("~"), ".comptrol"),
+    )
+    os.makedirs(state_dir, exist_ok=True)
+    token_path = os.path.join(state_dir, "browser-bridge.token")
+    if not os.path.exists(token_path):
+        with open(token_path, "x", encoding="utf-8") as token_file:
+            token_file.write(secrets.token_hex(32) + "\n")
+        try:
+            os.chmod(token_path, 0o600)
+        except OSError:
+            pass
+
+    config_path = os.path.join(os.path.dirname(host_path), "native_host_config.json")
+    with open(config_path, "w", encoding="utf-8") as config_file:
+        json.dump(
+            {
+                "state_dir": os.path.abspath(state_dir),
+                "daemon_url": os.environ.get(
+                    "COMPTROL_DAEMON_URL",
+                    "http://127.0.0.1:7317",
+                ),
+            },
+            config_file,
+            indent=2,
+        )
+        config_file.write("\n")
 
     manifest_host_path = host_path
     if platform.system() == "Windows":
