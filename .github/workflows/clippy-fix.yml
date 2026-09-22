@@ -21,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Patch strict-clippy blockers
+      - name: Patch strict-clippy and bridge readiness blockers
         shell: bash
         run: |
           set -euo pipefail
@@ -44,6 +44,13 @@ jobs:
           if old not in text and new not in text:
               raise SystemExit('E2E child binding pattern not found')
           text = text.replace(old, new, 1)
+
+          old = '        if TcpStream::connect(("127.0.0.1", port)).is_ok() {\n            return Daemon { child, port };\n        }\n'
+          new = '        if TcpStream::connect(("127.0.0.1", port)).is_ok()\n            && state_dir.join("browser-bridge.token").is_file()\n        {\n            return Daemon { child, port };\n        }\n'
+          if old not in text and new not in text:
+              raise SystemExit('E2E readiness pattern not found')
+          text = text.replace(old, new, 1)
+
           old = '    panic!("Comptrol HTTP daemon did not become ready");\n'
           new = '    let _ = child.kill();\n    let _ = child.wait();\n    panic!("Comptrol HTTP daemon did not become ready");\n'
           if old not in text and new not in text:
@@ -64,5 +71,5 @@ jobs:
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m "fix: close strict clippy blockers"
+          git commit -m "fix: close strict clippy and bridge E2E blockers"
           git push origin HEAD:codex/browser-bridge-release-hardening
