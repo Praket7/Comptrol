@@ -16,7 +16,7 @@ New in this branch: persistent consent broker with human-action waits (`awaiting
 
 Computer control becomes unsafe when delivery is confused with effect. Comptrol keeps those states separate. A request may be refused. A dispatch may be accepted without a verified effect. A repeated request with the same identity must not repeat a mutation.
 
-The normal MCP surface has six tools.
+The normal MCP surface has seven tools.
 
 1. Operate runs one bounded intent
 2. Inspect reads current state
@@ -24,6 +24,9 @@ The normal MCP surface has six tools.
 4. Reconcile resolves durable unknown state without repeating a mutation
 5. Restore checkpoint returns a local sandbox to a saved state
 6. Capabilities reports only usable routes
+7. Human action resolve records a user's decision after they respond to a native prompt
+
+For ChatGPT web, follow [`plugins/comptrol/CHATGPT_SETUP.md`](plugins/comptrol/CHATGPT_SETUP.md) to connect this local stdio server through OpenAI Secure MCP Tunnel. This is separate from Codex's local stdio integration.
 
 ## Local privacy
 
