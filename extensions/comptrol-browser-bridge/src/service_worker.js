@@ -16,6 +16,9 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 let nativePort = null;
 let reconnectAttempts = 0;
 let isConnected = false;
+let reconnectTimer = null;
+let connectPromise = null;
+let listenersRegistered = false;
 
 // Debugger attachment state
 const attachedTargets = new Map(); // targetId -> { tabId, debuggerPort, generation }
@@ -28,63 +31,72 @@ const GROUP_OBSERVE_ALARM = "comptrol-observe-groups";
  * Establish native messaging connection to Comptrol daemon
  */
 async function connectNative() {
-  return new Promise((resolve, reject) => {
+  if (nativePort && isConnected) return;
+  if (connectPromise) return connectPromise;
+
+  connectPromise = new Promise((resolve, reject) => {
     try {
       const port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
       nativePort = port;
-      
+
       port.onMessage.addListener(handleNativeMessage);
-      
       port.onDisconnect.addListener(() => {
-        console.log("Native messaging disconnected");
-        nativePort = null;
+        if (nativePort === port) nativePort = null;
         isConnected = false;
+        console.log("Native messaging disconnected");
         scheduleReconnect();
       });
-      
-      // Send handshake
+
+      const timeout = setTimeout(() => {
+        if (!isConnected) {
+          try { port.disconnect(); } catch {}
+          reject(new Error("Handshake timeout"));
+        }
+      }, 5000);
+
+      const listener = msg => {
+        if (msg.type !== "handshake_ack") return;
+        clearTimeout(timeout);
+        port.onMessage.removeListener(listener);
+        isConnected = true;
+        reconnectAttempts = 0;
+        resolve();
+      };
+      port.onMessage.addListener(listener);
       port.postMessage({
         type: "handshake",
         protocol: PROTOCOL_VERSION,
         timestamp: Date.now()
       });
-      
-      // Wait for handshake response
-      const timeout = setTimeout(() => {
-        reject(new Error("Handshake timeout"));
-      }, 5000);
-      
-      port.onMessage.addListener(function listener(msg) {
-        if (msg.type === "handshake_ack") {
-          clearTimeout(timeout);
-          port.onMessage.removeListener(listener);
-          isConnected = true;
-          reconnectAttempts = 0;
-          resolve();
-        }
-      });
-      
     } catch (error) {
       reject(error);
     }
   });
+
+  try {
+    await connectPromise;
+  } finally {
+    connectPromise = null;
+  }
 }
 
 /**
  * Schedule reconnection with exponential backoff
  */
 function scheduleReconnect() {
-  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    console.error("Max reconnect attempts reached");
+  if (isConnected || reconnectTimer || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      console.error("Max reconnect attempts reached");
+    }
     return;
   }
-  
+
   const delay = RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempts);
   reconnectAttempts++;
-  
-  setTimeout(() => {
-    connectNative().catch(err => {
-      console.error("Reconnect failed:", err);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectNative().catch(error => {
+      console.error("Reconnect failed:", error);
       scheduleReconnect();
     });
   }, delay);
@@ -397,21 +409,46 @@ async function handleHistory(message) {
     const targetId = String(message.targetId);
     const tabId = Number(targetId);
     if (!Number.isInteger(tabId)) throw new Error("Invalid target ID");
-    const before = await chrome.tabs.get(tabId);
-    if (message.forward) await chrome.tabs.goForward(tabId);
-    else await chrome.tabs.goBack(tabId);
-    const after = await waitForTabUpdate(
-      tabId,
-      tab => (tab.url || "") !== (before.url || "") || tab.status === "complete",
-      5000
+    if (!attachedTargets.has(targetId)) {
+      const attached = await attachDebugger(targetId);
+      if (!attached.ok) throw new Error(attached.error || "debugger attach failed");
+    }
+    const before = await chrome.debugger.sendCommand(
+      { tabId },
+      "Page.getNavigationHistory",
+      {}
     );
+    const currentIndex = Number(before.currentIndex);
+    const destinationIndex = message.forward ? currentIndex + 1 : currentIndex - 1;
+    const destination = before.entries?.[destinationIndex];
+    if (!destination) throw new Error(message.forward ? "No forward history" : "No back history");
+    await chrome.debugger.sendCommand(
+      { tabId },
+      "Page.navigateToHistoryEntry",
+      { entryId: destination.id }
+    );
+    const deadline = Date.now() + 5000;
+    let observed;
+    while (Date.now() < deadline) {
+      observed = await chrome.debugger.sendCommand(
+        { tabId },
+        "Page.getNavigationHistory",
+        {}
+      );
+      if (Number(observed.currentIndex) === destinationIndex) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    if (Number(observed?.currentIndex) !== destinationIndex) {
+      throw new Error("Browser did not confirm history navigation");
+    }
     sendToNative({
       type: "history_result",
       requestId: message.requestId,
       ok: true,
       result: {
         direction: message.forward ? "forward" : "back",
-        url: after.url || "",
+        entry: destination,
+        current_index: destinationIndex,
         verified: true,
         mouse: "untouched",
         clipboard: "untouched"
@@ -553,7 +590,6 @@ async function observeOpenGroups() {
  * Initialize extension
  */
 async function initialize() {
-  // Connect to native host
   try {
     await connectNative();
     console.log("Connected to Comptrol daemon");
@@ -561,38 +597,32 @@ async function initialize() {
     console.error("Failed to connect to daemon:", error);
     scheduleReconnect();
   }
-  
-  // Register debugger listeners once for the service worker lifetime.
-  chrome.debugger.onEvent.addListener(handleDebuggerEvent);
-  chrome.debugger.onDetach.addListener(handleDebuggerDetach);
 
-  // Set up alarms
   chrome.alarms.create(HEALTH_CHECK_ALARM, { periodInMinutes: 1 });
   chrome.alarms.create(GROUP_OBSERVE_ALARM, { periodInMinutes: 1 });
-  
-  // Set up alarm listeners
-  chrome.alarms.onAlarm.addListener(async (alarm) => {
-    if (alarm.name === HEALTH_CHECK_ALARM) {
-      // Health check - verify native connection
-      if (!isConnected) {
-        scheduleReconnect();
+
+  if (!listenersRegistered) {
+    listenersRegistered = true;
+    chrome.debugger.onEvent.addListener(handleDebuggerEvent);
+    chrome.debugger.onDetach.addListener(handleDebuggerDetach);
+
+    chrome.alarms.onAlarm.addListener(async alarm => {
+      if (alarm.name === HEALTH_CHECK_ALARM) {
+        if (!isConnected) scheduleReconnect();
+        await sendTargetsToNative();
+      } else if (alarm.name === GROUP_OBSERVE_ALARM) {
+        await observeOpenGroups();
       }
-      // Send targets periodically
-      await sendTargetsToNative();
-    } else if (alarm.name === GROUP_OBSERVE_ALARM) {
-      await observeOpenGroups();
-    }
-  });
-  
-  // Set up tab/group listeners for real-time updates
-  chrome.tabs.onCreated.addListener(() => sendTargetsToNative());
-  chrome.tabs.onRemoved.addListener(() => sendTargetsToNative());
-  chrome.tabs.onUpdated.addListener(() => sendTargetsToNative());
-  chrome.tabGroups.onCreated.addListener(() => observeOpenGroups());
-  chrome.tabGroups.onUpdated.addListener(() => observeOpenGroups());
-  chrome.tabGroups.onRemoved.addListener(() => observeOpenGroups());
-  
-  // Initial observation
+    });
+
+    chrome.tabs.onCreated.addListener(() => sendTargetsToNative());
+    chrome.tabs.onRemoved.addListener(() => sendTargetsToNative());
+    chrome.tabs.onUpdated.addListener(() => sendTargetsToNative());
+    chrome.tabGroups.onCreated.addListener(() => observeOpenGroups());
+    chrome.tabGroups.onUpdated.addListener(() => observeOpenGroups());
+    chrome.tabGroups.onRemoved.addListener(() => observeOpenGroups());
+  }
+
   await observeOpenGroups();
   await sendTargetsToNative();
 }
