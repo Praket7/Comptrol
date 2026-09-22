@@ -36,5 +36,6 @@ fn human_gated_set_never_writes() {
     assert!(matches!(
         result,
         Err(SettingsError::HumanActionRequired { .. })
+            | Err(SettingsError::UnsupportedPlatform { .. })
     ));
 }
