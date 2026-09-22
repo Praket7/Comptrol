@@ -77,7 +77,7 @@ The runtime refuses unsupported routes. It does not pretend that a platform back
 
 Basic observation and the policy core are implemented and tested.
 
-The macOS observer can use the public System Events accessibility surface when permission is available. Exact application launch is available through LaunchServices with process verification on macOS. Windows UI Automation and Linux AT SPI semantic routes are implemented behind persistent platform workers with the same semantic matching contract, while live acceptance on physical Windows and Linux hosts is still pending. Other platforms use best effort process observation.
+The macOS observer can use the public System Events accessibility surface when permission is available. Exact macOS application and resource launch uses LaunchServices for `.app` bundles; because `open` is a helper process, that route reports delivery without falsely claiming destination-process verification. Direct executable routes can verify the destination PID. Windows UI Automation and Linux AT SPI semantic routes are implemented behind persistent platform workers with the same semantic matching contract, while live acceptance on physical Windows and Linux hosts is still pending. Other platforms use best effort process observation.
 
 The runtime includes bounded event history, file checkpoints, fixture trace replay, exact browser target discovery, and a loopback diagnostics dashboard.
 
