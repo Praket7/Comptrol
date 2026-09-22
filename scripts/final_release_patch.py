@@ -11,3 +11,5 @@ elif new not in text:
     raise SystemExit("Windows accessibility permission route pattern not found")
 path.write_text(text, encoding="utf-8")
 print("Removed undocumented Windows accessibility settings URI")
+
+# This file is intentionally deleted by the guarded workflow after success.
