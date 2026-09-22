@@ -1,4 +1,6 @@
+use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use sha2::Sha256;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -10,6 +12,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const COMPANION_BRIDGE_ENDPOINT: &str = "comptrol+bridge://local";
+pub const BRIDGE_PROTOCOL_VERSION: &str = "comptrol.browser.bridge/0.1.0";
 pub const DEFAULT_HEALTH_MAX_AGE: Duration = Duration::from_secs(15);
 const BRIDGE_TOKEN_FILE: &str = "browser-bridge.token";
 const COMMAND_CAPACITY: i64 = 256;
@@ -121,6 +124,26 @@ pub fn auth_token(state_dir: &Path) -> io::Result<Option<String>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+pub fn challenge_proof(state_dir: &Path, nonce: &str) -> io::Result<String> {
+    if nonce.len() < 32
+        || nonce.len() > 256
+        || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "browser bridge challenge nonce must be 32-256 hexadecimal characters",
+        ));
+    }
+    let token = ensure_auth_token(state_dir)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes())
+        .map_err(|error| io::Error::other(format!("initialize browser bridge HMAC: {error}")))?;
+    mac.update(BRIDGE_PROTOCOL_VERSION.as_bytes());
+    mac.update(b"\0");
+    mac.update(nonce.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 impl BridgeStore {
