@@ -24,7 +24,7 @@ use comptrol_workflow::{Workflow, WorkflowExecutor, WorkflowNode};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -487,6 +487,8 @@ pub struct RoutePlan {
     pub rationale: String,
 }
 
+const ROUTE_LATENCY_SAMPLE_CAP: usize = 256;
+
 #[derive(Clone, Debug, Default)]
 struct RouteHistory {
     attempts: u64,
@@ -495,9 +497,7 @@ struct RouteHistory {
     dispatch_failures: u64,
     disturbance_events: u64,
     ewma_latency_ms: Option<f64>,
-    // Note: this is a running maximum latency, not a true p95 quantile.
-    // A true p95 would require storing all samples. The running max is
-    // more conservative (always >= p95) and suitable for routing decisions.
+    latency_samples_ms: VecDeque<f64>,
     p95_latency_ms: Option<f64>,
     last_success_at_ms: Option<u128>,
 }
@@ -510,6 +510,24 @@ impl RouteHistory {
             (self.verified_successes as f64 / self.attempts as f64).clamp(0.0, 1.0)
         }
     }
+
+    fn record_latency(&mut self, latency_ms: f64) {
+        self.latency_samples_ms.push_back(latency_ms);
+        while self.latency_samples_ms.len() > ROUTE_LATENCY_SAMPLE_CAP {
+            self.latency_samples_ms.pop_front();
+        }
+        self.p95_latency_ms = percentile_95(&self.latency_samples_ms);
+    }
+}
+
+fn percentile_95(samples: &VecDeque<f64>) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+    sorted.sort_by(f64::total_cmp);
+    let nearest_rank = ((sorted.len() as f64) * 0.95).ceil() as usize;
+    sorted.get(nearest_rank.saturating_sub(1)).copied()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1171,7 +1189,14 @@ impl Runtime {
                    ewma_latency_ms REAL,
                    p95_latency_ms REAL,
                    last_success_at_ms INTEGER
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS route_latency_samples (
+                   sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   route_key TEXT NOT NULL,
+                   latency_ms REAL NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS route_latency_samples_route
+                   ON route_latency_samples(route_key, sample_id);",
             )
             .map_err(|error| io::Error::other(format!("route stats schema: {error}")))?;
         for column in [
@@ -1200,6 +1225,7 @@ impl Runtime {
                             dispatch_failures: row.get::<_, i64>(4)?.max(0) as u64,
                             disturbance_events: row.get::<_, i64>(5)?.max(0) as u64,
                             ewma_latency_ms: row.get(6)?,
+                            latency_samples_ms: VecDeque::new(),
                             p95_latency_ms: row.get(7)?,
                             last_success_at_ms: row
                                 .get::<_, Option<i64>>(8)?
@@ -1212,6 +1238,34 @@ impl Runtime {
                 let (route, stats) =
                     row.map_err(|error| io::Error::other(format!("route stats row: {error}")))?;
                 route_history.insert(route, stats);
+            }
+        }
+        {
+            let mut statement = route_stats_db
+                .prepare(
+                    "SELECT route_key, latency_ms
+                     FROM route_latency_samples
+                     ORDER BY route_key ASC, sample_id ASC",
+                )
+                .map_err(|error| io::Error::other(format!("route latency samples read: {error}")))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })
+                .map_err(|error| io::Error::other(format!("route latency samples rows: {error}")))?;
+            for row in rows {
+                let (route, latency_ms) = row
+                    .map_err(|error| io::Error::other(format!("route latency sample row: {error}")))?;
+                let stats = route_history.entry(route).or_default();
+                stats.latency_samples_ms.push_back(latency_ms);
+                while stats.latency_samples_ms.len() > ROUTE_LATENCY_SAMPLE_CAP {
+                    stats.latency_samples_ms.pop_front();
+                }
+            }
+            for stats in route_history.values_mut() {
+                if !stats.latency_samples_ms.is_empty() {
+                    stats.p95_latency_ms = percentile_95(&stats.latency_samples_ms);
+                }
             }
         }
         let mut idempotent = HashMap::new();
@@ -1546,11 +1600,23 @@ impl Runtime {
             Some(previous) => (previous * 0.8) + (latency_ms * 0.2),
             None => latency_ms,
         });
-        // Running maximum (not true p95 quantile - see field doc comment).
-        entry.p95_latency_ms = Some(match entry.p95_latency_ms {
-            Some(previous) => previous.max(latency_ms),
-            None => latency_ms,
-        });
+        entry.record_latency(latency_ms);
+        let _ = self.route_stats_db.execute(
+            "INSERT INTO route_latency_samples(route_key, latency_ms) VALUES (?1, ?2)",
+            params![result.route, latency_ms],
+        );
+        let _ = self.route_stats_db.execute(
+            "DELETE FROM route_latency_samples
+             WHERE route_key = ?1
+               AND sample_id NOT IN (
+                 SELECT sample_id
+                 FROM route_latency_samples
+                 WHERE route_key = ?1
+                 ORDER BY sample_id DESC
+                 LIMIT 256
+               )",
+            params![result.route],
+        );
         let _ = self.route_stats_db.execute(
             "INSERT INTO route_stats(route_key, attempts, verified_successes, verification_failures, dispatch_failures, disturbance_events, ewma_latency_ms, p95_latency_ms, last_success_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -8792,6 +8858,22 @@ mod tests {
     use std::time::Duration;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn route_p95_uses_nearest_rank_percentile() {
+        let samples = (1..=20).map(|value| value as f64).collect::<VecDeque<_>>();
+        assert_eq!(percentile_95(&samples), Some(19.0));
+    }
+
+    #[test]
+    fn route_latency_samples_are_bounded() {
+        let mut history = RouteHistory::default();
+        for value in 0..(ROUTE_LATENCY_SAMPLE_CAP + 10) {
+            history.record_latency(value as f64);
+        }
+        assert_eq!(history.latency_samples_ms.len(), ROUTE_LATENCY_SAMPLE_CAP);
+        assert!(history.p95_latency_ms.is_some());
+    }
 
     fn runtime() -> Runtime {
         let suffix = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
