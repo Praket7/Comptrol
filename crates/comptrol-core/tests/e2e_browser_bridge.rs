@@ -43,7 +43,7 @@ fn free_port() -> u16 {
 fn start_daemon(state_dir: &PathBuf) -> Daemon {
     let port = free_port();
     let binary = env!("CARGO_BIN_EXE_comptrol");
-    let child = Command::new(binary)
+    let mut child = Command::new(binary)
         .args(["serve-http", &port.to_string()])
         .env("COMPTROL_STATE_DIR", state_dir)
         .stdout(Stdio::null())
@@ -52,11 +52,15 @@ fn start_daemon(state_dir: &PathBuf) -> Daemon {
         .expect("spawn Comptrol HTTP daemon");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && state_dir.join("browser-bridge.token").is_file()
+        {
             return Daemon { child, port };
         }
         thread::sleep(Duration::from_millis(25));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("Comptrol HTTP daemon did not become ready");
 }
 
