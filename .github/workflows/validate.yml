@@ -24,6 +24,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release
+      - name: Browser Bridge native messaging conformance
+        run: python scripts/browser_bridge_conformance.py
       - name: Windows real Chrome CDP conformance
         if: runner.os == 'Windows'
         run: python scripts/windows_chrome_conformance.py
