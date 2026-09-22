@@ -2599,6 +2599,44 @@ fn handle_http<S: HttpStream>(
         }
     }
     // ── Browser Bridge HTTP API (native messaging host → daemon) ──────────
+    let bridge_request = request_line
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|path| path.starts_with("/browser/"));
+    if bridge_request {
+        let expected_token = match comptrol::browser_bridge::ensure_auth_token(&default_state_dir()) {
+            Ok(token) => token,
+            Err(error) => {
+                return write_http_response(
+                    stream,
+                    500,
+                    "Internal Server Error",
+                    "application/json",
+                    serde_json::to_vec(&json!({
+                        "ok": false,
+                        "error": "browser_bridge_auth_unavailable",
+                        "message": error.to_string()
+                    }))
+                    .unwrap_or_default(),
+                    None,
+                );
+            }
+        };
+        if header_value("X-Comptrol-Bridge-Token") != Some(expected_token.as_str()) {
+            return write_http_response(
+                stream,
+                403,
+                "Forbidden",
+                "application/json",
+                serde_json::to_vec(&json!({
+                    "ok": false,
+                    "error": "browser_bridge_auth_required"
+                }))
+                .unwrap_or_default(),
+                None,
+            );
+        }
+    }
     if request_line.starts_with("POST /browser/targets ") {
         let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
         if cdp_endpoint.is_empty() {
