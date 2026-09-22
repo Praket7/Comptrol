@@ -49,45 +49,54 @@ pub struct WindowsProvider;
 impl SettingProvider for WindowsProvider {
     fn supports(&self, key: &SettingKey) -> bool {
         // Windows has no programmatic read or write surfaces wired in this
-        // build. All operations return UnsupportedPlatform/WriteRefused.
-        // Only human_surface() is available for opening the Settings page.
+        // build. Human surfaces are reported independently in capabilities().
         let _ = key;
         false
     }
 
     fn capabilities(&self, key: &SettingKey) -> SettingCapabilities {
-        let _ = key;
+        let human_surface_available = matches!(
+            key,
+            SettingKey::BluetoothEnabled
+                | SettingKey::AudioOutputDevice
+                | SettingKey::DisplayBrightness
+                | SettingKey::NotificationsAppEnabled { .. }
+                | SettingKey::DefaultBrowser
+                | SettingKey::PrivacyMicrophoneAppStatus { .. }
+        );
         SettingCapabilities {
             readable: false,
             writable: false,
-            human_surface_available: true,
+            human_surface_available,
             readback_verifiable: false,
         }
     }
 
     fn human_surface(&self, key: &SettingKey) -> String {
         match key {
-            SettingKey::AccessibilityComptrolStatus => {
-                "ms-settings:privacy-accessibility".to_owned()
-            }
             SettingKey::BluetoothEnabled => "ms-settings:bluetooth".to_owned(),
-            _ => "ms-settings:apps-defaults".to_owned(),
+            SettingKey::AudioOutputDevice => "ms-settings:sound".to_owned(),
+            SettingKey::DisplayBrightness => "ms-settings:display".to_owned(),
+            SettingKey::NotificationsAppEnabled { .. } => "ms-settings:notifications".to_owned(),
+            SettingKey::DefaultBrowser => "ms-settings:defaultapps".to_owned(),
+            SettingKey::PrivacyMicrophoneAppStatus { .. } => {
+                "ms-settings:privacy-microphone".to_owned()
+            }
+            SettingKey::AccessibilityComptrolStatus => String::new(),
         }
     }
 
     fn read(&self, key: &SettingKey) -> Result<SettingObservation, SettingsError> {
         Err(SettingsError::UnsupportedPlatform {
             key: key.name(),
-            reason: "Windows programmatic read for this setting is not wired in this build; use the ms-settings: surface".to_owned(),
+            reason: "Windows programmatic read for this setting is not wired in this build; use a documented Settings surface when one is available".to_owned(),
         })
     }
 
     fn write(&self, key: &SettingKey, _value: &SettingValue) -> Result<(), SettingsError> {
-        // Security-sensitive registry values are never written directly even
-        // when they exist. UI-gated settings go through human_surface.
         Err(SettingsError::WriteRefused {
             key: key.name(),
-            reason: "no official programmatic write surface is wired for this setting; open the exact Settings page for the user".to_owned(),
+            reason: "no official programmatic write surface is wired for this setting; use a documented Settings page when available".to_owned(),
         })
     }
 }
@@ -106,8 +115,7 @@ impl SettingProvider for MacosProvider {
     fn capabilities(&self, key: &SettingKey) -> SettingCapabilities {
         let human_surface_available = matches!(
             key,
-            SettingKey::DefaultBrowser
-                | SettingKey::BluetoothEnabled
+            SettingKey::BluetoothEnabled
                 | SettingKey::AccessibilityComptrolStatus
                 | SettingKey::PrivacyMicrophoneAppStatus { .. }
         );
@@ -132,8 +140,7 @@ impl SettingProvider for MacosProvider {
             SettingKey::BluetoothEnabled => {
                 "x-apple.systempreferences:com.apple.preference.bluetooth".to_owned()
             }
-            SettingKey::DefaultBrowser => "x-apple.systempreferences:".to_owned(),
-            _ => "x-apple.systempreferences:".to_owned(),
+            _ => String::new(),
         }
     }
 
@@ -148,7 +155,6 @@ impl SettingProvider for MacosProvider {
     }
 
     fn write(&self, key: &SettingKey, _value: &SettingValue) -> Result<(), SettingsError> {
-        // The TCC database and private LaunchServices preference files are never written.
         Err(SettingsError::WriteRefused {
             key: key.name(),
             reason: "macOS writes go through supported prompts and System Settings with the user; direct private-preference writes are refused".to_owned(),
@@ -178,19 +184,23 @@ impl SettingProvider for LinuxProvider {
             SettingKey::DefaultBrowser => SettingCapabilities {
                 readable: true,
                 writable: false,
-                human_surface_available: true,
+                human_surface_available: false,
                 readback_verifiable: true,
             },
-            SettingKey::DisplayBrightness => SettingCapabilities {
+            SettingKey::BluetoothEnabled
+            | SettingKey::AudioOutputDevice
+            | SettingKey::DisplayBrightness
+            | SettingKey::NotificationsAppEnabled { .. } => SettingCapabilities {
                 readable: false,
                 writable: false,
                 human_surface_available: true,
                 readback_verifiable: false,
             },
-            _ => SettingCapabilities {
+            SettingKey::AccessibilityComptrolStatus
+            | SettingKey::PrivacyMicrophoneAppStatus { .. } => SettingCapabilities {
                 readable: false,
                 writable: false,
-                human_surface_available: true,
+                human_surface_available: false,
                 readback_verifiable: false,
             },
         }
@@ -199,9 +209,12 @@ impl SettingProvider for LinuxProvider {
     fn human_surface(&self, key: &SettingKey) -> String {
         match key {
             SettingKey::BluetoothEnabled => "gnome-control-center bluetooth".to_owned(),
+            SettingKey::AudioOutputDevice => "gnome-control-center sound".to_owned(),
             SettingKey::DisplayBrightness => "gnome-control-center display".to_owned(),
-            SettingKey::DefaultBrowser => "xdg-settings get default-web-browser".to_owned(),
-            _ => "gnome-control-center".to_owned(),
+            SettingKey::NotificationsAppEnabled { .. } => {
+                "gnome-control-center notifications".to_owned()
+            }
+            _ => String::new(),
         }
     }
 
@@ -243,7 +256,7 @@ impl SettingProvider for LinuxProvider {
             key: key.name(),
             reason: match key {
                 SettingKey::DisplayBrightness => "no exact panel/backlight identity is present in this setting request, so writing a sysfs backlight or dimming-policy key would be ambiguous".to_owned(),
-                _ => "no stable documented write surface is wired for this setting on this desktop; use the Settings UI route".to_owned(),
+                _ => "no stable documented write surface is wired for this setting on this desktop; use an exact Settings UI route when one is available".to_owned(),
             },
         })
     }
