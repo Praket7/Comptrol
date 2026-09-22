@@ -1,7 +1,7 @@
 {
   "task_id": "v5.adapter_matrix",
   "benchmark_suite": "adapter",
-  "goal": "Verify all 14 adapters respond to handshake, capabilities, and describe-class commands via the public MCP interface.",
+  "goal": "Benchmark representative first-party adapter runtime routes after the separate V5 runtime-catalog gate verifies all 14 shipped adapters.",
   "timeout_ms": 60000,
   "initial_state": "fresh Comptrol state directory",
   "required_capabilities": [
@@ -10,7 +10,7 @@
   "tasks": [
     {
       "task_id": "v5.adapter.vscode_workspace_list",
-      "goal": "List VS Code workspaces via the adapter.",
+      "goal": "Exercise the VS Code read-only workspace route or verify an honest route_unavailable response when no live bridge is configured.",
       "iterations": 2,
       "verifier": "route_available_or_unavailable",
       "steps": [
@@ -28,7 +28,7 @@
     },
     {
       "task_id": "v5.adapter.resolve_video_timeline_list",
-      "goal": "List DaVinci Resolve video timelines via the adapter.",
+      "goal": "Exercise the DaVinci Resolve read-only timeline route or verify an honest route_unavailable response when Resolve is not configured.",
       "iterations": 2,
       "verifier": "route_available_or_unavailable",
       "steps": [
@@ -60,5 +60,5 @@
       ]
     }
   ],
-  "final_verifier": "all task verifiers pass"
+  "final_verifier": "all representative route verifiers pass; scripts/v5_adapter_catalog.py separately verifies all 14 runtime adapter descriptors"
 }
