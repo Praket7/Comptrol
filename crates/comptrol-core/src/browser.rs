@@ -294,7 +294,10 @@ pub fn ensure_state(
     // navigate verification criteria so a skipped navigation proves the
     // same postcondition a performed one would have.
     let url_satisfied = match (url, url_contains) {
-        (Some(expected), _) => current_url == expected,
+        (Some(expected), Some(fragment)) => {
+            current_url == expected || current_url.contains(fragment)
+        }
+        (Some(expected), None) => current_url == expected,
         (None, Some(fragment)) => current_url.contains(fragment),
         (None, None) => true,
     };
@@ -1288,8 +1291,24 @@ pub fn semantic_click(
             const locator = {locator_json};
             const deadline = performance.now() + {timeout_ms};
             const normalize = value => String(value || '').replace(/\\s+/g, ' ').trim();
+            const labelledByText = element => normalize(
+                (element.getAttribute('aria-labelledby') || '')
+                    .split(/\s+/).filter(Boolean)
+                    .map(id => element.ownerDocument.getElementById(id))
+                    .filter(Boolean)
+                    .map(node => node.innerText || node.textContent || '')
+                    .join(' ')
+            );
+            const labelsText = element => normalize(
+                element.labels
+                    ? [...element.labels].map(label => label.innerText || label.textContent || '').join(' ')
+                    : ''
+            );
             const nameOf = element => normalize(
                 element.getAttribute('aria-label') ||
+                labelledByText(element) ||
+                labelsText(element) ||
+                element.getAttribute('placeholder') ||
                 element.getAttribute('title') ||
                 element.innerText ||
                 element.textContent
@@ -1437,6 +1456,338 @@ pub fn semantic_click(
         code: "stale_reference".to_owned(),
         message: "The browser target changed during semantic click".to_owned(),
         recovery: Some("Inspect browser targets and retry once".to_owned()),
+    }))
+}
+
+pub fn semantic_fill(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: Option<&str>,
+    locator: &Value,
+    value: &str,
+    timeout_ms: u64,
+) -> Result<Value, ComptrolError> {
+    comptrol_browser::Locator::from_value(locator).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: Some(
+            "Use one supported locator identity and refine ambiguous matches".to_owned(),
+        ),
+    })?;
+    if value.len() > 256 * 1024 {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Semantic fill value exceeds the 256 KiB bound".to_owned(),
+            recovery: None,
+        });
+    }
+    let locator_json = serde_json::to_string(locator).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: None,
+    })?;
+    let value_json = serde_json::to_string(value).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: None,
+    })?;
+    let timeout_ms = timeout_ms.clamp(100, 30_000);
+    let expression = format!(
+        r#"(async () => {{
+            const locator = {locator_json};
+            const desired = {value_json};
+            const deadline = performance.now() + {timeout_ms};
+            const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+            const labelledByText = element => normalize(
+                (element.getAttribute('aria-labelledby') || '')
+                    .split(/\s+/).filter(Boolean)
+                    .map(id => element.ownerDocument.getElementById(id))
+                    .filter(Boolean)
+                    .map(node => node.innerText || node.textContent || '')
+                    .join(' ')
+            );
+            const labelsText = element => normalize(
+                element.labels
+                    ? [...element.labels].map(label => label.innerText || label.textContent || '').join(' ')
+                    : ''
+            );
+            const nameOf = element => normalize(
+                element.getAttribute('aria-label') ||
+                labelledByText(element) ||
+                labelsText(element) ||
+                element.getAttribute('placeholder') ||
+                element.getAttribute('title') ||
+                element.innerText ||
+                element.textContent
+            );
+            const roleOf = element => element.getAttribute('role') ||
+                (element.tagName === 'TEXTAREA' ? 'textbox' :
+                 element.tagName === 'INPUT' ? 'textbox' :
+                 element.tagName === 'SELECT' ? 'combobox' : '');
+            const roots = () => {{
+                const pending = [document];
+                const seen = [];
+                while (pending.length) {{
+                    const root = pending.shift();
+                    seen.push(root);
+                    for (const element of root.querySelectorAll('*')) {{
+                        if (element.shadowRoot) pending.push(element.shadowRoot);
+                        if (element.tagName === 'IFRAME') {{
+                            try {{ if (element.contentDocument) pending.push(element.contentDocument); }} catch (_) {{}}
+                        }}
+                    }}
+                }}
+                return seen;
+            }};
+            const all = selector => roots().flatMap(root => [...root.querySelectorAll(selector)]);
+            const candidates = () => {{
+                let elements;
+                if (locator.selector) {{
+                    elements = all(locator.selector);
+                }} else if (locator.test_id) {{
+                    elements = all('[data-testid], [data-test-id]');
+                }} else {{
+                    elements = all('input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]');
+                }}
+                return elements.filter(element => {{
+                    if (locator.test_id &&
+                        element.getAttribute('data-testid') !== locator.test_id &&
+                        element.getAttribute('data-test-id') !== locator.test_id) return false;
+                    if (locator.role && roleOf(element) !== locator.role) return false;
+                    if (locator.name && nameOf(element) !== normalize(locator.name)) return false;
+                    if (locator.text && !normalize(element.innerText || element.textContent).includes(normalize(locator.text))) return false;
+                    if (locator.href_contains && !(element.href || '').includes(locator.href_contains)) return false;
+                    return true;
+                }});
+            }};
+            const actionable = element => {{
+                if (!element.isConnected || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+                if (element.readOnly) return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+            }};
+            const stable = async element => {{
+                const first = element.getBoundingClientRect();
+                await new Promise(requestAnimationFrame);
+                const second = element.getBoundingClientRect();
+                return first.left === second.left && first.top === second.top &&
+                    first.width === second.width && first.height === second.height;
+            }};
+            const setNativeValue = (element, next) => {{
+                if (element instanceof HTMLSelectElement) {{
+                    element.value = next;
+                }} else if ('value' in element) {{
+                    const proto = element instanceof HTMLTextAreaElement
+                        ? HTMLTextAreaElement.prototype
+                        : HTMLInputElement.prototype;
+                    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (descriptor && descriptor.set) descriptor.set.call(element, next);
+                    else element.value = next;
+                }} else if (element.isContentEditable) {{
+                    element.textContent = next;
+                }} else {{
+                    throw new Error('target is not editable');
+                }}
+                element.dispatchEvent(new InputEvent('input', {{ bubbles: true, composed: true, inputType: 'insertText', data: null }}));
+                element.dispatchEvent(new Event('change', {{ bubbles: true, composed: true }}));
+            }};
+            const readValue = element => element.isContentEditable
+                ? (element.textContent || '')
+                : String(element.value ?? '');
+            while (performance.now() < deadline) {{
+                const matches = candidates();
+                if (matches.length === 1) {{
+                    const element = matches[0];
+                    element.scrollIntoView({{ block: 'center', inline: 'nearest' }});
+                    if (actionable(element) && await stable(element) && actionable(element)) {{
+                        element.focus();
+                        setNativeValue(element, desired);
+                        await Promise.resolve();
+                        await new Promise(requestAnimationFrame);
+                        const verified = readValue(element) === desired;
+                        return {{
+                            filled: verified,
+                            matches: 1,
+                            role: roleOf(element),
+                            name: nameOf(element),
+                            value_length: desired.length,
+                            verified,
+                            actionability: {{ attached: true, visible: true, stable: true, enabled: true }}
+                        }};
+                    }}
+                }} else if (matches.length > 1) {{
+                    return {{ filled: false, reason: 'ambiguous_locator', matches: matches.length, verified: false }};
+                }}
+                await new Promise(resolve => setTimeout(resolve, 25));
+            }}
+            return {{ filled: false, reason: 'not_actionable', matches: candidates().length, verified: false }};
+        }})()"#
+    );
+    let mut last_error = None;
+    for attempt in 0..=1 {
+        let current_revision = if attempt == 0 { revision } else { None };
+        match cdp_call(
+            endpoint,
+            target_id,
+            Some(browser_context_id),
+            current_revision,
+            "Runtime.evaluate",
+            json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+        ) {
+            Ok(data) => {
+                let result = data
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if result.get("verified").and_then(Value::as_bool) == Some(true) {
+                    return Ok(json!({
+                        "semantic_locator": locator,
+                        "attempts": attempt + 1,
+                        "role": result.get("role").cloned().unwrap_or(Value::Null),
+                        "name": result.get("name").cloned().unwrap_or(Value::Null),
+                        "value_length": result.get("value_length").cloned().unwrap_or(Value::Null),
+                        "actionability": result.get("actionability").cloned().unwrap_or(Value::Null),
+                        "verified": true
+                    }));
+                }
+                return Err(ComptrolError {
+                    code: result
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("verification_failed")
+                        .to_owned(),
+                    message: format!(
+                        "Semantic locator did not resolve to one editable element: {result}"
+                    ),
+                    recovery: Some(
+                        "Inspect compact browser state and refine the locator".to_owned(),
+                    ),
+                });
+            }
+            Err(error) if error.code == "stale_reference" && attempt == 0 => {
+                last_error = Some(error)
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| ComptrolError {
+        code: "stale_reference".to_owned(),
+        message: "The browser target changed during semantic fill".to_owned(),
+        recovery: Some("Inspect browser targets and retry once".to_owned()),
+    }))
+}
+
+pub fn compact_snapshot(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+    limit: usize,
+) -> Result<Value, ComptrolError> {
+    let limit = limit.clamp(1, 160);
+    let expression = format!(
+        r#"(() => {{
+            const limit = {limit};
+            const normalize = value => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+            const roleOf = element => element.getAttribute('role') ||
+                (element.tagName === 'A' ? 'link' :
+                 element.tagName === 'BUTTON' ? 'button' :
+                 element.tagName === 'TEXTAREA' ? 'textbox' :
+                 element.tagName === 'INPUT' ? 'textbox' :
+                 element.tagName === 'SELECT' ? 'combobox' : '');
+            const labelledByText = element => normalize(
+                (element.getAttribute('aria-labelledby') || '')
+                    .split(/\s+/).filter(Boolean)
+                    .map(id => element.ownerDocument.getElementById(id))
+                    .filter(Boolean)
+                    .map(node => node.innerText || node.textContent || '')
+                    .join(' ')
+            );
+            const labelsText = element => normalize(
+                element.labels
+                    ? [...element.labels].map(label => label.innerText || label.textContent || '').join(' ')
+                    : ''
+            );
+            const nameOf = element => normalize(
+                element.getAttribute('aria-label') ||
+                labelledByText(element) ||
+                labelsText(element) ||
+                element.getAttribute('placeholder') ||
+                element.getAttribute('title') ||
+                element.innerText ||
+                element.textContent
+            );
+            const roots = () => {{
+                const pending = [document];
+                const seen = [];
+                while (pending.length) {{
+                    const root = pending.shift();
+                    seen.push(root);
+                    for (const element of root.querySelectorAll('*')) {{
+                        if (element.shadowRoot) pending.push(element.shadowRoot);
+                        if (element.tagName === 'IFRAME') {{
+                            try {{ if (element.contentDocument) pending.push(element.contentDocument); }} catch (_) {{}}
+                        }}
+                    }}
+                }}
+                return seen;
+            }};
+            const candidates = roots().flatMap(root => [...root.querySelectorAll(
+                'button, a, input, select, textarea, [contenteditable="true"], [role], [tabindex]'
+            )]);
+            const visible = candidates.filter(element => {{
+                if (!element.isConnected) return false;
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+            }});
+            const elements = visible.slice(0, limit).map(element => ({{
+                tag: element.tagName.toLowerCase(),
+                role: roleOf(element),
+                name: nameOf(element),
+                type: normalize(element.getAttribute('type')),
+                test_id: normalize(element.getAttribute('data-testid') || element.getAttribute('data-test-id')),
+                id: normalize(element.id),
+                enabled: !(element.disabled || element.getAttribute('aria-disabled') === 'true'),
+                editable: Boolean(element.isContentEditable || element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT'),
+                href_present: Boolean(element.href)
+            }}));
+            return {{
+                title: normalize(document.title),
+                element_count: visible.length,
+                returned: elements.length,
+                truncated: visible.length > elements.length,
+                elements
+            }};
+        }})()"#
+    );
+    let data = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+        "Runtime.evaluate",
+        json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+    )?;
+    let snapshot = data
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "target_id": target_id,
+        "browser_context_id": browser_context_id,
+        "revision": revision,
+        "snapshot": snapshot,
+        "observation": "compact_actionable_state",
+        "typed_values_included": false,
+        "pixels_included": false,
+        "verified": true
     }))
 }
 

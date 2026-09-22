@@ -19,6 +19,11 @@ MACRO_KEYS = {"macro", "macros", "vba", "vba_macro", "run_macro", "execute_macro
 
 PP_FIXED_FORMAT_PDF = 2
 PP_LAYOUT_BLANK = 12
+MAX_BATCH_OPS = 64
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".svg", ".emf", ".wmf"}
+MSO_TEXT_ORIENTATION_HORIZONTAL = 1
+MSO_FALSE = 0
+MSO_TRUE = -1
 
 
 def comtypes_available():
@@ -154,6 +159,59 @@ def check_slide_ref(value, slide_count, field="slide"):
     return value
 
 
+def number_param(payload, key, *, required=False, minimum=None, maximum=None):
+    value = payload.get(key)
+    if value is None and not required:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("%s must be a number" % key)
+    value = float(value)
+    if minimum is not None and value < minimum:
+        raise ValueError("%s must be >= %s" % (key, minimum))
+    if maximum is not None and value > maximum:
+        raise ValueError("%s must be <= %s" % (key, maximum))
+    return value
+
+
+def hex_rgb(value):
+    if not isinstance(value, str):
+        raise ValueError("font_color must be a #RRGGBB string")
+    raw = value.strip().lstrip("#")
+    if len(raw) != 6:
+        raise ValueError("font_color must be a #RRGGBB string")
+    try:
+        red = int(raw[0:2], 16)
+        green = int(raw[2:4], 16)
+        blue = int(raw[4:6], 16)
+    except ValueError:
+        raise ValueError("font_color must be a #RRGGBB string")
+    return red + (green << 8) + (blue << 16)
+
+
+def apply_text_style(shape, payload):
+    try:
+        font = shape.TextFrame.TextRange.Font
+    except Exception as exc:
+        raise ValueError("shape does not expose a text font: %s" % exc)
+    if "font_size" in payload:
+        font.Size = number_param(payload, "font_size", required=True, minimum=1, maximum=400)
+    if "font_name" in payload:
+        name = payload.get("font_name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 100:
+            raise ValueError("font_name must be a non-empty string up to 100 chars")
+        font.Name = name.strip()
+    if "bold" in payload:
+        if not isinstance(payload.get("bold"), bool):
+            raise ValueError("bold must be boolean")
+        font.Bold = MSO_TRUE if payload["bold"] else MSO_FALSE
+    if "italic" in payload:
+        if not isinstance(payload.get("italic"), bool):
+            raise ValueError("italic must be boolean")
+        font.Italic = MSO_TRUE if payload["italic"] else MSO_FALSE
+    if "font_color" in payload:
+        font.Color.RGB = hex_rgb(payload["font_color"])
+
+
 def slide_ids(pres):
     ids = []
     count = int(pres.Slides.Count)
@@ -281,6 +339,36 @@ def do_slide_reorder(app, payload):
     }
 
 
+def do_slide_duplicate(app, payload):
+    bound = bind_presentation(app, payload)
+    if bound is None:
+        raise ValueError("presentation_not_open: provide presentation_path of an open deck or open it first")
+    before = int(bound.Slides.Count)
+    slide_num = check_slide_ref(payload.get("slide"), before)
+    source_id = int(bound.Slides(slide_num).SlideID)
+    duplicated = bound.Slides(slide_num).Duplicate()
+    after = int(bound.Slides.Count)
+    duplicate_id = int(duplicated(1).SlideID)
+    target = payload.get("to")
+    if target is not None:
+        check_slide_ref(target, after, field="to")
+        duplicated(1).MoveTo(target)
+    order_after = slide_ids(bound)
+    verified = after == before + 1 and duplicate_id != source_id and duplicate_id in order_after
+    return {
+        **presentation_state(bound),
+        "slide_count_before": before,
+        "slide_count_after": after,
+        "source_slide_id": source_id,
+        "duplicate_slide_id": duplicate_id,
+        "moved_to": target,
+        "backend": "windows-com",
+        "macros_executed": False,
+        "verified": verified,
+        "verification": "application_state",
+    }
+
+
 def find_shape(slide, selector):
     count = int(slide.Shapes.Count)
     if isinstance(selector, bool):
@@ -323,6 +411,8 @@ def do_shape_text_set(app, payload):
         shape.TextFrame.TextRange.Text = text
     except Exception as exc:
         raise ValueError("shape does not accept text: %s" % exc)
+    if any(key in payload for key in ("font_size", "font_name", "bold", "italic", "font_color")):
+        apply_text_style(shape, payload)
     try:
         readback = str(shape.TextFrame.TextRange.Text)
     except Exception:
@@ -339,6 +429,141 @@ def do_shape_text_set(app, payload):
         "shape": shape_name,
         "text": text,
         "readback": readback,
+        "backend": "windows-com",
+        "macros_executed": False,
+        "verified": verified,
+        "verification": "application_state",
+    }
+
+
+def do_shape_textbox_create(app, payload):
+    bound = bind_presentation(app, payload)
+    if bound is None:
+        raise ValueError("presentation_not_open: provide presentation_path of an open deck or open it first")
+    slide_num = check_slide_ref(payload.get("slide"), int(bound.Slides.Count))
+    left = number_param(payload, "left", required=True, minimum=-10000, maximum=20000)
+    top = number_param(payload, "top", required=True, minimum=-10000, maximum=20000)
+    width = number_param(payload, "width", required=True, minimum=1, maximum=20000)
+    height = number_param(payload, "height", required=True, minimum=1, maximum=20000)
+    text = payload.get("text", "")
+    if not isinstance(text, str) or len(text) > 10000:
+        raise ValueError("text must be a string up to 10000 chars")
+    slide = bound.Slides(slide_num)
+    before = int(slide.Shapes.Count)
+    shape = slide.Shapes.AddTextbox(MSO_TEXT_ORIENTATION_HORIZONTAL, left, top, width, height)
+    shape.TextFrame.TextRange.Text = text
+    name = payload.get("name")
+    if name is not None:
+        if not isinstance(name, str) or not name.strip() or len(name) > 100:
+            raise ValueError("name must be a non-empty string up to 100 chars")
+        shape.Name = name.strip()
+    if any(key in payload for key in ("font_size", "font_name", "bold", "italic", "font_color")):
+        apply_text_style(shape, payload)
+    after = int(slide.Shapes.Count)
+    shape_name = str(shape.Name)
+    verified = after == before + 1 and str(shape.TextFrame.TextRange.Text) == text
+    return {
+        **presentation_state(bound),
+        "slide": slide_num,
+        "shape": shape_name,
+        "shape_count_before": before,
+        "shape_count_after": after,
+        "backend": "windows-com",
+        "macros_executed": False,
+        "verified": verified,
+        "verification": "application_state",
+    }
+
+
+def do_shape_image_insert(app, payload):
+    bound = bind_presentation(app, payload)
+    if bound is None:
+        raise ValueError("presentation_not_open: provide presentation_path of an open deck or open it first")
+    slide_num = check_slide_ref(payload.get("slide"), int(bound.Slides.Count))
+    image_path = scoped_resolve(payload.get("image_path", ""), allowed_exts=IMAGE_EXTS, must_exist=True)
+    left = number_param(payload, "left", required=True, minimum=-10000, maximum=20000)
+    top = number_param(payload, "top", required=True, minimum=-10000, maximum=20000)
+    width = number_param(payload, "width", required=True, minimum=1, maximum=20000)
+    height = number_param(payload, "height", required=True, minimum=1, maximum=20000)
+    slide = bound.Slides(slide_num)
+    before = int(slide.Shapes.Count)
+    shape = slide.Shapes.AddPicture(str(image_path), MSO_FALSE, MSO_TRUE, left, top, width, height)
+    name = payload.get("name")
+    if name is not None:
+        if not isinstance(name, str) or not name.strip() or len(name) > 100:
+            raise ValueError("name must be a non-empty string up to 100 chars")
+        shape.Name = name.strip()
+    after = int(slide.Shapes.Count)
+    verified = after == before + 1
+    return {
+        **presentation_state(bound),
+        "slide": slide_num,
+        "shape": str(shape.Name),
+        "image_path": str(image_path),
+        "shape_count_before": before,
+        "shape_count_after": after,
+        "backend": "windows-com",
+        "macros_executed": False,
+        "verified": verified,
+        "verification": "application_state",
+    }
+
+
+def do_shape_delete(app, payload):
+    bound = bind_presentation(app, payload)
+    if bound is None:
+        raise ValueError("presentation_not_open: provide presentation_path of an open deck or open it first")
+    slide_num = check_slide_ref(payload.get("slide"), int(bound.Slides.Count))
+    slide = bound.Slides(slide_num)
+    before = int(slide.Shapes.Count)
+    shape = find_shape(slide, payload.get("shape"))
+    name = str(shape.Name)
+    shape.Delete()
+    after = int(slide.Shapes.Count)
+    verified = after == before - 1
+    return {
+        **presentation_state(bound),
+        "slide": slide_num,
+        "deleted_shape": name,
+        "shape_count_before": before,
+        "shape_count_after": after,
+        "backend": "windows-com",
+        "macros_executed": False,
+        "verified": verified,
+        "verification": "application_state",
+    }
+
+
+def do_shape_geometry_set(app, payload):
+    bound = bind_presentation(app, payload)
+    if bound is None:
+        raise ValueError("presentation_not_open: provide presentation_path of an open deck or open it first")
+    slide_num = check_slide_ref(payload.get("slide"), int(bound.Slides.Count))
+    shape = find_shape(bound.Slides(slide_num), payload.get("shape"))
+    requested = {}
+    limits = {
+        "left": (-10000, 20000),
+        "top": (-10000, 20000),
+        "width": (1, 20000),
+        "height": (1, 20000),
+        "rotation": (-3600, 3600),
+    }
+    for key, (minimum, maximum) in limits.items():
+        if key in payload:
+            requested[key] = number_param(payload, key, required=True, minimum=minimum, maximum=maximum)
+    if not requested:
+        raise ValueError("shape.geometry.set needs at least one of left, top, width, height, rotation")
+    mapping = {"left": "Left", "top": "Top", "width": "Width", "height": "Height", "rotation": "Rotation"}
+    for key, value in requested.items():
+        setattr(shape, mapping[key], value)
+    observed = {key: float(getattr(shape, mapping[key])) for key in requested}
+    verified = all(abs(observed[key] - requested[key]) <= 0.5 for key in requested)
+    return {
+        **presentation_state(bound),
+        "slide": slide_num,
+        "shape": str(shape.Name),
+        "requested": requested,
+        "observed": observed,
         "backend": "windows-com",
         "macros_executed": False,
         "verified": verified,
@@ -409,6 +634,65 @@ def do_export_pdf(app, payload):
     }
 
 
+def do_batch_edit(app, payload):
+    ops = payload.get("ops")
+    if not isinstance(ops, list) or not 1 <= len(ops) <= MAX_BATCH_OPS:
+        raise ValueError("ops must contain between 1 and %d operations" % MAX_BATCH_OPS)
+    presentation_path = payload.get("presentation_path", payload.get("path"))
+    handlers = {
+        "slide.create": do_slide_create,
+        "slide.delete": do_slide_delete,
+        "slide.reorder": do_slide_reorder,
+        "slide.duplicate": do_slide_duplicate,
+        "shape.text.set": do_shape_text_set,
+        "shape.textbox.create": do_shape_textbox_create,
+        "shape.image.insert": do_shape_image_insert,
+        "shape.delete": do_shape_delete,
+        "shape.geometry.set": do_shape_geometry_set,
+        "save": do_save,
+    }
+    results = []
+    for index, raw in enumerate(ops):
+        if not isinstance(raw, dict):
+            raise ValueError("batch operation %d must be an object" % index)
+        kind = raw.get("op")
+        func = handlers.get(kind)
+        if func is None:
+            raise ValueError("unsupported batch operation: %s" % kind)
+        params = dict(raw)
+        params.pop("op", None)
+        if presentation_path and "presentation_path" not in params and "path" not in params:
+            params["presentation_path"] = presentation_path
+        reject_macro_requests(params)
+        result = func(app, params)
+        if not result.get("verified"):
+            raise ValueError("batch operation %d was not verified" % index)
+        results.append({
+            "index": index,
+            "op": kind,
+            "verified": True,
+            "slide_count": result.get("slide_count"),
+            "slide_count_after": result.get("slide_count_after"),
+            "saved_path": result.get("saved_path"),
+        })
+    bound = bind_presentation(
+        app,
+        {"presentation_path": presentation_path} if presentation_path else {},
+    )
+    if bound is None:
+        raise ValueError("presentation_not_open: exact deck is no longer open")
+    state = presentation_state(bound)
+    return {
+        **state,
+        "applied": len(results),
+        "results": results,
+        "backend": "windows-com",
+        "macros_executed": False,
+        "verified": True,
+        "verification": "application_state_batch_readback",
+    }
+
+
 def handler(request):
     method = request.get("method")
     available = comtypes_available()
@@ -436,10 +720,16 @@ def handler(request):
                 "comtypes_available": available,
                 "intents": [
                     "presentation.desktop.open",
+                    "presentation.desktop.batch_edit",
                     "presentation.slide.create",
                     "presentation.slide.delete",
                     "presentation.slide.reorder",
+                    "presentation.slide.duplicate",
                     "presentation.shape.text.set",
+                    "presentation.shape.textbox.create",
+                    "presentation.shape.image.insert",
+                    "presentation.shape.delete",
+                    "presentation.shape.geometry.set",
                     "presentation.save",
                     "presentation.export_pdf",
                 ],
@@ -461,14 +751,26 @@ def handler(request):
         app = get_app()
         if intent == "presentation.desktop.open":
             result = do_open(app, payload)
+        elif intent == "presentation.desktop.batch_edit":
+            result = do_batch_edit(app, payload)
         elif intent == "presentation.slide.create":
             result = do_slide_create(app, payload)
         elif intent == "presentation.slide.delete":
             result = do_slide_delete(app, payload)
         elif intent == "presentation.slide.reorder":
             result = do_slide_reorder(app, payload)
+        elif intent == "presentation.slide.duplicate":
+            result = do_slide_duplicate(app, payload)
         elif intent == "presentation.shape.text.set":
             result = do_shape_text_set(app, payload)
+        elif intent == "presentation.shape.textbox.create":
+            result = do_shape_textbox_create(app, payload)
+        elif intent == "presentation.shape.image.insert":
+            result = do_shape_image_insert(app, payload)
+        elif intent == "presentation.shape.delete":
+            result = do_shape_delete(app, payload)
+        elif intent == "presentation.shape.geometry.set":
+            result = do_shape_geometry_set(app, payload)
         elif intent == "presentation.save":
             result = do_save(app, payload)
         elif intent == "presentation.export_pdf":

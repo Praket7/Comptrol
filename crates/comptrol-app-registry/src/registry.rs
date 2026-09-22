@@ -9,6 +9,8 @@ use crate::Resource;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -36,6 +38,45 @@ pub struct AppEntry {
     /// Platform-specific metadata.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+}
+
+const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Clone)]
+struct CachedEntries {
+    observed_at: Instant,
+    entries: Vec<AppEntry>,
+}
+
+fn registry_cache() -> &'static RwLock<Option<CachedEntries>> {
+    static CACHE: OnceLock<RwLock<Option<CachedEntries>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(None))
+}
+
+/// Return a process-local snapshot of installed applications. Platform app
+/// enumeration is comparatively expensive (notably Get-StartApps on Windows),
+/// so warm app launches reuse the snapshot for five minutes. Exact identity
+/// resolution is preserved; only the enumeration work is cached.
+pub fn installed_entries() -> Result<Vec<AppEntry>, RegistryError> {
+    if let Ok(cache) = registry_cache().read()
+        && let Some(cached) = cache.as_ref()
+        && cached.observed_at.elapsed() <= REGISTRY_CACHE_TTL
+    {
+        return Ok(cached.entries.clone());
+    }
+
+    let mut entries = system_entries()?;
+    entries.extend(path_entries()?);
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries.dedup_by(|a, b| a.id == b.id);
+
+    if let Ok(mut cache) = registry_cache().write() {
+        *cache = Some(CachedEntries {
+            observed_at: Instant::now(),
+            entries: entries.clone(),
+        });
+    }
+    Ok(entries)
 }
 
 /// Probe metadata about the current host (used by tests and doctor).
@@ -68,11 +109,7 @@ pub fn resolve(query: &str) -> Result<AppEntry, RegistryError> {
 /// All exact matches for `query` (id match or exact display-name match).
 pub fn resolve_all(query: &str) -> Result<Vec<AppEntry>, RegistryError> {
     let lower = query.to_ascii_lowercase();
-    let mut entries = system_entries()?;
-    entries.extend(path_entries()?);
-    entries.sort_by(|a, b| a.id.cmp(&b.id));
-    entries.dedup_by(|a, b| a.id == b.id);
-    Ok(entries
+    Ok(installed_entries()?
         .into_iter()
         .filter(|entry| {
             entry.id.to_ascii_lowercase() == lower
