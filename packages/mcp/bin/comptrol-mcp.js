@@ -4,7 +4,7 @@ if (process.env.COMPTROL_DAEMON === "1") {
 } else {
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
-const net = require("node:net");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { ensureChromeCdp, closeOwnedChrome } = require("./chrome-cdp.js");
@@ -19,20 +19,48 @@ process.env.COMPTROL_STATE_DIR ||= path.join(os.homedir(), ".comptrol");
 const bridgeMarker = path.join(process.env.COMPTROL_STATE_DIR, "browser-bridge.enabled");
 let bridgeSidecar;
 
-function portOpen(port) {
+function browserBridgeReady(port) {
+  const tokenPath = path.join(process.env.COMPTROL_STATE_DIR, "browser-bridge.token");
+  let token;
+  try {
+    token = fs.readFileSync(tokenPath, "utf8").trim();
+  } catch {
+    return Promise.resolve(false);
+  }
+  if (!/^[0-9a-fA-F]{64,}$/.test(token)) return Promise.resolve(false);
+
   return new Promise(resolve => {
-    const socket = net.createConnection({ host: "127.0.0.1", port });
-    let settled = false;
-    const finish = value => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(value);
-    };
-    socket.setTimeout(250);
-    socket.once("connect", () => finish(true));
-    socket.once("timeout", () => finish(false));
-    socket.once("error", () => finish(false));
+    const request = http.request({
+      host: "127.0.0.1",
+      port,
+      path: "/browser/status",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": "2",
+        "X-Comptrol-Bridge-Token": token,
+      },
+      timeout: 300,
+    }, response => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", chunk => { body += chunk; });
+      response.on("end", () => {
+        if (response.statusCode !== 200) return resolve(false);
+        try {
+          const value = JSON.parse(body);
+          resolve(value?.ok === true);
+        } catch {
+          resolve(false);
+        }
+      });
+    });
+    request.once("timeout", () => {
+      request.destroy();
+      resolve(false);
+    });
+    request.once("error", () => resolve(false));
+    request.end("{}");
   });
 }
 
@@ -40,7 +68,7 @@ async function ensureBrowserBridgeSidecar() {
   if (!fs.existsSync(bridgeMarker)) return false;
   process.env.COMPTROL_AUTO_START_CHROME_CDP = "0";
   const port = Number(process.env.COMPTROL_DAEMON_PORT || 7317);
-  if (await portOpen(port)) return true;
+  if (await browserBridgeReady(port)) return true;
   bridgeSidecar = spawn(binary, ["serve-http", String(port)], {
     stdio: ["ignore", "ignore", "inherit"],
     env: process.env,
@@ -51,7 +79,7 @@ async function ensureBrowserBridgeSidecar() {
     console.error(`Comptrol Browser Bridge sidecar failed to start: ${error.message}`);
   });
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    if (await portOpen(port)) return true;
+    if (await browserBridgeReady(port)) return true;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   bridgeSidecar.kill();
