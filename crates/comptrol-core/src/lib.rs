@@ -2646,6 +2646,12 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
                 && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some(),
             "First party application adapters require an explicit policy and adapter root",
         )),
+        "browser.cdp.frame_evaluate" => Some((
+            "browser_protocol",
+            std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+                && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
+            "Frame-scoped CDP requires the direct event-maintained frame graph; the companion bridge intentionally refuses this route until it can prove a stable frame binding",
+        )),
         value if value.starts_with("browser.cdp.") => Some((
             "browser_protocol",
             (std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
