@@ -381,20 +381,20 @@ async function handleCdpCommand(message) {
   try {
     const tabId = parseInt(targetId, 10);
     if (Number.isNaN(tabId)) {
-      void sendCommandResult({ type: "cdp_command_result", requestId, ok: false, error: "Invalid target ID" });
+      await sendCommandResult({ type: "cdp_command_result", requestId, ok: false, error: "Invalid target ID" });
       return;
     }
     if (!attachedTargets.has(targetId)) {
       const attached = await attachDebugger(targetId);
       if (!attached.ok) {
-        void sendCommandResult({ type: "cdp_command_result", requestId, ok: false, error: attached.error || "debugger attach failed" });
+        await sendCommandResult({ type: "cdp_command_result", requestId, ok: false, error: attached.error || "debugger attach failed" });
         return;
       }
     }
     const result = await chrome.debugger.sendCommand({ tabId }, method, params || {});
-    void sendCommandResult({ type: "cdp_command_result", requestId, ok: true, result });
+    await sendCommandResult({ type: "cdp_command_result", requestId, ok: true, result });
   } catch (error) {
-    void sendCommandResult({ type: "cdp_command_result", requestId, ok: false, error: error.message });
+    await sendCommandResult({ type: "cdp_command_result", requestId, ok: false, error: error.message });
   }
 }
 
@@ -423,7 +423,7 @@ function waitForTabUpdate(tabId, predicate, timeoutMs = 5000) {
 }
 
 async function handleBridgePing(message) {
-  void sendCommandResult({
+  await sendCommandResult({
     type: "bridge_ping_result",
     requestId: message.requestId,
     ok: true,
@@ -438,7 +438,7 @@ async function handleOpenTab(message) {
       active: !Boolean(message.background)
     });
     const targetId = String(tab.id);
-    void sendCommandResult({
+    await sendCommandResult({
       type: "open_tab_result",
       requestId: message.requestId,
       ok: true,
@@ -461,7 +461,7 @@ async function handleOpenTab(message) {
     });
     await sendTargetsToNative();
   } catch (error) {
-    void sendCommandResult({ type: "open_tab_result", requestId: message.requestId, ok: false, error: error.message });
+    await sendCommandResult({ type: "open_tab_result", requestId: message.requestId, ok: false, error: error.message });
   }
 }
 
@@ -471,7 +471,7 @@ async function handleCloseTab(message) {
     if (!Number.isInteger(tabId)) throw new Error("Invalid target ID");
     await chrome.tabs.remove(tabId);
     attachedTargets.delete(String(message.targetId));
-    void sendCommandResult({
+    await sendCommandResult({
       type: "close_tab_result",
       requestId: message.requestId,
       ok: true,
@@ -485,7 +485,7 @@ async function handleCloseTab(message) {
     });
     await sendTargetsToNative();
   } catch (error) {
-    void sendCommandResult({ type: "close_tab_result", requestId: message.requestId, ok: false, error: error.message });
+    await sendCommandResult({ type: "close_tab_result", requestId: message.requestId, ok: false, error: error.message });
   }
 }
 
@@ -526,7 +526,7 @@ async function handleHistory(message) {
     if (Number(observed?.currentIndex) !== destinationIndex) {
       throw new Error("Browser did not confirm history navigation");
     }
-    void sendCommandResult({
+    await sendCommandResult({
       type: "history_result",
       requestId: message.requestId,
       ok: true,
@@ -541,7 +541,7 @@ async function handleHistory(message) {
     });
     await sendTargetsToNative();
   } catch (error) {
-    void sendCommandResult({ type: "history_result", requestId: message.requestId, ok: false, error: error.message });
+    await sendCommandResult({ type: "history_result", requestId: message.requestId, ok: false, error: error.message });
   }
 }
 
@@ -592,7 +592,7 @@ async function handleDownloadFile(message) {
       conflictAction: "overwrite"
     });
     const item = await waitForDownload(downloadId);
-    void sendCommandResult({
+    await sendCommandResult({
       type: "download_file_result",
       requestId: message.requestId,
       ok: true,
@@ -604,7 +604,7 @@ async function handleDownloadFile(message) {
       }
     });
   } catch (error) {
-    void sendCommandResult({ type: "download_file_result", requestId: message.requestId, ok: false, error: error.message });
+    await sendCommandResult({ type: "download_file_result", requestId: message.requestId, ok: false, error: error.message });
   }
 }
 
