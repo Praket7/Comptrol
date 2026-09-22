@@ -1,9 +1,10 @@
 use comptrol::{
     CompiledWorkflow, MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime,
-    SERVER_VERSION, TraceMode, capabilities, compile_verified_trace, default_state_dir,
+    SERVER_VERSION, TraceMode,
     browser_bridge::{BridgeStore, COMPANION_BRIDGE_ENDPOINT, DEFAULT_HEALTH_MAX_AGE},
-    integration, mcp, pairing::PairingStore, privacy_network_endpoints, privacy_status, read_trace,
-    validate_compiled_workflow,
+    capabilities, compile_verified_trace, default_state_dir, integration, mcp,
+    pairing::PairingStore,
+    privacy_network_endpoints, privacy_status, read_trace, validate_compiled_workflow,
 };
 use comptrol_adapter_sdk::AdapterManifest;
 #[allow(unused_imports)]
@@ -2611,7 +2612,10 @@ fn handle_http<S: HttpStream>(
     // challenge endpoint deliberately sits outside /browser/* authentication.
     if request_line.starts_with("POST /browser-auth/challenge ") {
         let request_body: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
-        let nonce = request_body.get("nonce").and_then(Value::as_str).unwrap_or("");
+        let nonce = request_body
+            .get("nonce")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         return match comptrol::browser_bridge::challenge_proof(&default_state_dir(), nonce) {
             Ok(proof) => write_http_response(
                 stream,
@@ -2660,7 +2664,8 @@ fn handle_http<S: HttpStream>(
     let request_path = request_parts.next().unwrap_or("");
     let bridge_request = request_path.starts_with("/browser/");
     if bridge_request {
-        let expected_token = match comptrol::browser_bridge::ensure_auth_token(&default_state_dir()) {
+        let expected_token = match comptrol::browser_bridge::ensure_auth_token(&default_state_dir())
+        {
             Ok(token) => token,
             Err(error) => {
                 return write_http_response(
@@ -3034,8 +3039,7 @@ fn handle_http<S: HttpStream>(
     if request_line.starts_with("POST /browser/status ") {
         let cdp_endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default();
         let cdp_connected = !cdp_endpoint.is_empty()
-            && comptrol::browser::discover_cached_targets(&cdp_endpoint)
-                .is_ok();
+            && comptrol::browser::discover_cached_targets(&cdp_endpoint).is_ok();
         let bridge_health = {
             let queue = command_queue.lock().expect("command queue lock poisoned");
             queue.health(DEFAULT_HEALTH_MAX_AGE)
@@ -3171,7 +3175,8 @@ fn handle_http<S: HttpStream>(
             let _ = queue.append_event(event, request_body.clone());
             let _ = queue.record_heartbeat(Some("comptrol.browser.bridge/0.1.0"));
             if !request_id.is_empty() {
-                let result = if let Some(error) = request_body.get("error").filter(|v| !v.is_null()) {
+                let result = if let Some(error) = request_body.get("error").filter(|v| !v.is_null())
+                {
                     json!({"ok": false, "error": error, "event": event})
                 } else {
                     json!({"ok": true, "event": event, "data": request_body.get("data").cloned().unwrap_or(Value::Null)})
@@ -3252,7 +3257,8 @@ fn handle_http<S: HttpStream>(
                 None,
             );
         }
-        let result = if let Some(error) = request_body.get("error").filter(|value| !value.is_null()) {
+        let result = if let Some(error) = request_body.get("error").filter(|value| !value.is_null())
+        {
             json!({"ok": false, "error": error})
         } else if request_body.get("ok").and_then(Value::as_bool) == Some(false) {
             json!({"ok": false, "error": "extension_command_failed"})
@@ -3879,4 +3885,3 @@ fn run_adapter(args: Vec<String>) -> i32 {
         }
     }
 }
-

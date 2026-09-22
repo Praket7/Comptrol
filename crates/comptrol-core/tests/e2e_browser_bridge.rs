@@ -1,6 +1,6 @@
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -79,11 +79,7 @@ fn http_request(
     let bridge_header = bridge_token
         .map(|token| {
             let sequence = AUTH_NONCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let nonce = format!(
-                "{:032x}{:032x}",
-                std::process::id(),
-                sequence
-            );
+            let nonce = format!("{:032x}{:032x}", std::process::id(), sequence);
             let body_hash = Sha256::digest(&encoded)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
@@ -159,10 +155,7 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
         );
         assert_eq!(status, 200, "{challenge}");
         assert_eq!(challenge["ok"], true);
-        assert_eq!(
-            challenge["protocol"],
-            "comptrol.browser.bridge/0.1.0"
-        );
+        assert_eq!(challenge["protocol"], "comptrol.browser.bridge/0.1.0");
         let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("hmac key");
         mac.update(b"comptrol.browser.bridge/0.1.0");
         mac.update(b"\0");
@@ -175,13 +168,8 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
             .collect::<String>();
         assert_eq!(challenge["proof"], expected);
 
-        let (status, unauthorized) = http_request(
-            daemon.port,
-            "POST",
-            "/browser/status",
-            json!({}),
-            None,
-        );
+        let (status, unauthorized) =
+            http_request(daemon.port, "POST", "/browser/status", json!({}), None);
         assert_eq!(status, 403, "{unauthorized}");
         assert_eq!(unauthorized["error"], "browser_bridge_auth_required");
 

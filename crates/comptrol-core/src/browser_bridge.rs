@@ -1,8 +1,8 @@
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -81,7 +81,10 @@ pub fn ensure_auth_token(state_dir: &Path) -> io::Result<String> {
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 return auth_token(state_dir)?.ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "browser bridge token is invalid")
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "browser bridge token is invalid",
+                    )
                 });
             }
             Err(error) => return Err(error),
@@ -100,7 +103,10 @@ pub fn ensure_auth_token(state_dir: &Path) -> io::Result<String> {
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 return auth_token(state_dir)?.ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "browser bridge token is invalid")
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "browser bridge token is invalid",
+                    )
                 });
             }
             Err(error) => return Err(error),
@@ -128,9 +134,7 @@ pub fn auth_token(state_dir: &Path) -> io::Result<Option<String>> {
 }
 
 pub fn challenge_proof(state_dir: &Path, nonce: &str) -> io::Result<String> {
-    if nonce.len() < 32
-        || nonce.len() > 256
-        || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if nonce.len() < 32 || nonce.len() > 256 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -147,7 +151,6 @@ pub fn challenge_proof(state_dir: &Path, nonce: &str) -> io::Result<String> {
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-
 pub fn request_signature(
     token: &str,
     method: &str,
@@ -155,9 +158,7 @@ pub fn request_signature(
     nonce: &str,
     body: &[u8],
 ) -> io::Result<String> {
-    if nonce.len() < 32
-        || nonce.len() > 256
-        || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if nonce.len() < 32 || nonce.len() > 256 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -169,9 +170,16 @@ pub fn request_signature(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes())
-        .map_err(|error| io::Error::other(format!("initialize browser bridge request HMAC: {error}")))?;
-    for part in [BRIDGE_PROTOCOL_VERSION, method, path, nonce, body_hash_hex.as_str()] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).map_err(|error| {
+        io::Error::other(format!("initialize browser bridge request HMAC: {error}"))
+    })?;
+    for part in [
+        BRIDGE_PROTOCOL_VERSION,
+        method,
+        path,
+        nonce,
+        body_hash_hex.as_str(),
+    ] {
         mac.update(part.as_bytes());
         mac.update(b"\0");
     }
@@ -187,9 +195,7 @@ pub fn verify_request_signature(
     body: &[u8],
     signature_hex: &str,
 ) -> io::Result<bool> {
-    if nonce.len() < 32
-        || nonce.len() > 256
-        || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if nonce.len() < 32 || nonce.len() > 256 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Ok(false);
     }
@@ -202,9 +208,16 @@ pub fn verify_request_signature(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes())
-        .map_err(|error| io::Error::other(format!("initialize browser bridge request HMAC: {error}")))?;
-    for part in [BRIDGE_PROTOCOL_VERSION, method, path, nonce, body_hash_hex.as_str()] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).map_err(|error| {
+        io::Error::other(format!("initialize browser bridge request HMAC: {error}"))
+    })?;
+    for part in [
+        BRIDGE_PROTOCOL_VERSION,
+        method,
+        path,
+        nonce,
+        body_hash_hex.as_str(),
+    ] {
         mac.update(part.as_bytes());
         mac.update(b"\0");
     }
@@ -213,7 +226,10 @@ pub fn verify_request_signature(
 
 fn decode_hex(value: &str) -> io::Result<Vec<u8>> {
     if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid hexadecimal value"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid hexadecimal value",
+        ));
     }
     value
         .as_bytes()
@@ -704,18 +720,11 @@ mod tests {
         let token = ensure_auth_token(&state).expect("token");
         let nonce = "00112233445566778899aabbccddeeff";
         let body = br#"{"ok":true}"#;
-        let signature = request_signature(&token, "POST", "/browser/status", nonce, body)
-            .expect("signature");
+        let signature =
+            request_signature(&token, "POST", "/browser/status", nonce, body).expect("signature");
         assert!(
-            verify_request_signature(
-                &token,
-                "POST",
-                "/browser/status",
-                nonce,
-                body,
-                &signature,
-            )
-            .expect("verify")
+            verify_request_signature(&token, "POST", "/browser/status", nonce, body, &signature,)
+                .expect("verify")
         );
         assert!(
             !verify_request_signature(
@@ -754,7 +763,9 @@ mod tests {
     fn lease_expiry_requeues_command() {
         let state = temp_state("lease");
         let mut store = BridgeStore::open(&state).expect("store");
-        let request_id = store.submit("test", serde_json::json!({"a": 1})).expect("submit");
+        let request_id = store
+            .submit("test", serde_json::json!({"a": 1}))
+            .expect("submit");
         let first = store
             .lease_pending(8, Duration::from_millis(1))
             .expect("lease");

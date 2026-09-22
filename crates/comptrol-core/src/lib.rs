@@ -1247,15 +1247,20 @@ impl Runtime {
                      FROM route_latency_samples
                      ORDER BY route_key ASC, sample_id ASC",
                 )
-                .map_err(|error| io::Error::other(format!("route latency samples read: {error}")))?;
+                .map_err(|error| {
+                    io::Error::other(format!("route latency samples read: {error}"))
+                })?;
             let rows = statement
                 .query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
                 })
-                .map_err(|error| io::Error::other(format!("route latency samples rows: {error}")))?;
+                .map_err(|error| {
+                    io::Error::other(format!("route latency samples rows: {error}"))
+                })?;
             for row in rows {
-                let (route, latency_ms) = row
-                    .map_err(|error| io::Error::other(format!("route latency sample row: {error}")))?;
+                let (route, latency_ms) = row.map_err(|error| {
+                    io::Error::other(format!("route latency sample row: {error}"))
+                })?;
                 let stats = route_history.entry(route).or_default();
                 stats.latency_samples_ms.push_back(latency_ms);
                 while stats.latency_samples_ms.len() > ROUTE_LATENCY_SAMPLE_CAP {
@@ -1695,27 +1700,33 @@ impl Runtime {
             "browser" => {
                 if let Ok(endpoint) = std::env::var("COMPTROL_CDP_ENDPOINT") {
                     match browser::discover(&endpoint) {
-                        Ok(targets) => json!({ "endpoint": endpoint, "targets": targets, "transport": "direct_cdp" }),
-                        Err(error) => json!({ "endpoint": endpoint, "error": error, "transport": "direct_cdp" }),
+                        Ok(targets) => {
+                            json!({ "endpoint": endpoint, "targets": targets, "transport": "direct_cdp" })
+                        }
+                        Err(error) => {
+                            json!({ "endpoint": endpoint, "error": error, "transport": "direct_cdp" })
+                        }
                     }
                 } else {
                     let health = browser_bridge::BridgeStore::open(&default_state_dir())
                         .and_then(|store| store.health(browser_bridge::DEFAULT_HEALTH_MAX_AGE));
                     match health {
-                        Ok(health) if health.active => match browser::discover(browser_bridge::COMPANION_BRIDGE_ENDPOINT) {
-                            Ok(targets) => json!({
-                                "endpoint": browser_bridge::COMPANION_BRIDGE_ENDPOINT,
-                                "transport": "companion_extension",
-                                "targets": targets,
-                                "bridge_health": health,
-                            }),
-                            Err(error) => json!({
-                                "endpoint": browser_bridge::COMPANION_BRIDGE_ENDPOINT,
-                                "transport": "companion_extension",
-                                "error": error,
-                                "bridge_health": health,
-                            }),
-                        },
+                        Ok(health) if health.active => {
+                            match browser::discover(browser_bridge::COMPANION_BRIDGE_ENDPOINT) {
+                                Ok(targets) => json!({
+                                    "endpoint": browser_bridge::COMPANION_BRIDGE_ENDPOINT,
+                                    "transport": "companion_extension",
+                                    "targets": targets,
+                                    "bridge_health": health,
+                                }),
+                                Err(error) => json!({
+                                    "endpoint": browser_bridge::COMPANION_BRIDGE_ENDPOINT,
+                                    "transport": "companion_extension",
+                                    "error": error,
+                                    "bridge_health": health,
+                                }),
+                            }
+                        }
                         Ok(health) => json!({
                             "available": false,
                             "transport": "companion_extension",
@@ -1728,7 +1739,7 @@ impl Runtime {
                         }),
                     }
                 }
-            },
+            }
             "desktop" | "system" => {
                 desktop_observe(
                     &OperationRequest {

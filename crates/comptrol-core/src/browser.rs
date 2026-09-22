@@ -39,7 +39,9 @@ fn open_bridge_store() -> Result<BridgeStore, ComptrolError> {
     BridgeStore::open(&crate::default_state_dir()).map_err(|error| ComptrolError {
         code: "browser_bridge_unavailable".to_owned(),
         message: error.to_string(),
-        recovery: Some("Start the Comptrol daemon and reconnect the Browser Bridge extension".to_owned()),
+        recovery: Some(
+            "Start the Comptrol daemon and reconnect the Browser Bridge extension".to_owned(),
+        ),
     })
 }
 
@@ -60,19 +62,23 @@ fn bridge_command(
         return Err(ComptrolError {
             code: "browser_bridge_unavailable".to_owned(),
             message: "The Browser Bridge has no recent extension heartbeat".to_owned(),
-            recovery: Some("Open Chrome with the Comptrol Browser Bridge extension enabled".to_owned()),
+            recovery: Some(
+                "Open Chrome with the Comptrol Browser Bridge extension enabled".to_owned(),
+            ),
         });
     }
-    let request_id = store.submit(command_type, payload).map_err(|error| ComptrolError {
-        code: if error.kind() == io::ErrorKind::WouldBlock {
-            "browser_bridge_busy"
-        } else {
-            "browser_bridge_unavailable"
-        }
-        .to_owned(),
-        message: error.to_string(),
-        recovery: Some("Retry after the bridge drains pending commands".to_owned()),
-    })?;
+    let request_id = store
+        .submit(command_type, payload)
+        .map_err(|error| ComptrolError {
+            code: if error.kind() == io::ErrorKind::WouldBlock {
+                "browser_bridge_busy"
+            } else {
+                "browser_bridge_unavailable"
+            }
+            .to_owned(),
+            message: error.to_string(),
+            recovery: Some("Retry after the bridge drains pending commands".to_owned()),
+        })?;
     let response = store
         .wait_result(&request_id, timeout)
         .map_err(|error| ComptrolError {
@@ -119,7 +125,12 @@ fn bridge_targets() -> Result<Vec<BrowserTarget>, ComptrolError> {
                 .get("revision")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .or_else(|| Some(format!("bridge:{id}:{}", url.as_deref().unwrap_or_default())));
+                .or_else(|| {
+                    Some(format!(
+                        "bridge:{id}:{}",
+                        url.as_deref().unwrap_or_default()
+                    ))
+                });
             Some(BrowserTarget {
                 id,
                 target_type: Some(
@@ -138,7 +149,10 @@ fn bridge_targets() -> Result<Vec<BrowserTarget>, ComptrolError> {
                         .to_owned(),
                 ),
                 url,
-                title: value.get("title").and_then(Value::as_str).map(str::to_owned),
+                title: value
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 revision,
                 web_socket_url: None,
             })
@@ -227,7 +241,9 @@ pub fn live_target_state(
     target_id: &str,
 ) -> Result<Option<comptrol_browser::TargetRecord>, ComptrolError> {
     if is_companion_bridge(endpoint) {
-        let target = discover(endpoint)?.into_iter().find(|target| target.id == target_id);
+        let target = discover(endpoint)?
+            .into_iter()
+            .find(|target| target.id == target_id);
         return Ok(target.map(|target| comptrol_browser::TargetRecord {
             id: target.id,
             target_type: target.target_type.unwrap_or_else(|| "page".to_owned()),
@@ -238,7 +254,9 @@ pub fn live_target_state(
             opener_id: None,
             attached: true,
             generation: 0,
-            revision: target.revision.unwrap_or_else(|| "bridge:unknown".to_owned()),
+            revision: target
+                .revision
+                .unwrap_or_else(|| "bridge:unknown".to_owned()),
         }));
     }
     let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
@@ -801,12 +819,8 @@ pub fn wait_for_url(
         let deadline = Instant::now() + timeout;
         loop {
             let targets = discover(endpoint)?;
-            let target = crate::bind_browser_target(
-                &targets,
-                target_id,
-                Some(browser_context_id),
-                None,
-            )?;
+            let target =
+                crate::bind_browser_target(&targets, target_id, Some(browser_context_id), None)?;
             if target
                 .url
                 .as_deref()
@@ -822,7 +836,9 @@ pub fn wait_for_url(
                 return Err(ComptrolError {
                     code: "verification_failed".to_owned(),
                     message: format!("Browser URL did not contain {contains}"),
-                    recovery: Some("Inspect the target and retry with a bounded postcondition".to_owned()),
+                    recovery: Some(
+                        "Inspect the target and retry with a bounded postcondition".to_owned(),
+                    ),
                 });
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -1576,7 +1592,8 @@ pub fn cdp_download(
             .map(std::path::PathBuf::from)
             .ok_or_else(|| ComptrolError {
                 code: "browser_protocol_invalid".to_owned(),
-                message: "The Browser Bridge download result did not include a file path".to_owned(),
+                message: "The Browser Bridge download result did not include a file path"
+                    .to_owned(),
                 recovery: Some("Inspect Chrome downloads and retry".to_owned()),
             })?;
         let destination = download_dir.join(expected_name);

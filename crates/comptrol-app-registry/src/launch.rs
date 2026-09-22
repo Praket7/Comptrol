@@ -167,9 +167,7 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
         Resource::File { path } => {
             launch_executable(request, Some(path.as_str()), metadata, settle)
         }
-        Resource::Url { url } => {
-            launch_executable(request, Some(url.as_str()), metadata, settle)
-        }
+        Resource::Url { url } => launch_executable(request, Some(url.as_str()), metadata, settle),
         Resource::DeepLink { uri } => {
             launch_executable(request, Some(uri.as_str()), metadata, settle)
         }
@@ -262,10 +260,7 @@ fn open_macos_bundle(
     if !args.is_empty() {
         command.arg("--args").args(args);
     }
-    Ok(command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .spawn()?)
+    Ok(command.stdin(Stdio::null()).stdout(Stdio::null()).spawn()?)
 }
 
 fn route_pid_is_destination(route: &str) -> bool {
@@ -293,7 +288,6 @@ pub fn launch_verified(
         Err(_) => Ok((outcome, LaunchVerification::Unavailable)),
     }
 }
-
 
 /// Test probe exposing the verification decision for a given pid so
 /// conformance scripts can exercise the model without launching apps.
