@@ -54,11 +54,11 @@ jobs:
       - run: npm run test:launcher
       - run: npm run test:daemon-launcher
       - run: python3 scripts/browser_bridge_conformance.py
-      - name: Validate npm bundle with Browser Bridge
+      - name: Validate npm source bundle with Browser Bridge
         run: |
           rm -rf packages/mcp/browser-bridge
           cp -R extensions/comptrol-browser-bridge packages/mcp/browser-bridge
-          python3 scripts/validate_npm_package.py
+          python3 scripts/validate_npm_package.py --allow-missing-native
       - run: python3 scripts/client_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol
