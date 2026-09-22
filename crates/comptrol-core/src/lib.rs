@@ -20,7 +20,9 @@ pub use comptrol_verification::{
     VerificationCriterion, VerificationEvidence, VerificationLevel, VerificationReport,
     VerificationSource, VerificationState as StructuredVerificationState,
 };
-use comptrol_workflow::{Workflow, WorkflowExecutor, WorkflowNode};
+use comptrol_workflow::{
+    ReplayEvidence, Workflow, WorkflowExecutor, WorkflowHostStore, WorkflowNode, promote_candidate,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -297,6 +299,15 @@ pub struct OperationRequest {
     pub dry_run: bool,
     #[serde(default)]
     pub background: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ParallelReadSpec {
+    intent: String,
+    #[serde(default)]
+    target: Option<Target>,
+    #[serde(default)]
+    params: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1215,6 +1226,7 @@ pub struct Runtime {
     idempotent: HashMap<String, ActionResult>,
     route_history: HashMap<String, RouteHistory>,
     route_stats_db: Connection,
+    workflow_host: WorkflowHostStore,
     sequence: u64,
 }
 
@@ -1350,6 +1362,7 @@ impl Runtime {
                 idempotent.insert(key.clone(), result.clone());
             }
         }
+        let workflow_host = WorkflowHostStore::open(state_dir.join("promoted-workflows.json"))?;
         Ok(Self {
             policy: Policy::from_environment(),
             leases: LeaseManager::new(),
@@ -1371,6 +1384,7 @@ impl Runtime {
             idempotent,
             route_history,
             route_stats_db,
+            workflow_host,
             sequence: 0,
         })
     }
@@ -1697,7 +1711,7 @@ impl Runtime {
         entry.record_latency(latency_ms);
         let _ = self.route_stats_db.execute(
             "INSERT INTO route_latency_samples(route_key, latency_ms) VALUES (?1, ?2)",
-            params![result.route, latency_ms],
+            params![route_key, latency_ms],
         );
         let _ = self.route_stats_db.execute(
             "DELETE FROM route_latency_samples
@@ -1709,7 +1723,7 @@ impl Runtime {
                  ORDER BY sample_id DESC
                  LIMIT 256
                )",
-            params![result.route],
+            params![route_key],
         );
         let _ = self.route_stats_db.execute(
             "INSERT INTO route_stats(route_key, attempts, verified_successes, verification_failures, dispatch_failures, disturbance_events, ewma_latency_ms, p95_latency_ms, last_success_at_ms)
@@ -1724,7 +1738,7 @@ impl Runtime {
                p95_latency_ms = excluded.p95_latency_ms,
                last_success_at_ms = excluded.last_success_at_ms",
             params![
-                result.route,
+                route_key,
                 entry.attempts as i64,
                 entry.verified_successes as i64,
                 entry.verification_failures as i64,
@@ -1785,6 +1799,18 @@ impl Runtime {
                     }))
                     .collect::<Vec<_>>()
             }),
+            "workflows" => match self.workflow_host.load() {
+                Ok(host) => json!({
+                    "promoted": host.workflows.values().map(|workflow| json!({
+                        "id": workflow.id,
+                        "version": workflow.version,
+                        "intent": workflow.intent,
+                        "fingerprint": workflow.fingerprint,
+                        "parameter_count": workflow.parameters.len(),
+                    })).collect::<Vec<_>>()
+                }),
+                Err(error) => json!({ "error": error.to_string() }),
+            },
             "platform" => platform_diagnostics(),
             "browser" => {
                 if let Ok(endpoint) = std::env::var("COMPTROL_CDP_ENDPOINT") {
@@ -3012,6 +3038,171 @@ fn execute_workflow_request(
     request: &OperationRequest,
     operation_id: String,
 ) -> ActionResult {
+    if let Some(promote) = request.params.get("promote") {
+        let Some(candidate_value) = promote.get("candidate") else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Workflow promotion needs a candidate workflow".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        let Some(evidence_value) = promote.get("evidence") else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Workflow promotion needs replay evidence".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        let Ok(candidate) = serde_json::from_value::<Workflow>(candidate_value.clone()) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "workflow_validation_failed".to_owned(),
+                    message: "Promotion candidate did not match the closed workflow schema"
+                        .to_owned(),
+                    recovery: Some("Compile the candidate from a verified trace".to_owned()),
+                },
+            );
+        };
+        let Ok(evidence) = serde_json::from_value::<ReplayEvidence>(evidence_value.clone()) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "workflow_validation_failed".to_owned(),
+                    message: "Replay evidence did not match the promotion schema".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        let minimum_verified_runs = promote
+            .get("minimum_verified_runs")
+            .and_then(Value::as_u64)
+            .unwrap_or(3)
+            .clamp(1, 100) as u32;
+        let promoted = match promote_candidate(&candidate, &evidence, minimum_verified_runs) {
+            Ok(promoted) => promoted,
+            Err(error) => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "workflow_promotion_rejected".to_owned(),
+                        message: error.to_string(),
+                        recovery: Some(
+                            "Replay the candidate in a clean fixture with independent verification"
+                                .to_owned(),
+                        ),
+                    },
+                );
+            }
+        };
+        if let Err(error) = runtime.workflow_host.put(promoted.clone()) {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "workflow_store_failed".to_owned(),
+                    message: error.to_string(),
+                    recovery: Some("Repair the local promoted workflow store".to_owned()),
+                },
+            );
+        }
+        return success(
+            request,
+            operation_id,
+            "workflow_host",
+            EffectState::None,
+            VerificationState::Verified,
+            json!({
+                "promoted_workflow_id": promoted.id,
+                "version": promoted.version,
+                "intent": promoted.intent,
+                "fingerprint": promoted.fingerprint,
+                "minimum_verified_runs": minimum_verified_runs,
+            }),
+        );
+    }
+    if let Some(workflow_id) = request
+        .params
+        .get("promoted_workflow_id")
+        .and_then(Value::as_str)
+    {
+        let workflow = match runtime.workflow_host.get(workflow_id) {
+            Ok(Some(workflow)) => workflow,
+            Ok(None) => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "workflow_not_found".to_owned(),
+                        message: "The promoted workflow is not installed".to_owned(),
+                        recovery: Some(
+                            "Inspect promoted workflows or use a cold verified route".to_owned(),
+                        ),
+                    },
+                );
+            }
+            Err(error) => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "workflow_store_failed".to_owned(),
+                        message: error.to_string(),
+                        recovery: Some("Repair the local promoted workflow store".to_owned()),
+                    },
+                );
+            }
+        };
+        if request
+            .params
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .is_some_and(|expected| expected != workflow.fingerprint)
+        {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "workflow_fingerprint_mismatch".to_owned(),
+                    message: "The promoted workflow fingerprint changed".to_owned(),
+                    recovery: Some("Inspect the installed workflow before executing it".to_owned()),
+                },
+            );
+        }
+        return execute_typed_workflow(
+            runtime,
+            request,
+            operation_id,
+            workflow,
+            "promoted_workflow",
+        );
+    }
+    if let Some(parallel_reads) = request.params.get("parallel_reads") {
+        let Ok(specs) = serde_json::from_value::<Vec<ParallelReadSpec>>(parallel_reads.clone())
+        else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "parallel_reads did not match the closed read batch schema".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        return execute_parallel_read_batch(runtime, request, operation_id, specs);
+    }
     if let Some(compiled) = request.params.get("compiled_workflow") {
         let Ok(compiled) = serde_json::from_value::<CompiledWorkflow>(compiled.clone()) else {
             return ActionResult::refused(
@@ -3169,6 +3360,245 @@ fn execute_workflow_request(
             data: Value::Null,
             error: Some(error),
         },
+    }
+}
+
+fn parallel_read_allowed(intent: &str) -> bool {
+    matches!(
+        intent,
+        "system.ping"
+            | "capability.search"
+            | "desktop.observe"
+            | "platform.broker.observe"
+            | "app.resolve"
+            | "app.list"
+            | "permission.status"
+            | "settings.get"
+            | "popup.inspect"
+            | "browser.session.list"
+    )
+}
+
+fn execute_parallel_read_spec(spec: ParallelReadSpec, index: usize) -> ActionResult {
+    let request = OperationRequest {
+        intent: spec.intent,
+        target: spec.target,
+        params: spec.params,
+        postcondition: None,
+        risk: Some(Risk::R0),
+        idempotency_key: None,
+        dry_run: false,
+        background: Some("strict_background".to_owned()),
+    };
+    let operation_id = format!("parallel-read-{index}");
+    match request.intent.as_str() {
+        "system.ping" => success(
+            &request,
+            operation_id,
+            "native",
+            EffectState::None,
+            VerificationState::Verified,
+            json!({ "ready": true, "protocol": PROTOCOL_VERSION }),
+        ),
+        "capability.search" => capability_search(&request, operation_id),
+        "desktop.observe" => desktop_observe(&request, operation_id),
+        "platform.broker.observe" => platform_broker_observe(&request, operation_id),
+        "app.resolve" => app_resolve(&request, operation_id),
+        "app.list" => app_list(&request, operation_id),
+        "permission.status" => permission_status(&request, operation_id),
+        "settings.get" => settings_get(&request, operation_id),
+        "popup.inspect" => popup_inspect(&request, operation_id),
+        "browser.session.list" => browser_session_list(&request, operation_id),
+        _ => ActionResult::refused(
+            &request,
+            operation_id,
+            ComptrolError {
+                code: "parallel_read_denied".to_owned(),
+                message: "Only explicitly allowlisted R0 reads can run in parallel".to_owned(),
+                recovery: None,
+            },
+        ),
+    }
+}
+
+fn execute_parallel_read_batch(
+    runtime: &Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+    specs: Vec<ParallelReadSpec>,
+) -> ActionResult {
+    if specs.is_empty() || specs.len() > 8 {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "parallel_reads accepts between 1 and 8 read operations".to_owned(),
+                recovery: None,
+            },
+        );
+    }
+    if let Some(spec) = specs.iter().find(|spec| {
+        !parallel_read_allowed(&spec.intent)
+            || classify(&spec.intent) != Risk::R0
+            || !runtime.policy.allowed_intents.contains(&spec.intent)
+    }) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "parallel_read_denied".to_owned(),
+                message: format!("{} is not an authorized R0 parallel read", spec.intent),
+                recovery: Some(
+                    "Run mutating or privileged operations through the serialized verified route"
+                        .to_owned(),
+                ),
+            },
+        );
+    }
+    let handles = specs
+        .into_iter()
+        .enumerate()
+        .map(|(index, spec)| std::thread::spawn(move || execute_parallel_read_spec(spec, index)))
+        .collect::<Vec<_>>();
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.join() {
+            Ok(result) => results.push(result),
+            Err(_) => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "parallel_read_failed".to_owned(),
+                        message: "A read worker terminated unexpectedly".to_owned(),
+                        recovery: Some("Retry the reads serially".to_owned()),
+                    },
+                );
+            }
+        }
+    }
+    let verified = results
+        .iter()
+        .all(|result| result.error.is_none() && result.verification == VerificationState::Verified);
+    if !verified {
+        return ActionResult {
+            operation_id,
+            intent: request.intent.clone(),
+            route: "workflow_parallel_read".to_owned(),
+            target: request.target.clone(),
+            preflight: "passed".to_owned(),
+            delivery: DeliveryState::Delivered,
+            effect: EffectState::None,
+            verification: VerificationState::Failed,
+            disturbance: json!({ "foreground_changed": false }),
+            recovery: RecoveryState::None,
+            data: json!({ "parallelism": results.len(), "results": results }),
+            error: Some(ComptrolError {
+                code: "parallel_read_failed".to_owned(),
+                message: "At least one parallel read failed verification".to_owned(),
+                recovery: Some(
+                    "Inspect the failed read and retry only that observation".to_owned(),
+                ),
+            }),
+        };
+    }
+    success(
+        request,
+        operation_id,
+        "workflow_parallel_read",
+        EffectState::None,
+        VerificationState::Verified,
+        json!({ "parallelism": results.len(), "results": results }),
+    )
+}
+
+fn execute_typed_workflow(
+    runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+    mut workflow: Workflow,
+    route: &str,
+) -> ActionResult {
+    let parameters = request
+        .params
+        .get("parameters")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for node in workflow.nodes.values_mut() {
+        if let WorkflowNode::Act { params, .. } = node {
+            *params = resolve_workflow_parameters(params, &parameters);
+        }
+    }
+    let mutates = workflow.nodes.values().any(
+        |node| matches!(node, WorkflowNode::Act { intent, .. } if classify(intent).mutation()),
+    );
+    let target = request.target.clone();
+    let background = request.background.clone();
+    let cancellation = runtime.operation_cancel.clone();
+    let max_steps = workflow.nodes.len().saturating_mul(4).saturating_add(4);
+    let workflow_id = workflow.id.clone();
+    let workflow_version = workflow.version;
+    let mut executor = WorkflowExecutor {
+        action: |intent: &str, params: &Value| {
+            let result = runtime.operate(OperationRequest {
+                intent: intent.to_owned(),
+                target: target.clone(),
+                params: params.clone(),
+                postcondition: None,
+                risk: None,
+                idempotency_key: None,
+                dry_run: false,
+                background: background.clone(),
+            });
+            if let Some(error) = result.error.as_ref() {
+                return Err(error.message.clone());
+            }
+            serde_json::to_value(result).map_err(|error| error.to_string())
+        },
+        verify: |criterion: &Value, observed: &Value| {
+            criterion
+                .get("equals")
+                .is_some_and(|expected| observed.get("data") == Some(expected))
+                || criterion == observed
+        },
+        wait: |_event: &str, timeout_ms: u64| {
+            std::thread::sleep(Duration::from_millis(timeout_ms.min(60_000)));
+            Ok(())
+        },
+        max_steps,
+    };
+    let executed = if let Some(cancellation) = cancellation {
+        executor.run_with_cancel(&workflow, || cancellation.load(Ordering::SeqCst))
+    } else {
+        executor.run(&workflow)
+    };
+    match executed {
+        Ok(value) => success(
+            request,
+            operation_id,
+            route,
+            if mutates {
+                EffectState::Changed
+            } else {
+                EffectState::None
+            },
+            VerificationState::Verified,
+            json!({
+                "workflow_id": workflow_id,
+                "workflow_version": workflow_version,
+                "result": value,
+            }),
+        ),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "workflow_execution_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Observe the current state and use a cold route".to_owned()),
+            },
+        ),
     }
 }
 
@@ -9408,7 +9838,13 @@ mod tests {
         let stats = second.inspect("route_stats");
         let native = stats["routes"]
             .as_array()
-            .and_then(|routes| routes.iter().find(|route| route["route"] == "native"))
+            .and_then(|routes| {
+                routes.iter().find(|route| {
+                    route["route"]
+                        .as_str()
+                        .is_some_and(|key| key == "native" || key.starts_with("native|"))
+                })
+            })
             .expect("native route stats");
         assert!(native["attempts"].as_u64().unwrap_or_default() >= 1);
         assert!(native["verified_successes"].as_u64().unwrap_or_default() >= 1);
@@ -10557,5 +10993,44 @@ mod tests {
             unavailable.error.as_ref().map(|e| e.code.as_str()),
             Some("route_unavailable")
         );
+    }
+
+    #[test]
+    fn v6_parallel_read_allowlist_excludes_mutations() {
+        assert!(parallel_read_allowed("system.ping"));
+        assert!(parallel_read_allowed("app.list"));
+        assert!(!parallel_read_allowed("app.launch"));
+        assert!(!parallel_read_allowed("browser.cdp.click"));
+    }
+
+    #[test]
+    fn v6_contextual_route_stats_persist_under_context_key() {
+        let mut runtime = runtime();
+        let request = OperationRequest {
+            intent: "system.ping".to_owned(),
+            target: Some(Target {
+                kind: "fixture".to_owned(),
+                id: Some("alpha".to_owned()),
+                name: None,
+            }),
+            params: Value::Null,
+            postcondition: None,
+            risk: Some(Risk::R0),
+            idempotency_key: None,
+            dry_run: false,
+            background: None,
+        };
+        let result = runtime.operate(request.clone());
+        let key = route_history_key(&request, &result.route);
+        assert!(runtime.route_history.contains_key(&key));
+        let persisted: i64 = runtime
+            .route_stats_db
+            .query_row(
+                "SELECT COUNT(*) FROM route_stats WHERE route_key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .expect("route row");
+        assert_eq!(persisted, 1);
     }
 }

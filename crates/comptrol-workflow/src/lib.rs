@@ -88,6 +88,7 @@ pub struct PromotedWorkflowHost {
 /// Small durable host registry for promoted workflows. The runtime may place
 /// this file inside its SQLite-backed state directory; the atomic replace
 /// keeps a crash from producing a half-written active workflow set.
+#[derive(Debug)]
 pub struct WorkflowHostStore {
     path: PathBuf,
 }
