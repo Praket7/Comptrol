@@ -139,25 +139,19 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
 
     #[cfg(target_os = "macos")]
     if request.app.platform == "macos"
-        && request
+        && let Some(bundle) = request
             .app
             .executable
             .as_deref()
-            .is_some_and(|path| path.extension().and_then(|value| value.to_str()) == Some("app"))
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("app"))
     {
-        let bundle = request.app.executable.as_deref().expect("checked bundle path");
         let resource = match &request.resource {
             Resource::File { path } => Some(path.as_str()),
             Resource::Url { url } => Some(url.as_str()),
             Resource::DeepLink { uri } => Some(uri.as_str()),
             Resource::None => None,
         };
-        let child = open_macos_bundle(
-            bundle,
-            resource,
-            request.background,
-            &request.args,
-        )?;
+        let child = open_macos_bundle(bundle, resource, request.background, &request.args)?;
         let pid = child.id();
         std::thread::sleep(settle);
         return Ok(LaunchOutcome {
