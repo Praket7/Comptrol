@@ -21,8 +21,11 @@ Command channel:
 - Host posts results to daemon via POST /browser/command/result
 """
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import struct
 import sys
 import threading
@@ -98,12 +101,14 @@ def load_bridge_token():
     return None
 
 
-def daemon_post(endpoint, params=None):
-    """POST to authenticated daemon Browser Bridge endpoint."""
+_daemon_identity_verified_until = 0.0
+_daemon_identity_lock = threading.Lock()
+
+
+def _daemon_post_raw(endpoint, params=None, token=None):
     url = f"{LOCAL_DAEMON_URL}{endpoint}"
-    data = json.dumps(params or {}).encode("utf-8")
+    data = json.dumps(params or {}, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    token = load_bridge_token()
     if token:
         headers["X-Comptrol-Bridge-Token"] = token
     req = urllib.request.Request(
@@ -121,6 +126,49 @@ def daemon_post(endpoint, params=None):
         return {"ok": False, "error": "daemon_unreachable"}
     except Exception as e:
         return {"ok": False, "error": "daemon_error", "details": str(e)}
+
+
+def verify_daemon_identity(force=False):
+    """Verify the local daemon knows the shared secret without transmitting it."""
+    global _daemon_identity_verified_until
+    now = time.monotonic()
+    with _daemon_identity_lock:
+        if not force and now < _daemon_identity_verified_until:
+            return True
+        token = load_bridge_token()
+        if not token:
+            _daemon_identity_verified_until = 0.0
+            return False
+        nonce = secrets.token_hex(32)
+        response = _daemon_post_raw("/browser-auth/challenge", {"nonce": nonce})
+        proof = response.get("proof") if isinstance(response, dict) else None
+        expected = hmac.new(
+            token.encode("ascii"),
+            (PROTOCOL_VERSION + "\0" + nonce).encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        verified = (
+            response.get("ok") is True
+            and response.get("protocol") == PROTOCOL_VERSION
+            and isinstance(proof, str)
+            and hmac.compare_digest(proof.lower(), expected.lower())
+        )
+        _daemon_identity_verified_until = now + 5.0 if verified else 0.0
+        return verified
+
+
+def daemon_post(endpoint, params=None):
+    """POST only after the local daemon proves knowledge of the install secret."""
+    global _daemon_identity_verified_until
+    token = load_bridge_token()
+    if not token:
+        return {"ok": False, "error": "bridge_token_missing"}
+    if not verify_daemon_identity():
+        return {"ok": False, "error": "daemon_identity_unverified"}
+    response = _daemon_post_raw(endpoint, params, token=token)
+    if response.get("error") in {"daemon_http_403", "daemon_unreachable"}:
+        _daemon_identity_verified_until = 0.0
+    return response
 
 
 def command_poll_loop(native_port_ref):
