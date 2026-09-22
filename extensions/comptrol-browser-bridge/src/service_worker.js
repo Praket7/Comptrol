@@ -135,40 +135,97 @@ function handleNativeMessage(message) {
   });
 }
 
-async function readCachedCommandResult(requestId) {
-  if (!requestId) return null;
+function commandEntryTimestamp(entry) {
+  return Number(entry?.completedAt || entry?.startedAt || 0);
+}
+
+async function readCommandLedger() {
   const stored = await chrome.storage.local.get(COMMAND_CACHE_KEY);
   const entries = stored[COMMAND_CACHE_KEY] || {};
-  const entry = entries[requestId];
-  if (!entry) return null;
-  if (Date.now() - Number(entry.completedAt || 0) > COMMAND_CACHE_TTL_MS) {
-    delete entries[requestId];
-    await chrome.storage.local.set({ [COMMAND_CACHE_KEY]: entries });
-    return null;
+  const now = Date.now();
+  let changed = false;
+  for (const [id, entry] of Object.entries(entries)) {
+    if (now - commandEntryTimestamp(entry) > COMMAND_CACHE_TTL_MS) {
+      delete entries[id];
+      changed = true;
+    }
   }
-  return entry.response || null;
+  if (changed) {
+    await chrome.storage.local.set({ [COMMAND_CACHE_KEY]: entries });
+  }
+  return entries;
+}
+
+async function writeBoundedCommandLedger(entries) {
+  const ordered = Object.entries(entries).sort(
+    (a, b) => commandEntryTimestamp(b[1]) - commandEntryTimestamp(a[1])
+  );
+  const bounded = Object.fromEntries(ordered.slice(0, COMMAND_CACHE_MAX_ENTRIES));
+  await chrome.storage.local.set({ [COMMAND_CACHE_KEY]: bounded });
+}
+
+async function beginDedupedCommand(message) {
+  const requestId = message?.requestId;
+  if (!requestId || !DEDUPED_COMMAND_TYPES.has(message.type)) {
+    return { execute: true };
+  }
+  if (inflightCommandIds.has(requestId)) {
+    return { execute: false };
+  }
+
+  const entries = await readCommandLedger();
+  const entry = entries[requestId];
+  if (entry?.status === "completed") {
+    if (entry.response) {
+      sendToNative(entry.response);
+    } else {
+      sendToNative({
+        type: `${message.type}_result`,
+        requestId,
+        ok: false,
+        error: {
+          code: "requires_reconciliation",
+          message: "The prior command completed but its response exceeded the durable cache limit. Inspect current browser state before issuing a new mutation."
+        }
+      });
+    }
+    return { execute: false };
+  }
+  if (entry?.status === "inflight") {
+    sendToNative({
+      type: `${message.type}_result`,
+      requestId,
+      ok: false,
+      error: {
+        code: "requires_reconciliation",
+        message: "This command was already dispatched before the extension restarted. Comptrol will not repeat a potentially completed browser mutation without reconciliation."
+      }
+    });
+    return { execute: false };
+  }
+
+  entries[requestId] = {
+    status: "inflight",
+    startedAt: Date.now(),
+    commandType: message.type
+  };
+  await writeBoundedCommandLedger(entries);
+  inflightCommandIds.add(requestId);
+  return { execute: true };
 }
 
 async function cacheCommandResult(response) {
   const requestId = response?.requestId;
   if (!requestId) return;
   const encoded = JSON.stringify(response);
-  if (encoded.length > COMMAND_CACHE_MAX_RESULT_BYTES) return;
-
-  const stored = await chrome.storage.local.get(COMMAND_CACHE_KEY);
-  const entries = stored[COMMAND_CACHE_KEY] || {};
-  const now = Date.now();
-  for (const [id, entry] of Object.entries(entries)) {
-    if (now - Number(entry.completedAt || 0) > COMMAND_CACHE_TTL_MS) {
-      delete entries[id];
-    }
-  }
-  entries[requestId] = { completedAt: now, response };
-  const ordered = Object.entries(entries).sort(
-    (a, b) => Number(b[1].completedAt || 0) - Number(a[1].completedAt || 0)
-  );
-  const bounded = Object.fromEntries(ordered.slice(0, COMMAND_CACHE_MAX_ENTRIES));
-  await chrome.storage.local.set({ [COMMAND_CACHE_KEY]: bounded });
+  const entries = await readCommandLedger();
+  entries[requestId] = {
+    status: "completed",
+    completedAt: Date.now(),
+    response: encoded.length <= COMMAND_CACHE_MAX_RESULT_BYTES ? response : null,
+    responseTooLarge: encoded.length > COMMAND_CACHE_MAX_RESULT_BYTES
+  };
+  await writeBoundedCommandLedger(entries);
 }
 
 async function sendCommandResult(response) {
@@ -181,15 +238,8 @@ async function sendCommandResult(response) {
 
 async function dispatchNativeMessage(message) {
   const requestId = message?.requestId;
-  if (requestId && DEDUPED_COMMAND_TYPES.has(message.type)) {
-    const cached = await readCachedCommandResult(requestId);
-    if (cached) {
-      sendToNative(cached);
-      return;
-    }
-    if (inflightCommandIds.has(requestId)) return;
-    inflightCommandIds.add(requestId);
-  }
+  const dedupe = await beginDedupedCommand(message);
+  if (!dedupe.execute) return;
 
   switch (message.type) {
     case "handshake_ack":
