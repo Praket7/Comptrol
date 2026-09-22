@@ -1,0 +1,53 @@
+name: V6 Final Execution Apply
+
+on:
+  push:
+    branches:
+      - perf/v6-fastpath-20260922
+
+permissions:
+  contents: write
+
+concurrency:
+  group: comptrol-v6-final-apply
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/v6-fastpath-20260922
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply V6 final execution pass
+        run: python3 scripts/apply_v6_final.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Compile workspace
+        run: cargo check --workspace
+      - name: Clippy workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Workflow tests
+        run: cargo test -p comptrol-workflow
+      - name: Core tests
+        run: cargo test -p comptrol
+      - name: Browser Bridge conformance
+        run: python3 scripts/browser_bridge_conformance.py
+      - name: Browser tests
+        run: npm run test:browser
+      - name: Workspace tests
+        run: cargo test --workspace
+      - name: Remove temporary final-pass machinery
+        run: rm scripts/apply_v6_final.py .github/workflows/v6-final-apply.yml
+      - name: Commit V6 final execution pass
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 1
+          git commit -m "Finish V6 parallel reads and promoted workflows"
+          git push origin HEAD:perf/v6-fastpath-20260922
