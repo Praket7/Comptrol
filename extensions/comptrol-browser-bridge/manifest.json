@@ -12,7 +12,8 @@
     "alarms",
     "nativeMessaging",
     "scripting",
-    "activeTab"
+    "activeTab",
+    "downloads"
   ],
   "host_permissions": [
     "http://*/*",
