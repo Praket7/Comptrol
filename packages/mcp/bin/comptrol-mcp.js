@@ -55,6 +55,27 @@ function postJson(port, endpoint, body, headers = {}) {
   });
 }
 
+function signedBridgeHeaders(token, method, endpoint, body) {
+  const encoded = Buffer.from(JSON.stringify(body));
+  const nonce = crypto.randomBytes(32).toString("hex");
+  const bodyHash = crypto.createHash("sha256").update(encoded).digest("hex");
+  const signingInput = Buffer.from(
+    "comptrol.browser.bridge/0.1.0\0" +
+    method + "\0" +
+    endpoint + "\0" +
+    nonce + "\0" +
+    bodyHash + "\0",
+    "ascii",
+  );
+  return {
+    "X-Comptrol-Bridge-Nonce": nonce,
+    "X-Comptrol-Bridge-Signature": crypto
+      .createHmac("sha256", token)
+      .update(signingInput)
+      .digest("hex"),
+  };
+}
+
 async function browserBridgeReady(port) {
   const tokenPath = path.join(process.env.COMPTROL_STATE_DIR, "browser-bridge.token");
   let token;
@@ -91,11 +112,12 @@ async function browserBridgeReady(port) {
     return false;
   }
 
+  const statusBody = {};
   const status = await postJson(
     port,
     "/browser/status",
-    {},
-    { "X-Comptrol-Bridge-Token": token },
+    statusBody,
+    signedBridgeHeaders(token, "POST", "/browser/status", statusBody),
   );
   return status.status === 200 && status.body?.ok === true;
 }
