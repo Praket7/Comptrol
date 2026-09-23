@@ -21,12 +21,19 @@ version = args.version.removeprefix("v")
 
 binary = pathlib.Path(args.binary)
 output = pathlib.Path(args.output)
+root = pathlib.Path(__file__).resolve().parents[1]
+adapters = root / "adapters"
 if not binary.is_file():
     raise SystemExit(f"release binary is missing: {binary}")
+if not (adapters / "blender" / "adapter.toml").is_file():
+    raise SystemExit(f"first-party adapter bundle is missing: {adapters}")
 output.mkdir(parents=True, exist_ok=True)
 archive = output / f"comptrol-{version}-{args.platform}.zip"
 with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
     package.write(binary, f"comptrol/{binary.name}")
+    for path in sorted(adapters.rglob("*")):
+        if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc":
+            package.write(path, pathlib.PurePosixPath("comptrol", "adapters", path.relative_to(adapters)))
 
 digest = hashlib.sha256(archive.read_bytes()).hexdigest()
 (output / f"{archive.name}.sha256").write_text(f"{digest}  {archive.name}\n", encoding="utf-8")

@@ -45,7 +45,7 @@ pub use trace::{
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
-pub const SERVER_VERSION: &str = "0.1.64";
+pub const SERVER_VERSION: &str = "0.1.66";
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
 const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
@@ -69,6 +69,7 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "blender.scene.object.list",
     "blender.scene.object.create",
     "blender.scene.object.transform",
+    "blender.scene.object.delete",
     "blender.project.save",
     "blender.render",
     "video.project.list",
@@ -149,6 +150,55 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
 
 fn is_first_party_adapter_intent(intent: &str) -> bool {
     FIRST_PARTY_ADAPTER_INTENTS.contains(&intent)
+}
+
+fn adapter_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("COMPTROL_ADAPTER_ROOT") {
+        return PathBuf::from(root);
+    }
+    // Release archives and the npm package place `adapters/` beside the
+    // executable or at a nearby package root. Find the shipped bundle so an
+    // installed MCP does not depend on its current working directory.
+    if let Ok(executable) = std::env::current_exe() {
+        for parent in executable.ancestors().skip(1).take(5) {
+            let candidate = parent.join("adapters");
+            if candidate.join("blender").join("adapter.toml").is_file() {
+                return candidate;
+            }
+        }
+    }
+    let state_bundle = default_state_dir().join("adapters");
+    if state_bundle.join("blender").join("adapter.toml").is_file() {
+        return state_bundle;
+    }
+    PathBuf::from("adapters")
+}
+
+fn adapter_python() -> PathBuf {
+    if let Some(python) = std::env::var_os("COMPTROL_ADAPTER_PYTHON") {
+        return PathBuf::from(python);
+    }
+    let local_venv = default_state_dir().join(if cfg!(windows) {
+        "venv/Scripts/python.exe"
+    } else {
+        "venv/bin/python"
+    });
+    if local_venv.is_file() {
+        local_venv
+    } else {
+        PathBuf::from(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        })
+    }
+}
+
+fn is_creative_adapter_intent(intent: &str) -> bool {
+    intent.starts_with("blender.")
+        || intent.starts_with("video.")
+        || intent.starts_with("design.")
+        || intent.starts_with("presentation.")
 }
 
 fn adapter_id_for_intent(intent: &str, provider: Option<&str>) -> Result<&'static str, String> {
@@ -654,8 +704,8 @@ impl Default for Policy {
         Self {
             allow_sandbox_writes: false,
             allow_desktop_notify: false,
-            allow_app_launch: false,
-            max_risk: Risk::R0,
+            allow_app_launch: true,
+            max_risk: Risk::R2,
             allowed_intents: HashSet::from([
                 "system.ping".to_owned(),
                 "desktop.observe".to_owned(),
@@ -666,6 +716,8 @@ impl Default for Policy {
                 "workflow.execute".to_owned(),
                 "app.resolve".to_owned(),
                 "app.list".to_owned(),
+                "app.launch".to_owned(),
+                "browser.chrome.open_tab".to_owned(),
                 "permission.status".to_owned(),
                 "popup.inspect".to_owned(),
                 "browser.session.list".to_owned(),
@@ -827,12 +879,6 @@ impl Policy {
                 "browser.session.connect".to_owned(),
             ]);
         }
-        if std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1") {
-            policy.max_risk = policy.max_risk.max(Risk::R2);
-            policy
-                .allowed_intents
-                .insert("browser.chrome.open_tab".to_owned());
-        }
         if env_enabled("COMPTROL_ALLOW_ADAPTERS") {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             for intent in FIRST_PARTY_ADAPTER_INTENTS {
@@ -853,6 +899,18 @@ impl Policy {
                     .insert("discord.message.delete".to_owned());
                 policy.allowed_intents.insert("mail.send".to_owned());
                 policy.allowed_intents.insert("message.send".to_owned());
+            }
+        }
+        if env_enabled("COMPTROL_ALLOW_MAIL_SEND") && env_enabled("COMPTROL_ALLOW_ADAPTERS") {
+            policy.max_risk = Risk::R3;
+            policy.allowed_intents.insert("mail.send".to_owned());
+        }
+        if env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS") {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            for intent in FIRST_PARTY_ADAPTER_INTENTS {
+                if is_creative_adapter_intent(intent) && classify(intent) <= Risk::R2 {
+                    policy.allowed_intents.insert((*intent).to_owned());
+                }
             }
         }
         policy
@@ -2084,9 +2142,7 @@ fn execute_adapter_request(
             );
         }
     };
-    let root = std::env::var_os("COMPTROL_ADAPTER_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("adapters"));
+    let root = adapter_root();
     let manifest_path = root.join(adapter_name).join("adapter.toml");
     let manifest_text = match fs::read_to_string(&manifest_path) {
         Ok(text) => text,
@@ -2133,15 +2189,7 @@ fn execute_adapter_request(
     };
     let isolation_dimensions = manifest.isolation.dimensions();
     if !runtime.adapter_hosts.contains_key(adapter_name) {
-        let python = std::env::var_os("COMPTROL_ADAPTER_PYTHON")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(if cfg!(windows) {
-                    "python.exe"
-                } else {
-                    "python3"
-                })
-            });
+        let python = adapter_python();
         let script = root.join(adapter_name).join("src").join("adapter.py");
         let config = AdapterHostConfig {
             manifest,
@@ -2693,8 +2741,8 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
                 target_os = "windows",
                 target_os = "macos",
                 target_os = "linux"
-            )) && env_enabled("COMPTROL_ALLOW_BROWSER_LAUNCH"),
-            "Default-profile browser launch requires an explicit local policy",
+            )),
+            "Opens a URL in the existing default browser profile; page verification needs a local browser connection",
         )),
         "browser.chrome.restore_recent" | "browser.chrome.reopen_closed_group" => Some((
             "chrome_restore",
@@ -2731,9 +2779,11 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
         )),
         value if is_first_party_adapter_intent(value) => Some((
             "isolated_adapter",
-            env_enabled("COMPTROL_ALLOW_ADAPTERS")
-                && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some(),
-            "First party application adapters require an explicit policy and adapter root",
+            (env_enabled("COMPTROL_ALLOW_ADAPTERS")
+                || (env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS")
+                    && is_creative_adapter_intent(value)))
+                && adapter_root().is_dir(),
+            "First party application adapters require an explicit policy and a shipped adapter bundle",
         )),
         "browser.cdp.frame_evaluate" => Some((
             "browser_protocol",
@@ -4467,90 +4517,21 @@ fn browser_cdp_dom_action(
             )
         }
         "browser.cdp.wait_for" => {
-            let Some(selector) = request.params.get("selector").and_then(Value::as_str) else {
-                return ActionResult::refused(
-                    request,
-                    operation_id,
-                    ComptrolError {
-                        code: "invalid_input".to_owned(),
-                        message: "Browser wait needs a selector".to_owned(),
-                        recovery: None,
-                    },
-                );
-            };
-            let property = request
-                .params
-                .get("property")
-                .and_then(Value::as_str)
-                .unwrap_or("textContent");
-            if !matches!(
-                property,
-                "textContent" | "value" | "title" | "href" | "checked" | "disabled"
-            ) {
-                return ActionResult::refused(
-                    request,
-                    operation_id,
-                    ComptrolError {
-                        code: "invalid_input".to_owned(),
-                        message: "Browser wait property is not allowlisted".to_owned(),
-                        recovery: None,
-                    },
-                );
-            }
-            let condition = if let Some(expected) = request.params.get("equals") {
-                let Ok(expected) = serde_json::to_string(expected) else {
+            let expression = match browser_wait_expression(&request.params) {
+                Ok(expression) => expression,
+                Err(message) => {
                     return ActionResult::refused(
                         request,
                         operation_id,
                         ComptrolError {
                             code: "invalid_input".to_owned(),
-                            message: "Browser wait value is not serializable".to_owned(),
+                            message: message.to_owned(),
                             recovery: None,
                         },
                     );
-                };
-                format!("JSON.stringify(element[{property:?}]) === JSON.stringify({expected})")
-            } else if let Some(expected) = request.params.get("contains").and_then(Value::as_str) {
-                let Ok(expected) = serde_json::to_string(expected) else {
-                    return ActionResult::refused(
-                        request,
-                        operation_id,
-                        ComptrolError {
-                            code: "invalid_input".to_owned(),
-                            message: "Browser wait value is not serializable".to_owned(),
-                            recovery: None,
-                        },
-                    );
-                };
-                format!("String(element[{property:?}] ?? '').includes({expected})")
-            } else {
-                return ActionResult::refused(
-                    request,
-                    operation_id,
-                    ComptrolError {
-                        code: "invalid_input".to_owned(),
-                        message: "Browser wait needs equals or contains".to_owned(),
-                        recovery: None,
-                    },
-                );
+                }
             };
-            let Ok(selector) = serde_json::to_string(selector) else {
-                return ActionResult::refused(
-                    request,
-                    operation_id,
-                    ComptrolError {
-                        code: "invalid_input".to_owned(),
-                        message: "Browser selector is not serializable".to_owned(),
-                        recovery: None,
-                    },
-                );
-            };
-            (
-                format!(
-                    "(() => {{ const element = document.querySelector({selector}); return Boolean(element) && {condition}; }})()"
-                ),
-                true,
-            )
+            (expression, true)
         }
         _ => unreachable!(),
     };
@@ -4642,6 +4623,50 @@ fn browser_cdp_dom_action(
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn browser_wait_expression(params: &Value) -> Result<String, &'static str> {
+    let selector = params
+        .get("selector")
+        .and_then(Value::as_str)
+        .ok_or("Browser wait needs a selector")?;
+    let property = params
+        .get("property")
+        .and_then(Value::as_str)
+        .unwrap_or("textContent");
+    if property == "readyState" {
+        if selector != "document" {
+            return Err("Browser readyState wait requires selector document");
+        }
+        let expected = params
+            .get("equals")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "interactive" | "complete"))
+            .ok_or("Browser readyState wait needs equals interactive or complete")?;
+        return Ok(format!("document.readyState === {expected:?}"));
+    }
+    if !matches!(
+        property,
+        "textContent" | "value" | "title" | "href" | "checked" | "disabled"
+    ) {
+        return Err("Browser wait property is not allowlisted");
+    }
+    let condition = if let Some(expected) = params.get("equals") {
+        let expected = serde_json::to_string(expected)
+            .map_err(|_| "Browser wait value is not serializable")?;
+        format!("JSON.stringify(element[{property:?}]) === JSON.stringify({expected})")
+    } else if let Some(expected) = params.get("contains").and_then(Value::as_str) {
+        let expected = serde_json::to_string(expected)
+            .map_err(|_| "Browser wait value is not serializable")?;
+        format!("String(element[{property:?}] ?? '').includes({expected})")
+    } else {
+        return Err("Browser wait needs equals or contains");
+    };
+    let selector =
+        serde_json::to_string(selector).map_err(|_| "Browser selector is not serializable")?;
+    Ok(format!(
+        "(() => {{ const element = document.querySelector({selector}); return Boolean(element) && {condition}; }})()"
+    ))
 }
 
 fn browser_cdp_upload(
@@ -8605,13 +8630,14 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.chrome.open_tab".to_owned(),
-            available: (cfg!(target_os = "macos")
-                || cfg!(target_os = "windows")
-                || cfg!(target_os = "linux"))
-                && std::env::var("COMPTROL_ALLOW_BROWSER_LAUNCH").as_deref() == Ok("1"),
+            available: cfg!(any(
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "linux"
+            )),
             risk: Risk::R2,
             route: "browser_launcher".to_owned(),
-            note: "Opens a foreground Chrome tab in the existing default browser profile and reports launcher acceptance only".to_owned(),
+            note: "Opens a foreground Chrome tab in the existing default browser profile without an environment toggle; reports launcher acceptance unless a browser connection verifies page load".to_owned(),
         },
         Capability {
             name: "browser.chrome.restore_recent".to_owned(),
@@ -8779,10 +8805,18 @@ pub fn capabilities() -> Vec<Capability> {
     for intent in FIRST_PARTY_ADAPTER_INTENTS {
         result.push(Capability {
             name: (*intent).to_owned(),
-            available: env_enabled("COMPTROL_ALLOW_ADAPTERS")
-                && std::env::var_os("COMPTROL_ADAPTER_ROOT").is_some()
-                && (!matches!(*intent, "obs.recording.start" | "obs.recording.stop")
-                    || env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS")),
+            available: (env_enabled("COMPTROL_ALLOW_ADAPTERS")
+                || (env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS")
+                    && is_creative_adapter_intent(intent)))
+                && adapter_root().is_dir()
+                && match *intent {
+                    "mail.send" => env_enabled("COMPTROL_ALLOW_MAIL_SEND"),
+                    "obs.recording.start"
+                    | "obs.recording.stop"
+                    | "discord.message.delete"
+                    | "message.send" => env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS"),
+                    _ => true,
+                },
             risk: classify(intent),
             route: "isolated_adapter".to_owned(),
             note: "Runs through a bounded out of process first party adapter and requires application state verification".to_owned(),
@@ -9071,6 +9105,35 @@ mod tests {
     }
 
     #[test]
+    fn browser_wait_supports_bounded_document_readiness_checks() {
+        assert_eq!(
+            browser_wait_expression(&json!({
+                "selector": "document",
+                "property": "readyState",
+                "equals": "complete"
+            }))
+            .expect("valid readyState wait"),
+            "document.readyState === \"complete\""
+        );
+        assert!(
+            browser_wait_expression(&json!({
+                "selector": "#page",
+                "property": "readyState",
+                "equals": "complete"
+            }))
+            .is_err()
+        );
+        assert!(
+            browser_wait_expression(&json!({
+                "selector": "document",
+                "property": "readyState",
+                "equals": "loaded"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn route_latency_samples_are_bounded() {
         let mut history = RouteHistory::default();
         for value in 0..(ROUTE_LATENCY_SAMPLE_CAP + 10) {
@@ -9104,6 +9167,58 @@ mod tests {
             Some("policy_denied")
         );
         assert!(matches!(result.delivery, DeliveryState::Refused));
+    }
+
+    #[test]
+    fn default_policy_allows_opening_apps_and_urls_without_broad_control() {
+        let policy = Policy::default();
+        assert!(policy.allow_app_launch);
+        assert!(policy.authorize("app.launch", Risk::R1).is_ok());
+        assert!(
+            policy
+                .authorize("browser.chrome.open_tab", Risk::R2)
+                .is_ok()
+        );
+        assert!(policy.authorize("app.open_resource", Risk::R2).is_err());
+        assert!(policy.authorize("desktop.open_app", Risk::R2).is_err());
+        assert!(policy.authorize("browser.cdp.navigate", Risk::R2).is_err());
+        assert!(
+            route_plan_for_intent("browser.chrome.open_tab", Value::Null, None).candidates[0]
+                .feasible
+        );
+    }
+
+    #[test]
+    fn default_policy_routes_open_requests_without_environment_toggles() {
+        let mut runtime = runtime();
+        runtime.policy = Policy::default();
+        for (intent, params, risk, expected_route) in [
+            (
+                "app.launch",
+                json!({"app":"Blender"}),
+                Risk::R1,
+                "app_registry_launch",
+            ),
+            (
+                "browser.chrome.open_tab",
+                json!({"url":"https://example.test"}),
+                Risk::R2,
+                "browser_launcher",
+            ),
+        ] {
+            let result = runtime.operate(OperationRequest {
+                intent: intent.to_owned(),
+                target: None,
+                params,
+                postcondition: None,
+                risk: Some(risk),
+                idempotency_key: None,
+                dry_run: true,
+                background: Some("foreground_allowed".to_owned()),
+            });
+            assert_eq!(result.preflight, "passed", "{intent}: {:?}", result.error);
+            assert_eq!(result.route, expected_route);
+        }
     }
 
     #[test]

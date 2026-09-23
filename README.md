@@ -16,7 +16,7 @@ New in this branch: persistent consent broker with human-action waits (`awaiting
 
 Computer control becomes unsafe when delivery is confused with effect. Comptrol keeps those states separate. A request may be refused. A dispatch may be accepted without a verified effect. A repeated request with the same identity must not repeat a mutation.
 
-The normal MCP surface has six tools.
+The normal MCP surface has seven tools.
 
 1. Operate runs one bounded intent
 2. Inspect reads current state
@@ -24,6 +24,9 @@ The normal MCP surface has six tools.
 4. Reconcile resolves durable unknown state without repeating a mutation
 5. Restore checkpoint returns a local sandbox to a saved state
 6. Capabilities reports only usable routes
+7. Human action resolve records a user's decision after they respond to a native prompt
+
+For local Codex setup, including macOS Accessibility permission, follow [`plugins/comptrol/CHATGPT_SETUP.md`](plugins/comptrol/CHATGPT_SETUP.md). This local stdio plugin does not connect to ChatGPT web; that requires a separate remote MCP connection.
 
 ## Local privacy
 
@@ -44,12 +47,23 @@ The standard input and output transport is the compatibility path for Codex, Cla
 
 ## Install the launcher
 
-The published npm package is named `comptrolling`. Starting with version 0.1.1 it bundles the native runtime for macOS, Linux, and Windows.
+The published npm package is named `comptrolling`. It provides a local stdio MCP launcher with a bundled native runtime for macOS, Linux, and Windows.
 
 ```text
-npm install comptrolling
-npx comptrolling
+npm install --global comptrolling
+comptrolling
 ```
+
+For the native command-line interface (`comptrol open ...`), install and run the Rust binary as described in [Install from source](#install-from-source). The npm command above is the MCP launcher.
+
+Open an exact installed app or a URL in one command:
+
+```text
+comptrol open Blender
+comptrol open https://www.espn.com/
+```
+
+App launch and Chrome URL opening are enabled by default as individual operations; no environment flags are needed. Chrome opens in the existing default profile. If a local DevTools endpoint or Browser Bridge is already connected, the same command also verifies that the page reaches `document.readyState === "complete"`; otherwise it reports that the browser accepted the URL without claiming page-load verification.
 
 The npm release also bundles the optional Browser Bridge for controlling already-open signed-in Chrome tabs without copying a browser profile. Chrome requires the human to load/approve the extension and assigns the extension ID, so Comptrol does not silently install it during `npm install`. To set it up:
 
@@ -83,7 +97,7 @@ The runtime includes bounded event history, file checkpoints, fixture trace repl
 
 Privacy is local by default. `comptrol privacy status` reports telemetry and redaction defaults. The privacy network endpoint report lists optional routes. MCP and browser protocol messages are bounded to one mebibyte.
 
-With explicit local app launch policy, macOS, Windows, and Linux can open an exact app through their native launcher. With explicit browser launcher policy, Chrome can open a foreground tab in the existing default browser profile. With a local DevTools endpoint or a healthy Browser Bridge session, browser tabs can be controlled through exact target identities. The bridge persists target snapshots locally, leases commands for crash recovery, and reports active health only while the extension/native-host connection is fresh. These routes do not synthesize mouse input or touch the clipboard.
+By default, macOS, Windows, and Linux can open an exact app through the native launcher, and Chrome can open a foreground tab in the existing default browser profile. These two allowlisted open actions do not grant general desktop input, app-resource access, or browser page mutation. With a local DevTools endpoint or a healthy Browser Bridge session, browser tabs can be controlled through exact target identities. The bridge persists target snapshots locally, leases commands for crash recovery, and reports active health only while the extension/native-host connection is fresh. These routes do not synthesize mouse input or touch the clipboard.
 
 Supported browser operations can request strict background posture. Routes that cannot prove that posture refuse instead of activating another application or silently taking control of the foreground.
 

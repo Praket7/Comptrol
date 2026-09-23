@@ -1,19 +1,19 @@
 {
   "name": "comptrol",
-  "version": "0.1.64",
-  "description": "Local first, policy bound computer control with verified browser and desktop routes.",
+  "version": "0.1.66",
+  "description": "Local Codex computer control with verified browser, desktop, settings, and application routes.",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Comptrol",
-    "shortDescription": "Use Comptrol in Codex.",
-    "longDescription": "Comptrol adds a local Codex plugin scaffold.",
+    "shortDescription": "Verified local computer control.",
+    "longDescription": "Start Comptrol locally from Codex to control supported browser, desktop, mail, Discord, settings, and creative app routes.",
     "developerName": "Local developer",
     "category": "Productivity",
-    "capabilities": [],
-    "defaultPrompt": "Help me use Comptrol."
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": "Use the local Comptrol MCP for bounded computer work. Inspect available capabilities and permissions before acting, then verify the changed application or saved artifact."
   },
   "mcpServers": "./.mcp.json",
   "apps": "./.app.json"

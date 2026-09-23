@@ -1,12 +1,12 @@
 # ChatGPT and Codex plugin
 
-The repository contains a current portable Agent Plugins package at `plugins/comptrol`. Its root `plugin.json` uses the Agent Plugins schema, its root `mcp.json` points at the local Streamable HTTP endpoint, its compatibility manifest remains under `.codex-plugin/plugin.json`, and its skill explains the verified-control contract.
+The repository contains a portable Agent Plugins package at `plugins/comptrol`. Its root `plugin.json` uses the Agent Plugins schema, both MCP manifests launch the local `comptrol mcp` stdio runtime, its compatibility manifest remains under `.codex-plugin/plugin.json`, and its skill explains the verified-control contract.
 
 The repo marketplace is `.agents/plugins/marketplace.json`. Validate the package with `python3 scripts/validate_plugin_package.py` and the Codex compatibility manifest with the plugin creator validator.
 
-Start the local endpoint with `comptrol-http` after installing the npm package, or with `comptrol serve-http` from a native checkout. The endpoint remains loopback-only. A ChatGPT desktop user must enable developer mode, register the local MCP connection, approve the connection, and then install the local marketplace plugin. The repository does not invent or embed a `plugin_asdk_app` registration id, and the local package is not claimed to be publicly submitted or live-tested in ChatGPT.
+Follow [`plugins/comptrol/CHATGPT_SETUP.md`](../plugins/comptrol/CHATGPT_SETUP.md) to install the local Codex plugin and grant macOS Accessibility access. This package does not connect to ChatGPT web: ChatGPT custom apps require a remote MCP connection, and a local stdio command cannot be launched by a browser chat. Secure MCP Tunnel is a separate connection that this repository does not configure. Plan availability for write-capable custom MCP apps must be checked in ChatGPT; do not assume Plus grants it.
 
-The portable MCP schema supports remote HTTPS servers for public submission. This package intentionally keeps the local endpoint explicit so it cannot silently turn local computer control into an unauthenticated remote listener.
+The portable package intentionally keeps its local endpoint explicit. It is not a public ChatGPT submission: public distribution needs a stable HTTPS service, per-user identity and authorization, and an outbound paired local-agent design. The local preview must never be exposed as an unauthenticated public listener.
 
 Verified workflows can be compiled from a privacy-aware trace and validated before replay:
 

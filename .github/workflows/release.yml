@@ -172,6 +172,8 @@ jobs:
             fi
           done
           chmod +x packages/mcp/native/*/comptrol 2>/dev/null || true
+          rm -rf packages/mcp/adapters
+          cp -R adapters packages/mcp/adapters
           rm -rf packages/mcp/browser-bridge
           cp -R extensions/comptrol-browser-bridge packages/mcp/browser-bridge
           test -f packages/mcp/browser-bridge/manifest.json
@@ -182,6 +184,10 @@ jobs:
           test -f packages/mcp/native/linux-arm64/comptrol
           test -f packages/mcp/native/linux-x64/comptrol
           test -f packages/mcp/native/win32-x64/comptrol.exe
+          test -f packages/mcp/adapters/blender/adapter.toml
+          test -f packages/mcp/adapters/davinci-resolve/src/adapter.py
+          test -f packages/mcp/adapters/canva/src/adapter.py
+          test -f packages/mcp/adapters/powerpoint/src/adapter.py
           python3 scripts/validate_npm_package.py
       - name: Publish package with npm token
         run: |

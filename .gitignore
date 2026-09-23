@@ -1,6 +1,7 @@
 /target
 /.comptrol
+packages/mcp/adapters/
+packages/mcp/browser-bridge/
 .DS_Store
 **/__pycache__/
 *.pyc
-

@@ -5,7 +5,9 @@ Route: exact .pptx file in, mutate through a closed op schema, save,
 reopen, and verify by readback. Macros/VBA are never executed.
 """
 import hashlib
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -162,7 +164,7 @@ def validate_ops(ops):
         raise ValueError("ops must be a non-empty list")
     if len(ops) > MAX_OPS:
         raise ValueError("ops list exceeds limit of %d" % MAX_OPS)
-    allowed = {"replace_text", "insert_image", "speaker_notes.set", "slide.create", "slide.delete", "slide.reorder"}
+    allowed = {"replace_text", "insert_image", "speaker_notes.set", "slide.create", "slide.delete", "slide.reorder", "shape.create", "shape.text.set", "shape.style.set", "shape.geometry.set"}
     for op in ops:
         if not isinstance(op, dict):
             raise ValueError("each op must be an object")
@@ -203,6 +205,29 @@ def validate_ops(ops):
         elif name == "slide.reorder":
             if "slide" not in op or "to" not in op:
                 raise ValueError("slide.reorder requires slide and to")
+        elif name in {"shape.create", "shape.text.set", "shape.style.set", "shape.geometry.set"}:
+            if "slide" not in op or isinstance(op["slide"], bool) or not isinstance(op["slide"], int):
+                raise ValueError(name + " requires a 1-based integer slide")
+            if name != "shape.create" and not (isinstance(op.get("shape"), (str, int)) and not isinstance(op.get("shape"), bool)):
+                raise ValueError(name + " requires a shape name or 1-based index")
+            if name == "shape.create" and op.get("kind") not in {"rect", "round_rect", "ellipse", "line", "text"}:
+                raise ValueError("shape.create kind must be rect, round_rect, ellipse, line, or text")
+            for key in ("left_in", "top_in", "width_in", "height_in", "rotation"):
+                if key in op and (isinstance(op[key], bool) or not isinstance(op[key], (int, float)) or not math.isfinite(op[key]) or abs(op[key]) > 10000):
+                    raise ValueError(key + " must be a finite number within +/-10000")
+            if any(key in op and op[key] <= 0 for key in ("width_in", "height_in")):
+                raise ValueError("width_in and height_in must be positive")
+            for key in ("fill", "line", "font_color"):
+                if key in op and (not isinstance(op[key], str) or not re.fullmatch(r"#?[0-9a-fA-F]{6}", op[key])):
+                    raise ValueError(key + " must be a six-digit hex color")
+            if name == "shape.text.set" and (not isinstance(op.get("text"), str) or len(op["text"]) > 10000):
+                raise ValueError("shape.text.set requires text up to 10000 chars")
+            if name == "shape.create" and (not all(isinstance(op.get(k), (int, float)) and not isinstance(op.get(k), bool) and math.isfinite(op[k]) and op[k] > 0 for k in ("width_in", "height_in"))):
+                raise ValueError("shape.create requires positive width_in and height_in")
+            if name == "shape.create" and ("name" in op and (not isinstance(op["name"], str) or not op["name"].strip() or len(op["name"]) > 100)):
+                raise ValueError("shape.create name must be a non-empty string up to 100 chars")
+            if name == "shape.create" and ("text" in op and (not isinstance(op["text"], str) or len(op["text"]) > 10000 or op["kind"] == "line")):
+                raise ValueError("shape.create text must be up to 10000 chars and cannot be set on a line")
     return ops
 
 
@@ -289,6 +314,78 @@ def apply_insert_image(prs, op):
     else:
         slide.shapes.add_picture(str(asset), left, top)
     return {"slide": slide_num, "asset": str(asset)}
+
+
+def find_shape(slide, selector):
+    if isinstance(selector, int) and not isinstance(selector, bool):
+        if not 1 <= selector <= len(slide.shapes):
+            raise ValueError("shape index is out of range")
+        return slide.shapes[selector - 1]
+    if isinstance(selector, str) and selector.strip():
+        for shape in slide.shapes:
+            if shape.name == selector:
+                return shape
+    raise ValueError("shape name or index was not found")
+
+
+def apply_shape_op(prs, op):
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.util import Inches, Pt
+
+    slide_num = op["slide"]
+    if not 1 <= slide_num <= len(prs.slides):
+        raise ValueError("shape operation slide is out of range")
+    slide = prs.slides[slide_num - 1]
+    name = op["op"]
+    if name == "shape.create":
+        kind = op["kind"]
+        left, top = Inches(float(op.get("left_in", 1))), Inches(float(op.get("top_in", 1)))
+        width, height = Inches(float(op["width_in"])), Inches(float(op["height_in"]))
+        if kind == "text":
+            shape = slide.shapes.add_textbox(left, top, width, height)
+        elif kind == "line":
+            shape = slide.shapes.add_connector(1, left, top, left + width, top + height)
+        else:
+            types = {"rect": MSO_SHAPE.RECTANGLE, "round_rect": MSO_SHAPE.ROUNDED_RECTANGLE, "ellipse": MSO_SHAPE.OVAL}
+            shape = slide.shapes.add_shape(types[kind], left, top, width, height)
+        if op.get("name"):
+            shape.name = op["name"]
+        if "text" in op:
+            shape.text_frame.text = op["text"]
+    else:
+        shape = find_shape(slide, op["shape"])
+    if name in {"shape.create", "shape.geometry.set"}:
+        for key, attr in (("left_in", "left"), ("top_in", "top"), ("width_in", "width"), ("height_in", "height")):
+            if key in op:
+                setattr(shape, attr, Inches(float(op[key])))
+        if "rotation" in op:
+            shape.rotation = float(op["rotation"])
+    if name in {"shape.create", "shape.style.set"}:
+        for key, target in (("fill", "fill"), ("line", "line")):
+            if key not in op:
+                continue
+            color = RGBColor.from_string(op[key].lstrip("#").upper())
+            if target == "fill":
+                shape.fill.solid()
+                shape.fill.fore_color.rgb = color
+            else:
+                shape.line.color.rgb = color
+        if "font_color" in op or "font_size" in op:
+            for paragraph in shape.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    if "font_color" in op:
+                        run.font.color.rgb = RGBColor.from_string(op["font_color"].lstrip("#").upper())
+                    if "font_size" in op:
+                        size = op["font_size"]
+                        if isinstance(size, bool) or not isinstance(size, (int, float)) or not 1 <= size <= 400:
+                            raise ValueError("font_size must be between 1 and 400 points")
+                        run.font.size = Pt(size)
+    if name == "shape.text.set":
+        if not shape.has_text_frame:
+            raise ValueError("selected shape does not contain text")
+        shape.text_frame.text = op["text"]
+    return {"slide": slide_num, "shape": shape.name, "op": name}
 
 
 def apply_notes_set(prs, op):
@@ -404,6 +501,8 @@ def do_batch_edit(payload):
         elif name == "slide.reorder":
             parse_slide_ref(op["slide"], simulated)
             parse_slide_ref(op["to"], simulated)
+        elif name in {"shape.create", "shape.text.set", "shape.style.set", "shape.geometry.set"}:
+            parse_slide_ref(op["slide"], simulated)
         elif name == "slide.create":
             requested = op.get("index")
             if requested is not None:
@@ -435,6 +534,8 @@ def do_batch_edit(payload):
             applied.append({"op": name, **apply_slide_delete(prs, op)})
         elif name == "slide.reorder":
             applied.append({"op": name, **apply_slide_reorder(prs, op)})
+        elif name in {"shape.create", "shape.text.set", "shape.style.set", "shape.geometry.set"}:
+            applied.append(apply_shape_op(prs, op))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(output_path))
@@ -455,6 +556,49 @@ def do_batch_edit(payload):
         combined.append(notes_text(slide))
     haystack = "\n".join(combined)
     missing = [text for text in expected_texts if text and text not in haystack]
+    expected_shapes = {}
+    for op, applied_op in zip(ops, applied):
+        if op["op"] not in {"shape.create", "shape.text.set", "shape.style.set", "shape.geometry.set"}:
+            continue
+        selector = applied_op.get("shape") if op["op"] == "shape.create" else op["shape"]
+        key = (op["slide"], selector)
+        expected = expected_shapes.setdefault(key, {})
+        if op["op"] == "shape.create":
+            for prop, default in (("left_in", 1), ("top_in", 1), ("width_in", None), ("height_in", None)):
+                expected[prop] = op.get(prop, default)
+        if op["op"] in {"shape.create", "shape.geometry.set"}:
+            expected.update({field: op[field] for field in ("left_in", "top_in", "width_in", "height_in", "rotation") if field in op})
+        if op["op"] in {"shape.create", "shape.style.set"}:
+            expected.update({field: op[field] for field in ("fill", "line", "font_color", "font_size") if field in op})
+        if op["op"] == "shape.text.set" or (op["op"] == "shape.create" and "text" in op):
+            if "text" in op:
+                expected["text"] = op["text"]
+    shape_mismatches = []
+    for (slide_num, selector), expected in expected_shapes.items():
+        try:
+            shape = find_shape(reprobe.slides[slide_num - 1], selector)
+            checks = {}
+            from pptx.util import Inches, Pt
+            for field, attr in (("left_in", "left"), ("top_in", "top"), ("width_in", "width"), ("height_in", "height")):
+                if field in expected and expected[field] is not None:
+                    checks[field] = getattr(shape, attr) == Inches(float(expected[field]))
+            if "rotation" in expected:
+                checks["rotation"] = abs(float(shape.rotation) - float(expected["rotation"])) < 0.001
+            if "text" in expected:
+                checks["text"] = shape.has_text_frame and shape.text_frame.text == expected["text"]
+            if "fill" in expected:
+                checks["fill"] = str(shape.fill.fore_color.rgb).upper() == expected["fill"].lstrip("#").upper()
+            if "line" in expected:
+                checks["line"] = str(shape.line.color.rgb).upper() == expected["line"].lstrip("#").upper()
+            if "font_color" in expected or "font_size" in expected:
+                runs = [run for paragraph in shape.text_frame.paragraphs for run in paragraph.runs]
+                if "font_color" in expected:
+                    checks["font_color"] = bool(runs) and str(runs[0].font.color.rgb).upper() == expected["font_color"].lstrip("#").upper()
+                if "font_size" in expected:
+                    checks["font_size"] = bool(runs) and runs[0].font.size == Pt(expected["font_size"])
+            shape_mismatches.extend({"slide": slide_num, "shape": str(selector), "field": field} for field, value in checks.items() if not value)
+        except Exception as exc:
+            shape_mismatches.append({"slide": slide_num, "shape": str(selector), "field": str(exc)})
     deletes = sum(1 for entry in applied if entry.get("op") == "slide.delete")
     creates = sum(1 for entry in applied if entry.get("op") == "slide.create")
     reorders = [entry for entry in applied if entry.get("op") == "slide.reorder"]
@@ -462,6 +606,7 @@ def do_batch_edit(payload):
     verified = (
         slide_count_after == expected_count
         and not missing
+        and not shape_mismatches
         and size_after > 0
     )
     return {
@@ -475,6 +620,7 @@ def do_batch_edit(payload):
         "reorder_applied": reorders,
         "applied": applied,
         "missing_texts": missing,
+        "shape_mismatches": shape_mismatches,
         "sha256_before": sha_before,
         "sha256_after": sha_after,
         "size_before": size_before,

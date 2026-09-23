@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import math
 import shutil
 import subprocess
 import sys
@@ -13,19 +14,76 @@ from adapter_ipc import bridge_request, resolve_endpoint  # noqa: E402
 
 def script_for(payload):
     intent = payload.get("intent")
+    def vector(key, default):
+        value = payload.get(key, default)
+        if (not isinstance(value, list) or len(value) != 3
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) or abs(v) > 1_000_000 for v in value)):
+            raise ValueError(key + " must be three finite numbers within +/-1000000")
+        return tuple(value)
+
+    def color(key):
+        value = payload.get(key)
+        if (not isinstance(value, list) or len(value) not in (3, 4)
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) or not 0 <= v <= 1 for v in value)):
+            raise ValueError(key + " must contain 3 or 4 color channels from 0 to 1")
+        return tuple(value) if len(value) == 4 else (*value, 1.0)
+
+    def project_output():
+        raw = payload.get("output_path")
+        if not isinstance(raw, str) or not raw.strip() or Path(raw).suffix.lower() != ".blend":
+            raise ValueError("offline edits require an explicit .blend output_path")
+        return str(Path(raw).resolve())
+
     if intent == "blender.scene.object.list":
-        return "import bpy, json; print(json.dumps({'objects':[o.name for o in bpy.context.scene.objects]}))"
+        return "import bpy, json; print(json.dumps({'objects':[{'name':o.name,'type':o.type,'location':list(o.location),'rotation':list(o.rotation_euler),'scale':list(o.scale)} for o in bpy.context.scene.objects]}))"
     if intent == "blender.scene.object.create":
         name = str(payload.get("name", ""))
         if not name or len(name) > 120 or any(char in name for char in "\r\n\x00"):
             raise ValueError("invalid object name")
-        return f"import bpy, json; bpy.ops.mesh.primitive_cube_add(); o=bpy.context.object; o.name={name!r}; print(json.dumps({{'created':o.name}}))"
+        shape = payload.get("shape", "cube")
+        operators = {"cube": "primitive_cube_add", "uv_sphere": "primitive_uv_sphere_add", "ico_sphere": "primitive_ico_sphere_add", "cylinder": "primitive_cylinder_add", "cone": "primitive_cone_add", "torus": "primitive_torus_add", "plane": "primitive_plane_add"}
+        if shape not in operators:
+            raise ValueError("shape must be one of " + ", ".join(operators))
+        location, rotation, scale = vector("location", [0, 0, 0]), vector("rotation", [0, 0, 0]), vector("scale", [1, 1, 1])
+        material = ""
+        if "base_color" in payload:
+            rgba = color("base_color")
+            metallic = payload.get("metallic", 0.0)
+            roughness = payload.get("roughness", 0.5)
+            for key, value in (("metallic", metallic), ("roughness", roughness)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+                    raise ValueError(key + " must be from 0 to 1")
+            material = f"m=bpy.data.materials.new(name={name + ' Material'!r}); m.diffuse_color={rgba!r}; m.use_nodes=True; bs=m.node_tree.nodes.get('Principled BSDF'); bs.inputs['Base Color'].default_value={rgba!r}; bs.inputs['Metallic'].default_value={float(metallic)!r}; bs.inputs['Roughness'].default_value={float(roughness)!r}; o.data.materials.append(m); "
+        save = f"bpy.ops.wm.save_as_mainfile(filepath={project_output()!r}); "
+        return f"import bpy, json; bpy.ops.mesh.{operators[shape]}(location={location!r}, rotation={rotation!r}); o=bpy.context.object; o.name={name!r}; o.scale={scale!r}; {material}{save}print(json.dumps({{'created':o.name,'type':o.type,'location':list(o.location),'rotation':list(o.rotation_euler),'scale':list(o.scale),'saved':bpy.data.filepath}}))"
     if intent == "blender.scene.object.transform":
         name = str(payload.get("name", ""))
-        location = payload.get("location")
-        if not name or not isinstance(location, list) or len(location) != 3 or not all(isinstance(value, (int, float)) for value in location):
-            raise ValueError("name and numeric three-element location are required")
-        return f"import bpy, json; o=bpy.data.objects.get({name!r}); o.location={tuple(location)!r} if o else (_ for _ in ()).throw(RuntimeError('object missing')); print(json.dumps({{'name':o.name,'location':list(o.location)}}))"
+        if not name:
+            raise ValueError("name is required")
+        changes = []
+        for key, prop, default in (("location", "location", [0, 0, 0]), ("rotation", "rotation_euler", [0, 0, 0]), ("scale", "scale", [1, 1, 1])):
+            if key in payload:
+                changes.append(f"o.{prop}={vector(key, default)!r}; ")
+        material = ""
+        if "base_color" in payload:
+            rgba = color("base_color")
+            metallic, roughness = payload.get("metallic", 0.0), payload.get("roughness", 0.5)
+            for key, value in (("metallic", metallic), ("roughness", roughness)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+                    raise ValueError(key + " must be from 0 to 1")
+            material = f"m=bpy.data.materials.get({name + ' Material'!r}) or bpy.data.materials.new({name + ' Material'!r}); m.diffuse_color={rgba!r}; m.use_nodes=True; bs=m.node_tree.nodes.get('Principled BSDF'); bs.inputs['Base Color'].default_value={rgba!r}; bs.inputs['Metallic'].default_value={float(metallic)!r}; bs.inputs['Roughness'].default_value={float(roughness)!r}; o.data.materials.clear(); o.data.materials.append(m); "
+        if not changes and not material:
+            raise ValueError("provide location, rotation, scale, or base_color")
+        save = f"bpy.ops.wm.save_as_mainfile(filepath={project_output()!r}); "
+        return f"import bpy, json; o=bpy.data.objects.get({name!r}); (_ for _ in ()).throw(RuntimeError('object missing')) if o is None else None; {''.join(changes)}{material}{save}print(json.dumps({{'name':o.name,'location':list(o.location),'rotation':list(o.rotation_euler),'scale':list(o.scale),'saved':bpy.data.filepath}}))"
+    if intent == "blender.scene.object.delete":
+        name = str(payload.get("name", ""))
+        if not name:
+            raise ValueError("name is required")
+        save = f"bpy.ops.wm.save_as_mainfile(filepath={project_output()!r}); "
+        return f"import bpy, json; o=bpy.data.objects.get({name!r}); (_ for _ in ()).throw(RuntimeError('object missing')) if o is None else bpy.data.objects.remove(o, do_unlink=True); {save}print(json.dumps({{'deleted':{name!r},'saved':bpy.data.filepath}}))"
     if intent == "blender.project.save":
         path = Path(str(payload.get("path", ""))).resolve()
         if path.suffix.lower() != ".blend":
@@ -48,6 +106,24 @@ def script_for(payload):
     raise ValueError("unsupported intent")
 
 
+def find_blender():
+    override = os.environ.get("COMPTROL_BLENDER_BIN", "").strip()
+    if override and Path(override).is_file():
+        return override
+    for name in ("blender", "blender.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    candidates = [
+        Path("/Applications/Blender.app/Contents/MacOS/Blender"),
+        Path.home() / "Applications/Blender.app/Contents/MacOS/Blender",
+    ]
+    if os.name == "nt":
+        for base in (os.environ.get("ProgramFiles", "C:/Program Files"), os.environ.get("ProgramW6432", "C:/Program Files")):
+            candidates.extend(Path(base).glob("Blender Foundation/Blender */blender.exe"))
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
 def handler(request):
     method = request.get("method")
     live_endpoint, endpoint_source = resolve_endpoint(
@@ -63,11 +139,12 @@ def handler(request):
         return response(request, True, "available", {"backend": "blender_typed_bridge", "mode": "live_or_offline", "live": bool(live_endpoint)})
     if method == "shutdown":
         return response(request, True, "available", {"stopped": True})
-    executable = os.environ.get("COMPTROL_BLENDER_BIN") or shutil.which("blender") or shutil.which("blender.exe")
+    executable = find_blender()
     if not executable:
         return response(request, False, "unsupported", error={"code": "blender_not_found", "message": "Blender executable is not available"})
     try:
         payload = request.get("payload", {})
+        intent = payload.get("intent")
         bridge_token = os.environ.get("COMPTROL_BLENDER_BRIDGE_TOKEN")
         if live_endpoint and bridge_token and payload.get("mode", "live") == "live":
             try:
@@ -111,6 +188,12 @@ def handler(request):
             data["output_size"] = artifact.stat().st_size if artifact.is_file() else 0
             data["verified"] = artifact.is_file() and data["output_size"] > 0
             data["verification"] = "render_artifact_readback"
+        elif intent in {"blender.scene.object.create", "blender.scene.object.transform", "blender.scene.object.delete"}:
+            artifact = Path(str(payload.get("output_path", ""))).resolve()
+            data["output_path"] = str(artifact)
+            data["output_size"] = artifact.stat().st_size if artifact.is_file() else 0
+            data["verified"] = artifact.is_file() and data["output_size"] > 0
+            data["verification"] = "blend_file_readback"
         return response(request, True, "available", data)
     except Exception as exc:
         return response(request, False, "unhealthy", error={"code": "blender_request_failed", "message": str(exc)})

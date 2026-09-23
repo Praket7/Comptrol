@@ -135,13 +135,16 @@ pub fn system_entries() -> Result<Vec<AppEntry>, RegistryError> {
 #[cfg(target_os = "macos")]
 fn macos_entries() -> Result<Vec<AppEntry>, RegistryError> {
     let mut entries = Vec::new();
-    let roots = [
-        "/Applications",
-        "/System/Applications",
-        "/Applications/Utilities",
+    let mut roots = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+        PathBuf::from("/Applications/Utilities"),
     ];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join("Applications"));
+    }
     for root in roots {
-        let read = match std::fs::read_dir(root) {
+        let read = match std::fs::read_dir(&root) {
             Ok(read) => read,
             Err(_) => continue,
         };

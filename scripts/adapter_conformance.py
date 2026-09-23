@@ -121,6 +121,7 @@ HANDLER_SENTINELS = {
     "blender.scene.object.list": ("adapters/blender/src/comptrol_live_bridge.py", "scene.objects"),
     "blender.scene.object.create": ("adapters/blender/src/comptrol_live_bridge.py", "primitive_cube_add"),
     "blender.scene.object.transform": ("adapters/blender/src/comptrol_live_bridge.py", "obj.location"),
+    "blender.scene.object.delete": ("adapters/blender/src/comptrol_live_bridge.py", "bpy.data.objects.remove(obj, do_unlink=True)"),
     "blender.project.save": ("adapters/blender/src/comptrol_live_bridge.py", "save_as_mainfile"),
     "blender.render": ("adapters/blender/src/comptrol_live_bridge.py", "write_still"),
     "obs.scene.list": ("adapters/obs/src/adapter.py", "GetSceneList"),
@@ -234,4 +235,3 @@ assert "secrets" in extension, "extension must pair through SecretStorage"
 assert "pipe:" in extension or "pipe\\\\" in extension, "extension must support named pipes"
 
 print("adapter IPC conformance passed: shared client, migrated bridges, pairing")
-
