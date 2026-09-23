@@ -135,6 +135,7 @@ impl AdapterRegistry {
                         "blender.scene.object.list".to_owned(),
                         "blender.scene.object.create".to_owned(),
                         "blender.scene.object.transform".to_owned(),
+                        "blender.scene.object.delete".to_owned(),
                         "blender.project.save".to_owned(),
                         "blender.render".to_owned(),
                     ],
