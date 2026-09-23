@@ -3,6 +3,7 @@
 
 import json
 import os
+import pathlib
 import socket
 import stat
 import subprocess
@@ -51,8 +52,10 @@ def send_frame(connection, value):
 
 with tempfile.TemporaryDirectory(prefix="comptrol-ipc-") as state:
     path = os.environ.get("COMPTROL_PIPE_NAME", r"\\.\pipe\comptrol") if is_windows else os.path.join(state, "comptrol.sock")
+    root = pathlib.Path(__file__).resolve().parents[1]
+    binary = pathlib.Path(os.environ.get("COMPTROL_BIN", str(root / "target" / "debug" / ("comptrol.exe" if is_windows else "comptrol"))))
     process = subprocess.Popen(
-        ["target/debug/comptrol", "daemon"],
+        [str(binary), "daemon"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env={**os.environ, "COMPTROL_STATE_DIR": state, "COMPTROL_SOCKET_PATH": path, "COMPTROL_PIPE_NAME": path},
@@ -87,6 +90,34 @@ with tempfile.TemporaryDirectory(prefix="comptrol-ipc-") as state:
             assert version_error["error"]["code"] == "protocol_version_unsupported"
         finally:
             connection.close()
+        oversized = open(path, "r+b", buffering=0) if is_windows else socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if not is_windows:
+            oversized.settimeout(2)
+            oversized.connect(path)
+        try:
+            header = (1024 * 1024 + 1).to_bytes(4, "big")
+            if is_windows:
+                oversized.write(header)
+                oversized.flush()
+            else:
+                oversized.sendall(header)
+            try:
+                read_frame(oversized)
+            except (OSError, RuntimeError, ValueError):
+                pass
+            else:
+                raise AssertionError("daemon accepted an oversized IPC frame")
+        finally:
+            oversized.close()
+        survivor = open(path, "r+b", buffering=0) if is_windows else socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if not is_windows:
+            survivor.settimeout(2)
+            survivor.connect(path)
+        try:
+            send_frame(survivor, {"version": 1, "id": "health-after-oversize", "method": "health"})
+            assert read_frame(survivor)["result"]["ready"] is True
+        finally:
+            survivor.close()
         print("IPC conformance passed")
     finally:
         process.terminate()

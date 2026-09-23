@@ -17,6 +17,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -24,6 +27,32 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release
+      - run: npm run test:daemon-launcher
+      - name: Native daemon IPC conformance
+        run: python scripts/ipc_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol${{ runner.os == 'Windows' && '.exe' || '' }}
+      - name: macOS Accessibility fixture conformance
+        if: runner.os == 'macOS'
+        run: python scripts/macos_ax_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
+      - name: Windows UI Automation fixture conformance
+        if: runner.os == 'Windows'
+        run: python scripts/windows_uia_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol.exe
+          COMPTROL_REQUIRE_WINDOWS_UIA: '1'
+      - name: Linux AT-SPI fixture conformance
+        if: runner.os == 'Linux'
+        run: python scripts/linux_atspi_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
+      - name: Linux real Chrome CDP upload and download conformance
+        if: runner.os == 'Linux'
+        run: python scripts/chrome_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
       - name: Browser Bridge native messaging conformance
         run: python scripts/browser_bridge_conformance.py
       - name: Windows real Chrome CDP conformance
@@ -71,6 +100,12 @@ jobs:
         env:
           COMPTROL_BIN: target/release/comptrol
       - run: python3 scripts/mtls_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
+      - run: python3 scripts/pairing_conformance.py
+        env:
+          COMPTROL_BIN: target/release/comptrol
+      - run: python3 scripts/release_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol
       - run: python3 scripts/benchmark_v4.py --binary target/release/comptrol --iterations 25 --output benchmark-results/v4-transport.json

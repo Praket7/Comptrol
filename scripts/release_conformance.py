@@ -8,6 +8,7 @@ import tempfile
 
 
 root = pathlib.Path(__file__).resolve().parents[1]
+binary = os.environ.get("COMPTROL_BIN", str(root / "target" / "debug" / "comptrol"))
 openssl = "openssl"
 with tempfile.TemporaryDirectory(prefix="comptrol-release-") as temporary:
     directory = pathlib.Path(temporary)
@@ -24,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-release-") as temporary:
             "python3",
             str(root / "scripts" / "package_release.py"),
             "--binary",
-            str(root / "target" / "debug" / "comptrol"),
+            binary,
             "--platform",
             "conformance",
             "--version",
