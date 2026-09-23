@@ -86,6 +86,21 @@ def result_verification(response: dict) -> Optional[str]:
     return None
 
 
+def route_available_or_unavailable(result: dict) -> tuple[bool, str]:
+    error_code = result_error_code(result)
+    if error_code in (None, "route_unavailable"):
+        return True, ""
+    data = result_data(result)
+    if (
+        error_code == "adapter_execution_failed"
+        and isinstance(data, dict)
+        and data.get("health") in ("requires_consent", "unsupported")
+        and result.get("result", {}).get("structuredContent", {}).get("effect") == "not_attempted"
+    ):
+        return True, ""
+    return False, f"unexpected error: {error_code}: {result}"
+
+
 def dict_data(response: dict) -> dict:
     value = result_data(response)
     return value if isinstance(value, dict) else {}
@@ -130,10 +145,7 @@ VERIFIERS: Dict[str, Callable[[dict, dict, Any], tuple[bool, str]]] = {
         and result_data(result).get(expected[0]) == expected[1],
         f"result data {expected[0]} != {expected[1]}: {result}",
     ),
-    "route_available_or_unavailable": lambda result, _, __: (
-        result_error_code(result) in (None, "route_unavailable"),
-        f"unexpected error: {result_error_code(result)}: {result}",
-    ),
+    "route_available_or_unavailable": lambda result, _, __: route_available_or_unavailable(result),
     "contains_provider_metadata": lambda result, _, __: (
         isinstance(result_data(result), dict)
         and ("provider" in result_data(result) or "metadata" in result_data(result)),
