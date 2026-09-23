@@ -1,7 +1,7 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 
 const directory = await mkdtemp(join(tmpdir(), "comptrol-daemon-launcher-"));
@@ -72,6 +72,26 @@ const launcher = spawn(process.execPath, ["packages/mcp/bin/comptrol-mcp.js"], {
   stdio: ["pipe", "pipe", "pipe"],
 });
 const exited = once(launcher, "exit");
+async function stopLauncher() {
+  if (launcher.exitCode !== null || launcher.signalCode !== null) return;
+  if (process.platform === "win32") {
+    try {
+      execFileSync("taskkill", ["/PID", String(launcher.pid), "/T", "/F"], { stdio: "ignore" });
+    } catch {
+      launcher.kill("SIGKILL");
+    }
+  } else {
+    launcher.kill("SIGTERM");
+  }
+  await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5000))]);
+  if (launcher.exitCode === null && launcher.signalCode === null) {
+    launcher.kill("SIGKILL");
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5000))]);
+  }
+  if (launcher.exitCode === null && launcher.signalCode === null) {
+    throw new Error("daemon launcher did not stop after its process tree was terminated");
+  }
+}
 let output = "";
 let errors = "";
 launcher.stdout.on("data", (chunk) => { output += chunk; });
@@ -82,8 +102,7 @@ while (!output.includes('"id":1') && Date.now() < firstDeadline) {
   await new Promise((resolve) => setTimeout(resolve, 25));
 }
 if (!output.includes('"id":1')) {
-  launcher.kill("SIGKILL");
-  await exited;
+  await stopLauncher();
   await rm(directory, { recursive: true, force: true });
   throw new Error(`daemon launcher did not answer first request ${output} ${errors}`);
 }
@@ -97,13 +116,11 @@ while (!output.includes('"id":2') && Date.now() < secondDeadline) {
   await new Promise((resolve) => setTimeout(resolve, 25));
 }
 if (!output.includes('"id":2') || !errors.includes("reconnecting")) {
-  launcher.kill("SIGKILL");
-  await exited;
+  await stopLauncher();
   await rm(directory, { recursive: true, force: true });
   throw new Error(`daemon launcher did not reconnect ${output} ${errors}`);
 }
-launcher.kill("SIGTERM");
-await exited;
+await stopLauncher();
 const starts = await readFile(marker, "utf8");
 if (Number(starts) < 2) throw new Error(`daemon was not restarted ${starts}`);
 const requests = await readFile(received, "utf8");
