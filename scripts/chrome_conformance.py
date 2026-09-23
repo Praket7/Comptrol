@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -45,8 +46,13 @@ if os.name == "nt":
         pathlib.Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
     ]
     chrome = os.environ.get("COMPTROL_CHROME_BIN", next((str(path) for path in chrome_defaults if path.exists()), "chrome.exe"))
-else:
+elif sys.platform == "darwin":
     chrome = os.environ.get("COMPTROL_CHROME_BIN", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+else:
+    chrome = os.environ.get("COMPTROL_CHROME_BIN") or next(
+        (path for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser") if (path := shutil.which(name))),
+        "google-chrome",
+    )
 binary = os.environ.get("COMPTROL_BIN", str(pathlib.Path(__file__).resolve().parents[1] / "target" / ("debug/comptrol.exe" if os.name == "nt" else "debug/comptrol")))
 if not pathlib.Path(chrome).exists():
     if os.environ.get("COMPTROL_REQUIRE_CHROME") == "1":

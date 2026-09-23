@@ -53,6 +53,7 @@ jobs:
         run: python scripts/chrome_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol
+          COMPTROL_REQUIRE_CHROME: '1'
       - name: Browser Bridge native messaging conformance
         run: python scripts/browser_bridge_conformance.py
       - name: Windows real Chrome CDP conformance
