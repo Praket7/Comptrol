@@ -50,6 +50,17 @@ def send_frame(connection, value):
         connection.sendall(payload)
 
 
+def connect_pipe(path, timeout=10):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return open(path, "r+b", buffering=0)
+        except (FileNotFoundError, PermissionError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 with tempfile.TemporaryDirectory(prefix="comptrol-ipc-") as state:
     path = os.environ.get("COMPTROL_PIPE_NAME", r"\\.\pipe\comptrol") if is_windows else os.path.join(state, "comptrol.sock")
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -71,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-ipc-") as state:
             connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             connection.connect(path)
         else:
-            connection = open(path, "r+b", buffering=0)
+            connection = connect_pipe(path)
         try:
             send_frame(connection, {"version": 1, "id": "health", "method": "health"})
             health = read_frame(connection)
@@ -90,7 +101,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-ipc-") as state:
             assert version_error["error"]["code"] == "protocol_version_unsupported"
         finally:
             connection.close()
-        oversized = open(path, "r+b", buffering=0) if is_windows else socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        oversized = connect_pipe(path) if is_windows else socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if not is_windows:
             oversized.settimeout(2)
             oversized.connect(path)
@@ -109,7 +120,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-ipc-") as state:
                 raise AssertionError("daemon accepted an oversized IPC frame")
         finally:
             oversized.close()
-        survivor = open(path, "r+b", buffering=0) if is_windows else socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        survivor = connect_pipe(path) if is_windows else socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if not is_windows:
             survivor.settimeout(2)
             survivor.connect(path)
