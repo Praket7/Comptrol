@@ -338,23 +338,37 @@ fn execute_once(
         .map_err(|error| format!("UI Automation root unavailable: {error}"))?;
     let condition = unsafe { automation.CreateTrueCondition() }
         .map_err(|error| format!("UI Automation condition unavailable: {error}"))?;
-    let cached =
-        unsafe { root.FindFirstBuildCache(TreeScope_Children, &condition, &cache.cache_request) }
-            .map_err(|error| format!("scoped window cache query failed: {error}"))?;
-    let candidates = unsafe { cached.FindAll(TreeScope_Descendants, &condition) }
-        .map_err(|error| format!("UI Automation tree query failed: {error}"))?;
-    let count = unsafe { candidates.Length() }
-        .map_err(|error| format!("UI Automation result count failed: {error}"))?;
+    let windows =
+        unsafe { root.FindAllBuildCache(TreeScope_Children, &condition, &cache.cache_request) }
+            .map_err(|error| format!("desktop window query failed: {error}"))?;
+    let window_count = unsafe { windows.Length() }
+        .map_err(|error| format!("desktop window count failed: {error}"))?;
     let mut matches = Vec::new();
-    for index in 0..count.min(2048) {
-        let element = unsafe { candidates.GetElement(index) }
-            .map_err(|error| format!("UI Automation element read failed: {error}"))?;
-        if !matches_element(&element, &request)? {
+    let mut bounded_nodes = 0;
+    for index in 0..window_count.min(256) {
+        let window = unsafe { windows.GetElement(index) }
+            .map_err(|error| format!("desktop window read failed: {error}"))?;
+        if unsafe { window.CurrentProcessId() }
+            .map_err(|error| format!("desktop window process identity failed: {error}"))?
+            != request.process_id as i32
+        {
             continue;
         }
-        matches.push(element);
-        if matches.len() > 1 {
-            return Err("target_ambiguous".to_owned());
+        let candidates = unsafe { window.FindAll(TreeScope_Descendants, &condition) }
+            .map_err(|error| format!("UI Automation tree query failed: {error}"))?;
+        let count = unsafe { candidates.Length() }
+            .map_err(|error| format!("UI Automation result count failed: {error}"))?;
+        bounded_nodes += count.min(2048);
+        for candidate_index in 0..count.min(2048) {
+            let element = unsafe { candidates.GetElement(candidate_index) }
+                .map_err(|error| format!("UI Automation element read failed: {error}"))?;
+            if !matches_element(&element, &request)? {
+                continue;
+            }
+            matches.push(element);
+            if matches.len() > 1 {
+                return Err("target_ambiguous".to_owned());
+            }
         }
     }
     let Some(element) = matches.pop() else {
@@ -392,7 +406,7 @@ fn execute_once(
         "route": "windows_uia_scoped_cache",
         "process_id": request.process_id,
         "candidate_count": 1,
-        "bounded_nodes": count.min(2048),
+        "bounded_nodes": bounded_nodes,
         "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
         "mouse": "untouched",
         "clipboard": "untouched",
