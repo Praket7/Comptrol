@@ -11,6 +11,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VERIFY = ROOT / "scripts" / "verify_release.py"
+CREATIVE_ADAPTERS = ("blender", "davinci-resolve", "canva", "powerpoint")
+
+
+def release_members(binary: bytes = b"binary") -> dict[str, bytes]:
+    members = {"comptrol/comptrol": binary}
+    for adapter in CREATIVE_ADAPTERS:
+        members[f"comptrol/adapters/{adapter}/adapter.toml"] = b"fixture"
+        members[f"comptrol/adapters/{adapter}/src/adapter.py"] = b"fixture"
+    return members
 
 
 def make_archive(directory: Path, name: str, members: dict[str, bytes]) -> None:
@@ -37,13 +46,14 @@ def run(directory: Path, expected_success: bool) -> None:
 
 with tempfile.TemporaryDirectory(prefix="comptrol-release-test-") as temporary:
     root = Path(temporary)
-    make_archive(root, "valid.zip", {"comptrol/comptrol": b"binary"})
+    make_archive(root, "valid.zip", release_members())
     run(root, True)
 
     invalid = root / "invalid.zip"
     with zipfile.ZipFile(invalid, "w") as package:
         package.writestr("../escape", b"bad")
-        package.writestr("comptrol/comptrol", b"binary")
+        for member, data in release_members().items():
+            package.writestr(member, data)
     digest = hashlib.sha256(invalid.read_bytes()).hexdigest()
     (root / "invalid.zip.sha256").write_text(f"{digest}  invalid.zip\n", encoding="utf-8")
     (root / "invalid.sbom.json").write_text('{"packages": []}\n', encoding="utf-8")
@@ -51,7 +61,8 @@ with tempfile.TemporaryDirectory(prefix="comptrol-release-test-") as temporary:
 
     empty = root / "empty.zip"
     with zipfile.ZipFile(empty, "w") as package:
-        package.writestr("comptrol/comptrol", b"")
+        for member, data in release_members(binary=b"").items():
+            package.writestr(member, data)
     digest = hashlib.sha256(empty.read_bytes()).hexdigest()
     (root / "empty.zip.sha256").write_text(f"{digest}  empty.zip\n", encoding="utf-8")
     (root / "empty.sbom.json").write_text('{"packages": []}\n', encoding="utf-8")
