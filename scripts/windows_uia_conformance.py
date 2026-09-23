@@ -33,10 +33,12 @@ def call(process, identifier, method, params):
 
 root = pathlib.Path(__file__).resolve().parents[1]
 binary = os.environ.get("COMPTROL_BIN", str(root / "target" / "debug" / "comptrol.exe"))
-fixture = subprocess.Popen([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(root / "fixtures" / "windows" / "UIAutomationFixture.ps1")])
+fixture = subprocess.Popen([powershell, "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", str(root / "fixtures" / "windows" / "UIAutomationFixture.ps1")])
 runtime = None
 try:
     time.sleep(1)
+    if fixture.poll() is not None:
+        raise RuntimeError("Windows UI Automation fixture exited before it could be inspected")
     runtime = subprocess.Popen(
         [binary, "mcp"],
         stdin=subprocess.PIPE,
@@ -52,7 +54,7 @@ try:
     result = call(runtime, 2, "tools/call", {"name": "operate", "arguments": {
         "intent": "windows.uia.press",
         "idempotency_key": "windows-uia-press",
-        "params": {"process_id": fixture.pid, "name": "Submit", "role": "Button"},
+        "params": {"process_id": fixture.pid, "name": "Submit", "role": "button"},
         "postcondition": {"attribute": "name", "equals": "Submitted"},
     }})
     structured = result["result"]["structuredContent"]
