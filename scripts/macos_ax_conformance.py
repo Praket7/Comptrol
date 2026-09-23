@@ -64,7 +64,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-ax-") as temporary:
             "intent": "macos.ax.press",
             "idempotency_key": "ax-fixture-press",
             "target": {"kind": "application", "name": "comptrol_ax_fixture"},
-            "params": {"app": "comptrol_ax_fixture", "control": "Submit", "role": "button"},
+            "params": {"app": "comptrol_ax_fixture", "process_id": app.pid, "control": "Submit", "role": "button"},
             "postcondition": {"attribute": "name", "equals": "Submitted"},
         }})
         structured = result["result"]["structuredContent"]
@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-ax-") as temporary:
                 raise SystemExit("macOS Accessibility permission is required")
             print("macOS AX conformance skipped because Accessibility permission is unavailable")
         else:
-            assert structured["verification"] == "verified"
+            assert structured["verification"] == "verified", json.dumps(structured, sort_keys=True)
             print("macOS AX conformance passed")
     finally:
         if runtime is not None:
