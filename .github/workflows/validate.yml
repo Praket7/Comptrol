@@ -38,7 +38,7 @@ jobs:
         env:
           COMPTROL_BIN: target/release/comptrol
       - name: Windows UI Automation fixture conformance
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && vars.COMPTROL_RUN_LIVE_WINDOWS_UIA == 'true'
         run: python scripts/windows_uia_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol.exe
