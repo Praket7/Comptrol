@@ -12,7 +12,7 @@ cd Comptrol
 cargo build --release
 ```
 
-The executable is `target/release/comptrol` on macOS/Linux and `target/release/comptrol.exe` on Windows. The latest npm package may lag behind this repository; building this checkout ensures you get the code and adapters on its current branch.
+The executable is `target/release/comptrol` on macOS/Linux and `target/release/comptrol.exe` on Windows. The published npm version is also 0.1.66. Building from this checkout uses its bundled adapters and lets you pick up later `main` changes before a new npm release is published.
 
 ## 2. Install the plugin in Codex
 
