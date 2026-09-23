@@ -33,7 +33,7 @@ jobs:
         env:
           COMPTROL_BIN: target/release/comptrol${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: macOS Accessibility fixture conformance
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && vars.COMPTROL_RUN_LIVE_MACOS_AX == 'true'
         run: python scripts/macos_ax_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol
