@@ -55,7 +55,7 @@ def connect_pipe(path, timeout=10):
     while True:
         try:
             return open(path, "r+b", buffering=0)
-        except (FileNotFoundError, PermissionError):
+        except OSError:
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.05)
