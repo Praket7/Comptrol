@@ -26,7 +26,7 @@ The normal MCP surface has seven tools.
 6. Capabilities reports only usable routes
 7. Human action resolve records a user's decision after they respond to a native prompt
 
-For ChatGPT web, follow [`plugins/comptrol/CHATGPT_SETUP.md`](plugins/comptrol/CHATGPT_SETUP.md) to connect this local stdio server through OpenAI Secure MCP Tunnel. This is separate from Codex's local stdio integration.
+For local Codex setup, including macOS Accessibility permission, follow [`plugins/comptrol/CHATGPT_SETUP.md`](plugins/comptrol/CHATGPT_SETUP.md). This local stdio plugin does not connect to ChatGPT web; that requires a separate remote MCP connection.
 
 ## Local privacy
 
@@ -47,12 +47,14 @@ The standard input and output transport is the compatibility path for Codex, Cla
 
 ## Install the launcher
 
-The published npm package is named `comptrolling`. Starting with version 0.1.1 it bundles the native runtime for macOS, Linux, and Windows.
+The published npm package is named `comptrolling`. It provides a local stdio MCP launcher with a bundled native runtime for macOS, Linux, and Windows.
 
 ```text
-npm install comptrolling
-npx comptrolling
+npm install --global comptrolling
+comptrolling
 ```
+
+For the native command-line interface (`comptrol open ...`), install and run the Rust binary as described in [Install from source](#install-from-source). The npm command above is the MCP launcher.
 
 Open an exact installed app or a URL in one command:
 
