@@ -989,6 +989,8 @@ pub enum DurableState {
 pub struct DurableOperation {
     pub operation_id: String,
     pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
     pub intent: String,
     pub risk: Risk,
     pub target: Option<Target>,
@@ -1079,6 +1081,7 @@ impl OperationJournal {
         self.write(DurableOperation {
             operation_id: operation_id.to_owned(),
             idempotency_key: request.idempotency_key.clone(),
+            request_fingerprint: Some(request_fingerprint(request)),
             intent: request.intent.clone(),
             risk,
             target: request.target.clone(),
@@ -1118,8 +1121,9 @@ impl OperationJournal {
         self.write(DurableOperation {
             operation_id: result.operation_id.clone(),
             idempotency_key: request.idempotency_key.clone(),
+            request_fingerprint: Some(request_fingerprint(request)),
             intent: request.intent.clone(),
-            risk: request.risk.unwrap_or_else(|| classify(&request.intent)),
+            risk: effective_risk(request),
             target: request.target.clone(),
             state,
             metadata: operation_metadata(request),
@@ -1201,14 +1205,17 @@ pub struct Runtime {
     pub durable_events: DurableEventHub,
     pub trace: Option<TraceRecorder>,
     pub stop: StopLatch,
-    /// Persistent consent store. Opened lazily; failures surface in doctor.
+    /// Persistent consent store. A load failure blocks consent-gated actions.
     pub consent: Option<comptrol_consent::ConsentStore>,
+    consent_error: Option<String>,
     /// Human action broker tracking paused operations awaiting user
     /// approval (UAC, polkit, TCC, browser consent...).
     pub human_actions: comptrol_consent::HumanActionBroker,
     operation_cancel: Option<Arc<AtomicBool>>,
     adapter_hosts: HashMap<String, AdapterHost>,
     idempotent: HashMap<String, ActionResult>,
+    idempotency_fingerprints: HashMap<String, String>,
+    idempotency_conflicts: HashSet<String>,
     route_history: HashMap<String, RouteHistory>,
     route_stats_db: Connection,
     sequence: u64,
@@ -1341,11 +1348,37 @@ impl Runtime {
             }
         }
         let mut idempotent = HashMap::new();
+        let mut idempotency_fingerprints = HashMap::new();
+        let mut idempotency_conflicts = HashSet::new();
         for record in operations.completed() {
             if let (Some(key), Some(result)) = (&record.idempotency_key, &record.result) {
-                idempotent.insert(key.clone(), result.clone());
+                let Some(fingerprint) = record.request_fingerprint.as_ref() else {
+                    idempotent.remove(key);
+                    idempotency_fingerprints.remove(key);
+                    idempotency_conflicts.insert(key.clone());
+                    continue;
+                };
+                if idempotency_conflicts.contains(key) {
+                    continue;
+                }
+                if idempotency_fingerprints
+                    .get(key)
+                    .is_some_and(|existing| existing != fingerprint)
+                {
+                    idempotent.remove(key);
+                    idempotency_fingerprints.remove(key);
+                    idempotency_conflicts.insert(key.clone());
+                } else {
+                    idempotent.insert(key.clone(), result.clone());
+                    idempotency_fingerprints.insert(key.clone(), fingerprint.clone());
+                }
             }
         }
+        let (consent, consent_error) =
+            match comptrol_consent::ConsentStore::open(state_dir.join("consent.jsonl")) {
+                Ok(store) => (Some(store), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
         Ok(Self {
             policy: Policy::from_environment(),
             leases: LeaseManager::new(),
@@ -1358,13 +1391,16 @@ impl Runtime {
                 .map_err(io::Error::other)?,
             trace,
             stop: StopLatch::new(&state_dir),
-            consent: comptrol_consent::ConsentStore::open(state_dir.join("consent.jsonl")).ok(),
+            consent,
+            consent_error,
             human_actions: comptrol_consent::HumanActionBroker::with_path(
                 state_dir.join("human_actions.json"),
             ),
             operation_cancel: None,
             adapter_hosts: HashMap::new(),
             idempotent,
+            idempotency_fingerprints,
+            idempotency_conflicts,
             route_history,
             route_stats_db,
             sequence: 0,
@@ -1377,16 +1413,36 @@ impl Runtime {
             .clone()
             .filter(|key| !key.trim().is_empty())
             .unwrap_or_else(|| self.next_operation_id());
+        let fingerprint = request_fingerprint(&request);
         if let Some(previous) = request
             .idempotency_key
             .as_ref()
             .and_then(|key| self.idempotent.get(key))
         {
+            if self
+                .idempotency_conflicts
+                .contains(request.idempotency_key.as_deref().unwrap_or_default())
+                || self
+                    .idempotency_fingerprints
+                    .get(request.idempotency_key.as_deref().unwrap_or_default())
+                    != Some(&fingerprint)
+            {
+                return idempotency_conflict(&request, operation_id);
+            }
             let mut replay = previous.clone();
             replay.recovery = RecoveryState::IdempotentReplay;
             return replay;
         }
-        let risk = request.risk.unwrap_or_else(|| classify(&request.intent));
+        if let Some(key) = request.idempotency_key.as_deref()
+            && (self.idempotency_conflicts.contains(key)
+                || self.operations.records.values().any(|record| {
+                    record.idempotency_key.as_deref() == Some(key)
+                        && record.request_fingerprint.as_deref() != Some(&fingerprint)
+                }))
+        {
+            return idempotency_conflict(&request, operation_id);
+        }
+        let risk = effective_risk(&request);
         if let Some(background) = request.background.as_deref()
             && !matches!(
                 background,
@@ -1449,33 +1505,40 @@ impl Runtime {
                 .or(target.name.as_deref())
                 .map(str::to_owned)
         });
-        if risk.mutation()
-            && let Some(store) = &self.consent
-            && consent_gate_applies(&request.intent)
-        {
-            let denied = match store.authorize(
-                &request.intent,
-                &request.intent,
-                to_consent_risk(risk),
-                consent_resource.as_deref(),
-            ) {
-                comptrol_consent::ConsentDecision::Denied { .. } => true,
-                comptrol_consent::ConsentDecision::Allowed { .. } => false,
-            };
-            if denied {
+        if risk.mutation() && consent_gate_applies(&request.intent) {
+            let store_unavailable = self.consent.is_none();
+            let allowed = self.consent.as_ref().is_some_and(|store| {
+                matches!(
+                    store.authorize(
+                        &request.intent,
+                        &request.intent,
+                        to_consent_risk(risk),
+                        consent_resource.as_deref(),
+                    ),
+                    comptrol_consent::ConsentDecision::Allowed { .. }
+                )
+            });
+            if !allowed {
                 let result = ActionResult::refused(
                     &request,
                     operation_id,
                     ComptrolError {
-                        code: "consent_required".to_owned(),
-                        message: format!(
-                            "No active consent grant covers {}",
-                            request.intent
-                        ),
-                        recovery: Some(
-                            "Run setup to grant this capability locally, or ask the user to approve it"
-                                .to_owned(),
-                        ),
+                        code: if store_unavailable {
+                            "consent_store_unavailable".to_owned()
+                        } else {
+                            "consent_required".to_owned()
+                        },
+                        message: if store_unavailable {
+                            "Persistent consent records could not be verified".to_owned()
+                        } else {
+                            format!("No active consent grant covers {}", request.intent)
+                        },
+                        recovery: Some(if store_unavailable {
+                            "Repair or recreate the local consent store before retrying this action"
+                                .to_owned()
+                        } else {
+                            "Run local setup to grant this capability, or ask the user to approve it".to_owned()
+                        }),
                     },
                 );
                 self.remember(&request, result.clone());
@@ -1737,7 +1800,7 @@ impl Runtime {
             "consent" => json!({
                 "store": match &self.consent {
                     Some(store) => json!({ "available": true, "path": store.path(), "active_grants": store.active(None).len() }),
-                    None => json!({ "available": false, "reason": "consent store failed to open; run setup to recreate it" }),
+                    None => json!({ "available": false, "reason": self.consent_error, "mutations_blocked": true }),
                 },
                 "human_actions": {
                     "pending": self.human_actions.all().iter().filter(|action| action.resolution.is_none()).count(),
@@ -1895,12 +1958,11 @@ impl Runtime {
                     error: None,
                 };
                 let idempotency_key = record.idempotency_key.clone();
+                let fingerprint = record.request_fingerprint.clone();
                 if let Err(error) = self.operations.reconciled(record, result.clone()) {
                     return json!({ "state": "unknown", "operation_id": operation_id, "error": { "code": "recovery_write_failed", "message": error.to_string() } });
                 }
-                if let Some(key) = idempotency_key {
-                    self.idempotent.insert(key, result.clone());
-                }
+                self.cache_idempotency(idempotency_key, fingerprint, result.clone());
                 return json!({ "state": "reconciled", "result": result });
             }
         }
@@ -1937,12 +1999,11 @@ impl Runtime {
                         error: None,
                     };
                     let idempotency_key = record.idempotency_key.clone();
+                    let fingerprint = record.request_fingerprint.clone();
                     if let Err(error) = self.operations.reconciled(record, result.clone()) {
                         return json!({ "state": "unknown", "operation_id": operation_id, "error": { "code": "recovery_write_failed", "message": error.to_string() } });
                     }
-                    if let Some(key) = idempotency_key {
-                        self.idempotent.insert(key, result.clone());
-                    }
+                    self.cache_idempotency(idempotency_key, fingerprint, result.clone());
                     return json!({ "state": "reconciled", "result": result });
                 }
                 Ok(_) => {}
@@ -1991,12 +2052,11 @@ impl Runtime {
                     error: None,
                 };
                 let idempotency_key = record.idempotency_key.clone();
+                let fingerprint = record.request_fingerprint.clone();
                 if let Err(error) = self.operations.reconciled(record, result.clone()) {
                     return json!({ "state": "unknown", "operation_id": operation_id, "error": { "code": "recovery_write_failed", "message": error.to_string() } });
                 }
-                if let Some(key) = idempotency_key {
-                    self.idempotent.insert(key, result.clone());
-                }
+                self.cache_idempotency(idempotency_key, fingerprint, result.clone());
                 return json!({ "state": "reconciled", "result": result });
             }
         }
@@ -2008,12 +2068,46 @@ impl Runtime {
         format!("op-{}-{}", now_ms(), self.sequence)
     }
 
+    fn cache_idempotency(
+        &mut self,
+        key: Option<String>,
+        fingerprint: Option<String>,
+        result: ActionResult,
+    ) {
+        let Some(key) = key else { return };
+        let Some(fingerprint) = fingerprint else {
+            self.idempotent.remove(&key);
+            self.idempotency_fingerprints.remove(&key);
+            self.idempotency_conflicts.insert(key);
+            return;
+        };
+        if self
+            .idempotency_fingerprints
+            .get(&key)
+            .is_some_and(|existing| existing != &fingerprint)
+        {
+            self.idempotent.remove(&key);
+            self.idempotency_fingerprints.remove(&key);
+            self.idempotency_conflicts.insert(key);
+            return;
+        }
+        if !self.idempotency_conflicts.contains(&key) {
+            self.idempotency_fingerprints
+                .insert(key.clone(), fingerprint);
+            self.idempotent.insert(key, result);
+        }
+    }
+
     fn remember(&mut self, request: &OperationRequest, result: ActionResult) {
         if let Some(key) = request.idempotency_key.as_ref()
             && !matches!(&result.delivery, DeliveryState::Unknown)
             && !matches!(&result.recovery, RecoveryState::RequiresReconciliation)
         {
-            self.idempotent.insert(key.clone(), result.clone());
+            self.cache_idempotency(
+                Some(key.clone()),
+                Some(request_fingerprint(request)),
+                result.clone(),
+            );
         }
         if let Err(error) = self.operations.complete(request, &result) {
             eprintln!("comptrol operation journal error: {error}");
@@ -2118,6 +2212,49 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.reopen_closed_group" => Risk::R0,
         _ => Risk::R2,
     }
+}
+
+fn effective_risk(request: &OperationRequest) -> Risk {
+    classify(&request.intent).max(request.risk.unwrap_or(Risk::R0))
+}
+
+fn request_fingerprint(request: &OperationRequest) -> String {
+    #[derive(Serialize)]
+    struct CanonicalRequest<'a> {
+        intent: &'a str,
+        target: &'a Option<Target>,
+        params: &'a Value,
+        postcondition: &'a Option<Value>,
+        risk: Risk,
+        dry_run: bool,
+        background: &'a Option<String>,
+    }
+
+    use sha2::{Digest, Sha256};
+    let request = CanonicalRequest {
+        intent: &request.intent,
+        target: &request.target,
+        params: &request.params,
+        postcondition: &request.postcondition,
+        risk: effective_risk(request),
+        dry_run: request.dry_run,
+        background: &request.background,
+    };
+    let bytes = serde_json::to_vec(&request).expect("operation request is serializable");
+    format!("v1:{:x}", Sha256::digest(bytes))
+}
+
+fn idempotency_conflict(request: &OperationRequest, operation_id: String) -> ActionResult {
+    ActionResult::refused(
+        request,
+        operation_id,
+        ComptrolError {
+            code: "idempotency_conflict".to_owned(),
+            message: "This idempotency key is already bound to a different or unverifiable request"
+                .to_owned(),
+            recovery: Some("Use a new idempotency key for a changed request".to_owned()),
+        },
+    )
 }
 
 fn execute_adapter_request(
@@ -5041,7 +5178,8 @@ fn sandbox_write(
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if relative.starts_with('/') || relative.contains("..") {
+    let relative_path = Path::new(relative);
+    if !sandbox_relative(relative) {
         return ActionResult::refused(
             request,
             operation_id,
@@ -5052,11 +5190,9 @@ fn sandbox_write(
             },
         );
     }
-    let root = state_dir().join("sandbox");
-    let path = root.join(relative);
-    if let Err(error) = fs::create_dir_all(&root)
-        .and_then(|_| checkpoints.create(&operation_id, &path))
-        .and_then(|_| fs::write(&path, content.as_bytes()))
+    let path = checkpoints.sandbox_path().join(relative_path);
+    if let Err(error) =
+        checkpoints.write_sandbox_file(&operation_id, relative_path, content.as_bytes())
     {
         return ActionResult::refused(
             request,
@@ -5083,19 +5219,13 @@ fn sandbox_copy(
     operation_id: String,
     checkpoints: &CheckpointStore,
 ) -> ActionResult {
-    sandbox_copy_at(
-        request,
-        operation_id,
-        checkpoints,
-        &state_dir().join("sandbox"),
-    )
+    sandbox_copy_at(request, operation_id, checkpoints)
 }
 
 fn sandbox_copy_at(
     request: &OperationRequest,
     operation_id: String,
     checkpoints: &CheckpointStore,
-    sandbox_root: &Path,
 ) -> ActionResult {
     let Some(source) = request.params.get("source").and_then(Value::as_str) else {
         return ActionResult::refused(
@@ -5130,65 +5260,9 @@ fn sandbox_copy_at(
             },
         );
     }
-    let Ok(source) = fs::canonicalize(sandbox_root.join(source)) else {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "path_denied".to_owned(),
-                message: "Sandbox copy source does not exist".to_owned(),
-                recovery: None,
-            },
-        );
-    };
-    let Ok(root) = fs::canonicalize(sandbox_root) else {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "path_denied".to_owned(),
-                message: "The Comptrol sandbox is unavailable".to_owned(),
-                recovery: None,
-            },
-        );
-    };
-    if !source.starts_with(&root) || !source.is_file() {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "path_denied".to_owned(),
-                message: "Sandbox copy source must be a regular sandbox file".to_owned(),
-                recovery: None,
-            },
-        );
-    }
-    let destination = root.join(destination);
-    let Some(parent) = destination.parent() else {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "path_denied".to_owned(),
-                message: "Sandbox copy destination has no parent".to_owned(),
-                recovery: None,
-            },
-        );
-    };
-    let parent_safe = fs::create_dir_all(parent).is_ok()
-        && fs::canonicalize(parent).is_ok_and(|canonical| canonical.starts_with(&root));
-    if destination.is_symlink() || !parent_safe {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "path_denied".to_owned(),
-                message: "Sandbox copy destination is not a safe sandbox path".to_owned(),
-                recovery: None,
-            },
-        );
-    }
-    let Ok(bytes) = fs::read(&source) else {
+    let source_path = Path::new(source);
+    let destination_path = Path::new(destination);
+    let Ok(bytes) = checkpoints.read_sandbox_file(source_path) else {
         return ActionResult::refused(
             request,
             operation_id,
@@ -5199,10 +5273,7 @@ fn sandbox_copy_at(
             },
         );
     };
-    if let Err(error) = checkpoints
-        .create(&operation_id, &destination)
-        .and_then(|_| fs::copy(&source, &destination).map(|_| ()))
-    {
+    if let Err(error) = checkpoints.write_sandbox_file(&operation_id, destination_path, &bytes) {
         return ActionResult::refused(
             request,
             operation_id,
@@ -5213,8 +5284,11 @@ fn sandbox_copy_at(
             },
         );
     }
-    let verified =
-        fs::read(&destination).is_ok_and(|copied| stable_hash(&copied) == stable_hash(&bytes));
+    let destination = checkpoints.sandbox_path().join(destination_path);
+    let source = checkpoints.sandbox_path().join(source_path);
+    let verified = checkpoints
+        .read_sandbox_file(destination_path)
+        .is_ok_and(|copied| copied == bytes);
     if !verified {
         return ActionResult {
             operation_id,
@@ -5246,7 +5320,12 @@ fn sandbox_copy_at(
 }
 
 fn sandbox_relative(path: &str) -> bool {
-    !path.is_empty() && !path.starts_with('/') && !path.split('/').any(|part| part == "..")
+    let path = Path::new(path);
+    !path.as_os_str().is_empty()
+        && !path.to_string_lossy().contains('\\')
+        && path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
 }
 
 fn desktop_notify(request: &OperationRequest, operation_id: String) -> ActionResult {
@@ -8951,7 +9030,7 @@ fn doctor(runtime: &Runtime) -> Value {
         "consent": {
             "store": match &runtime.consent {
                 Some(store) => json!({ "available": true, "path": store.path(), "active_grants": store.active(None).len() }),
-                None => json!({ "available": false, "reason": "consent store failed to open; run setup to recreate it" }),
+                None => json!({ "available": false, "reason": runtime.consent_error, "mutations_blocked": true }),
             },
             "awaiting_human_action": runtime.human_actions.all().iter().filter(|action| action.resolution.is_none()).count(),
         },
@@ -8991,7 +9070,34 @@ fn doctor(runtime: &Runtime) -> Value {
         "route_statistics": { "durable": "implemented", "planner_feedback": "implemented", "latency": "implemented" },
         "client_configuration": integration::list(),
         "remote": { "available": false, "binding": "loopback_only" },
+        "readiness": readiness_report(runtime),
         "state_dir": state_dir()
+    })
+}
+
+fn readiness_report(runtime: &Runtime) -> Value {
+    let capabilities = capabilities()
+        .into_iter()
+        .map(|capability| {
+            let history = runtime.route_history.get(&capability.route);
+            let attempts = history.map_or(0, |stats| stats.attempts);
+            let verified = history.map_or(0, |stats| stats.verified_successes);
+            json!({
+                "intent": capability.name,
+                "route": capability.route,
+                "environment_available": capability.available,
+                "local_policy_allowed": runtime.policy.authorize(&capability.name, capability.risk).is_ok(),
+                "live_status": if verified > 0 { "verified_here" } else if attempts > 0 { "attempted_not_verified" } else { "not_tested_here" },
+                "attempt_count": attempts,
+                "verified_successes": verified,
+                "last_verified_at_ms": history.and_then(|stats| stats.last_success_at_ms),
+                "note": capability.note
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "meaning": "environment_available describes local configuration only; verified_here means this runtime recorded a verified operation. Neither status proves an external application is installed.",
+        "capabilities": capabilities
     })
 }
 
@@ -9534,6 +9640,73 @@ mod tests {
     }
 
     #[test]
+    fn caller_cannot_lower_mutation_risk_to_bypass_stop_latch() {
+        let mut runtime = runtime();
+        runtime.stop.engage().expect("stop");
+        allow(&mut runtime, "filesystem.write", Risk::R1);
+        let result = runtime.operate(OperationRequest {
+            intent: "filesystem.write".to_owned(),
+            target: None,
+            params: json!({"path":"risk.txt","content":"blocked"}),
+            postcondition: None,
+            risk: Some(Risk::R0),
+            idempotency_key: Some("risk-downgrade".to_owned()),
+            dry_run: false,
+            background: None,
+        });
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("stopped")
+        );
+    }
+
+    #[test]
+    fn idempotency_key_rejects_changed_request_and_replays_exact_request_after_restart() {
+        let dir = std::env::temp_dir().join(format!("comptrol-idempotency-{}", now_ms()));
+        let key = Some("stable-key".to_owned());
+        let request = OperationRequest {
+            intent: "system.ping".to_owned(),
+            target: None,
+            params: json!({"value":1}),
+            postcondition: None,
+            risk: None,
+            idempotency_key: key.clone(),
+            dry_run: false,
+            background: None,
+        };
+        let mut runtime = Runtime::new(dir.clone()).expect("runtime");
+        let first = runtime.operate(request.clone());
+        let replay = runtime.operate(request.clone());
+        assert!(matches!(replay.recovery, RecoveryState::IdempotentReplay));
+        let mut changed = request.clone();
+        changed.params = json!({"value":2});
+        assert_eq!(
+            runtime
+                .operate(changed.clone())
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("idempotency_conflict")
+        );
+        drop(runtime);
+        let mut restarted = Runtime::new(dir.clone()).expect("restart");
+        assert!(matches!(
+            restarted.operate(request).recovery,
+            RecoveryState::IdempotentReplay
+        ));
+        assert_eq!(
+            restarted
+                .operate(changed)
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("idempotency_conflict")
+        );
+        assert!(!first.operation_id.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn sandbox_copy_verifies_and_rejects_parent_traversal() {
         let directory = std::env::temp_dir().join(format!("comptrol-copy-{}", now_ms()));
         let sandbox = directory.join("sandbox");
@@ -9550,7 +9723,7 @@ mod tests {
             dry_run: false,
             background: None,
         };
-        let result = sandbox_copy_at(&request, "copy-op".to_owned(), &checkpoints, &sandbox);
+        let result = sandbox_copy_at(&request, "copy-op".to_owned(), &checkpoints);
         assert_eq!(result.verification, VerificationState::Verified);
         assert_eq!(
             fs::read(sandbox.join("nested/copy.txt")).expect("copy"),
@@ -9558,7 +9731,7 @@ mod tests {
         );
         let mut invalid = request;
         invalid.params["source"] = json!("../outside.txt");
-        let result = sandbox_copy_at(&invalid, "copy-invalid".to_owned(), &checkpoints, &sandbox);
+        let result = sandbox_copy_at(&invalid, "copy-invalid".to_owned(), &checkpoints);
         assert_eq!(
             result.error.as_ref().map(|error| error.code.as_str()),
             Some("path_denied")
@@ -9652,6 +9825,7 @@ mod tests {
         let record = DurableOperation {
             operation_id: "op-restart".to_owned(),
             idempotency_key: Some("recover-key".to_owned()),
+            request_fingerprint: Some(request_fingerprint(&request)),
             intent: request.intent.clone(),
             risk: Risk::R1,
             target: None,
@@ -9682,6 +9856,7 @@ mod tests {
         let record = DurableOperation {
             operation_id: "op-interrupted".to_owned(),
             idempotency_key: Some("interrupted-key".to_owned()),
+            request_fingerprint: None,
             intent: "command.run".to_owned(),
             risk: Risk::R3,
             target: None,
@@ -9720,6 +9895,7 @@ mod tests {
         let record = DurableOperation {
             operation_id: "op-unknown".to_owned(),
             idempotency_key: request.idempotency_key.clone(),
+            request_fingerprint: Some(request_fingerprint(&request)),
             intent: request.intent.clone(),
             risk: Risk::R1,
             target: None,
@@ -9764,6 +9940,7 @@ mod tests {
         let record = DurableOperation {
             operation_id: "op-observed".to_owned(),
             idempotency_key: request.idempotency_key.clone(),
+            request_fingerprint: Some(request_fingerprint(&request)),
             intent: request.intent.clone(),
             risk: Risk::R1,
             target: None,
@@ -9859,8 +10036,8 @@ mod tests {
     #[test]
     fn checkpoint_restores_existing_file() {
         let dir = std::env::temp_dir().join(format!("comptrol-checkpoint-{}", now_ms()));
-        let source = dir.join("note.txt");
-        fs::create_dir_all(&dir).expect("checkpoint dir");
+        let source = dir.join("sandbox/note.txt");
+        fs::create_dir_all(source.parent().expect("parent")).expect("checkpoint dir");
         fs::write(&source, b"before").expect("source");
         let store = CheckpointStore::new(&dir).expect("store");
         let checkpoint = store.create("operation", &source).expect("checkpoint");
@@ -10142,8 +10319,69 @@ mod tests {
         let mut runtime = runtime();
         let report = runtime.inspect("doctor");
         assert_eq!(report["consent"]["store"]["available"], json!(true));
+        let ping = report["readiness"]["capabilities"]
+            .as_array()
+            .expect("readiness list")
+            .iter()
+            .find(|entry| entry["intent"] == "system.ping")
+            .expect("ping readiness");
+        assert_eq!(ping["live_status"], "not_tested_here");
+        assert_eq!(ping["environment_available"], true);
+        runtime.operate(OperationRequest {
+            intent: "system.ping".to_owned(),
+            target: None,
+            params: Value::Null,
+            postcondition: None,
+            risk: Some(Risk::R0),
+            idempotency_key: None,
+            dry_run: false,
+            background: None,
+        });
+        let report = runtime.inspect("doctor");
+        let ping = report["readiness"]["capabilities"]
+            .as_array()
+            .expect("readiness list")
+            .iter()
+            .find(|entry| entry["intent"] == "system.ping")
+            .expect("ping readiness");
+        assert_eq!(ping["live_status"], "verified_here");
         let consent = runtime.inspect("consent");
         assert!(consent["human_actions"]["pending"].is_u64());
+    }
+
+    #[test]
+    fn corrupt_consent_store_fails_closed_and_reports_reason() {
+        let dir = std::env::temp_dir().join(format!("comptrol-consent-corrupt-{}", now_ms()));
+        fs::create_dir_all(&dir).expect("state");
+        fs::write(dir.join("consent.jsonl"), b"not valid json\n").expect("corrupt store");
+        let mut runtime = Runtime::new(dir.clone()).expect("runtime keeps running");
+        allow(&mut runtime, "software.install", Risk::R3);
+        let result = runtime.operate(OperationRequest {
+            intent: "software.install".to_owned(),
+            target: Some(Target {
+                kind: "package".to_owned(),
+                id: Some("test:package".to_owned()),
+                name: None,
+            }),
+            params: json!({}),
+            postcondition: None,
+            risk: Some(Risk::R3),
+            idempotency_key: None,
+            dry_run: true,
+            background: None,
+        });
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("consent_store_unavailable")
+        );
+        let report = runtime.inspect("doctor");
+        assert_eq!(report["consent"]["store"]["available"], json!(false));
+        assert!(
+            report["consent"]["store"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn allow(runtime: &mut Runtime, intent: &str, risk: Risk) {

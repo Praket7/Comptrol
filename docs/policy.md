@@ -1,7 +1,19 @@
-# Policy
+# Local permissions
 
-Policy runs below the MCP adapter. The agent cannot grant itself a new capability.
+Comptrol checks local rules before it changes anything. An assistant cannot give itself new permission.
 
-The default policy allows system ping, desktop observation, platform broker observation, opening an exact installed app with `app.launch`, and opening a URL in the existing default Chrome profile with `browser.chrome.open_tab`. The open routes are individually allowlisted; they do not grant general desktop input, app-resource access, browser DOM mutation, or file writes. Setting `COMPTROL_ALLOW_SANDBOX_WRITES=1` enables writes and regular file copies below the Comptrol sandbox. Setting `COMPTROL_ALLOW_DESKTOP_NOTIFY=1` enables the notification route on macOS.
+## What works by default
 
-Those environment switches are intentionally coarse for the foundation release. A file based policy with per application and per path scopes is required before broader desktop mutation is enabled.
+Comptrol can answer a basic status check, observe supported computer state, open an exact installed app, and open a URL in Chrome. Opening an app does not grant permission to edit it. Opening a page does not grant permission to read or change its contents.
+
+## Changes need permission
+
+File writes are limited to the Comptrol sandbox. Local settings can enable sandbox writes or desktop notifications. These switches are broad. Keep them off unless you need them.
+
+Some sensitive actions also need a saved approval for the exact capability and resource. Comptrol stores those approvals on your computer. A missing, damaged, expired, or revoked approval blocks the action. The doctor report shows when the approval store cannot be read.
+
+The caller can ask for a stricter risk level. It cannot lower the server's own risk classification. The emergency stop blocks changes even when the caller labels them as read only.
+
+## Separate hosted access
+
+These rules protect the local runtime. ChatGPT on the web needs a separately configured authenticated HTTPS connection. Do not expose the local loopback service directly to the internet.

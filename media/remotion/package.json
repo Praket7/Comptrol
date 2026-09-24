@@ -1,0 +1,16 @@
+{
+  "name": "comptrol-demo",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "render": "remotion render src/index.jsx ComptrolDemo out/comptrol.mp4",
+    "still": "remotion still src/index.jsx ComptrolDemo out/comptrol.png --frame=150"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.506",
+    "@remotion/renderer": "4.0.506",
+    "remotion": "4.0.506",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  }
+}

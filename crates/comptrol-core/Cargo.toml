@@ -19,6 +19,7 @@ comptrol-verification = { path = "../comptrol-verification" }
 comptrol-workflow = { path = "../comptrol-workflow" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+cap-std = "4.0.3"
 toml = "0.8"
 tungstenite = "0.27"
 getrandom = "0.3"

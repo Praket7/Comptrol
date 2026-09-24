@@ -1,13 +1,15 @@
 import json
+import re
 from pathlib import Path
 
 text = Path("README.md").read_text(encoding="utf8")
-# Narrowed from the old brittle class ("-–—:;") which banned ASCII hyphens,
-# colons, and semicolons needed for versions, paths, and normal technical
-# prose. Only em/en dashes remain constrained.
-for character in "–—":
+# Keep the project README within the requested plain language style.
+for character in "-:;–—":
     if character in text:
         raise SystemExit(f"README contains forbidden character {character!r}")
+for word in ("for", "and", "nor", "but", "or", "yet", "so"):
+    if re.search(rf"\b{word}\b", text, re.IGNORECASE):
+        raise SystemExit(f"README contains forbidden word {word!r}")
 
 # Generated consistency checks: the README must agree with the single VERSION
 # source and the published npm package identity rather than drifting.

@@ -1,54 +1,34 @@
-# Comptrol V5 Benchmarks
+# How Comptrol is checked
 
-## Overview
+Comptrol has local test pages for repeatable browser tasks. The benchmark runner starts a fresh runtime, runs each task, then checks the result independently. A returned tool response alone does not count as success.
 
-V5 benchmarks are driven by an **executable** runner (`bench/runners/run_matrix.py`) that spawns the release `comptrol` binary over stdio MCP and records per-task latency distributions with p50/p95. Every task is defined as JSON in `bench/tasks/v5/`. Results are written to `bench/results/` with full metadata.
+## Current browser result
 
-## Running
+The current local run completed three browser tasks three times each. All nine runs passed. The record includes timing, tool calls, retries, wrong target events, false success reports, foreground changes.
 
-```bash
-python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/browser_matrix.json --binary target/debug/comptrol --iterations 5
-python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/adapter_matrix.json --binary target/release/comptrol --iterations 3
+[Open the full result](../bench/results/audit_browser_fixture_20260923.json)
+
+The result file records that the changes were uncommitted at measurement time.
+
+This is a small browser fixture on one macOS ARM64 computer. It does not measure every website, browser profile, operating system, or adapter. It is not a promise about future speed.
+
+## Run the browser check
+
+Build Comptrol, then run the browser fixture check.
+
+```sh
+cargo build -p comptrol
+node scripts/browser_conformance.mjs
 ```
 
-All scripts must run with `/opt/homebrew/bin/python3.11` **and** `/usr/bin/python3` (3.10; no `tomllib`).
+The check launches a local test page. It verifies page readiness, navigation, semantic clicks, target identity, uploads, downloads, recovery. No real account or user file is involved.
 
-## Task Matrix Contract
+## Run the repeated matrix
 
-Each `bench/tasks/v5/<name>.json` contains:
-- `task_id`: unique identifier
-- `benchmark_suite`: category
-- `goal`: plain-language goal
-- `tasks`: array of task objects, each with:
-  - `task_id`, `goal`, `method`, `params`, `iterations`, `final_verifier`
-  - Optional `skip_reason` for live-platform tasks that need unavailable permissions
-- `final_verifier`: overall matrix verification string
+```sh
+python3 bench/runners/run_matrix.py --matrix bench/tasks/v5/browser_matrix.json --binary target/debug/comptrol --iterations 3 --output bench/results/local-browser.json
+```
 
-## Measurement Scope
+Results list a median and a p95 latency per task. A fair comparison needs the same machine, task matrix, initial state, number of runs, independent verifier.
 
-Each row records:
-- `verified`: whether the independent verifier passed
-- `latency_ms`: wall-clock per iteration
-- `mcp_calls`, `internal_route_actions`, `screenshots`, `bytes_returned`
-- `retries`, `wrong_target_events`, `foreground_disturbances`, `false_positive_verifications`
-
-The runner computes p50/p95 per task over N iterations and writes a full results JSON with per-iteration rows.
-
-## Transport Ping vs Task Performance
-
-The transport ping (`v4.transport.smoke`) is a **connectivity check only**. It must never be presented as task performance. Task performance requires an independent final verifier and a real fixture or live platform.
-
-## Results Schema
-
-Results JSON contains:
-- `matrix`, `benchmark_suite`, `metadata` (os, arch, cpu, python, rust, git head)
-- `generated_at`
-- `tasks`: array of per-task summaries with p50/p95 and full iteration rows
-
-## Matched Comparison
-
-Comparing two runs requires:
-1. Same initial state (fresh state directory)
-2. Same independent verifier
-3. Same iteration count
-4. Transport ping excluded from performance claims
+The fixture proves only the behavior exercised by its tasks. Windows and Linux desktop control, live app editing, hosted ChatGPT connections need separate tests on those real systems.
