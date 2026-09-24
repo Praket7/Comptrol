@@ -28,7 +28,7 @@ def find_chrome():
     raise FileNotFoundError("Google Chrome was not found in the standard Windows installation paths")
 
 
-def wait_for_endpoint(endpoint, timeout=15):
+def wait_for_endpoint(endpoint, timeout=45):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -53,6 +53,7 @@ endpoint = f"http://127.0.0.1:{port}"
 chrome = find_chrome()
 process = subprocess.Popen([
     str(chrome),
+    "--headless=new",
     "--remote-debugging-address=127.0.0.1",
     f"--remote-debugging-port={port}",
     f"--user-data-dir={profile}",
