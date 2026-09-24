@@ -6,7 +6,7 @@ Comptrol runs on your computer. It connects an assistant to a small set of compu
 
 Install Node.js with npm, then install the `comptrolling` package.
 
-The currently published npm release is 0.1.66. It does not include the new GitHub changes yet. Build from source with [the local Codex guide](../plugins/comptrol/CHATGPT_SETUP.md) to use them now.
+The npm release for these changes is version 0.1.67. For local Codex setup, follow [the local Codex guide](../plugins/comptrol/CHATGPT_SETUP.md).
 
 ```sh
 npm install -g comptrolling

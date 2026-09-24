@@ -1,6 +1,6 @@
 # Current support
 
-Checked on 23 September 2026. Version 0.1.66 is listed on npm. The matching public GitHub release contains runtime archives for all five listed processor and operating system combinations. This checks package availability. It does not prove every adapter works on every computer.
+Checked on 24 September 2026. Version 0.1.67 is the release version for this update. The public GitHub release contains runtime archives for all five listed processor and operating system combinations. This checks package availability. It does not prove every adapter works on every computer.
 
 | Computer | Runtime package | Computer controls | Evidence in this checkout |
 |---|---|---|---|
@@ -10,7 +10,7 @@ Checked on 23 September 2026. Version 0.1.66 is listed on npm. The matching publ
 | Linux x64 | Available | Accessibility control needs an active desktop accessibility session. | Release archive is published. No Linux desktop session was tested here. |
 | Linux ARM64 | Available | Same session requirement as Linux x64. | Release archive is published. No Linux desktop session was tested here. |
 
-The npm package requires Node.js 18 or newer. It starts the matching native runtime. App controls depend on installed apps, local permission, each app's own connection settings. The 0.1.66 npm release predates the changes in this GitHub update. A new npm release is required to receive these fixes through npm.
+The npm package requires Node.js 18 or newer. It starts the matching native runtime. App controls depend on installed apps, local permission, each app's own connection settings.
 
 ## What live means
 
@@ -24,4 +24,4 @@ Installing the npm package does not connect ChatGPT on the web to your computer.
 
 ## Verified package references
 
-The release lists macOS ARM64, macOS Intel, Windows x64, Linux ARM64, Linux x64 archives. The [GitHub release](https://github.com/Praket7/Comptrol/releases/tag/v0.1.66) is public. The [npm package](https://www.npmjs.com/package/comptrolling/v/0.1.66) lists the same package version.
+The release lists macOS ARM64, macOS Intel, Windows x64, Linux ARM64, Linux x64 archives. The [GitHub release](https://github.com/Praket7/Comptrol/releases/tag/v0.1.67) is public. The [npm package](https://www.npmjs.com/package/comptrolling/v/0.1.67) lists the same package version.

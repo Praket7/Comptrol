@@ -1,6 +1,6 @@
 {
   "name": "comptrol",
-  "version": "0.1.66",
+  "version": "0.1.67",
   "description": "Local Codex computer control with verified browser, desktop, settings, and application routes.",
   "author": {
     "name": "Local developer"

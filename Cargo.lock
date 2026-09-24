@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "cap-std",
  "comptrol-adapter-host",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-adapter-host"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "comptrol-adapter-sdk",
  "getrandom 0.3.4",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-adapter-sdk"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde",
  "serde_json",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-app-registry"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde",
  "serde_json",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-browser"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "dirs",
  "futures-util",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-consent"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde",
  "serde_json",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-platform-linux"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "atspi",
  "serde_json",
@@ -426,14 +426,14 @@ dependencies = [
 
 [[package]]
 name = "comptrol-platform-macos"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "comptrol-platform-windows"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde_json",
  "windows",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-popup"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde",
  "serde_json",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-settings"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde",
  "serde_json",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-software"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde",
  "serde_json",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-verification"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde",
  "serde_json",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "comptrol-workflow"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "serde",
  "serde_json",

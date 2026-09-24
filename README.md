@@ -24,7 +24,7 @@ The word adapter means a connection to an app. Some connections use an app's own
 
 Install comptrolling, the Comptrol package. Add its local server command to a compatible assistant app. Then ask it to list available capabilities. MCP is the connection format that lets assistant apps use Comptrol.
 
-The latest npm package is version 0.1.66. The changes on GitHub are not in that package. Build from source to use these fixes before the next package release.
+This update uses npm version 0.1.67. Install it with npm to get this release.
 
 [Start here](docs/start.md)
 
