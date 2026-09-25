@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Chrome user data directory locations by platform
 fn chrome_user_data_dirs() -> Vec<PathBuf> {
@@ -64,14 +64,9 @@ fn find_devtools_active_port(user_data_dir: &Path) -> Option<(u16, String)> {
         let path = entry.path();
         if path.file_name() == Some(std::ffi::OsStr::new("DevToolsActivePort"))
             && let Ok(content) = fs::read_to_string(&path)
+            && let Some(active_port) = parse_devtools_active_port(&content)
         {
-            let lines: Vec<&str> = content.lines().collect();
-            if lines.len() >= 2
-                && let Ok(port) = lines[0].parse::<u16>()
-            {
-                let ws_path = lines[1].to_string();
-                return Some((port, ws_path));
-            }
+            return Some(active_port);
         }
     }
     None
@@ -82,40 +77,12 @@ fn find_devtools_active_port(user_data_dir: &Path) -> Option<(u16, String)> {
 /// This implements the actual Chrome DevTools Protocol approach:
 /// 1. Find Chrome user data directory and read DevToolsActivePort
 /// 2. Construct ws://127.0.0.1:<port><path> URL
-/// 3. Connect to the WebSocket (user must have enabled remote debugging and clicked Allow)
-pub async fn connect_permissioned_auto_connect(
-    _debug_port: u16,
-    timeout: Duration,
-) -> Result<String, String> {
-    let start = std::time::Instant::now();
-
+/// 3. Return its local WebSocket URL for the persistent browser manager to
+///    connect and verify (Chrome may show its native Allow prompt on that socket).
+pub fn connect_permissioned_auto_connect() -> Result<String, String> {
     for user_data_dir in chrome_user_data_dirs() {
         if let Some((port, ws_path)) = find_devtools_active_port(&user_data_dir) {
-            let _ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
-
-            // Verify we can connect to the WebSocket
-            let client = reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .map_err(|e| format!("HTTP client error: {}", e))?;
-
-            let http_url = format!("http://127.0.0.1:{}/json/version", port);
-            let deadline = start + timeout;
-
-            while std::time::Instant::now() < deadline {
-                if let Ok(resp) = client.get(&http_url).send().await
-                    && resp.status().is_success()
-                {
-                    return Ok(format!("ws://127.0.0.1:{}{}", port, ws_path));
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-
-            return Err(format!(
-                "Found DevToolsActivePort at {} but Chrome did not respond on http://127.0.0.1:{}/json/version within timeout. Ensure remote debugging is enabled in chrome://inspect/#remote-debugging and you have clicked Allow.",
-                user_data_dir.display(),
-                port
-            ));
+            return Ok(format!("ws://127.0.0.1:{port}{ws_path}"));
         }
     }
 
@@ -125,12 +92,20 @@ pub async fn connect_permissioned_auto_connect(
     )
 }
 
-/// Get the auto-connect debug port from environment or default.
-pub fn auto_connect_debug_port() -> u16 {
-    std::env::var("COMPTROL_CHROME_DEBUG_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(9222)
+fn parse_devtools_active_port(content: &str) -> Option<(u16, String)> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < 2 {
+        return None;
+    }
+    let port = lines[0].parse::<u16>().ok()?;
+    let ws_path = lines[1];
+    if port == 0
+        || !ws_path.starts_with("/devtools/browser/")
+        || ws_path.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some((port, ws_path.to_owned()))
 }
 
 /// Control surfaces the broker knows about.
@@ -230,21 +205,30 @@ fn native_bridge_available() -> bool {
 pub fn list_sessions() -> Vec<BrowserSession> {
     let cdp_configured = std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some();
     let auto_connect_armed = std::env::var("COMPTROL_CHROME_AUTO_CONNECT").as_deref() == Ok("1");
+    let chrome_endpoint_detected = chrome_user_data_dirs()
+        .iter()
+        .any(|user_data_dir| find_devtools_active_port(user_data_dir).is_some());
+    let companion_available = native_bridge_available();
     vec![
         BrowserSession {
             provider: SessionProvider::PermissionedAutoConnect,
-            available: auto_connect_armed,
-            reason: if auto_connect_armed {
-                "permissioned auto-connect is armed; Chrome still shows its Allow prompt per connection".to_owned()
+            available: auto_connect_armed && chrome_endpoint_detected,
+            reason: if !auto_connect_armed {
+                "Comptrol auto-connect is not armed in this server process; enable COMPTROL_CHROME_AUTO_CONNECT and reload the server. Chrome's Remote Debugging setting is separate."
+                    .to_owned()
+            } else if chrome_endpoint_detected {
+                "Comptrol auto-connect is armed and Chrome's DevToolsActivePort is present; list is discovery only, so a live CDP handshake and Chrome's native Allow decision are still unverified. Chrome asks again for each new connection, not each operation on a reused connection."
+                    .to_owned()
             } else {
-                "remote debugging consent is not enabled; open chrome://inspect/#remote-debugging and enable it, then arm COMPTROL_CHROME_AUTO_CONNECT".to_owned()
+                "Comptrol auto-connect is armed, but no Chrome DevToolsActivePort was found. Start Chrome and enable Remote Debugging at chrome://inspect/#remote-debugging; connection consent is checked when connect is requested."
+                    .to_owned()
             },
             signed_in_capable: true,
         },
         BrowserSession {
             provider: SessionProvider::CompanionExtension,
-            available: native_bridge_available(),
-            reason: if native_bridge_available() {
+            available: companion_available,
+            reason: if companion_available {
                 "companion extension native host is registered; CDP commands route through the daemon"
                     .to_owned()
             } else {
@@ -493,6 +477,23 @@ mod tests {
                 .filter(|session| session.signed_in_capable)
                 .count()
                 == 2
+        );
+    }
+
+    #[test]
+    fn devtools_active_port_requires_a_browser_websocket_path() {
+        let valid = parse_devtools_active_port("9222\n/devtools/browser/session-id\n");
+        assert_eq!(
+            valid,
+            Some((9222, "/devtools/browser/session-id".to_owned()))
+        );
+        assert_eq!(
+            parse_devtools_active_port("9222\n/not-a-browser-path\n"),
+            None
+        );
+        assert_eq!(
+            parse_devtools_active_port("9222\n/devtools/browser/session\u{0}\n"),
+            None
         );
     }
 }

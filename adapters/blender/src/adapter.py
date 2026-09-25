@@ -36,6 +36,63 @@ def script_for(payload):
             raise ValueError("offline edits require an explicit .blend output_path")
         return str(Path(raw).resolve())
 
+    if intent == "blender.scene.create_2d_rocket":
+        output = Path(str(payload.get("output_path", ""))).resolve()
+        if output.suffix.lower() != ".blend":
+            raise ValueError("2D rocket creation requires an explicit .blend output_path")
+        render = Path(str(payload.get("render_path", output.with_suffix(".png")))).resolve()
+        if render.suffix.lower() != ".png":
+            raise ValueError("2D rocket render_path must end in .png")
+        return f'''import bpy, json
+scene = bpy.context.scene
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete(use_global=False)
+def material(name, color):
+    mat = bpy.data.materials.new(name=name)
+    mat.diffuse_color = (*color, 1.0)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    nodes.clear()
+    emission = nodes.new("ShaderNodeEmission")
+    emission.inputs["Color"].default_value = (*color, 1.0)
+    output_node = nodes.new("ShaderNodeOutputMaterial")
+    mat.node_tree.links.new(emission.outputs["Emission"], output_node.inputs["Surface"])
+    return mat
+def polygon(name, points, color, z):
+    mesh = bpy.data.meshes.new(name + " Mesh")
+    mesh.from_pydata([(x, y, z) for x, y in points], [], [tuple(range(len(points)))])
+    mesh.materials.append(material(name + " Color", color))
+    obj = bpy.data.objects.new(name, mesh)
+    scene.collection.objects.link(obj)
+    return obj
+polygon("Background", [(-5,-5),(5,-5),(5,5),(-5,5)], (0.035,0.075,0.16), -0.2)
+polygon("Rocket Body", [(-0.52,-1.45),(0.52,-1.45),(0.52,1.0),(-0.52,1.0)], (0.88,0.92,0.98), 0.0)
+polygon("Rocket Nose", [(-0.52,1.0),(0.0,2.1),(0.52,1.0)], (0.96,0.28,0.16), 0.02)
+polygon("Left Fin", [(-0.52,-0.75),(-1.08,-1.5),(-0.52,-1.32)], (0.96,0.28,0.16), 0.03)
+polygon("Right Fin", [(0.52,-0.75),(1.08,-1.5),(0.52,-1.32)], (0.96,0.28,0.16), 0.03)
+polygon("Window Rim", [(-0.31,0.45),(0.0,0.76),(0.31,0.45),(0.31,0.12),(0.0,-0.12),(-0.31,0.12)], (0.05,0.18,0.34), 0.04)
+polygon("Window", [(-0.20,0.42),(0.0,0.61),(0.20,0.42),(0.20,0.18),(0.0,0.02),(-0.20,0.18)], (0.18,0.78,0.95), 0.05)
+polygon("Flame Outer", [(-0.36,-1.48),(0.0,-2.35),(0.36,-1.48)], (1.0,0.36,0.06), 0.01)
+polygon("Flame Inner", [(-0.17,-1.49),(0.0,-2.05),(0.17,-1.49)], (1.0,0.82,0.18), 0.06)
+camera_data = bpy.data.cameras.new("Rocket Camera")
+camera = bpy.data.objects.new("Rocket Camera", camera_data)
+scene.collection.objects.link(camera)
+camera.location = (0,0,20)
+camera_data.type = "ORTHO"
+camera_data.ortho_scale = 10
+scene.camera = camera
+scene.render.engine = "BLENDER_EEVEE"
+scene.render.resolution_x = 1000
+scene.render.resolution_y = 1000
+scene.render.resolution_percentage = 100
+scene.render.image_settings.file_format = "PNG"
+scene.render.filepath = {str(render)!r}
+scene.world.color = (0.035,0.075,0.16)
+bpy.ops.wm.save_as_mainfile(filepath={str(output)!r})
+bpy.ops.render.render(write_still=True)
+print(json.dumps({{"saved":bpy.data.filepath,"render":scene.render.filepath,"objects":[o.name for o in scene.objects]}}))
+'''
+
     if intent == "blender.scene.object.list":
         return "import bpy, json; print(json.dumps({'objects':[{'name':o.name,'type':o.type,'location':list(o.location),'rotation':list(o.rotation_euler),'scale':list(o.scale)} for o in bpy.context.scene.objects]}))"
     if intent == "blender.scene.object.create":
@@ -161,19 +218,24 @@ def handler(request):
             payload = bridge.get("payload", {})
             return response(request, True, "available", {**payload, "verified": payload.get("verified") is True, "verification": "blender_bpy_readback", "mode": "live"})
         input_path = Path(str(payload.get("input_path", ""))).resolve()
-        if not input_path.is_file() or input_path.suffix.lower() != ".blend":
+        rocket_recipe = intent == "blender.scene.create_2d_rocket"
+        if not rocket_recipe and (not input_path.is_file() or input_path.suffix.lower() != ".blend"):
             return response(request, False, "unsupported", error={"code": "blender_input_required", "message": "Offline Blender operations require an exact existing input_path .blend file"})
         script = script_for(payload)
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as handle:
             handle.write(script)
             script_path = handle.name
         try:
-            completed = subprocess.run([executable, "--background", str(input_path), "--python", script_path], capture_output=True, text=True, timeout=30, check=False)
+            command = [executable, "--background"]
+            command += ["--factory-startup"] if rocket_recipe else [str(input_path)]
+            command += ["--python", script_path]
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=120 if rocket_recipe else 30, check=False)
         finally:
             os.unlink(script_path)
-        if completed.returncode != 0:
-            return response(request, False, "degraded", error={"code": "blender_failed", "message": completed.stderr[-2000:]})
-        data = {"mode": "offline", "input_path": str(input_path), "stdout": completed.stdout[-4000:], "verified_process_exit": True, "live_project_modified": False}
+        script_readback = '"objects"' in completed.stdout and "Rocket Body" in completed.stdout
+        if completed.returncode != 0 or (rocket_recipe and not script_readback):
+            return response(request, False, "degraded", error={"code": "blender_failed" if completed.returncode != 0 else "blender_script_not_verified", "message": (completed.stderr + "\n" + completed.stdout)[-3000:]})
+        data = {"mode": "offline", "input_path": str(input_path) if not rocket_recipe else None, "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-2000:], "verified_process_exit": True, "live_project_modified": False}
         # Offline verification is artifact-based: the saved or rendered file
         # must exist with nonzero size. Process exit alone is never proof.
         if intent == "blender.project.save":
@@ -182,6 +244,15 @@ def handler(request):
             data["output_size"] = saved.stat().st_size if saved.is_file() else 0
             data["verified"] = saved.is_file() and data["output_size"] > 0
             data["verification"] = "blend_file_readback"
+        elif intent == "blender.scene.create_2d_rocket":
+            saved = Path(str(payload.get("output_path", ""))).resolve()
+            render = Path(str(payload.get("render_path", saved.with_suffix(".png")))).resolve()
+            data["output_path"] = str(saved)
+            data["output_size"] = saved.stat().st_size if saved.is_file() else 0
+            data["render_path"] = str(render)
+            data["render_size"] = render.stat().st_size if render.is_file() else 0
+            data["verified"] = saved.is_file() and data["output_size"] > 0 and render.is_file() and data["render_size"] > 0
+            data["verification"] = "blend_and_render_artifact_readback"
         elif intent == "blender.render":
             artifact = Path(str(payload.get("output_path", ""))).resolve()
             data["output_path"] = str(artifact)

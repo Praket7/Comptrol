@@ -7,7 +7,7 @@ mod session;
 pub use blocking::{BlockingBrowserManager, WaitGraphSnapshot};
 pub use manager::BrowserManager;
 pub use session::{
-    BrowserSession, CachedTargetState, SessionProvider, TargetStateCache, auto_connect_debug_port,
+    BrowserSession, CachedTargetState, SessionProvider, TargetStateCache,
     connect_permissioned_auto_connect, list_sessions, select_provider,
 };
 

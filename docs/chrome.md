@@ -14,6 +14,12 @@ The normal repository check uses the deterministic fixture websocket. Real Chrom
 
 For a user visible validation, start Chrome with a loopback DevTools endpoint and set `COMPTROL_CDP_ENDPOINT` plus `COMPTROL_ALLOW_BROWSER_CDP`. The validation must use the user chosen profile intentionally. Comptrol will reuse that profile but will not copy cookies or credentials into another profile.
 
+## Existing signed-in Chrome session
+
+On Chrome 144 and newer, enable **Remote Debugging** at `chrome://inspect/#remote-debugging`. The Comptrol plugin arms `COMPTROL_CHROME_AUTO_CONNECT=1`; when the user calls `browser.session.connect`, Comptrol reads Chrome's `DevToolsActivePort` file and connects to its loopback WebSocket URL. Chrome can show its native **Allow** prompt for that connection. Comptrol verifies the connection with `Browser.getVersion` and keeps the same WebSocket open for later target discovery and browser actions.
+
+This permissioned route uses the WebSocket path in `DevToolsActivePort` directly. It does not rely on `/json/version` or `/json/list`, which may return 404 for Chrome's permissioned endpoint. A user-started classic debugging endpoint continues to use its HTTP discovery routes.
+
 On Windows, the repository launcher creates a separate profile and exposes the endpoint automatically. It does not touch the normal Chrome profile.
 
 The native `comptrol mcp` startup path also performs this setup automatically when no `COMPTROL_CDP_ENDPOINT` is already configured. This applies to source builds, GitHub release binaries, and the `comptrolling` npm launcher. Set `COMPTROL_AUTO_START_CHROME_CDP=0` to opt out. Set `COMPTROL_CHROME_START_URL` to choose the first page, or `COMPTROL_CHROME_PROFILE` to choose the isolated profile directory.

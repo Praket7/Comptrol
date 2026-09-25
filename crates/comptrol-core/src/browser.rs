@@ -174,16 +174,21 @@ pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
         }
         return Ok(targets);
     }
-    let value = get_json(endpoint, "/json/list").map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Start a supported browser with remote debugging enabled".to_owned()),
-    })?;
-    let targets = parse_targets(&value).ok_or_else(|| ComptrolError {
-        code: "browser_protocol_invalid".to_owned(),
-        message: "The browser returned an invalid target list".to_owned(),
-        recovery: Some("Inspect the configured DevTools endpoint".to_owned()),
-    })?;
+    let targets = if is_websocket_endpoint(endpoint) {
+        let value = protocol_call(endpoint, "Target.getTargets", json!({}))?;
+        parse_cdp_target_infos(&value)?
+    } else {
+        let value = get_json(endpoint, "/json/list").map_err(|error| ComptrolError {
+            code: "browser_unavailable".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Start a supported browser with remote debugging enabled".to_owned()),
+        })?;
+        parse_targets(&value).ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser returned an invalid target list".to_owned(),
+            recovery: Some("Inspect the configured DevTools endpoint".to_owned()),
+        })?
+    };
     if let Ok(mut caches) = target_caches().lock() {
         caches.insert(
             endpoint.to_owned(),
@@ -437,7 +442,7 @@ pub fn open_tab(
             Duration::from_secs(10),
         );
     }
-    if !background && browser_context_id.is_none() {
+    if !is_websocket_endpoint(endpoint) && !background && browser_context_id.is_none() {
         let path = format!("/json/new?{}", encode_new_tab_url(url));
         let (status, value) =
             request_json(endpoint, "PUT", &path, &[], None).map_err(|error| ComptrolError {
@@ -467,19 +472,7 @@ pub fn open_tab(
             "verified": true
         }));
     }
-    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Start the existing browser with local DevTools enabled".to_owned()),
-    })?;
-    let web_socket_url = version
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: "The browser did not provide a browser websocket".to_owned(),
-            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
-        })?;
+    let web_socket_url = browser_websocket_endpoint(endpoint)?;
     let mut create_params = json!({
         "url": url,
         "background": background,
@@ -489,7 +482,7 @@ pub fn open_tab(
     if let Some(browser_context_id) = real_context_id(browser_context_id) {
         create_params["browserContextId"] = json!(browser_context_id);
     }
-    let created = protocol_call(web_socket_url, "Target.createTarget", create_params)?;
+    let created = protocol_call(&web_socket_url, "Target.createTarget", create_params)?;
     let target_id = created
         .get("targetId")
         .and_then(Value::as_str)
@@ -498,7 +491,7 @@ pub fn open_tab(
             message: "The browser did not return the opened tab identity".to_owned(),
             recovery: Some("Inspect the browser target list".to_owned()),
         })?;
-    wait_for_event(web_socket_url, Duration::from_secs(2), |event| {
+    wait_for_event(&web_socket_url, Duration::from_secs(2), |event| {
         event.get("method").and_then(Value::as_str) == Some("Target.targetCreated")
             && event
                 .get("params")
@@ -629,25 +622,13 @@ pub fn close_tab(
         Some(browser_context_id),
         Some(revision),
     )?;
-    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Inspect the existing browser websocket endpoint".to_owned()),
-    })?;
-    let web_socket_url = version
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: "The browser did not provide a browser websocket".to_owned(),
-            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
-        })?;
+    let web_socket_url = browser_websocket_endpoint(endpoint)?;
     let value = protocol_call(
-        web_socket_url,
+        &web_socket_url,
         "Target.closeTarget",
         json!({ "targetId": target_id }),
     )?;
-    wait_for_event(web_socket_url, Duration::from_secs(2), |event| {
+    wait_for_event(&web_socket_url, Duration::from_secs(2), |event| {
         event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed")
             && event
                 .get("params")
@@ -1243,6 +1224,9 @@ pub fn cdp_frame_call(
 }
 
 fn browser_websocket_endpoint(endpoint: &str) -> Result<String, ComptrolError> {
+    if is_websocket_endpoint(endpoint) {
+        return Ok(endpoint.to_owned());
+    }
     let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
         code: "browser_unavailable".to_owned(),
         message: error.to_string(),
@@ -1258,6 +1242,122 @@ fn browser_websocket_endpoint(endpoint: &str) -> Result<String, ComptrolError> {
             message: "The browser version response did not contain a local websocket".to_owned(),
             recovery: Some("Start Chrome with a supported local debugger endpoint".to_owned()),
         })
+}
+
+/// Wait for a requested visible-page text postcondition using a bounded,
+/// data-only query. Caller text is JSON-escaped before entering the expression.
+pub fn wait_for_text(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    text: &str,
+    timeout: Duration,
+) -> Result<Value, ComptrolError> {
+    if text.trim().is_empty() || text.chars().any(char::is_control) {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Text postconditions must contain non-control text".to_owned(),
+            recovery: None,
+        });
+    }
+    let needle = serde_json::to_string(text).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: None,
+    })?;
+    let expression = format!(
+        "(() => {{ const text = {needle}; const body = document.body?.innerText || ''; const index = body.indexOf(text); return {{ matched: index >= 0, count: index < 0 ? 0 : body.split(text).length - 1 }}; }})()"
+    );
+    let deadline = Instant::now() + timeout;
+    loop {
+        let result = cdp_call(
+            endpoint,
+            target_id,
+            Some(browser_context_id),
+            None,
+            "Runtime.evaluate",
+            json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
+        )?;
+        let value = result
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if value.get("matched").and_then(Value::as_bool) == Some(true) {
+            return Ok(json!({
+                "text": text,
+                "count": value.get("count").and_then(Value::as_u64).unwrap_or(1),
+                "verified": true,
+                "wait": "visible_document_text"
+            }));
+        }
+        if Instant::now() >= deadline {
+            return Err(ComptrolError {
+                code: "verification_failed".to_owned(),
+                message: format!("The visible page did not contain the requested text: {text}"),
+                recovery: Some(
+                    "Inspect the exact page and use a current semantic locator".to_owned(),
+                ),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
+fn session_endpoint() -> &'static Mutex<Option<String>> {
+    static ENDPOINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    ENDPOINT.get_or_init(|| Mutex::new(None))
+}
+
+/// Return the live browser endpoint selected for this Comptrol process.
+/// A permissioned Chrome session is stored here after its native consent and
+/// CDP handshake succeed; it is never written into process-wide environment
+/// state, where concurrent operations could silently switch profiles.
+pub fn active_endpoint() -> Option<String> {
+    session_endpoint()
+        .lock()
+        .ok()
+        .and_then(|endpoint| endpoint.clone())
+        .or_else(|| std::env::var("COMPTROL_CDP_ENDPOINT").ok())
+        .filter(|endpoint| !endpoint.is_empty())
+}
+
+pub fn set_active_endpoint(endpoint: String) {
+    if let Ok(mut current) = session_endpoint().lock() {
+        *current = Some(endpoint);
+    }
+}
+
+fn is_websocket_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with("ws://") || endpoint.starts_with("wss://")
+}
+
+fn parse_cdp_target_infos(value: &Value) -> Result<Vec<BrowserTarget>, ComptrolError> {
+    let target_infos = value
+        .get("targetInfos")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "Chrome returned no targetInfos for Target.getTargets".to_owned(),
+            recovery: Some("Inspect the permissioned Chrome WebSocket".to_owned()),
+        })?;
+    let values = target_infos
+        .iter()
+        .filter_map(|target| {
+            Some(json!({
+                "id": target.get("targetId")?.as_str()?,
+                "type": target.get("type").and_then(Value::as_str),
+                "browserContextId": target.get("browserContextId").and_then(Value::as_str),
+                "url": target.get("url").and_then(Value::as_str),
+                "title": target.get("title").and_then(Value::as_str),
+            }))
+        })
+        .collect::<Vec<_>>();
+    parse_targets(&json!(values)).ok_or_else(|| ComptrolError {
+        code: "browser_protocol_invalid".to_owned(),
+        message: "Chrome returned an invalid target list".to_owned(),
+        recovery: Some("Inspect the permissioned Chrome WebSocket".to_owned()),
+    })
 }
 
 /// Resolve and click a semantic locator in one bounded browser transaction.
@@ -1964,19 +2064,7 @@ pub fn cdp_download(
     let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
     let target_revision = target.revision.clone();
-    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Inspect the existing browser websocket endpoint".to_owned()),
-    })?;
-    let browser_web_socket_url = version
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: "The browser did not provide a browser websocket".to_owned(),
-            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
-        })?;
+    let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
     // Real Chrome omits browserContextId for default-context targets and
     // rejects unknown GUIDs, so the canonical "default" label must never be
     // sent as if it were a real context GUID.
@@ -1992,7 +2080,7 @@ pub fn cdp_download(
     }
     bridge()
         .command(
-            browser_web_socket_url,
+            &browser_web_socket_url,
             "Browser.setDownloadBehavior",
             download_behavior,
         )
@@ -2018,7 +2106,7 @@ pub fn cdp_download(
             "awaitPromise": true
         }),
     )?;
-    let download = wait_for_event(browser_web_socket_url, Duration::from_secs(10), |event| {
+    let download = wait_for_event(&browser_web_socket_url, Duration::from_secs(10), |event| {
         event.get("method").and_then(Value::as_str) == Some("Browser.downloadWillBegin")
     })?;
     let guid = download
@@ -2031,7 +2119,7 @@ pub fn cdp_download(
             recovery: Some("Inspect the browser download protocol events".to_owned()),
         })?
         .to_owned();
-    let progress = wait_for_event(browser_web_socket_url, Duration::from_secs(30), |event| {
+    let progress = wait_for_event(&browser_web_socket_url, Duration::from_secs(30), |event| {
         event.get("method").and_then(Value::as_str) == Some("Browser.downloadProgress")
             && event
                 .get("params")
@@ -2309,6 +2397,31 @@ mod tests {
         assert_eq!(targets[0].id, "tab");
         assert_eq!(targets[0].browser_context_id.as_deref(), Some("context"));
         assert_eq!(targets[0].revision.as_deref(), Some("rev"));
+    }
+
+    #[test]
+    fn permissioned_cdp_target_infos_keep_live_page_identity() {
+        let targets = parse_cdp_target_infos(&json!({
+            "targetInfos": [{
+                "targetId": "classroom-tab",
+                "type": "page",
+                "browserContextId": "profile-context",
+                "url": "https://classroom.google.com/",
+                "title": "Google Classroom"
+            }]
+        }))
+        .expect("CDP target list");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "classroom-tab");
+        assert_eq!(targets[0].target_type.as_deref(), Some("page"));
+        assert_eq!(
+            targets[0].browser_context_id.as_deref(),
+            Some("profile-context")
+        );
+        assert_eq!(
+            targets[0].url.as_deref(),
+            Some("https://classroom.google.com/")
+        );
     }
 
     #[test]

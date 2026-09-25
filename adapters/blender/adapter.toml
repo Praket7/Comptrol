@@ -35,6 +35,12 @@ background = "supported"
 verification = "application_state"
 
 [[capabilities]]
+intent = "blender.scene.create_2d_rocket"
+risk = "R2"
+background = "supported"
+verification = "persisted_artifact"
+
+[[capabilities]]
 intent = "blender.project.save"
 risk = "R2"
 background = "supported"

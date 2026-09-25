@@ -235,7 +235,7 @@ fn windows_entries() -> Result<Vec<AppEntry>, RegistryError> {
                         id: id.to_owned(),
                         display_name: name.to_owned(),
                         platform: "windows".to_owned(),
-                        executable: None,
+                        executable: program_files_registration_path(id),
                         version: None,
                         metadata: BTreeMap::new(),
                     });
@@ -261,6 +261,43 @@ fn windows_entries() -> Result<Vec<AppEntry>, RegistryError> {
     }
 
     Ok(entries)
+}
+
+/// Some Windows Start Apps records expose an executable as a known-folder
+/// relative identity (for example `{FOLDERID_ProgramFiles}\\Vendor\\app.exe`).
+/// Resolve only that exact, documented root, canonicalize both sides, and
+/// require an existing executable so arbitrary shell identities are not run.
+#[cfg(any(target_os = "windows", test))]
+pub(super) fn program_files_registration_path(id: &str) -> Option<PathBuf> {
+    const PROGRAM_FILES: &str = "{6D809377-6AF0-444B-8957-A3773F02200E}\\";
+    let relative = id.strip_prefix(PROGRAM_FILES)?;
+    if relative.is_empty() {
+        return None;
+    }
+    let relative_path = PathBuf::from(relative);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+        || !relative_path
+            .extension()?
+            .to_string_lossy()
+            .eq_ignore_ascii_case("exe")
+    {
+        return None;
+    }
+    let root = PathBuf::from(std::env::var_os("ProgramFiles")?);
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let candidate = std::fs::canonicalize(canonical_root.join(relative_path)).ok()?;
+    if !candidate.starts_with(&canonical_root) || !candidate.is_file() {
+        return None;
+    }
+    Some(candidate)
 }
 
 #[cfg(target_os = "windows")]

@@ -136,6 +136,7 @@ impl AdapterRegistry {
                         "blender.scene.object.create".to_owned(),
                         "blender.scene.object.transform".to_owned(),
                         "blender.scene.object.delete".to_owned(),
+                        "blender.scene.create_2d_rocket".to_owned(),
                         "blender.project.save".to_owned(),
                         "blender.render".to_owned(),
                     ],
@@ -218,6 +219,7 @@ impl AdapterRegistry {
                     version: "0.1.0".to_owned(),
                     platforms: vec!["windows".to_owned()],
                     capabilities: vec![
+                        "presentation.desktop.create".to_owned(),
                         "presentation.desktop.open".to_owned(),
                         "presentation.desktop.batch_edit".to_owned(),
                         "presentation.slide.create".to_owned(),

@@ -1,5 +1,6 @@
 #![allow(non_upper_case_globals, non_camel_case_types, clippy::collapsible_if)]
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use windows::Win32::System::Com::{
@@ -8,13 +9,15 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
     IUIAutomationValuePattern, TreeScope_Children, TreeScope_Descendants, UIA_ButtonControlTypeId,
-    UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_EditControlTypeId,
-    UIA_InvokePatternId, UIA_ValuePatternId,
+    UIA_CONTROLTYPE_ID, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
+    UIA_EditControlTypeId, UIA_InvokePatternId, UIA_TextControlTypeId, UIA_ValuePatternId,
+    UIA_WindowControlTypeId,
 };
 
 #[allow(non_upper_case_globals)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
+    Inspect,
     Press,
     SetValue,
 }
@@ -22,6 +25,7 @@ pub enum Action {
 #[derive(Clone, Debug)]
 pub struct Request<'a> {
     pub process_id: u32,
+    pub window_handle: Option<u64>,
     pub name: Option<&'a str>,
     pub automation_id: Option<&'a str>,
     pub role: Option<&'a str>,
@@ -29,11 +33,13 @@ pub struct Request<'a> {
     pub value: Option<&'a str>,
     pub expected_attribute: Option<&'a str>,
     pub expected_value: Option<&'a str>,
+    pub max_nodes: usize,
 }
 
 #[derive(Clone, Debug)]
 struct OwnedRequest {
     process_id: u32,
+    window_handle: Option<u64>,
     name: Option<String>,
     automation_id: Option<String>,
     role: Option<String>,
@@ -41,12 +47,14 @@ struct OwnedRequest {
     value: Option<String>,
     expected_attribute: Option<String>,
     expected_value: Option<String>,
+    max_nodes: usize,
 }
 
 impl<'a> From<Request<'a>> for OwnedRequest {
     fn from(request: Request<'a>) -> Self {
         Self {
             process_id: request.process_id,
+            window_handle: request.window_handle,
             name: request.name.map(str::to_owned),
             automation_id: request.automation_id.map(str::to_owned),
             role: request.role.map(str::to_owned),
@@ -54,6 +62,7 @@ impl<'a> From<Request<'a>> for OwnedRequest {
             value: request.value.map(str::to_owned),
             expected_attribute: request.expected_attribute.map(str::to_owned),
             expected_value: request.expected_value.map(str::to_owned),
+            max_nodes: request.max_nodes.clamp(1, 512),
         }
     }
 }
@@ -62,6 +71,7 @@ impl OwnedRequest {
     fn as_request(&self) -> Request<'_> {
         Request {
             process_id: self.process_id,
+            window_handle: self.window_handle,
             name: self.name.as_deref(),
             automation_id: self.automation_id.as_deref(),
             role: self.role.as_deref(),
@@ -69,6 +79,7 @@ impl OwnedRequest {
             value: self.value.as_deref(),
             expected_attribute: self.expected_attribute.as_deref(),
             expected_value: self.expected_value.as_deref(),
+            max_nodes: self.max_nodes,
         }
     }
 }
@@ -134,6 +145,8 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
     let window_count = unsafe { windows.Length() }
         .map_err(|error| format!("desktop window count failed: {error}"))?;
     let mut matches = Vec::new();
+    let mut inspected = Vec::new();
+    let mut seen_window_handles = HashSet::new();
     let mut bounded_nodes = 0;
     for index in 0..window_count.min(256) {
         let window = unsafe { windows.GetElement(index) }
@@ -144,6 +157,21 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
         {
             continue;
         }
+        let root_window_handle = unsafe { window.CurrentNativeWindowHandle() }
+            .map_err(|error| format!("window handle read failed: {error}"))?
+            .0 as u64;
+        if request
+            .window_handle
+            .is_some_and(|expected| expected != root_window_handle)
+        {
+            continue;
+        }
+        // UIA can expose the same top-level window through more than one root
+        // node (notably hosted UWP windows). Avoid counting/invoking the same
+        // native window twice, while retaining ambiguity across distinct HWNDs.
+        if root_window_handle != 0 && !seen_window_handles.insert(root_window_handle) {
+            continue;
+        }
         let candidates = unsafe { window.FindAll(TreeScope_Descendants, &condition) }
             .map_err(|error| format!("UI Automation tree query failed: {error}"))?;
         let count = unsafe { candidates.Length() }
@@ -152,6 +180,27 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
         for candidate_index in 0..count.min(2048) {
             let element = unsafe { candidates.GetElement(candidate_index) }
                 .map_err(|error| format!("UI Automation element read failed: {error}"))?;
+            if request.action == Action::Inspect {
+                let name = unsafe { element.CurrentName() }
+                    .map_err(|error| format!("UI Automation name read failed: {error}"))?;
+                let automation_id = unsafe { element.CurrentAutomationId() }
+                    .map_err(|error| format!("UI Automation id read failed: {error}"))?;
+                let control_type = unsafe { element.CurrentControlType() }
+                    .map_err(|error| format!("UI Automation control type failed: {error}"))?;
+                let enabled = unsafe { element.CurrentIsEnabled() }
+                    .map_err(|error| format!("UI Automation enabled state failed: {error}"))?;
+                inspected.push(json!({
+                    "name": name.to_string(),
+                    "automation_id": automation_id.to_string(),
+                    "role": control_type_name(control_type),
+                    "enabled": enabled.as_bool(),
+                    "window_handle": root_window_handle,
+                }));
+                if inspected.len() >= request.max_nodes {
+                    break;
+                }
+                continue;
+            }
             if !matches_element(&element, &request)? {
                 continue;
             }
@@ -160,6 +209,22 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
                 return Err("target_ambiguous".to_owned());
             }
         }
+        if request.action == Action::Inspect && inspected.len() >= request.max_nodes {
+            break;
+        }
+    }
+    if request.action == Action::Inspect {
+        return Ok(json!({
+            "verified": true,
+            "route": "windows_uia_inspect",
+            "process_id": request.process_id,
+            "controls": inspected,
+            "control_count": inspected.len(),
+            "bounded_nodes": bounded_nodes,
+            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "mouse": "untouched",
+            "clipboard": "untouched",
+        }));
     }
     let Some(element) = matches.pop() else {
         return Err("target_missing".to_owned());
@@ -173,6 +238,7 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
         .map_err(|error| format!("window handle read failed: {error}"))?
         .0 as u64;
     match request.action {
+        Action::Inspect => unreachable!("inspect returned before action dispatch"),
         Action::Press => {
             let pattern: IUIAutomationInvokePattern =
                 unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }
@@ -201,6 +267,18 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
         "clipboard": "untouched",
         "window_handle": window_handle,
     }))
+}
+
+fn control_type_name(control_type: UIA_CONTROLTYPE_ID) -> &'static str {
+    match control_type {
+        UIA_ButtonControlTypeId => "button",
+        UIA_CheckBoxControlTypeId => "checkbox",
+        UIA_ComboBoxControlTypeId => "combobox",
+        UIA_EditControlTypeId => "edit",
+        UIA_TextControlTypeId => "text",
+        UIA_WindowControlTypeId => "window",
+        _ => "other",
+    }
 }
 
 fn matches_element(element: &IUIAutomationElement, request: &Request<'_>) -> Result<bool, String> {

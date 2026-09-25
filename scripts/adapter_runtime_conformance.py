@@ -24,6 +24,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-adapter-runtime-") as state:
         env={
             **os.environ,
             "COMPTROL_ALLOW_ADAPTERS": "1",
+            "COMPTROL_AUTO_START_CHROME_CDP": "0",
             "COMPTROL_ADAPTER_ROOT": str(root / "adapters"),
             "COMPTROL_STATE_DIR": state,
         },

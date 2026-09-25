@@ -28,7 +28,7 @@ Inactive and grouped live tabs remain addressable through exact target identity 
 
 The fixture page includes a nested frame, download, dialog, dynamic node, shadow root, canvas, and intentionally untrusted instruction text. The text is fixture data only and is never treated as runtime instruction.
 
-The runtime can use the same narrow routes against a local Chromium DevTools endpoint when `COMPTROL_ALLOW_BROWSER_CDP=1` is set outside the agent channel. Every CDP mutation requires the exact page target, browser context, and target revision returned by discovery.
+The runtime can use the same narrow routes against a local Chromium DevTools endpoint when `COMPTROL_ALLOW_BROWSER_CDP=1` is set outside the agent channel. For a permissioned Chrome 144+ session, `COMPTROL_CHROME_AUTO_CONNECT=1` arms the session broker, which reads Chrome's loopback WebSocket URL from `DevToolsActivePort`; Chrome's native **Allow** prompt remains in control. Every CDP mutation requires the exact page target, browser context, and target revision returned by discovery.
 
 Uploads are restricted to the Comptrol sandbox and verify only the selected filename. Generic CDP reports the upload stage as `selected` and remains unverified until a site or application adapter proves transfer or acceptance. Downloads require a stable idempotency key, use a key scoped sandbox directory, wait for the expected file, and verify the resulting file. A repeated key returns an existing verified download without clicking the page again.
 

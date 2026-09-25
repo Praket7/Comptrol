@@ -124,6 +124,7 @@ HANDLER_SENTINELS = {
     "blender.scene.object.delete": ("adapters/blender/src/comptrol_live_bridge.py", "bpy.data.objects.remove(obj, do_unlink=True)"),
     "blender.project.save": ("adapters/blender/src/comptrol_live_bridge.py", "save_as_mainfile"),
     "blender.render": ("adapters/blender/src/comptrol_live_bridge.py", "write_still"),
+    "blender.scene.create_2d_rocket": ("adapters/blender/src/adapter.py", "blend_and_render_artifact_readback"),
     "obs.scene.list": ("adapters/obs/src/adapter.py", "GetSceneList"),
     "obs.scene.switch": ("adapters/obs/src/adapter.py", "GetCurrentProgramScene"),
     "obs.source.visibility.set": ("adapters/obs/src/adapter.py", "GetSceneItemList"),

@@ -70,6 +70,7 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "blender.scene.object.create",
     "blender.scene.object.transform",
     "blender.scene.object.delete",
+    "blender.scene.create_2d_rocket",
     "blender.project.save",
     "blender.render",
     "video.project.list",
@@ -112,6 +113,7 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "presentation.export",
     "presentation.read",
     "presentation.batch_edit",
+    "presentation.desktop.create",
     "presentation.desktop.open",
     "presentation.desktop.batch_edit",
     "presentation.shape.text.set",
@@ -279,8 +281,8 @@ pub fn privacy_network_endpoints() -> Value {
         "endpoints": [
             {
                 "name": "browser_cdp",
-                "configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
-                "address": std::env::var("COMPTROL_CDP_ENDPOINT").ok(),
+                "configured": browser::active_endpoint().is_some(),
+                "address": browser::active_endpoint(),
                 "reason": "Only used when an explicit browser action is requested"
             },
             {
@@ -816,6 +818,9 @@ impl Policy {
             policy
                 .allowed_intents
                 .insert("windows.uia.set_value".to_owned());
+            policy
+                .allowed_intents
+                .insert("windows.uia.inspect".to_owned());
         }
         if std::env::var("COMPTROL_ALLOW_LINUX_ATSPI").as_deref() == Ok("1") {
             policy.max_risk = policy.max_risk.max(Risk::R2);
@@ -1657,7 +1662,7 @@ impl Runtime {
                 browser_chrome_restore_recent(&request, operation_id)
             }
             "command.run" => command_run(&request, operation_id),
-            "windows.uia.press" | "windows.uia.set_value" => {
+            "windows.uia.inspect" | "windows.uia.press" | "windows.uia.set_value" => {
                 windows_uia_action(&request, operation_id)
             }
             "linux.atspi.press" | "linux.atspi.set_value" => {
@@ -1830,7 +1835,7 @@ impl Runtime {
             }),
             "platform" => platform_diagnostics(),
             "browser" => {
-                if let Ok(endpoint) = std::env::var("COMPTROL_CDP_ENDPOINT") {
+                if let Some(endpoint) = browser::active_endpoint() {
                     match browser::discover(&endpoint) {
                         Ok(targets) => {
                             json!({ "endpoint": endpoint, "targets": targets, "transport": "direct_cdp" })
@@ -1968,11 +1973,11 @@ impl Runtime {
         }
         if record.intent == "browser.fixture.submit"
             && let (Some(endpoint), Some(key)) = (
-                std::env::var_os("COMPTROL_CDP_ENDPOINT"),
+                browser::active_endpoint(),
                 record.idempotency_key.as_deref(),
             )
         {
-            match browser::fixture_state(&endpoint.to_string_lossy()) {
+            match browser::fixture_state(&endpoint) {
                 Ok(state)
                     if state
                         .get("submissions")
@@ -2160,6 +2165,7 @@ fn classify(intent: &str) -> Risk {
         | "browser.chrome.restore_recent"
         | "browser.chrome.reopen_closed_group" => Risk::R2,
         "command.run" => Risk::R3,
+        "windows.uia.inspect" => Risk::R0,
         "windows.uia.press" | "windows.uia.set_value" => Risk::R2,
         "linux.atspi.press" | "linux.atspi.set_value" => Risk::R2,
         "browser.fixture.submit" => Risk::R1,
@@ -2892,7 +2898,7 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
                 && std::env::var_os("COMPTROL_COMMAND_ROOT").is_some(),
             "Command execution requires an allowlist policy and command root",
         )),
-        "windows.uia.press" | "windows.uia.set_value" => Some((
+        "windows.uia.inspect" | "windows.uia.press" | "windows.uia.set_value" => Some((
             "windows_uia",
             cfg!(target_os = "windows") && env_enabled("COMPTROL_ALLOW_WINDOWS_UIA"),
             "Windows UI Automation requires Windows and explicit policy",
@@ -2924,14 +2930,12 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
         )),
         "browser.cdp.frame_evaluate" => Some((
             "browser_protocol",
-            std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
+            browser::active_endpoint().is_some() && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
             "Frame-scoped CDP requires the direct event-maintained frame graph; the companion bridge intentionally refuses this route until it can prove a stable frame binding",
         )),
         value if value.starts_with("browser.cdp.") => Some((
             "browser_protocol",
-            (std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                || browser_bridge::bridge_is_active())
+            (browser::active_endpoint().is_some() || browser_bridge::bridge_is_active())
                 && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
             "Browser protocol control requires a direct CDP endpoint or a live companion bridge heartbeat and explicit policy",
         )),
@@ -3032,6 +3036,7 @@ fn route_catalog() -> Vec<RoutePlan> {
         "browser.chrome.restore_recent",
         "browser.chrome.reopen_closed_group",
         "command.run",
+        "windows.uia.inspect",
         "windows.uia.press",
         "linux.atspi.press",
         "macos.ax.press",
@@ -3286,7 +3291,7 @@ fn resolve_workflow_parameters(template: &Value, parameters: &Value) -> Value {
 }
 
 fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> ActionResult {
-    let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") else {
+    let Some(endpoint) = browser::active_endpoint() else {
         return ActionResult::refused(
             request,
             operation_id,
@@ -3338,7 +3343,7 @@ fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> A
         );
     };
     match browser::fixture_submit(
-        &endpoint.to_string_lossy(),
+        &endpoint,
         target_id,
         browser_context_id,
         revision,
@@ -3362,8 +3367,8 @@ fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> A
 }
 
 fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> ActionResult {
-    let endpoint = if let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") {
-        endpoint
+    let endpoint = if let Some(endpoint) = browser::active_endpoint() {
+        std::ffi::OsString::from(endpoint)
     } else if browser_bridge::bridge_is_active() {
         std::ffi::OsString::from(browser_bridge::COMPANION_BRIDGE_ENDPOINT)
     } else {
@@ -4306,6 +4311,11 @@ enum BrowserWorkflowStep {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    WaitText {
+        text: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 fn browser_cdp_workflow(
@@ -4348,7 +4358,9 @@ fn browser_cdp_workflow(
             ComptrolError {
                 code: "invalid_input".to_owned(),
                 message: "Browser workflows need a steps array".to_owned(),
-                recovery: Some("Use navigate, click, fill, and wait_url steps".to_owned()),
+                recovery: Some(
+                    "Use data-only navigate, click, fill, wait_url, and wait_text steps".to_owned(),
+                ),
             },
         );
     };
@@ -4359,7 +4371,9 @@ fn browser_cdp_workflow(
             ComptrolError {
                 code: "invalid_input".to_owned(),
                 message: "Browser workflow steps did not match the closed schema".to_owned(),
-                recovery: Some("Use data-only navigate, click, and wait_url steps".to_owned()),
+                recovery: Some(
+                    "Use data-only navigate, click, fill, wait_url, and wait_text steps".to_owned(),
+                ),
             },
         );
     };
@@ -4391,6 +4405,7 @@ fn browser_cdp_workflow(
     };
     let mut revision = target.revision;
     let mut completed = Vec::with_capacity(steps.len());
+    let mut postcondition_verified = false;
     for (index, step) in steps.iter().enumerate() {
         let result = match step {
             BrowserWorkflowStep::Navigate {
@@ -4413,6 +4428,7 @@ fn browser_cdp_workflow(
                 if let Ok(state) = live
                     && state.get("satisfied").and_then(Value::as_bool) == Some(true)
                 {
+                    postcondition_verified = true;
                     Ok(json!({
                         "action": "navigate",
                         "url": url,
@@ -4430,22 +4446,29 @@ fn browser_cdp_workflow(
                         json!({"url": url}),
                     ) {
                         Ok(data) => {
-                            if let Some(expected) = url_contains
-                                && let Err(error) = browser_wait_for_url(
-                                    &endpoint,
-                                    target_id,
-                                    browser_context_id,
-                                    expected,
-                                    timeout_ms.unwrap_or(2_000),
-                                )
-                            {
-                                return browser_failure(request, operation_id, error);
-                            }
+                            let expected = url_contains.clone().unwrap_or_else(|| {
+                                url.split_once("://")
+                                    .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+                                    .unwrap_or(url)
+                                    .to_owned()
+                            });
+                            let observed = match browser_wait_for_url(
+                                &endpoint,
+                                target_id,
+                                browser_context_id,
+                                &expected,
+                                timeout_ms.unwrap_or(2_000),
+                            ) {
+                                Ok(observed) => observed,
+                                Err(error) => return browser_failure(request, operation_id, error),
+                            };
+                            postcondition_verified = true;
                             Ok(json!({
                                 "action":"navigate",
                                 "url": url,
                                 "navigated": true,
-                                "protocol": data
+                                "protocol": data,
+                                "postcondition": observed
                             }))
                         }
                         Err(error) => Err(error),
@@ -4486,7 +4509,21 @@ fn browser_cdp_workflow(
                 contains,
                 timeout_ms.unwrap_or(2_000),
             )
-            .map(|_| json!({"action":"wait_url", "contains": contains})),
+            .map(|observed| {
+                postcondition_verified = true;
+                json!({"action":"wait_url", "contains": contains, "observed": observed})
+            }),
+            BrowserWorkflowStep::WaitText { text, timeout_ms } => browser::wait_for_text(
+                &endpoint,
+                target_id,
+                browser_context_id,
+                text,
+                Duration::from_millis(timeout_ms.unwrap_or(2_000).clamp(100, 30_000)),
+            )
+            .map(|observed| {
+                postcondition_verified = true;
+                json!({"action":"wait_text", "observed": observed})
+            }),
         };
         let data = match result {
             Ok(data) => data,
@@ -4505,8 +4542,12 @@ fn browser_cdp_workflow(
         operation_id,
         "browser_protocol",
         EffectState::Changed,
-        VerificationState::Verified,
-        json!({"steps": completed, "step_count": completed.len(), "verified": true}),
+        if postcondition_verified {
+            VerificationState::Verified
+        } else {
+            VerificationState::Unverified
+        },
+        json!({"steps": completed, "step_count": completed.len(), "verified": postcondition_verified}),
     )
 }
 
@@ -5771,7 +5812,7 @@ fn permission_status(request: &OperationRequest, operation_id: String) -> Action
             "windows_uia_policy": std::env::var("COMPTROL_ALLOW_WINDOWS_UIA").as_deref() == Ok("1"),
             "linux_atspi_bus": std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
             "linux_session": std::env::var("XDG_SESSION_TYPE").ok().or_else(|| std::env::var("WAYLAND_DISPLAY").ok().map(|_| "wayland".to_owned())),
-            "browser_cdp_configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            "browser_cdp_configured": browser::active_endpoint().is_some(),
             "software_policy": std::env::var("COMPTROL_ALLOW_SOFTWARE").as_deref() == Ok("1"),
             "software_install_policy": std::env::var("COMPTROL_ALLOW_SOFTWARE_INSTALL").as_deref() == Ok("1"),
             "settings_policy": std::env::var("COMPTROL_ALLOW_SETTINGS").as_deref() == Ok("1"),
@@ -6734,7 +6775,7 @@ fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResu
                 && let Some(target_id) = target_spec.id.as_ref().or(target_spec.name.as_ref())
             {
                 // First, try CDP if this looks like a browser target or CDP is available.
-                if std::env::var("COMPTROL_CDP_ENDPOINT").is_ok() {
+                if let Some(endpoint) = browser::active_endpoint() {
                     let mut dialog_request = request.clone();
                     dialog_request.intent = "browser.cdp.dialog".to_owned();
                     dialog_request.params = json!({
@@ -6745,9 +6786,7 @@ fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResu
                     let cdp_result = browser_cdp_dialog(
                         &dialog_request,
                         operation_id.clone(),
-                        std::ffi::OsStr::new(
-                            &std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default(),
-                        ),
+                        std::ffi::OsStr::new(&endpoint),
                     );
                     if cdp_result.error.is_none() {
                         return cdp_result;
@@ -6862,7 +6901,7 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
     };
     match provider {
         "explicit_cdp_endpoint" => {
-            if std::env::var_os("COMPTROL_CDP_ENDPOINT").is_none() {
+            if browser::active_endpoint().is_none() {
                 return ActionResult::refused(
                     request,
                     operation_id,
@@ -6883,10 +6922,7 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
             )
         }
         "chrome_permissioned_auto_connect" => {
-            let timeout = Duration::from_secs(30);
-            let ws_url = match tokio::runtime::Runtime::new().unwrap().block_on(
-                comptrol_browser::connect_permissioned_auto_connect(9222, timeout),
-            ) {
+            let ws_url = match comptrol_browser::connect_permissioned_auto_connect() {
                 Ok(url) => url,
                 Err(e) => {
                     return ActionResult::refused(
@@ -6900,10 +6936,44 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                     );
                 }
             };
-            // Set the endpoint for subsequent browser operations
-            unsafe {
-                std::env::set_var("COMPTROL_CDP_ENDPOINT", &ws_url);
-            }
+            let version = browser::bridge().command(&ws_url, "Browser.getVersion", json!({}));
+            let product = match version {
+                Ok(value) => value
+                    .get("product")
+                    .and_then(Value::as_str)
+                    .filter(|product| product.starts_with("Chrome/"))
+                    .map(str::to_owned),
+                Err(error) => {
+                    return ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "route_unavailable".to_owned(),
+                            message: format!(
+                                "Chrome's permissioned WebSocket did not complete a live CDP handshake: {error}"
+                            ),
+                            recovery: Some(
+                                "Keep Chrome running with Remote Debugging enabled and accept its native Allow prompt when shown".to_owned(),
+                            ),
+                        },
+                    );
+                }
+            };
+            let Some(product) = product else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "browser_protocol_invalid".to_owned(),
+                        message: "The permissioned WebSocket did not identify a Chrome browser"
+                            .to_owned(),
+                        recovery: Some(
+                            "Inspect the active Chrome remote debugging session".to_owned(),
+                        ),
+                    },
+                );
+            };
+            browser::set_active_endpoint(ws_url);
             success(
                 request,
                 operation_id,
@@ -6913,7 +6983,7 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                 json!({
                     "provider": "chrome_permissioned_auto_connect",
                     "status": "connected_via_permissioned_auto_connect",
-                    "websocket_url": ws_url,
+                    "browser_product": product,
                     "note": "Chrome shows its native Allow prompt per connection; Comptrol never bypasses it"
                 }),
             )
@@ -7196,7 +7266,7 @@ fn browser_chrome_restore_recent(request: &OperationRequest, operation_id: Strin
             },
         );
     }
-    let endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").ok();
+    let endpoint = browser::active_endpoint();
     // Compatibility alias: a legacy caller that passes only a group name gets
     // tab_group semantics with native restore then explicit reconstruction
     // permission preserved from its params.
@@ -7814,7 +7884,8 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
     };
     let name = request.params.get("name").and_then(Value::as_str);
     let automation_id = request.params.get("automation_id").and_then(Value::as_str);
-    if name.is_none() && automation_id.is_none() {
+    let inspecting = request.intent == "windows.uia.inspect";
+    if !inspecting && name.is_none() && automation_id.is_none() {
         return ActionResult::refused(
             request,
             operation_id,
@@ -7826,8 +7897,10 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
         );
     }
     #[cfg(windows)]
-    if std::env::var("COMPTROL_WINDOWS_UIA_LEGACY").as_deref() != Ok("1") {
-        let action = if request.intent.ends_with("press") {
+    if inspecting || std::env::var("COMPTROL_WINDOWS_UIA_LEGACY").as_deref() != Ok("1") {
+        let action = if inspecting {
+            comptrol_platform_windows::Action::Inspect
+        } else if request.intent.ends_with("press") {
             comptrol_platform_windows::Action::Press
         } else {
             comptrol_platform_windows::Action::SetValue
@@ -7844,6 +7917,7 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
             .unzip();
         let result = comptrol_platform_windows::execute(comptrol_platform_windows::Request {
             process_id: process_id as u32,
+            window_handle: request.params.get("window_handle").and_then(Value::as_u64),
             name,
             automation_id,
             role: request.params.get("role").and_then(Value::as_str),
@@ -7851,8 +7925,21 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
             value: request.params.get("value").and_then(Value::as_str),
             expected_attribute,
             expected_value,
+            max_nodes: request
+                .params
+                .get("max_nodes")
+                .and_then(Value::as_u64)
+                .unwrap_or(128) as usize,
         });
         return match result {
+            Ok(data) if inspecting => success(
+                request,
+                operation_id,
+                "windows_uia_inspect",
+                EffectState::None,
+                VerificationState::Verified,
+                data,
+            ),
             Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
                 request,
                 operation_id,
@@ -8702,7 +8789,7 @@ pub fn capabilities() -> Vec<Capability> {
         Capability {
             name: "browser.cdp.dialog".to_owned(),
             available: std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1")
-                && std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+                && browser::active_endpoint().is_some(),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Handles a JavaScript dialog on one exact target; protected dialogs go through popup.dismiss".to_owned(),
@@ -8770,7 +8857,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
@@ -8779,7 +8866,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.open_tab".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
@@ -8787,7 +8874,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.close_tab".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
@@ -8795,7 +8882,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.history".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
@@ -8803,7 +8890,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.accessibility_snapshot".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
@@ -8811,7 +8898,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.screenshot".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
@@ -8819,7 +8906,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.coordinate_click".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
@@ -8827,7 +8914,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.focus".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R1,
             route: "browser_protocol".to_owned(),
@@ -8835,7 +8922,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.semantic_click".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
@@ -8843,7 +8930,7 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.workflow".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
@@ -8858,14 +8945,14 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.discovery".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            available: browser::active_endpoint().is_some(),
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
             note: "Discovers exact local browser targets without mutation".to_owned(),
         },
         Capability {
             name: "browser.fixture.submit".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: browser::active_endpoint().is_some()
                 && std::env::var("COMPTROL_ALLOW_BROWSER_FIXTURE").as_deref() == Ok("1"),
             risk: Risk::R1,
             route: "browser_fixture".to_owned(),
@@ -9042,9 +9129,9 @@ fn doctor(runtime: &Runtime) -> Value {
         "desktop_observation": { "available": true, "semantic_mutation": platform_capabilities().iter().any(|capability| capability.name == "platform.macos.ax" && capability.available) },
         "platform": platform_diagnostics(),
         "browser": {
-            "configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            "configured": browser::active_endpoint().is_some(),
             "fixture_mutation": runtime.policy.allowed_intents.contains("browser.fixture.submit"),
-            "status": if std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some() { "configured" } else { "not_configured" },
+            "status": if browser::active_endpoint().is_some() { "configured" } else { "not_configured" },
             "persistent_multiplexer": "implemented_not_live_verified",
             "event_target_frame_graph": "implemented_not_live_verified",
             "chrome_native_restore": "implemented_not_live_verified",
@@ -9794,10 +9881,11 @@ mod tests {
         let steps: Vec<BrowserWorkflowStep> = serde_json::from_value(json!([
             {"action":"navigate","url":"https://example.com","url_contains":"example.com"},
             {"action":"click","locator":{"role":"link","name":"Example"},"timeout_ms":900},
-            {"action":"wait_url","contains":"/done","timeout_ms":1200}
+            {"action":"wait_url","contains":"/done","timeout_ms":1200},
+            {"action":"wait_text","text":"Task completed","timeout_ms":1200}
         ]))
         .expect("browser workflow schema");
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 4);
         assert!(
             serde_json::from_value::<Vec<BrowserWorkflowStep>>(json!([
                 {"action":"evaluate","expression":"alert(1)"}

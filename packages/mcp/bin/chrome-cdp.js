@@ -80,19 +80,18 @@ function defaultProfile() {
 async function detectExistingCdpEndpoint() {
   const explicit = process.env.COMPTROL_CDP_ENDPOINT;
   if (explicit) {
+    if (/^wss?:\/\//i.test(explicit)) {
+      return { endpoint: explicit, owned: false, source: "configured_websocket" };
+    }
     const endpoint = explicit.replace(/\/$/, "");
     if (await waitForEndpoint(endpoint, 2)) return { endpoint, owned: false, source: "configured" };
     console.error(`Comptrol CDP endpoint is configured but unreachable: ${endpoint}`);
     return undefined;
   }
-  // A permissioned existing-session Chrome or any user-launched
-  // debug-enabled Chrome exposes /json/version on its loopback port.
-  for (const port of [process.env.COMPTROL_CHROME_CDP_PORT, "9222"].filter(Boolean)) {
-    const endpoint = `http://127.0.0.1:${port}`;
-    if (await waitForEndpoint(endpoint, 1)) {
-      return { endpoint, owned: false, source: "existing_permissioned" };
-    }
-  }
+  // Chrome 144+'s permissioned existing-session route is connected by the
+  // Rust session broker from DevToolsActivePort and the Chrome Allow prompt.
+  // It is not a classic /json/version endpoint. Never infer consent from an
+  // open local port here; the MCP operation will request and verify consent.
   return undefined;
 }
 
