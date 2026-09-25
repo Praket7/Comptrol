@@ -1,19 +1,26 @@
 {
   "name": "comptrol",
   "version": "0.1.67",
-  "description": "Local Codex computer control with verified browser, desktop, settings, and application routes.",
+  "description": "Local first, policy bound computer control with verified browser and desktop routes.",
   "author": {
-    "name": "Local developer"
+    "name": "Comptrol contributors",
+    "url": "https://github.com/Praket7/Comptrol"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Comptrol",
-    "shortDescription": "Verified local computer control.",
-    "longDescription": "Start Comptrol locally from Codex to control supported browser, desktop, mail, Discord, settings, and creative app routes.",
-    "developerName": "Local developer",
+    "shortDescription": "Verified local computer control",
+    "longDescription": "Use policy-bound browser and desktop routes with explicit target identity, recovery, and outcome verification.",
+    "developerName": "Comptrol contributors",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],
-    "defaultPrompt": "Use the local Comptrol MCP for bounded computer work. Inspect available capabilities and permissions before acting, then verify the changed application or saved artifact."
+    "websiteURL": "https://github.com/Praket7/Comptrol",
+    "privacyPolicyURL": "https://github.com/Praket7/Comptrol/blob/main/PRIVACY.md",
+    "defaultPrompt": [
+      "Use Comptrol for a local action only when the exact target and verification level are clear.",
+      "Prefer a verified programmatic or browser route over screenshot-driven interaction."
+    ],
+    "brandColor": "#2457A6"
   },
   "mcpServers": "./.mcp.json",
   "apps": "./.app.json"

@@ -1,6 +1,6 @@
 # Client integration
 
-Run the compiled binary with the command `comptrol mcp` as the MCP server command.
+For the npm installation, configure the MCP command as `comptrolling` with no arguments. The launcher starts the bundled native runtime and keeps the stdio connection alive. If you build from source, configure the full path to the compiled `comptrol` binary with the argument `mcp` instead.
 
 The server speaks newline delimited JSON on standard input and standard output. Logs go to standard error. The same binary can be used by Codex, Claude Code, Cursor, and any other client that supports MCP stdio.
 

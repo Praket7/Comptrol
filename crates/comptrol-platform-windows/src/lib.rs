@@ -7,7 +7,7 @@
 mod uia;
 
 #[cfg(windows)]
-pub use uia::{Action, Request, SemanticCacheEntry, UiaScopedCache, execute};
+pub use uia::{Action, Request, execute};
 
 #[cfg(not(windows))]
 pub mod unsupported {
