@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { execFileSync, spawn } from "node:child_process"
 import { existsSync } from "node:fs"
+import { once } from "node:events"
 
 const startedAt = performance.now()
 let mcpCalls = 0
@@ -9,6 +10,7 @@ let bytesOut = 0
 let workflowSteps = 0
 const port = 17418
 const fixture = spawn(process.execPath, ["scripts/browser_fixture.mjs"], { env: { ...process.env, COMPTROL_FIXTURE_PORT: String(port) }, stdio: ["ignore", "ignore", "pipe"] })
+let cliFixture
 await new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error("fixture startup timeout")), 3000)
   fixture.stderr.once("data", () => { clearTimeout(timer); resolve() })
@@ -68,6 +70,10 @@ try {
     const browser = await response(2, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "inspect", arguments: { kind: "browser" } } })
     const browserText = browser.result.structuredContent.targets
     assert.equal(browserText[0].id, "comptrol-fixture-page")
+    const discovery = await response(56, { jsonrpc: "2.0", id: 56, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.discovery", idempotency_key: "browser-target-discovery", params: {} } } })
+    assert.equal(discovery.result.structuredContent.verification, "verified", JSON.stringify(discovery))
+    assert.equal(discovery.result.structuredContent.data.targets[0].id, "comptrol-fixture-page")
+    assert.equal(discovery.result.structuredContent.data.targets[0].browser_context_id, "comptrol-fixture-context")
     const action = await response(3, { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.fixture.submit", idempotency_key: "mcp-submit", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, message: "through MCP" } } } })
     assert.equal(action.result.structuredContent.verification, "verified")
     const cdp = await response(4, { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "operate", arguments: { intent: "browser.cdp.evaluate", idempotency_key: "cdp-evaluate", params: { target_id: target.id, browser_context_id: target.browserContextId, revision: target.revision, expression: "document.title" } } } })
@@ -139,12 +145,27 @@ try {
     const metrics = await fetch(`http://127.0.0.1:${port}/metrics`).then(response => response.json())
     assert.equal(metrics.pageWebsocketConnections, 0, JSON.stringify(metrics))
     assert.equal(metrics.browserWebsocketConnections, 1, JSON.stringify(metrics))
+    const comptrolExited = once(comptrol, "exit")
     comptrol.kill("SIGTERM")
-    const openedByCli = JSON.parse(execFileSync(binary, ["open", `http://127.0.0.1:${port}/cli-ready`], {
+    await comptrolExited
+    const cliPort = port + 1
+    cliFixture = spawn(process.execPath, ["scripts/browser_fixture.mjs"], {
+      env: { ...process.env, COMPTROL_FIXTURE_PORT: String(cliPort) },
+      stdio: ["ignore", "ignore", "pipe"],
+    })
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("CLI fixture startup timeout")), 3000)
+      cliFixture.stderr.once("data", () => { clearTimeout(timer); resolve() })
+      cliFixture.once("error", reject)
+    })
+    const openedByCli = JSON.parse(execFileSync(binary, ["open", `http://127.0.0.1:${cliPort}/cli-ready`], {
       encoding: "utf8",
-      env: { ...process.env, COMPTROL_CDP_ENDPOINT: `http://127.0.0.1:${port}`, COMPTROL_ALLOW_BROWSER_CDP: "1", COMPTROL_STATE_DIR: `/tmp/comptrol-open-${process.pid}-${Date.now()}` },
+      env: { ...process.env, COMPTROL_CDP_ENDPOINT: `http://127.0.0.1:${cliPort}`, COMPTROL_ALLOW_BROWSER_CDP: "1", COMPTROL_STATE_DIR: `/tmp/comptrol-open-${process.pid}-${Date.now()}` },
       timeout: 35_000,
     }))
+    const cliFixtureExited = once(cliFixture, "exit")
+    cliFixture.kill("SIGTERM")
+    await cliFixtureExited
     assert.equal(openedByCli.verified, true, JSON.stringify(openedByCli))
     assert.equal(openedByCli.page_load.verification, "verified")
     console.log(JSON.stringify({
@@ -166,5 +187,6 @@ try {
   }
   console.log("browser fixture conformance passed")
 } finally {
+  cliFixture?.kill("SIGTERM")
   fixture.kill("SIGTERM")
 }

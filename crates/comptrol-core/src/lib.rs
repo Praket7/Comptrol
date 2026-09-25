@@ -714,6 +714,7 @@ impl Default for Policy {
                 "platform.broker.observe".to_owned(),
                 "browser.cdp.wait_for".to_owned(),
                 "browser.cdp.accessibility_snapshot".to_owned(),
+                "browser.cdp.discovery".to_owned(),
                 "browser.cdp.reopen_closed_group".to_owned(),
                 "workflow.execute".to_owned(),
                 "app.resolve".to_owned(),
@@ -861,6 +862,11 @@ impl Policy {
         if std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1") {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             policy.allowed_intents.extend([
+                // These operations only inspect browser targets or expose
+                // their accessible names. Keep them available with CDP
+                // inspection enabled, without opening the mutation routes.
+                "browser.cdp.discovery".to_owned(),
+                "browser.cdp.accessibility_snapshot".to_owned(),
                 "browser.cdp.evaluate".to_owned(),
                 "browser.cdp.frame_evaluate".to_owned(),
                 "browser.cdp.ensure_state".to_owned(),
@@ -1694,6 +1700,7 @@ impl Runtime {
             | "browser.cdp.screenshot"
             | "browser.cdp.coordinate_click"
             | "browser.cdp.dialog"
+            | "browser.cdp.discovery"
             | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             intent if is_first_party_adapter_intent(intent) => {
@@ -2213,7 +2220,8 @@ fn classify(intent: &str) -> Risk {
         | "video.render.preset.list"
         | "video.render.status" => Risk::R0,
         intent if is_first_party_adapter_intent(intent) => Risk::R2,
-        "browser.cdp.wait_for"
+        "browser.cdp.discovery"
+        | "browser.cdp.wait_for"
         | "browser.cdp.accessibility_snapshot"
         | "browser.cdp.reopen_closed_group" => Risk::R0,
         _ => Risk::R2,
@@ -3382,6 +3390,35 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    if request.intent == "browser.cdp.discovery" {
+        return match browser::discover(&endpoint.to_string_lossy()) {
+            Ok(targets) => {
+                let pages = targets
+                    .into_iter()
+                    .filter(|target| target.target_type.as_deref() == Some("page"))
+                    .map(|target| {
+                        json!({
+                            "id": target.id,
+                            "type": target.target_type,
+                            "browser_context_id": target.browser_context_id,
+                            "url": target.url,
+                            "title": target.title,
+                            "revision": target.revision,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                success(
+                    request,
+                    operation_id,
+                    "browser_protocol",
+                    EffectState::None,
+                    VerificationState::Verified,
+                    json!({ "targets": pages, "verified": true }),
+                )
+            }
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
     if request.intent == "browser.cdp.frame_evaluate" {
         let Some(frame_id) = request.params.get("frame_id").and_then(Value::as_str) else {
             return ActionResult::refused(
@@ -4529,6 +4566,12 @@ fn browser_cdp_workflow(
             Ok(data) => data,
             Err(error) => return browser_failure(request, operation_id, error),
         };
+        // Semantic click and fill steps carry an in-page readback. Preserve
+        // that evidence at the workflow boundary so an action-only workflow
+        // does not downgrade a verified step to an unverified result.
+        if data.get("verified").and_then(Value::as_bool) == Some(true) {
+            postcondition_verified = true;
+        }
         completed.push(json!({"index": index, "result": data}));
         if let Ok(current) = browser::discover_cached_targets(&endpoint)
             && let Ok(bound) =
@@ -5181,6 +5224,29 @@ fn desktop_observe(request: &OperationRequest, operation_id: String) -> ActionRe
                 data["accessibility"] = json!("unavailable");
                 data["diagnostic"] = json!(error.to_string());
             }
+        }
+    } else if cfg!(target_os = "windows") {
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 128 @{Name='process_name';Expression={$_.ProcessName}},@{Name='process_id';Expression={$_.Id}},@{Name='window_handle';Expression={$_.MainWindowHandle.ToInt64()}},@{Name='window_title';Expression={$_.MainWindowTitle}} | ConvertTo-Json -Compress",
+            ])
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let windows = serde_json::from_slice::<Value>(&output.stdout).unwrap_or(Value::Null);
+            let windows = match windows {
+                Value::Array(windows) => windows,
+                Value::Null => Vec::new(),
+                window => vec![window],
+            };
+            data["windows"] = json!(windows);
+            data["process_observation"] = json!("verified");
+        } else {
+            data["process_observation"] = json!("unavailable");
         }
     } else if let Ok(output) = Command::new("ps").args(["-A", "-o", "comm="]).output()
         && output.status.success()

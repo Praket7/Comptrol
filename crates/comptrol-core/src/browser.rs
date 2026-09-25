@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 struct TargetCacheEntry {
@@ -841,30 +841,70 @@ pub fn wait_for_url(
             "verified": true
         }));
     }
-    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
-        code: "browser_protocol_invalid".to_owned(),
-        message: "The target did not provide a websocket debugger URL".to_owned(),
-        recovery: Some("Inspect browser targets again".to_owned()),
-    })?;
-    let event = wait_for_event(&web_socket_url, timeout, |event| {
-        let method = event.get("method").and_then(Value::as_str);
-        matches!(
-            method,
-            Some("Page.frameNavigated") | Some("Page.navigatedWithinDocument")
+    // Permissioned Chrome exposes a browser-level WebSocket and targetInfos,
+    // not a per-page webSocketDebuggerUrl. Wait on the persistent flattened
+    // session's event-maintained target graph, then verify exact target and
+    // context identity before accepting the URL postcondition.
+    let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
+    let expected_target_id = target_id.to_owned();
+    let expected_context_id = browser_context_id.to_owned();
+    let expected_url_fragment = contains.to_owned();
+    let snapshot = bridge()
+        .wait_target_graph(
+            &browser_web_socket_url,
+            timeout.as_millis().min(u64::MAX as u128) as u64,
+            Arc::new(move |record| {
+                record.id == expected_target_id
+                    && record.target_type == "page"
+                    && record.browser_context_id.as_deref() == Some(expected_context_id.as_str())
+                    && record
+                        .url
+                        .as_deref()
+                        .is_some_and(|url| url.contains(&expected_url_fragment))
+            }),
+            1,
         )
-    })?;
-    invalidate_target_cache(endpoint);
-    let observed = discover(endpoint)?;
-    let bound = crate::bind_browser_target(&observed, target_id, Some(browser_context_id), None)?;
-    if bound
+        .map_err(|error| ComptrolError {
+            code: if matches!(error, BrowserError::Timeout) {
+                "verification_failed"
+            } else if matches!(error, BrowserError::Closed) {
+                "browser_disconnected"
+            } else {
+                "browser_protocol_error"
+            }
+            .to_owned(),
+            message: error.to_string(),
+            recovery: Some("Inspect the exact browser target and retry".to_owned()),
+        })?;
+    let observed = snapshot
+        .targets
+        .iter()
+        .find(|record| {
+            record.id == target_id
+                && record.target_type == "page"
+                && record.browser_context_id.as_deref() == Some(browser_context_id)
+                && record
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| url.contains(contains))
+        })
+        .ok_or_else(|| ComptrolError {
+            code: "verification_failed".to_owned(),
+            message: "The browser target graph did not confirm the exact target postcondition"
+                .to_owned(),
+            recovery: Some("Inspect the exact browser target and retry".to_owned()),
+        })?;
+    if observed
         .url
         .as_deref()
         .is_some_and(|url| url.contains(contains))
     {
         return Ok(json!({
-            "url": bound.url,
-            "event": event,
-            "wait": "protocol_event",
+            "url": observed.url,
+            "target_id": observed.id,
+            "browser_context_id": observed.browser_context_id,
+            "generation": snapshot.generation,
+            "wait": "target_graph_event",
             "verified": true
         }));
     }

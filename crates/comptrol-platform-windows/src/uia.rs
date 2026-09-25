@@ -3,15 +3,17 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-    IUIAutomationValuePattern, TreeScope_Children, TreeScope_Descendants, UIA_ButtonControlTypeId,
-    UIA_CONTROLTYPE_ID, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
-    UIA_EditControlTypeId, UIA_InvokePatternId, UIA_TextControlTypeId, UIA_ValuePatternId,
-    UIA_WindowControlTypeId,
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationExpandCollapsePattern,
+    IUIAutomationInvokePattern, IUIAutomationSelectionItemPattern, IUIAutomationValuePattern,
+    TreeScope_Children, TreeScope_Descendants, UIA_ButtonControlTypeId, UIA_CONTROLTYPE_ID,
+    UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_EditControlTypeId,
+    UIA_ExpandCollapsePatternId, UIA_InvokePatternId, UIA_ListItemControlTypeId,
+    UIA_SelectionItemPatternId, UIA_TextControlTypeId, UIA_ValuePatternId, UIA_WindowControlTypeId,
 };
 
 #[allow(non_upper_case_globals)]
@@ -136,21 +138,14 @@ pub fn execute(request: Request<'_>) -> Result<Value, String> {
 
 fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Value, String> {
     let started = Instant::now();
-    let root = unsafe { automation.GetRootElement() }
-        .map_err(|error| format!("UI Automation root unavailable: {error}"))?;
     let condition = unsafe { automation.CreateTrueCondition() }
         .map_err(|error| format!("UI Automation condition unavailable: {error}"))?;
-    let windows = unsafe { root.FindAll(TreeScope_Children, &condition) }
-        .map_err(|error| format!("desktop window query failed: {error}"))?;
-    let window_count = unsafe { windows.Length() }
-        .map_err(|error| format!("desktop window count failed: {error}"))?;
+    let windows = target_windows(automation, &request)?;
     let mut matches = Vec::new();
     let mut inspected = Vec::new();
     let mut seen_window_handles = HashSet::new();
     let mut bounded_nodes = 0;
-    for index in 0..window_count.min(256) {
-        let window = unsafe { windows.GetElement(index) }
-            .map_err(|error| format!("desktop window read failed: {error}"))?;
+    for window in windows {
         if unsafe { window.CurrentProcessId() }
             .map_err(|error| format!("desktop window process identity failed: {error}"))?
             != request.process_id as i32
@@ -201,7 +196,7 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
                 }
                 continue;
             }
-            if !matches_element(&element, &request)? {
+            if !matches_element(&element, &request, root_window_handle)? {
                 continue;
             }
             matches.push(element);
@@ -240,10 +235,40 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
     match request.action {
         Action::Inspect => unreachable!("inspect returned before action dispatch"),
         Action::Press => {
-            let pattern: IUIAutomationInvokePattern =
-                unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }
-                    .map_err(|error| format!("Invoke pattern unavailable: {error}"))?;
-            unsafe { pattern.Invoke() }.map_err(|error| format!("Invoke failed: {error}"))?;
+            if request
+                .role
+                .is_some_and(|role| role.eq_ignore_ascii_case("combobox"))
+            {
+                if let Ok(pattern) = unsafe {
+                    element.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(
+                        UIA_ExpandCollapsePatternId,
+                    )
+                } {
+                    unsafe { pattern.Expand() }
+                        .map_err(|error| format!("Expand failed: {error}"))?;
+                } else {
+                    let pattern: IUIAutomationInvokePattern =
+                        unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }.map_err(
+                            |error| format!("Expand and Invoke patterns unavailable: {error}"),
+                        )?;
+                    unsafe { pattern.Invoke() }
+                        .map_err(|error| format!("Invoke failed: {error}"))?;
+                }
+            } else if request
+                .role
+                .is_some_and(|role| role.eq_ignore_ascii_case("listitem"))
+            {
+                let pattern: IUIAutomationSelectionItemPattern =
+                    unsafe { element.GetCurrentPatternAs(UIA_SelectionItemPatternId) }
+                        .map_err(|error| format!("SelectionItem pattern unavailable: {error}"))?;
+                unsafe { pattern.Select() }
+                    .map_err(|error| format!("Selection failed: {error}"))?;
+            } else {
+                let pattern: IUIAutomationInvokePattern =
+                    unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }
+                        .map_err(|error| format!("Invoke pattern unavailable: {error}"))?;
+                unsafe { pattern.Invoke() }.map_err(|error| format!("Invoke failed: {error}"))?;
+            }
         }
         Action::SetValue => {
             let value = request.value.ok_or("value_required")?;
@@ -275,24 +300,36 @@ fn control_type_name(control_type: UIA_CONTROLTYPE_ID) -> &'static str {
         UIA_CheckBoxControlTypeId => "checkbox",
         UIA_ComboBoxControlTypeId => "combobox",
         UIA_EditControlTypeId => "edit",
+        UIA_ListItemControlTypeId => "listitem",
         UIA_TextControlTypeId => "text",
         UIA_WindowControlTypeId => "window",
         _ => "other",
     }
 }
 
-fn matches_element(element: &IUIAutomationElement, request: &Request<'_>) -> Result<bool, String> {
-    matches_element_identity(element, request, None)
+fn matches_element(
+    element: &IUIAutomationElement,
+    request: &Request<'_>,
+    root_window_handle: u64,
+) -> Result<bool, String> {
+    matches_element_identity(element, request, None, root_window_handle)
 }
 
 fn matches_element_identity(
     element: &IUIAutomationElement,
     request: &Request<'_>,
     expected_name: Option<&str>,
+    root_window_handle: u64,
 ) -> Result<bool, String> {
     let process_id = unsafe { element.CurrentProcessId() }
         .map_err(|error| format!("UI Automation process identity failed: {error}"))?;
-    if process_id != request.process_id as i32 {
+    // Packaged Windows apps are often hosted by ApplicationFrameHost. Their
+    // top-level UIA window belongs to the host process while descendants can
+    // report the packaged app process. Permit that split only when the caller
+    // pinned the exact HWND; without it, retain strict PID matching.
+    let exact_hosted_window =
+        root_window_handle != 0 && request.window_handle == Some(root_window_handle);
+    if process_id != request.process_id as i32 && !exact_hosted_window {
         return Ok(false);
     }
     if let Some(name) = expected_name.or(request.name) {
@@ -316,6 +353,7 @@ fn matches_element_identity(
             "button" => UIA_ButtonControlTypeId,
             "checkbox" => UIA_CheckBoxControlTypeId,
             "combobox" => UIA_ComboBoxControlTypeId,
+            "listitem" | "option" => UIA_ListItemControlTypeId,
             "edit" | "textfield" => UIA_EditControlTypeId,
             _ => return Err("unsupported_role".to_owned()),
         };
@@ -331,21 +369,23 @@ fn find_postcondition_element(
     request: &Request<'_>,
 ) -> Result<Option<IUIAutomationElement>, String> {
     let expected_name = request.expected_value;
-    let root = unsafe { automation.GetRootElement() }
-        .map_err(|error| format!("UI Automation root unavailable: {error}"))?;
     let condition = unsafe { automation.CreateTrueCondition() }
         .map_err(|error| format!("UI Automation condition unavailable: {error}"))?;
-    let windows = unsafe { root.FindAll(TreeScope_Children, &condition) }
-        .map_err(|error| format!("desktop window query failed: {error}"))?;
-    let window_count = unsafe { windows.Length() }
-        .map_err(|error| format!("desktop window count failed: {error}"))?;
+    let windows = target_windows(automation, request)?;
     let mut matched = None;
-    for window_index in 0..window_count.min(256) {
-        let window = unsafe { windows.GetElement(window_index) }
-            .map_err(|error| format!("desktop window read failed: {error}"))?;
+    for window in windows {
         if unsafe { window.CurrentProcessId() }
             .map_err(|error| format!("desktop window process identity failed: {error}"))?
             != request.process_id as i32
+        {
+            continue;
+        }
+        let root_window_handle = unsafe { window.CurrentNativeWindowHandle() }
+            .map_err(|error| format!("window handle read failed: {error}"))?
+            .0 as u64;
+        if request
+            .window_handle
+            .is_some_and(|expected| expected != root_window_handle)
         {
             continue;
         }
@@ -356,7 +396,7 @@ fn find_postcondition_element(
         for index in 0..count.min(2048) {
             let element = unsafe { candidates.GetElement(index) }
                 .map_err(|error| format!("UI Automation element read failed: {error}"))?;
-            if matches_element_identity(&element, request, expected_name)? {
+            if matches_element_identity(&element, request, expected_name, root_window_handle)? {
                 if matched.is_some() {
                     return Ok(None);
                 }
@@ -365,6 +405,36 @@ fn find_postcondition_element(
         }
     }
     Ok(matched)
+}
+
+fn target_windows(
+    automation: &IUIAutomation,
+    request: &Request<'_>,
+) -> Result<Vec<IUIAutomationElement>, String> {
+    if let Some(handle) = request.window_handle {
+        let window = unsafe { automation.ElementFromHandle(HWND(handle as *mut _)) }
+            .map_err(|error| format!("UI Automation target window unavailable: {error}"))?;
+        let process_id = unsafe { window.CurrentProcessId() }
+            .map_err(|error| format!("UI Automation process identity failed: {error}"))?;
+        if process_id != request.process_id as i32 {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![window]);
+    }
+    let root = unsafe { automation.GetRootElement() }
+        .map_err(|error| format!("UI Automation root unavailable: {error}"))?;
+    let condition = unsafe { automation.CreateTrueCondition() }
+        .map_err(|error| format!("UI Automation condition unavailable: {error}"))?;
+    let windows = unsafe { root.FindAll(TreeScope_Children, &condition) }
+        .map_err(|error| format!("desktop window query failed: {error}"))?;
+    let window_count = unsafe { windows.Length() }
+        .map_err(|error| format!("desktop window count failed: {error}"))?;
+    (0..window_count.min(256))
+        .map(|index| {
+            unsafe { windows.GetElement(index) }
+                .map_err(|error| format!("desktop window read failed: {error}"))
+        })
+        .collect()
 }
 
 fn verify_after_action(

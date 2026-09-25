@@ -12,6 +12,7 @@ use crate::registry::AppEntry;
 use crate::{Resource, Resource as OpenResource};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 #[derive(Debug, thiserror::Error)]
@@ -174,11 +175,10 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
         Resource::None => {
             #[cfg(windows)]
             {
-                let app_id = &request.app.id;
-                let is_aumid = app_id.contains('_')
-                    && (app_id.ends_with("!App") || app_id.ends_with("!Application"));
-                if is_aumid {
-                    let shell_path = format!("shell:AppsFolder\\{app_id}");
+                // AUMIDs may use a specific application id after `!`, not
+                // only the conventional `!App` or `!Application` suffixes.
+                if is_aumid(&request.app.id) {
+                    let shell_path = format!("shell:AppsFolder\\{}", request.app.id);
                     let mut command = std::process::Command::new("explorer.exe");
                     command.arg(&shell_path);
                     command.stdin(Stdio::null()).stdout(Stdio::null());
@@ -205,17 +205,18 @@ fn launch_executable(
     metadata: BTreeMap<String, String>,
     settle: std::time::Duration,
 ) -> Result<LaunchOutcome, LaunchError> {
-    let Some(executable) = request.app.executable.clone() else {
+    let Some(registered_executable) = request.app.executable.clone() else {
         return Err(LaunchError::ExactResourceRouteUnavailable(
             request.app.id.clone(),
         ));
     };
+    let executable = resolve_known_launcher(&registered_executable);
     if executable.is_dir() {
         return Err(LaunchError::ExactResourceRouteUnavailable(
             request.app.id.clone(),
         ));
     }
-    let mut command = std::process::Command::new(executable);
+    let mut command = std::process::Command::new(&executable);
     if let Some(resource) = resource {
         command.arg(resource);
     }
@@ -238,8 +239,36 @@ fn launch_executable(
         route: "executable_argv".to_owned(),
         pid: Some(pid),
         resource: request.resource.clone(),
-        metadata,
+        metadata: if executable != registered_executable {
+            let mut metadata = metadata;
+            metadata.insert(
+                "launcher_resolved_from".to_owned(),
+                registered_executable.to_string_lossy().into_owned(),
+            );
+            metadata.insert(
+                "launched_executable".to_owned(),
+                executable.to_string_lossy().into_owned(),
+            );
+            metadata
+        } else {
+            metadata
+        },
     })
+}
+
+fn resolve_known_launcher(registered: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if registered
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("blender-launcher.exe"))
+        && let Some(parent) = registered.parent()
+    {
+        let blender = parent.join("blender.exe");
+        if blender.is_file() {
+            return blender;
+        }
+    }
+    registered.to_path_buf()
 }
 
 #[cfg(target_os = "macos")]
@@ -265,6 +294,13 @@ fn open_macos_bundle(
 
 fn route_pid_is_destination(route: &str) -> bool {
     matches!(route, "executable_argv")
+}
+
+#[cfg(any(windows, test))]
+fn is_aumid(app_id: &str) -> bool {
+    app_id
+        .split_once('!')
+        .is_some_and(|(package_family, app)| !package_family.is_empty() && !app.is_empty())
 }
 
 /// Launch and then verify, per the V5 rule that delivery is not verification.
@@ -317,5 +353,29 @@ mod tests {
         // Unavailable is only returned on non-Unix platforms where liveness probing is not implemented
         let result = launcher_probe(0x7FFFFFFF);
         assert_eq!(result, LaunchVerification::ExitedEarly);
+    }
+
+    #[test]
+    fn aumid_accepts_packaged_apps_with_specific_application_ids() {
+        assert!(is_aumid(
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+        ));
+        assert!(is_aumid("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"));
+        assert!(!is_aumid("windows.immersivecontrolpanel_cw5n1h2txyewy!"));
+        assert!(!is_aumid("Microsoft.WindowsCalculator"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blender_launcher_resolves_to_the_actual_application_executable() {
+        let root =
+            std::env::temp_dir().join(format!("comptrol-blender-launch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let launcher = root.join("blender-launcher.exe");
+        let blender = root.join("blender.exe");
+        std::fs::write(&launcher, b"launcher fixture").unwrap();
+        std::fs::write(&blender, b"application fixture").unwrap();
+        assert_eq!(resolve_known_launcher(&launcher), blender);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
