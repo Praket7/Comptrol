@@ -63,7 +63,7 @@ def main() -> None:
                     "id": 1,
                     "method": "initialize",
                     "params": {
-                        "protocolVersion": "2025-03-26",
+                        "protocolVersion": "2025-06-18",
                         "capabilities": {},
                         "clientInfo": {"name": "comptrol-npm-conformance", "version": "1.0"},
                     },
@@ -88,6 +88,7 @@ def main() -> None:
             names = {tool["name"] for tool in tools["result"]["tools"]}
             required = {"operate", "inspect", "watch", "reconcile", "capabilities"}
             assert initialized["result"]["serverInfo"]["name"] == "comptrol", initialized
+            assert initialized["result"]["protocolVersion"] == "2025-06-18", initialized
             assert required <= names, sorted(names)
             assert ping["result"]["structuredContent"]["verification"] == "verified", ping
             print(
