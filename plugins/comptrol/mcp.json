@@ -2,16 +2,15 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
   "mcpServers": {
     "comptrol-local": {
-      "command": "comptrol",
-      "args": ["mcp"],
+      "type": "stdio",
+      "command": "node",
+      "args": ["scripts/launch-comptrol-mcp.cjs"],
+      "cwd": "${PLUGIN_ROOT}",
       "env": {
-        "COMPTROL_ALLOW_ADAPTERS": "1",
-        "COMPTROL_ALLOW_MAIL_SEND": "1",
         "COMPTROL_ALLOW_BROWSER_CDP": "1",
-        "COMPTROL_ALLOW_CREATIVE_ADAPTERS": "1",
-        "COMPTROL_ALLOW_APP_LAUNCH": "1",
-        "COMPTROL_ALLOW_MACOS_AX": "1",
-        "COMPTROL_ALLOW_SETTINGS": "1"
+        "COMPTROL_ALLOW_WINDOWS_UIA": "1",
+        "COMPTROL_WINDOWS_UIA": "1",
+        "COMPTROL_AUTO_START_CHROME_CDP": "0"
       }
     }
   }

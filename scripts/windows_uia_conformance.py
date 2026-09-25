@@ -33,10 +33,16 @@ def call(process, identifier, method, params):
 
 root = pathlib.Path(__file__).resolve().parents[1]
 binary = os.environ.get("COMPTROL_BIN", str(root / "target" / "debug" / "comptrol.exe"))
-fixture = subprocess.Popen([powershell, "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", str(root / "fixtures" / "windows" / "UIAutomationFixture.ps1")])
+state_dir = pathlib.Path(os.environ.get("COMPTROL_STATE_DIR", str(root / "target" / "windows-uia-state")))
+state_dir.mkdir(parents=True, exist_ok=True)
+fixture_state = pathlib.Path(os.environ.get("COMPTROL_FIXTURE_STATE", str(state_dir / "fixture-state.json")))
+fixture = subprocess.Popen([
+    powershell, "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File",
+    str(root / "fixtures" / "windows" / "UIAutomationFixture.ps1"), "-StatePath", str(fixture_state),
+])
 runtime = None
 try:
-    time.sleep(1)
+    time.sleep(3)
     if fixture.poll() is not None:
         raise RuntimeError("Windows UI Automation fixture exited before it could be inspected")
     runtime = subprocess.Popen(
@@ -47,14 +53,16 @@ try:
         env={
             **os.environ,
             "COMPTROL_ALLOW_WINDOWS_UIA": "1",
-            "COMPTROL_STATE_DIR": str(root / "target" / "windows-uia-state"),
+            "COMPTROL_WINDOWS_UIA": "1",
+            "COMPTROL_AUTO_START_CHROME_CDP": "0",
+            "COMPTROL_STATE_DIR": str(state_dir),
         },
     )
     call(runtime, 1, "initialize", {})
     result = call(runtime, 2, "tools/call", {"name": "operate", "arguments": {
         "intent": "windows.uia.press",
-        "idempotency_key": "windows-uia-press",
-        "params": {"process_id": fixture.pid, "name": "Submit", "role": "button"},
+        "idempotency_key": f"windows-uia-press-{fixture.pid}",
+        "params": {"process_id": fixture.pid, "name": "Submit", "automation_id": "SubmitButton", "role": "button"},
         "postcondition": {"attribute": "name", "equals": "Submitted"},
     }})
     structured = result["result"]["structuredContent"]
@@ -62,6 +70,14 @@ try:
         raise RuntimeError(structured)
     assert structured["verification"] == "verified", structured
     assert structured["route"] == "windows_uia_direct", structured
+    fixture_result = json.loads(fixture_state.read_text(encoding="utf-8"))
+    assert fixture_result.get("status") == "Submitted", fixture_result
+    assert fixture_result.get("submission_count") == 1, fixture_result
+    assert fixture_result.get("field_value") == "", fixture_result
+    assert fixture_result.get("duplicate_one_count") == 0, fixture_result
+    assert fixture_result.get("duplicate_two_count") == 0, fixture_result
+    assert fixture_result.get("disabled_count") == 0, fixture_result
+    print(json.dumps({"runtime": structured, "independent_fixture_state": fixture_result}, ensure_ascii=False))
     print("Windows UI Automation conformance passed")
 finally:
     if runtime is not None:
