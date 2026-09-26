@@ -1678,7 +1678,34 @@ fn call_tool_with_cancel(
         }
         _ => json!({ "error": { "code": "tool_not_found", "message": format!("Unknown tool {name}") } }),
     };
-    json!({ "content": [{ "type": "text", "text": serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned()) }], "structuredContent": value })
+    // MCP structuredContent must be a JSON object. Capabilities and route
+    // inspection are naturally lists, so preserve their shape under a named
+    // field while keeping the text content backward compatible.
+    let structured_content = structured_content_value(&value);
+    json!({ "content": [{ "type": "text", "text": serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned()) }], "structuredContent": structured_content })
+}
+
+fn structured_content_value(value: &Value) -> Value {
+    if value.is_object() {
+        value.clone()
+    } else {
+        json!({ "result": value })
+    }
+}
+
+#[cfg(test)]
+mod mcp_result_tests {
+    use super::structured_content_value;
+    use serde_json::json;
+
+    #[test]
+    fn structured_content_is_always_an_object_without_changing_list_shape() {
+        let list = json!([{"name":"one"},{"name":"two"}]);
+        assert_eq!(structured_content_value(&list), json!({"result":list}));
+
+        let object = json!({"status":"ready"});
+        assert_eq!(structured_content_value(&object), object);
+    }
 }
 
 fn run_inspect(kind: &str) -> Value {

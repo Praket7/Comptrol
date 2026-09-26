@@ -35,6 +35,10 @@ pub struct Request<'a> {
     pub value: Option<&'a str>,
     pub expected_attribute: Option<&'a str>,
     pub expected_value: Option<&'a str>,
+    /// Select an ordinal among identical controls only when the observed
+    /// candidate count is supplied and unchanged.
+    pub match_index: Option<usize>,
+    pub expected_match_count: Option<usize>,
     pub max_nodes: usize,
 }
 
@@ -49,6 +53,8 @@ struct OwnedRequest {
     value: Option<String>,
     expected_attribute: Option<String>,
     expected_value: Option<String>,
+    match_index: Option<usize>,
+    expected_match_count: Option<usize>,
     max_nodes: usize,
 }
 
@@ -64,6 +70,8 @@ impl<'a> From<Request<'a>> for OwnedRequest {
             value: request.value.map(str::to_owned),
             expected_attribute: request.expected_attribute.map(str::to_owned),
             expected_value: request.expected_value.map(str::to_owned),
+            match_index: request.match_index,
+            expected_match_count: request.expected_match_count,
             max_nodes: request.max_nodes.clamp(1, 512),
         }
     }
@@ -81,6 +89,8 @@ impl OwnedRequest {
             value: self.value.as_deref(),
             expected_attribute: self.expected_attribute.as_deref(),
             expected_value: self.expected_value.as_deref(),
+            match_index: self.match_index,
+            expected_match_count: self.expected_match_count,
             max_nodes: self.max_nodes,
         }
     }
@@ -200,7 +210,7 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
                 continue;
             }
             matches.push(element);
-            if matches.len() > 1 {
+            if matches.len() > 1 && request.match_index.is_none() {
                 return Err("target_ambiguous".to_owned());
             }
         }
@@ -220,6 +230,15 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
             "mouse": "untouched",
             "clipboard": "untouched",
         }));
+    }
+    if let Some(index) = request.match_index {
+        checked_match_index(matches.len(), index, request.expected_match_count)
+            .map_err(str::to_owned)?;
+        let element = matches.swap_remove(index);
+        matches.clear();
+        matches.push(element);
+    } else if request.expected_match_count.is_some() {
+        return Err("expected_match_count requires match_index".to_owned());
     }
     let Some(element) = matches.pop() else {
         return Err("target_missing".to_owned());
@@ -264,10 +283,24 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
                 unsafe { pattern.Select() }
                     .map_err(|error| format!("Selection failed: {error}"))?;
             } else {
-                let pattern: IUIAutomationInvokePattern =
-                    unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }
-                        .map_err(|error| format!("Invoke pattern unavailable: {error}"))?;
-                unsafe { pattern.Invoke() }.map_err(|error| format!("Invoke failed: {error}"))?;
+                // Many native controls expose selection rather than Invoke
+                // (Chrome's tabs are a common example). Prefer Invoke for
+                // buttons and menus, then fall back to the semantic
+                // SelectionItem pattern instead of refusing the action.
+                if let Ok(pattern) = unsafe {
+                    element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
+                } {
+                    unsafe { pattern.Invoke() }
+                        .map_err(|error| format!("Invoke failed: {error}"))?;
+                } else {
+                    let pattern: IUIAutomationSelectionItemPattern =
+                        unsafe { element.GetCurrentPatternAs(UIA_SelectionItemPatternId) }
+                            .map_err(|error| {
+                                format!("Invoke and SelectionItem patterns unavailable: {error}")
+                            })?;
+                    unsafe { pattern.Select() }
+                        .map_err(|error| format!("Selection failed: {error}"))?;
+                }
             }
         }
         Action::SetValue => {
@@ -292,6 +325,20 @@ fn execute_once(automation: &IUIAutomation, request: Request<'_>) -> Result<Valu
         "clipboard": "untouched",
         "window_handle": window_handle,
     }))
+}
+
+fn checked_match_index(
+    actual_count: usize,
+    index: usize,
+    expected_count: Option<usize>,
+) -> Result<usize, &'static str> {
+    let Some(expected_count) = expected_count else {
+        return Err("indexed UIA targeting needs expected_match_count");
+    };
+    if actual_count != expected_count || index >= actual_count {
+        return Err("target_set_changed");
+    }
+    Ok(index)
 }
 
 fn control_type_name(control_type: UIA_CONTROLTYPE_ID) -> &'static str {
@@ -489,6 +536,16 @@ fn verify(element: &IUIAutomationElement, request: &Request<'_>) -> Result<bool,
             .map_err(|error| format!("Enabled verification failed: {error}"))?
             .as_bool()
             == (request.expected_value == Some("true"))),
+        Some("selected") => {
+            let pattern: IUIAutomationSelectionItemPattern =
+                unsafe { element.GetCurrentPatternAs(UIA_SelectionItemPatternId) }.map_err(
+                    |error| format!("Selection verification pattern unavailable: {error}"),
+                )?;
+            Ok(unsafe { pattern.CurrentIsSelected() }
+                .map_err(|error| format!("Selection verification failed: {error}"))?
+                .as_bool()
+                == (request.expected_value == Some("true")))
+        }
         Some(_) => Err("unsupported_verification_attribute".to_owned()),
     }
 }
@@ -505,5 +562,27 @@ impl ComGuard {
 impl Drop for ComGuard {
     fn drop(&mut self) {
         unsafe { CoUninitialize() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_match_index;
+
+    #[test]
+    fn indexed_target_requires_the_same_observed_candidate_set() {
+        assert_eq!(checked_match_index(3, 1, Some(3)), Ok(1));
+        assert_eq!(
+            checked_match_index(2, 1, Some(3)),
+            Err("target_set_changed")
+        );
+        assert_eq!(
+            checked_match_index(3, 3, Some(3)),
+            Err("target_set_changed")
+        );
+        assert_eq!(
+            checked_match_index(3, 0, None),
+            Err("indexed UIA targeting needs expected_match_count")
+        );
     }
 }

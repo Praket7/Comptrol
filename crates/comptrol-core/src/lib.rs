@@ -7991,6 +7991,16 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
             value: request.params.get("value").and_then(Value::as_str),
             expected_attribute,
             expected_value,
+            match_index: request
+                .params
+                .get("match_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            expected_match_count: request
+                .params
+                .get("expected_match_count")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
             max_nodes: request
                 .params
                 .get("max_nodes")
