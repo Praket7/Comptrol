@@ -13955,15 +13955,17 @@ mod tests {
             json!({"provider": "companion_extension"}),
             Risk::R2,
         );
-        assert_eq!(disconnected.verification, VerificationState::Unverified);
         match disconnected.error.as_ref().map(|error| error.code.as_str()) {
-            Some("route_unavailable") => assert!(
-                disconnected
-                    .error
-                    .as_ref()
-                    .is_some_and(|error| error.message.contains("native host is not registered"))
-            ),
+            Some("route_unavailable") => {
+                assert_eq!(disconnected.verification, VerificationState::NotAttempted);
+                assert!(
+                    disconnected.error.as_ref().is_some_and(|error| error
+                        .message
+                        .contains("native host is not registered"))
+                );
+            }
             None => {
+                assert_eq!(disconnected.verification, VerificationState::Unverified);
                 assert_eq!(disconnected.data["status"], "registered_but_inactive");
                 assert_eq!(disconnected.data["bridge_health"]["active"], false);
             }
