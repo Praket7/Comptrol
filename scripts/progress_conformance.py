@@ -3,13 +3,22 @@
 
 import json
 import os
+import pathlib
 import subprocess
 import tempfile
 
 
+# Honor COMPTROL_BIN so the tested artifact is pinned; Windows needs .exe.
+binary = os.environ.get("COMPTROL_BIN") or str(
+    pathlib.Path(__file__).resolve().parents[1]
+    / "target"
+    / "debug"
+    / ("comptrol.exe" if os.name == "nt" else "comptrol")
+)
+
 with tempfile.TemporaryDirectory(prefix="comptrol-progress-") as state:
     process = subprocess.Popen(
-        ["target/debug/comptrol", "mcp"],
+        [binary, "mcp"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,

@@ -31,7 +31,7 @@ rustls-pemfile = "2"
 tokio = { version = "1", features = ["rt"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 comptrol-platform-linux = { path = "../comptrol-platform-linux" }

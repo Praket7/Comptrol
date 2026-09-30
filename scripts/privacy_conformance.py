@@ -3,11 +3,19 @@
 
 import json
 import os
+import pathlib
 import subprocess
 import tempfile
 
 
-binary = "target/debug/comptrol"
+# Resolve the runtime under test explicitly: honor COMPTROL_BIN so the tested
+# artifact is pinned, and use an absolute Windows-compatible path otherwise.
+binary = os.environ.get("COMPTROL_BIN") or str(
+    pathlib.Path(__file__).resolve().parents[1]
+    / "target"
+    / "debug"
+    / ("comptrol.exe" if os.name == "nt" else "comptrol")
+)
 with tempfile.TemporaryDirectory(prefix="comptrol-privacy-") as state:
     environment = dict(os.environ, COMPTROL_STATE_DIR=state)
     status = json.loads(subprocess.check_output([binary, "privacy", "status"], env=environment))

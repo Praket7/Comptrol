@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 struct TargetCacheEntry {
@@ -35,23 +35,94 @@ fn is_companion_bridge(endpoint: &str) -> bool {
     endpoint == COMPANION_BRIDGE_ENDPOINT
 }
 
-fn open_bridge_store() -> Result<BridgeStore, ComptrolError> {
-    BridgeStore::open(&crate::default_state_dir()).map_err(|error| ComptrolError {
-        code: "browser_bridge_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some(
-            "Start the Comptrol daemon and reconnect the Browser Bridge extension".to_owned(),
-        ),
-    })
+/// Match a browser URL without ever considering its query string or fragment.
+/// Matchers may be an origin/host (for example `classroom.google.com`), a
+/// path (`/c/`), an origin plus path, or an absolute URL. This matters for
+/// identity-provider redirects where the destination site appears only in a
+/// `continue=` query parameter.
+pub fn url_matches(actual: &str, matcher: &str) -> bool {
+    let Some((actual_scheme, actual_authority, actual_path)) = url_parts(actual) else {
+        return false;
+    };
+    if matcher.starts_with('/') {
+        return actual_path.contains(matcher);
+    }
+
+    if let Some((expected_scheme, expected_authority, expected_path)) = url_parts(matcher) {
+        if !actual_scheme.eq_ignore_ascii_case(expected_scheme)
+            || !actual_authority.eq_ignore_ascii_case(expected_authority)
+        {
+            return false;
+        }
+        return expected_path.is_empty()
+            || expected_path == "/"
+            || actual_path.contains(expected_path);
+    }
+
+    let expected = matcher.trim_end_matches('/');
+    if expected.is_empty() {
+        return false;
+    }
+    if let Some((expected_host, expected_path)) = expected.split_once('/') {
+        return actual_authority.eq_ignore_ascii_case(expected_host)
+            && actual_path.contains(&format!("/{expected_path}"));
+    }
+
+    actual_authority.eq_ignore_ascii_case(expected)
+        || actual_path.contains(expected)
+        || format!("{actual_scheme}://{actual_authority}{actual_path}").contains(expected)
 }
+
+fn url_parts(url: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, remainder) = url.split_once("://")?;
+    if scheme.is_empty() || remainder.is_empty() {
+        return None;
+    }
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = remainder[..authority_end]
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() {
+        return None;
+    }
+    let path_and_suffix = &remainder[authority_end..];
+    let path_end = path_and_suffix
+        .find(['?', '#'])
+        .unwrap_or(path_and_suffix.len());
+    let path = &path_and_suffix[..path_end];
+    Some((scheme, authority, path))
+}
+
+fn open_bridge_store() -> Result<&'static std::sync::Mutex<BridgeStore>, ComptrolError> {
+    // B3: one process-wide store instead of a fresh SQLite open per command.
+    // WAL makes cross-process sharing safe; this removes the per-command
+    // open/close cost from every bridge call in the MCP runtime.
+    static STORE: std::sync::OnceLock<std::sync::Mutex<BridgeStore>> = std::sync::OnceLock::new();
+    let store = STORE.get_or_init(|| {
+        std::sync::Mutex::new(
+            BridgeStore::open(&crate::default_state_dir())
+                .unwrap_or_else(|error| panic!("browser bridge store unavailable: {error}")),
+        )
+    });
+    Ok(store)
+}
+
+/// R7: heavy bridge operations (tab open/activate/history/download) get a
+/// generous budget — cold pages and SPA navigations exceed 10 s regularly,
+/// and timing out there is honest but unhelpful.
+const BRIDGE_HEAVY_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn bridge_command(
     command_type: &str,
     payload: Value,
     timeout: Duration,
 ) -> Result<Value, ComptrolError> {
-    let mut store = open_bridge_store()?;
+    let started = Instant::now();
+    let store = open_bridge_store()?;
     let health = store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .health(DEFAULT_HEALTH_MAX_AGE)
         .map_err(|error| ComptrolError {
             code: "browser_bridge_unavailable".to_owned(),
@@ -68,6 +139,8 @@ fn bridge_command(
         });
     }
     let request_id = store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .submit(command_type, payload)
         .map_err(|error| ComptrolError {
             code: if error.kind() == io::ErrorKind::WouldBlock {
@@ -79,27 +152,144 @@ fn bridge_command(
             message: error.to_string(),
             recovery: Some("Retry after the bridge drains pending commands".to_owned()),
         })?;
-    let response = store
-        .wait_result(&request_id, timeout)
-        .map_err(|error| ComptrolError {
-            code: if error.kind() == io::ErrorKind::TimedOut {
-                "browser_bridge_timeout"
-            } else {
-                "browser_bridge_unavailable"
+    let response_result = {
+        let store = store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.wait_result(&request_id, timeout)
+    };
+    let response = match response_result {
+        Ok(response) => response,
+        Err(timeout_error) if timeout_error.kind() == io::ErrorKind::TimedOut => {
+            // Wake-and-continue: a timeout with a fresh heartbeat is the
+            // signature of a suspended MV3 service worker (the host keeps
+            // posting its own heartbeats, so heartbeat recency is not proof of
+            // liveness). Nudge Chrome via the OS launcher — a new tab fires
+            // tabs.onCreated, which wakes the worker — then keep waiting on
+            // the SAME request_id. Re-submitting would risk double execution
+            // of a mutation; the original command is still leased and the
+            // revived host delivers it to the revived worker.
+            {
+                let mut store = store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _ = store.record_channel_state("wake_requested");
+                let _ = store.record_wake_requested("command_timeout");
             }
-            .to_owned(),
-            message: error.to_string(),
-            recovery: Some("Verify the Browser Bridge extension is connected and retry".to_owned()),
-        })?;
+            // The OS-launch wake is opt-in: launching chrome.exe for a URL
+            // (or with no URL at all) surfaces Chrome's profile picker or
+            // Windows' "new app to open this about link" dialog when the
+            // browser is closed, which read as random popups to the user.
+            // The event-driven wake path (native_host draining the recorded
+            // wake request) runs without spawning anything and is the
+            // default; operators can restore the launch nudge explicitly.
+            let wake_result = if std::env::var("COMPTROL_WAKE_LAUNCH").as_deref() == Ok("1") {
+                let wake_url = std::env::var("COMPTROL_WAKE_URL")
+                    .unwrap_or_else(|_| "about:blank#comptrol-wake".to_owned());
+                launch_chrome_tab(&wake_url)
+            } else {
+                Ok(json!({ "skipped": true, "reason": "launch wake disabled by default" }))
+            };
+            if wake_result.is_err() {
+                store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record_channel_state("wake_failed")
+                    .ok();
+            }
+            let response = {
+                let store = store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                store.wait_result(&request_id, timeout)
+            }
+            .map_err(|error| ComptrolError {
+                code: if error.kind() == io::ErrorKind::TimedOut {
+                    "browser_bridge_timeout"
+                } else {
+                    "browser_bridge_unavailable"
+                }
+                .to_owned(),
+                message: error.to_string(),
+                recovery: Some(
+                    "Verify the Browser Bridge extension is connected and retry".to_owned(),
+                ),
+            });
+            match response {
+                Ok(response) => response,
+                Err(_) => {
+                    let mut store = store
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    store.record_channel_state("degraded").ok();
+                    // P2.4: eligible for one automatic requeue when the
+                    // channel recovers (same request_id; the dedupe ledger
+                    // makes the replay safe).
+                    store.mark_retryable(&request_id).ok();
+                    drop(store);
+                    return Err(ComptrolError {
+                        code: "browser_bridge_timeout".to_owned(),
+                        message: format!(
+                            "Browser bridge command {request_id} timed out even after a service-worker wake attempt ({} ms elapsed)",
+                            started.elapsed().as_millis()
+                        ),
+                        recovery: Some(
+                            "Reconnect the Browser Bridge extension (reload it at chrome://extensions) and reconcile browser state before retrying".to_owned(),
+                        ),
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            return Err(ComptrolError {
+                code: if error.kind() == io::ErrorKind::TimedOut {
+                    "browser_bridge_timeout"
+                } else {
+                    "browser_bridge_unavailable"
+                }
+                .to_owned(),
+                message: error.to_string(),
+                recovery: Some(
+                    "Verify the Browser Bridge extension is connected and retry".to_owned(),
+                ),
+            });
+        }
+    };
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     } else {
+        let error_value = response.get("error").cloned().unwrap_or(Value::Null);
+        if error_value.get("code").and_then(Value::as_str) == Some("sw_deadline") {
+            // K1 mirror: the extension hit its own per-command deadline and
+            // remediated the debugger attachment. The page operation MAY or
+            // may not have completed inside Chrome — reconcile with an
+            // independent postcondition before re-issuing a mutation.
+            // P2.4: also mark eligible for one automatic requeue on recovery.
+            store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .mark_retryable(&request_id)
+                .ok();
+            return Err(ComptrolError {
+                code: "sw_deadline".to_owned(),
+                message: error_value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("The extension remediated a stuck debugger command")
+                    .to_owned(),
+                recovery: Some(
+                    "Reconcile page state with an independent postcondition (e.g. browser.cdp.wait_for) before retrying; the stuck attachment was already detached"
+                        .to_owned(),
+                ),
+            });
+        }
         Err(ComptrolError {
             code: "browser_protocol_error".to_owned(),
-            message: response
-                .get("error")
-                .map(Value::to_string)
-                .unwrap_or_else(|| "Browser Bridge command failed".to_owned()),
+            message: if error_value.is_null() {
+                "Browser Bridge command failed".to_owned()
+            } else {
+                error_value.to_string()
+            },
             recovery: Some("Inspect the exact browser target and retry".to_owned()),
         })
     }
@@ -107,11 +297,15 @@ fn bridge_command(
 
 fn bridge_targets() -> Result<Vec<BrowserTarget>, ComptrolError> {
     let store = open_bridge_store()?;
-    let values = store.targets().map_err(|error| ComptrolError {
-        code: "browser_bridge_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Wait for the extension to publish a fresh target snapshot".to_owned()),
-    })?;
+    let values = store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .targets()
+        .map_err(|error| ComptrolError {
+            code: "browser_bridge_unavailable".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Wait for the extension to publish a fresh target snapshot".to_owned()),
+        })?;
     Ok(values
         .into_iter()
         .filter_map(|value| {
@@ -174,16 +368,21 @@ pub fn discover(endpoint: &str) -> Result<Vec<BrowserTarget>, ComptrolError> {
         }
         return Ok(targets);
     }
-    let value = get_json(endpoint, "/json/list").map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Start a supported browser with remote debugging enabled".to_owned()),
-    })?;
-    let targets = parse_targets(&value).ok_or_else(|| ComptrolError {
-        code: "browser_protocol_invalid".to_owned(),
-        message: "The browser returned an invalid target list".to_owned(),
-        recovery: Some("Inspect the configured DevTools endpoint".to_owned()),
-    })?;
+    let targets = if is_websocket_endpoint(endpoint) {
+        let value = protocol_call(endpoint, "Target.getTargets", json!({}))?;
+        parse_cdp_target_infos(&value)?
+    } else {
+        let value = get_json(endpoint, "/json/list").map_err(|error| ComptrolError {
+            code: "browser_unavailable".to_owned(),
+            message: error.to_string(),
+            recovery: Some("Start a supported browser with remote debugging enabled".to_owned()),
+        })?;
+        parse_targets(&value).ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "The browser returned an invalid target list".to_owned(),
+            recovery: Some("Inspect the configured DevTools endpoint".to_owned()),
+        })?
+    };
     if let Ok(mut caches) = target_caches().lock() {
         caches.insert(
             endpoint.to_owned(),
@@ -434,10 +633,10 @@ pub fn open_tab(
                 "background": background,
                 "browserContextId": browser_context_id.unwrap_or("default"),
             }),
-            Duration::from_secs(10),
+            BRIDGE_HEAVY_TIMEOUT,
         );
     }
-    if !background && browser_context_id.is_none() {
+    if !is_websocket_endpoint(endpoint) && !background && browser_context_id.is_none() {
         let path = format!("/json/new?{}", encode_new_tab_url(url));
         let (status, value) =
             request_json(endpoint, "PUT", &path, &[], None).map_err(|error| ComptrolError {
@@ -467,19 +666,7 @@ pub fn open_tab(
             "verified": true
         }));
     }
-    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Start the existing browser with local DevTools enabled".to_owned()),
-    })?;
-    let web_socket_url = version
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: "The browser did not provide a browser websocket".to_owned(),
-            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
-        })?;
+    let web_socket_url = browser_websocket_endpoint(endpoint)?;
     let mut create_params = json!({
         "url": url,
         "background": background,
@@ -489,7 +676,7 @@ pub fn open_tab(
     if let Some(browser_context_id) = real_context_id(browser_context_id) {
         create_params["browserContextId"] = json!(browser_context_id);
     }
-    let created = protocol_call(web_socket_url, "Target.createTarget", create_params)?;
+    let created = protocol_call(&web_socket_url, "Target.createTarget", create_params)?;
     let target_id = created
         .get("targetId")
         .and_then(Value::as_str)
@@ -498,7 +685,7 @@ pub fn open_tab(
             message: "The browser did not return the opened tab identity".to_owned(),
             recovery: Some("Inspect the browser target list".to_owned()),
         })?;
-    wait_for_event(web_socket_url, Duration::from_secs(2), |event| {
+    wait_for_event(&web_socket_url, Duration::from_secs(2), |event| {
         event.get("method").and_then(Value::as_str) == Some("Target.targetCreated")
             && event
                 .get("params")
@@ -536,6 +723,58 @@ pub fn open_tab(
     })
 }
 
+/// Activate (foreground) or deactivate (background) one exact live tab through
+/// the companion bridge. Activation enables rendering-dependent verification
+/// steps with a brief, disclosed focus hop; the caller can deactivate right
+/// after to hand the foreground back to the user's tab.
+pub fn activate_tab(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: &str,
+    deactivate: bool,
+) -> Result<Value, ComptrolError> {
+    let targets = discover_cached(endpoint)?;
+    if is_companion_bridge(endpoint) {
+        let target = crate::bind_browser_target(
+            &targets,
+            target_id,
+            Some(browser_context_id),
+            Some(revision),
+        )?;
+        let result = bridge_command(
+            "activate_tab",
+            json!({"targetId": target.id, "deactivate": deactivate}),
+            BRIDGE_HEAVY_TIMEOUT,
+        )?;
+        invalidate_target_cache(endpoint);
+        return Ok(result);
+    }
+    // Direct CDP route: bring the page to front via Page.bringToFront.
+    let target = crate::bind_browser_target(
+        &targets,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+    )?;
+    let value = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        Some(revision),
+        "Page.bringToFront",
+        json!({}),
+    )?;
+    Ok(json!({
+        "activated": !deactivate,
+        "deactivated": deactivate,
+        "target_id": target.id,
+        "response": value,
+        "verified": true,
+        "route": "direct_cdp_bring_to_front"
+    }))
+}
+
 pub fn launch_chrome_tab(url: &str) -> Result<Value, ComptrolError> {
     validate_url(url)?;
     let status = if cfg!(target_os = "macos") {
@@ -543,15 +782,25 @@ pub fn launch_chrome_tab(url: &str) -> Result<Value, ComptrolError> {
             .args(["-a", "Google Chrome", url])
             .status()
     } else if cfg!(target_os = "windows") {
-        Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Process -FilePath $env:COMPTROL_CHROME_URL",
-            ])
-            .env("COMPTROL_CHROME_URL", url)
-            .status()
+        // Launch chrome.exe directly instead of ShellExecuting the URL.
+        // ShellExecute routes through URI associations, and Windows has no
+        // handler for `about:` URIs, so every wake/navigation popup asked
+        // the user to pick "a new app to open this about:link". Passing the
+        // URL as chrome.exe's argument hands it to Chrome itself; when an
+        // instance is already running, that instance opens the tab.
+        let chrome = crate::chrome_autostart::chrome_path();
+        match chrome {
+            Some(chrome) => Command::new(&chrome).arg(url).status(),
+            None => Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Process -FilePath $env:COMPTROL_CHROME_URL",
+                ])
+                .env("COMPTROL_CHROME_URL", url)
+                .status(),
+        }
     } else if cfg!(target_os = "linux") {
         Command::new("xdg-open").arg(url).status()
     } else {
@@ -618,7 +867,7 @@ pub fn close_tab(
         let result = bridge_command(
             "close_tab",
             json!({"targetId": target.id}),
-            Duration::from_secs(10),
+            BRIDGE_HEAVY_TIMEOUT,
         )?;
         invalidate_target_cache(endpoint);
         return Ok(result);
@@ -629,25 +878,13 @@ pub fn close_tab(
         Some(browser_context_id),
         Some(revision),
     )?;
-    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Inspect the existing browser websocket endpoint".to_owned()),
-    })?;
-    let web_socket_url = version
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: "The browser did not provide a browser websocket".to_owned(),
-            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
-        })?;
+    let web_socket_url = browser_websocket_endpoint(endpoint)?;
     let value = protocol_call(
-        web_socket_url,
+        &web_socket_url,
         "Target.closeTarget",
         json!({ "targetId": target_id }),
     )?;
-    wait_for_event(web_socket_url, Duration::from_secs(2), |event| {
+    wait_for_event(&web_socket_url, Duration::from_secs(2), |event| {
         event.get("method").and_then(Value::as_str) == Some("Target.targetDestroyed")
             && event
                 .get("params")
@@ -694,7 +931,7 @@ pub fn history(
         let result = bridge_command(
             "history",
             json!({"targetId": target.id, "forward": forward}),
-            Duration::from_secs(10),
+            BRIDGE_HEAVY_TIMEOUT,
         )?;
         invalidate_target_cache(endpoint);
         return Ok(result);
@@ -827,7 +1064,7 @@ pub fn wait_for_url(
             if target
                 .url
                 .as_deref()
-                .is_some_and(|url| url.contains(contains))
+                .is_some_and(|url| url_matches(url, contains))
             {
                 return Ok(json!({
                     "url": target.url,
@@ -852,7 +1089,7 @@ pub fn wait_for_url(
     if target
         .url
         .as_deref()
-        .is_some_and(|url| url.contains(contains))
+        .is_some_and(|url| url_matches(url, contains))
     {
         return Ok(json!({
             "url": target.url,
@@ -860,30 +1097,70 @@ pub fn wait_for_url(
             "verified": true
         }));
     }
-    let web_socket_url = target.web_socket_url.ok_or_else(|| ComptrolError {
-        code: "browser_protocol_invalid".to_owned(),
-        message: "The target did not provide a websocket debugger URL".to_owned(),
-        recovery: Some("Inspect browser targets again".to_owned()),
-    })?;
-    let event = wait_for_event(&web_socket_url, timeout, |event| {
-        let method = event.get("method").and_then(Value::as_str);
-        matches!(
-            method,
-            Some("Page.frameNavigated") | Some("Page.navigatedWithinDocument")
+    // Permissioned Chrome exposes a browser-level WebSocket and targetInfos,
+    // not a per-page webSocketDebuggerUrl. Wait on the persistent flattened
+    // session's event-maintained target graph, then verify exact target and
+    // context identity before accepting the URL postcondition.
+    let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
+    let expected_target_id = target_id.to_owned();
+    let expected_context_id = browser_context_id.to_owned();
+    let expected_url_fragment = contains.to_owned();
+    let snapshot = bridge()
+        .wait_target_graph(
+            &browser_web_socket_url,
+            timeout.as_millis().min(u64::MAX as u128) as u64,
+            Arc::new(move |record| {
+                record.id == expected_target_id
+                    && record.target_type == "page"
+                    && record.browser_context_id.as_deref() == Some(expected_context_id.as_str())
+                    && record
+                        .url
+                        .as_deref()
+                        .is_some_and(|url| url_matches(url, &expected_url_fragment))
+            }),
+            1,
         )
-    })?;
-    invalidate_target_cache(endpoint);
-    let observed = discover(endpoint)?;
-    let bound = crate::bind_browser_target(&observed, target_id, Some(browser_context_id), None)?;
-    if bound
+        .map_err(|error| ComptrolError {
+            code: if matches!(error, BrowserError::Timeout) {
+                "verification_failed"
+            } else if matches!(error, BrowserError::Closed) {
+                "browser_disconnected"
+            } else {
+                "browser_protocol_error"
+            }
+            .to_owned(),
+            message: error.to_string(),
+            recovery: Some("Inspect the exact browser target and retry".to_owned()),
+        })?;
+    let observed = snapshot
+        .targets
+        .iter()
+        .find(|record| {
+            record.id == target_id
+                && record.target_type == "page"
+                && record.browser_context_id.as_deref() == Some(browser_context_id)
+                && record
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| url_matches(url, contains))
+        })
+        .ok_or_else(|| ComptrolError {
+            code: "verification_failed".to_owned(),
+            message: "The browser target graph did not confirm the exact target postcondition"
+                .to_owned(),
+            recovery: Some("Inspect the exact browser target and retry".to_owned()),
+        })?;
+    if observed
         .url
         .as_deref()
-        .is_some_and(|url| url.contains(contains))
+        .is_some_and(|url| url_matches(url, contains))
     {
         return Ok(json!({
-            "url": bound.url,
-            "event": event,
-            "wait": "protocol_event",
+            "url": observed.url,
+            "target_id": observed.id,
+            "browser_context_id": observed.browser_context_id,
+            "generation": snapshot.generation,
+            "wait": "target_graph_event",
             "verified": true
         }));
     }
@@ -983,6 +1260,27 @@ pub fn capture_screenshot(
     Ok(result)
 }
 
+/// Extract the captured viewport (width, height) from a capture_id of the
+/// form `{target}:{context}:{revision}:{format}:{W}x{H}:{digest}`. The last
+/// `digits x digits` segment wins: hex digests contain no 'x', so the viewport
+/// is the only WxH-shaped segment in practice, and preferring the last one
+/// keeps an exotic revision from shadowing it. Returns None for ids without a
+/// parseable viewport so coordinate clicks are refused instead of guessed.
+fn capture_viewport_from_id(capture_id: &str) -> Option<(f64, f64)> {
+    capture_id
+        .split(':')
+        .filter_map(|segment| {
+            let mut parts = segment.split('x');
+            let width = parts.next()?.parse::<u64>().ok()?;
+            let height = parts.next()?.parse::<u64>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some((width as f64, height as f64))
+        })
+        .next_back()
+}
+
 /// Click one coordinate only when it is bound to an immediately verifiable
 /// screenshot capture. A changed pixel digest or viewport refuses the action
 /// as stale instead of guessing against moved page geometry.
@@ -997,6 +1295,7 @@ pub fn coordinate_click(
     y: f64,
     button: &str,
 ) -> Result<Value, ComptrolError> {
+    let action_started = Instant::now();
     if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
         return Err(ComptrolError {
             code: "invalid_input".to_owned(),
@@ -1012,25 +1311,74 @@ pub fn coordinate_click(
             recovery: None,
         });
     }
-    let current = capture_screenshot(
+    // Post-geometry-fix, the runtime only needs the CURRENT viewport
+    // dimensions to complete the staleness check against the caller's
+    // capture_id — not a full screenshot. A lightweight evaluate is ~20x
+    // cheaper than Page.captureScreenshot (PNG encode + transport over the
+    // bridge dominated the old path at multi-second scale on large canvases).
+    let viewport_started = Instant::now();
+    let viewport = cdp_call(
         endpoint,
         target_id,
-        browser_context_id,
-        revision,
-        "png",
-        None,
-        Value::Null,
-        false,
+        Some(browser_context_id),
+        Some(revision),
+        "Runtime.evaluate",
+        json!({
+            "expression": "(() => ({ width: Math.max(1, Math.floor(window.innerWidth)), height: Math.max(1, Math.floor(window.innerHeight)) }))()",
+            "returnByValue": true
+        }),
     )?;
-    let width = current["viewport"]["width"].as_u64().unwrap_or(0) as f64;
-    let height = current["viewport"]["height"].as_u64().unwrap_or(0) as f64;
-    if x >= width || y >= height || current["capture_id"].as_str() != Some(capture_id) {
+    let viewport_ms = viewport_started.elapsed().as_millis() as u64;
+    let viewport_value = viewport
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .cloned()
+        .unwrap_or_else(|| json!({"width": 0, "height": 0}));
+    let width = viewport_value["width"].as_u64().unwrap_or(0) as f64;
+    let height = viewport_value["height"].as_u64().unwrap_or(0) as f64;
+    if x >= width || y >= height {
         return Err(ComptrolError {
             code: "stale_geometry".to_owned(),
-            message: "The screenshot geometry no longer matches the requested coordinate"
-                .to_owned(),
-            recovery: Some("Capture a fresh screenshot and retry with its capture_id".to_owned()),
+            message: format!(
+                "The requested coordinate ({x}, {y}) is outside the current viewport ({width}x{height})"
+            ),
+            recovery: Some(
+                "Capture a fresh screenshot and retry with coordinates inside the viewport"
+                    .to_owned(),
+            ),
         });
+    }
+    // Geometry staleness check (F11): the caller's capture_id embeds the
+    // viewport it captured. Pixel digests can NEVER match on animated pages
+    // (a blinking caret changes pixels between any two captures), so the
+    // binding proof is the viewport the caller saw, not the pixels. A resize
+    // between capture and click still produces a fresh, different viewport
+    // and is refused.
+    let caller_viewport = capture_viewport_from_id(capture_id);
+    match caller_viewport {
+        Some((captured_width, captured_height)) => {
+            if captured_width != width || captured_height != height {
+                return Err(ComptrolError {
+                    code: "stale_geometry".to_owned(),
+                    message: format!(
+                        "The viewport changed since the caller's capture ({captured_width}x{captured_height} -> {width}x{height})"
+                    ),
+                    recovery: Some(
+                        "Capture a fresh screenshot and retry with its capture_id".to_owned(),
+                    ),
+                });
+            }
+        }
+        None => {
+            return Err(ComptrolError {
+                code: "stale_geometry".to_owned(),
+                message: "The caller's capture_id does not carry a parseable viewport geometry"
+                    .to_owned(),
+                recovery: Some(
+                    "Capture a fresh screenshot and pass its capture_id verbatim".to_owned(),
+                ),
+            });
+        }
     }
     let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(
@@ -1040,6 +1388,7 @@ pub fn coordinate_click(
         Some(revision),
     )?;
     let target_revision = target.revision.clone();
+    let press_started = Instant::now();
     cdp_call(
         endpoint,
         target_id,
@@ -1062,10 +1411,15 @@ pub fn coordinate_click(
         "y": y,
         "button": button,
         "capture_id": capture_id,
-        "viewport": current["viewport"],
+        "viewport": viewport_value,
         "verified": false,
         "verification": "dispatch_only",
-        "evidence": "fresh_pixel_capture_geometry"
+        "evidence": "caller_capture_viewport_binding",
+        "timings_ms": {
+            "viewport_probe": viewport_ms,
+            "mouse_dispatch": press_started.elapsed().as_millis() as u64,
+            "total": action_started.elapsed().as_millis() as u64
+        }
     }))
 }
 
@@ -1151,6 +1505,28 @@ pub fn cdp_call(
     method: &str,
     params: Value,
 ) -> Result<Value, ComptrolError> {
+    cdp_call_with_timeout(
+        endpoint,
+        target_id,
+        browser_context_id,
+        revision,
+        method,
+        params,
+        // R7: 5 s was too tight for cold SPA pages; 8 s covers first paint
+        // while keeping the failure signal fast.
+        Duration::from_secs(8),
+    )
+}
+
+fn cdp_call_with_timeout(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: Option<&str>,
+    revision: Option<&str>,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, ComptrolError> {
     let targets = discover_cached(endpoint)?;
     if is_companion_bridge(endpoint) {
         let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
@@ -1161,7 +1537,7 @@ pub fn cdp_call(
                 "method": method,
                 "params": params,
             }),
-            Duration::from_secs(15),
+            timeout,
         )?;
         if matches!(method, "Page.navigate" | "Page.navigateToHistoryEntry") {
             invalidate_target_cache(endpoint);
@@ -1212,13 +1588,20 @@ pub fn cdp_frame_call(
     params: Value,
 ) -> Result<Value, ComptrolError> {
     if is_companion_bridge(endpoint) {
-        return Err(ComptrolError {
-            code: "route_unavailable".to_owned(),
-            message: format!(
-                "Frame-scoped {method} requires the direct CDP frame graph; the companion bridge does not expose a stable frame-to-tab binding"
-            ),
-            recovery: Some("Use a direct CDP endpoint for frame-scoped evaluation".to_owned()),
-        });
+        // B7: the extension tracks frame -> session bindings per attached tab
+        // (Target.setAutoAttach + Page.getFrameTree), so frame-scoped commands
+        // reach cross-origin OOPIF iframes through the bridge. Generation and
+        // revision are advisory here; the SW resolves the live session.
+        let _ = (generation, revision);
+        return bridge_command(
+            "cdp_frame_command",
+            json!({
+                "frameId": frame_id,
+                "method": method,
+                "params": params,
+            }),
+            BRIDGE_HEAVY_TIMEOUT,
+        );
     }
     let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
     bridge()
@@ -1243,6 +1626,9 @@ pub fn cdp_frame_call(
 }
 
 fn browser_websocket_endpoint(endpoint: &str) -> Result<String, ComptrolError> {
+    if is_websocket_endpoint(endpoint) {
+        return Ok(endpoint.to_owned());
+    }
     let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
         code: "browser_unavailable".to_owned(),
         message: error.to_string(),
@@ -1258,6 +1644,341 @@ fn browser_websocket_endpoint(endpoint: &str) -> Result<String, ComptrolError> {
             message: "The browser version response did not contain a local websocket".to_owned(),
             recovery: Some("Start Chrome with a supported local debugger endpoint".to_owned()),
         })
+}
+
+/// Wait for a requested visible-page text postcondition using a bounded,
+/// data-only query. Caller text is JSON-escaped before entering the expression.
+pub fn wait_for_text(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    text: &str,
+    timeout: Duration,
+) -> Result<Value, ComptrolError> {
+    if text.trim().is_empty() || text.chars().any(char::is_control) {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "Text postconditions must contain non-control text".to_owned(),
+            recovery: None,
+        });
+    }
+    let needle = serde_json::to_string(text).map_err(|error| ComptrolError {
+        code: "invalid_input".to_owned(),
+        message: error.to_string(),
+        recovery: None,
+    })?;
+    // Keep the wait inside one CDP request. Polling Runtime.evaluate from the
+    // caller added one bridge round trip every 80 ms and could spend the full
+    // command timeout on each poll. A MutationObserver is event driven and
+    // resolves promptly once the requested text appears.
+    let timeout_ms = timeout.as_millis().clamp(100, 10_000);
+    let expression = format!(
+        r#"(async () => {{
+            const text = {needle};
+            const read = () => {{
+                // K7: innerText is layout-dependent and empty in hidden
+                // (background) tabs — Chrome does not render them at all.
+                // Fall back to textContent (pure DOM presence) whenever the
+                // document is not visible so background workflows can still
+                // verify text honestly.
+                const probe = document.hidden ? 'dom_text_content' : 'rendered_inner_text';
+                const body = document.hidden
+                    ? (document.body?.textContent || '')
+                    : (document.body?.innerText || document.body?.textContent || '');
+                const index = body.indexOf(text);
+                return {{ matched: index >= 0, count: index < 0 ? 0 : body.split(text).length - 1, probe }};
+            }};
+            const first = read();
+            if (first.matched) return first;
+            return await new Promise(resolve => {{
+                let settled = false;
+                let timer = 0;
+                const observer = new MutationObserver(() => {{
+                    const value = read();
+                    if (value.matched) finish(value);
+                }});
+                const finish = value => {{
+                    if (settled) return;
+                    settled = true;
+                    observer.disconnect();
+                    clearTimeout(timer);
+                    resolve(value);
+                }};
+                observer.observe(document, {{ subtree: true, childList: true, characterData: true }});
+                const afterObserve = read();
+                if (afterObserve.matched) {{ finish(afterObserve); return; }}
+                timer = setTimeout(() => finish(read()), {timeout_ms});
+            }});
+        }})()"#
+    );
+    let started = Instant::now();
+    let result = cdp_call_with_timeout(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        None,
+        "Runtime.evaluate",
+        json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
+        Duration::from_millis(timeout_ms as u64 + 2_000),
+    )?;
+    let value = result
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if value.get("matched").and_then(Value::as_bool) == Some(true) {
+        return Ok(json!({
+            "text": text,
+            "count": value.get("count").and_then(Value::as_u64).unwrap_or(1),
+            "elapsed_ms": started.elapsed().as_millis(),
+            "verified": true,
+            "wait": "mutation_observer",
+            "probe": value.get("probe").and_then(Value::as_str).unwrap_or("rendered_inner_text")
+        }));
+    }
+    Err(ComptrolError {
+        code: "verification_failed".to_owned(),
+        message: format!(
+            "The page did not contain the requested text: {text} (rendered-text probe when visible, DOM text-presence probe when hidden)"
+        ),
+        recovery: Some("Inspect the exact page and use a current semantic locator".to_owned()),
+    })
+}
+
+fn session_endpoint() -> &'static Mutex<Option<String>> {
+    static ENDPOINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    ENDPOINT.get_or_init(|| Mutex::new(None))
+}
+
+/// Return the live browser endpoint selected for this Comptrol process.
+/// A permissioned Chrome session is stored here after its native consent and
+/// CDP handshake succeed; it is never written into process-wide environment
+/// state, where concurrent operations could silently switch profiles.
+pub fn active_endpoint() -> Option<String> {
+    session_endpoint()
+        .lock()
+        .ok()
+        .and_then(|endpoint| endpoint.clone())
+        .or_else(|| std::env::var("COMPTROL_CDP_ENDPOINT").ok())
+        .filter(|endpoint| !endpoint.is_empty())
+}
+
+pub fn set_active_endpoint(endpoint: String) {
+    if let Ok(mut current) = session_endpoint().lock() {
+        *current = Some(endpoint);
+    }
+}
+
+fn is_websocket_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with("ws://") || endpoint.starts_with("wss://")
+}
+
+/// Type text into whatever element currently has keyboard focus by dispatching
+/// real `Input.insertText` events (a trusted browser input channel, not page
+/// JavaScript). This is what makes canvas editors — Google Docs, Sheets grids —
+/// reachable: they ignore synthetic DOM events, but they honor real input.
+///
+/// The caller places the caret first (semantic_click on the editable surface,
+/// or coordinate_click with fresh geometry), then calls here.
+pub fn type_text(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: Option<&str>,
+    text: &str,
+) -> Result<Value, ComptrolError> {
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "type_text needs non-empty text without control characters".to_owned(),
+            recovery: Some("Send separate key presses for Enter, Tab, or Escape".to_owned()),
+        });
+    }
+    if text.len() > 1024 * 1024 {
+        return Err(ComptrolError {
+            code: "invalid_input".to_owned(),
+            message: "type_text payload exceeds the bounded size".to_owned(),
+            recovery: None,
+        });
+    }
+    let result = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        revision,
+        "Input.insertText",
+        json!({ "text": text }),
+    )?;
+    Ok(json!({
+        "inserted_text_length": text.chars().count(),
+        "dispatch": result,
+        "verified": false,
+        "verification": "dispatch_only",
+        "basis": "trusted_input_channel"
+    }))
+}
+
+/// Press one key (or key with modifiers) via real `Input.dispatchKeyEvent`
+/// events: rawKeyDown + keyUp, with the key's computed Windows-style code so
+/// editors like Google Sheets commit on Enter exactly as they do for a
+/// physical keyboard.
+pub fn press_key(
+    endpoint: &str,
+    target_id: &str,
+    browser_context_id: &str,
+    revision: Option<&str>,
+    key: &str,
+    modifiers: Option<&Vec<Value>>,
+) -> Result<Value, ComptrolError> {
+    // CDP modifier bitmask: Alt=1, Ctrl=2, Meta/Command=4, Shift=8.
+    let mut modifier_mask: u32 = 0;
+    if let Some(mods) = modifiers {
+        for value in mods {
+            let name = value.as_str().unwrap_or("").to_ascii_lowercase();
+            let bit = match name.as_str() {
+                "alt" | "option" => 1_u32,
+                "ctrl" | "control" | "cmd_or_ctrl" => 2_u32,
+                "meta" | "cmd" | "command" | "win" => 4_u32,
+                "shift" => 8_u32,
+                other => {
+                    return Err(ComptrolError {
+                        code: "invalid_input".to_owned(),
+                        message: format!(
+                            "press_key does not know the modifier {other:?}; use ctrl, alt, shift, or meta"
+                        ),
+                        recovery: None,
+                    });
+                }
+            };
+            modifier_mask |= bit;
+        }
+    }
+    // Allowlisted named keys with their unmodified-text and key-code values
+    // (CDP expects Windows-native virtual key names here).
+    let (key_value, code, windows_key_code, text_value): (String, String, u32, Option<String>) =
+        match key {
+            "Enter" => (
+                "Enter".into(),
+                "Enter".into(),
+                13_u32,
+                Some("\r".to_owned()),
+            ),
+            "Tab" => ("Tab".into(), "Tab".into(), 9, Some("\t".to_owned())),
+            "Escape" => ("Escape".into(), "Escape".into(), 27, None),
+            "Backspace" => ("Backspace".into(), "Backspace".into(), 8, None),
+            "Delete" => ("Delete".into(), "Delete".into(), 46, None),
+            "ArrowUp" => ("ArrowUp".into(), "ArrowUp".into(), 38, None),
+            "ArrowDown" => ("ArrowDown".into(), "ArrowDown".into(), 40, None),
+            "ArrowLeft" => ("ArrowLeft".into(), "ArrowLeft".into(), 37, None),
+            "ArrowRight" => ("ArrowRight".into(), "ArrowRight".into(), 39, None),
+            "Home" => ("Home".into(), "Home".into(), 36, None),
+            "End" => ("End".into(), "End".into(), 35, None),
+            "PageUp" => ("PageUp".into(), "PageUp".into(), 33, None),
+            "PageDown" => ("PageDown".into(), "PageDown".into(), 34, None),
+            _ => {
+                let mut chars = key.chars();
+                let single = chars.next().ok_or_else(|| ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "press_key needs a named key or a single character".to_owned(),
+                    recovery: None,
+                })?;
+                if chars.next().is_some() {
+                    return Err(ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: format!(
+                        "press_key does not know the key {key:?}; use a named key or one character"
+                    ),
+                    recovery: Some(
+                        "Named keys: Enter, Tab, Escape, Backspace, Delete, arrows, Home, End, PageUp, PageDown"
+                            .to_owned(),
+                    ),
+                });
+                }
+                let upper = single.to_uppercase().next().unwrap_or(single);
+                // US-layout virtual key code for letters/digits (others are rare
+                // enough that 0 still dispatches, but 0 makes some editors drop
+                // the event entirely).
+                let vk = match single {
+                    c if c.is_ascii_uppercase() || c.is_ascii_lowercase() => upper as u32,
+                    c if c.is_ascii_digit() => c as u32,
+                    _ => 0_u32,
+                };
+                (
+                    single.to_string(),
+                    format!("Key{upper}"),
+                    vk,
+                    Some(single.to_string()),
+                )
+            }
+        };
+    let down_result = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        revision,
+        "Input.dispatchKeyEvent",
+        json!({
+            "type": "keyDown",
+            "key": key_value,
+            "code": code,
+            "windowsVirtualKeyCode": windows_key_code,
+            "nativeVirtualKeyCode": windows_key_code,
+            "text": text_value,
+            "unmodifiedText": text_value,
+            "modifiers": modifier_mask,
+        }),
+    )?;
+    let up_result = cdp_call(
+        endpoint,
+        target_id,
+        Some(browser_context_id),
+        revision,
+        "Input.dispatchKeyEvent",
+        json!({
+            "type": "keyUp",
+            "key": key_value,
+            "code": code,
+            "windowsVirtualKeyCode": windows_key_code,
+            "nativeVirtualKeyCode": windows_key_code,
+            "modifiers": modifier_mask,
+        }),
+    )?;
+    Ok(json!({
+        "key": key_value,
+        "down": down_result,
+        "up": up_result,
+        "verified": false,
+        "verification": "dispatch_only",
+        "basis": "trusted_input_channel"
+    }))
+}
+
+fn parse_cdp_target_infos(value: &Value) -> Result<Vec<BrowserTarget>, ComptrolError> {
+    let target_infos = value
+        .get("targetInfos")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ComptrolError {
+            code: "browser_protocol_invalid".to_owned(),
+            message: "Chrome returned no targetInfos for Target.getTargets".to_owned(),
+            recovery: Some("Inspect the permissioned Chrome WebSocket".to_owned()),
+        })?;
+    let values = target_infos
+        .iter()
+        .filter_map(|target| {
+            Some(json!({
+                "id": target.get("targetId")?.as_str()?,
+                "type": target.get("type").and_then(Value::as_str),
+                "browserContextId": target.get("browserContextId").and_then(Value::as_str),
+                "url": target.get("url").and_then(Value::as_str),
+                "title": target.get("title").and_then(Value::as_str),
+            }))
+        })
+        .collect::<Vec<_>>();
+    parse_targets(&json!(values)).ok_or_else(|| ComptrolError {
+        code: "browser_protocol_invalid".to_owned(),
+        message: "Chrome returned an invalid target list".to_owned(),
+        recovery: Some("Inspect the permissioned Chrome WebSocket".to_owned()),
+    })
 }
 
 /// Resolve and click a semantic locator in one bounded browser transaction.
@@ -1366,9 +2087,22 @@ pub fn semantic_click(
                     Boolean(host && (hit === host || host.contains(hit)));
             }};
             const stable = async element => {{
-                const first = element.getBoundingClientRect();
+                // In hidden (background) tabs Chrome never fires
+                // requestAnimationFrame, so awaiting it hangs forever. When the
+                // document is not visible, skip animation-frame stability and
+                // rely on a timed geometry re-read (mutations that land between
+                // the two reads still shift the rect and fail the check).
+                const read = () => element.getBoundingClientRect();
+                if (document.hidden) {{
+                    const first = read();
+                    await new Promise(resolve => setTimeout(resolve, 120));
+                    const second = read();
+                    return first.left === second.left && first.top === second.top &&
+                        first.width === second.width && first.height === second.height;
+                }}
+                const first = read();
                 await new Promise(requestAnimationFrame);
-                const second = element.getBoundingClientRect();
+                const second = read();
                 return first.left === second.left && first.top === second.top &&
                     first.width === second.width && first.height === second.height;
             }};
@@ -1405,7 +2139,7 @@ pub fn semantic_click(
     let mut last_error = None;
     for attempt in 0..=1 {
         let current_revision = if attempt == 0 { revision } else { None };
-        match cdp_call(
+        match cdp_call_with_timeout(
             endpoint,
             target_id,
             Some(browser_context_id),
@@ -1416,6 +2150,7 @@ pub fn semantic_click(
                 "returnByValue": true,
                 "awaitPromise": true
             }),
+            Duration::from_millis(timeout_ms.saturating_add(2_000)),
         ) {
             Ok(data) => {
                 let value = data
@@ -1424,12 +2159,19 @@ pub fn semantic_click(
                     .cloned()
                     .unwrap_or(Value::Null);
                 if value.get("clicked").and_then(Value::as_bool) == Some(true) {
+                    // Honesty: this "verified" is the actor attesting that it
+                    // dispatched the click inside the page, NOT an independent
+                    // readback of the user-visible outcome. VerificationState
+                    // labels it actor_attested; callers needing independent
+                    // proof should run a postcondition wait (e.g.
+                    // browser.cdp.wait_for) through a separate observation.
                     return Ok(json!({
                         "result": data,
                         "semantic_locator": locator,
                         "attempts": attempt + 1,
                         "actionability": value.get("actionability").cloned().unwrap_or(Value::Null),
-                        "verified": true
+                        "verified": true,
+                        "verified_by": "actor_dispatch"
                     }));
                 }
                 return Err(ComptrolError {
@@ -1570,9 +2312,22 @@ pub fn semantic_fill(
                     Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
             }};
             const stable = async element => {{
-                const first = element.getBoundingClientRect();
+                // In hidden (background) tabs Chrome never fires
+                // requestAnimationFrame, so awaiting it hangs forever. When the
+                // document is not visible, skip animation-frame stability and
+                // rely on a timed geometry re-read (mutations that land between
+                // the two reads still shift the rect and fail the check).
+                const read = () => element.getBoundingClientRect();
+                if (document.hidden) {{
+                    const first = read();
+                    await new Promise(resolve => setTimeout(resolve, 120));
+                    const second = read();
+                    return first.left === second.left && first.top === second.top &&
+                        first.width === second.width && first.height === second.height;
+                }}
+                const first = read();
                 await new Promise(requestAnimationFrame);
-                const second = element.getBoundingClientRect();
+                const second = read();
                 return first.left === second.left && first.top === second.top &&
                     first.width === second.width && first.height === second.height;
             }};
@@ -1606,7 +2361,10 @@ pub fn semantic_fill(
                         element.focus();
                         setNativeValue(element, desired);
                         await Promise.resolve();
-                        await new Promise(requestAnimationFrame);
+                        // Post-fill verification must not depend on animation
+                        // frames: hidden tabs never fire rAF. A macrotask is
+                        // enough for the value change to be observable.
+                        await new Promise(resolve => setTimeout(resolve, 25));
                         const verified = readValue(element) === desired;
                         return {{
                             filled: verified,
@@ -1629,13 +2387,14 @@ pub fn semantic_fill(
     let mut last_error = None;
     for attempt in 0..=1 {
         let current_revision = if attempt == 0 { revision } else { None };
-        match cdp_call(
+        match cdp_call_with_timeout(
             endpoint,
             target_id,
             Some(browser_context_id),
             current_revision,
             "Runtime.evaluate",
             json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+            Duration::from_millis(timeout_ms.saturating_add(2_000)),
         ) {
             Ok(data) => {
                 let result = data
@@ -1690,7 +2449,16 @@ pub fn compact_snapshot(
 ) -> Result<Value, ComptrolError> {
     let limit = limit.clamp(1, 160);
     let expression = format!(
-        r#"(() => {{
+        r#"(async () => {{
+            if (document.readyState === 'loading') {{
+                await new Promise(resolve => {{
+                    const timer = setTimeout(resolve, 3000);
+                    document.addEventListener('DOMContentLoaded', () => {{
+                        clearTimeout(timer);
+                        resolve();
+                    }}, {{ once: true }});
+                }});
+            }}
             const limit = {limit};
             const normalize = value => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 160);
             const roleOf = element => element.getAttribute('role') ||
@@ -1964,19 +2732,7 @@ pub fn cdp_download(
     let targets = discover_cached(endpoint)?;
     let target = crate::bind_browser_target(&targets, target_id, browser_context_id, revision)?;
     let target_revision = target.revision.clone();
-    let version = get_json(endpoint, "/json/version").map_err(|error| ComptrolError {
-        code: "browser_unavailable".to_owned(),
-        message: error.to_string(),
-        recovery: Some("Inspect the existing browser websocket endpoint".to_owned()),
-    })?;
-    let browser_web_socket_url = version
-        .get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ComptrolError {
-            code: "browser_protocol_invalid".to_owned(),
-            message: "The browser did not provide a browser websocket".to_owned(),
-            recovery: Some("Use a Chrome endpoint that exposes the browser target".to_owned()),
-        })?;
+    let browser_web_socket_url = browser_websocket_endpoint(endpoint)?;
     // Real Chrome omits browserContextId for default-context targets and
     // rejects unknown GUIDs, so the canonical "default" label must never be
     // sent as if it were a real context GUID.
@@ -1992,7 +2748,7 @@ pub fn cdp_download(
     }
     bridge()
         .command(
-            browser_web_socket_url,
+            &browser_web_socket_url,
             "Browser.setDownloadBehavior",
             download_behavior,
         )
@@ -2018,7 +2774,7 @@ pub fn cdp_download(
             "awaitPromise": true
         }),
     )?;
-    let download = wait_for_event(browser_web_socket_url, Duration::from_secs(10), |event| {
+    let download = wait_for_event(&browser_web_socket_url, Duration::from_secs(10), |event| {
         event.get("method").and_then(Value::as_str) == Some("Browser.downloadWillBegin")
     })?;
     let guid = download
@@ -2031,7 +2787,7 @@ pub fn cdp_download(
             recovery: Some("Inspect the browser download protocol events".to_owned()),
         })?
         .to_owned();
-    let progress = wait_for_event(browser_web_socket_url, Duration::from_secs(30), |event| {
+    let progress = wait_for_event(&browser_web_socket_url, Duration::from_secs(30), |event| {
         event.get("method").and_then(Value::as_str) == Some("Browser.downloadProgress")
             && event
                 .get("params")
@@ -2282,6 +3038,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn url_matches_uses_origin_and_path_without_query_or_fragment() {
+        let chooser = "https://accounts.google.com/v3/signin/accountchooser?continue=https%3A%2F%2Fclassroom.google.com%2Fu%2F2%2Fh%2Fst";
+        let classroom = "https://classroom.google.com/u/2/c/NzI5OTczMzQ2OTYx";
+        let query_only_path =
+            "https://accounts.google.com/?continue=https://classroom.google.com/c/123";
+
+        assert!(!url_matches(chooser, "classroom.google.com"));
+        assert!(!url_matches(query_only_path, "/c/"));
+        assert!(url_matches(classroom, "classroom.google.com"));
+        assert!(url_matches(classroom, "/c/"));
+        assert!(url_matches(
+            classroom,
+            "https://classroom.google.com/u/2/c/"
+        ));
+        assert!(!url_matches(
+            "https://accounts.google.com/?next=https://classroom.google.com/c/123#classroom.google.com",
+            "classroom.google.com"
+        ));
+        assert!(url_matches(
+            "http://127.0.0.1:17418/next",
+            "127.0.0.1:17418"
+        ));
+    }
+
+    #[test]
+    fn capture_viewport_parses_wxh_segment_and_ignores_digest() {
+        let id = "tab123:ctx:rev:png:1280x800:3f2a9c1d";
+        assert_eq!(capture_viewport_from_id(id), Some((1280.0, 800.0)));
+    }
+
+    #[test]
+    fn capture_viewport_returns_none_for_digest_only_suffixes() {
+        // A pure hex digest contains no 'x', so it must never parse as a
+        // viewport. This is the exact shape that broke the earlier rsplit(':')
+        // parser and made every coordinate click refuse as unparseable.
+        let id = "tab123:ctx:rev:png:1280x800:deadbeefcafe";
+        assert_eq!(capture_viewport_from_id(id), Some((1280.0, 800.0)));
+        assert_eq!(capture_viewport_from_id("tab:ctx:rev:png:3f2a9c1d"), None);
+        assert_eq!(capture_viewport_from_id("tab:ctx:rev:png"), None);
+    }
+
+    #[test]
+    fn capture_viewport_prefers_last_wxh_segment() {
+        // An exotic revision like 'r2x3' is a valid WxH-shaped segment; the
+        // parser takes the LAST such segment so the true viewport wins.
+        let id = "tab:ctx:r2x3:png:1024x768:abc";
+        assert_eq!(capture_viewport_from_id(id), Some((1024.0, 768.0)));
+        // Malformed segments (empty, negative, triple) are skipped.
+        assert_eq!(
+            capture_viewport_from_id("tab:ctx:rev:png:x800:100x200:abc"),
+            Some((100.0, 200.0))
+        );
+        assert_eq!(capture_viewport_from_id("tab:ctx:rev:png:1x2x3:abc"), None);
+    }
+
+    #[test]
     fn browser_endpoint_is_loopback_only() {
         let error = discover("http://example.com:9222").expect_err("remote endpoint");
         assert_eq!(error.code, "browser_unavailable");
@@ -2309,6 +3121,31 @@ mod tests {
         assert_eq!(targets[0].id, "tab");
         assert_eq!(targets[0].browser_context_id.as_deref(), Some("context"));
         assert_eq!(targets[0].revision.as_deref(), Some("rev"));
+    }
+
+    #[test]
+    fn permissioned_cdp_target_infos_keep_live_page_identity() {
+        let targets = parse_cdp_target_infos(&json!({
+            "targetInfos": [{
+                "targetId": "classroom-tab",
+                "type": "page",
+                "browserContextId": "profile-context",
+                "url": "https://classroom.google.com/",
+                "title": "Google Classroom"
+            }]
+        }))
+        .expect("CDP target list");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "classroom-tab");
+        assert_eq!(targets[0].target_type.as_deref(), Some("page"));
+        assert_eq!(
+            targets[0].browser_context_id.as_deref(),
+            Some("profile-context")
+        );
+        assert_eq!(
+            targets[0].url.as_deref(),
+            Some("https://classroom.google.com/")
+        );
     }
 
     #[test]

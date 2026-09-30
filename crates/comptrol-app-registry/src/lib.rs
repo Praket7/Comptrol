@@ -14,11 +14,13 @@
 
 pub mod launch;
 pub mod registry;
+pub mod surface;
 
 pub use launch::{
     LaunchOutcome, LaunchRequest, LaunchVerification, launch, launch_verified, launcher_probe,
 };
 pub use registry::{AppEntry, RegistryError, resolve, resolve_all};
+pub use surface::{CorrelateOptions, SurfaceError, SurfaceRef, WindowState, correlate};
 
 /// What the caller asked to open.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

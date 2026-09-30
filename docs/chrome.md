@@ -14,6 +14,12 @@ The normal repository check uses the deterministic fixture websocket. Real Chrom
 
 For a user visible validation, start Chrome with a loopback DevTools endpoint and set `COMPTROL_CDP_ENDPOINT` plus `COMPTROL_ALLOW_BROWSER_CDP`. The validation must use the user chosen profile intentionally. Comptrol will reuse that profile but will not copy cookies or credentials into another profile.
 
+## Existing signed-in Chrome session
+
+On Chrome 144 and newer, enable **Remote Debugging** at `chrome://inspect/#remote-debugging`. The Comptrol plugin arms `COMPTROL_CHROME_AUTO_CONNECT=1`; when the user calls `browser.session.connect`, Comptrol reads Chrome's `DevToolsActivePort` file and connects to its loopback WebSocket URL. Chrome can show its native **Allow** prompt for that connection. Comptrol verifies the connection with `Browser.getVersion` and keeps the same WebSocket open for later target discovery and browser actions.
+
+This permissioned route uses the WebSocket path in `DevToolsActivePort` directly. It does not rely on `/json/version` or `/json/list`, which may return 404 for Chrome's permissioned endpoint. A user-started classic debugging endpoint continues to use its HTTP discovery routes.
+
 On Windows, the repository launcher creates a separate profile and exposes the endpoint automatically. It does not touch the normal Chrome profile.
 
 The native `comptrol mcp` startup path also performs this setup automatically when no `COMPTROL_CDP_ENDPOINT` is already configured. This applies to source builds, GitHub release binaries, and the `comptrolling` npm launcher. Set `COMPTROL_AUTO_START_CHROME_CDP=0` to opt out. Set `COMPTROL_CHROME_START_URL` to choose the first page, or `COMPTROL_CHROME_PROFILE` to choose the isolated profile directory.
@@ -35,7 +41,9 @@ The Chrome process remains open until its dedicated window is closed. The endpoi
 
 For a remotely reachable transport, use `comptrol serve-mtls <port>` with `COMPTROL_MTLS_CERT`, `COMPTROL_MTLS_KEY`, and `COMPTROL_MTLS_CLIENT_CA`. The server does not parse MCP until the client certificate chains to the configured CA. Keep the bind address explicit with `COMPTROL_MTLS_BIND`; no remote listener is enabled by default.
 
-`browser.cdp.screenshot` returns a bounded digest by default. Set `include_pixels` to true to receive the bounded base64 PNG/JPEG/WebP payload plus `capture_id` and viewport geometry. A following `browser.cdp.coordinate_click` must provide that exact capture token and is refused with `stale_geometry` if the pixels or viewport changed. This is deterministic coordinate recovery, not a claim that pixels were semantically understood.
+`browser.cdp.screenshot` returns a bounded digest by default. Set `include_pixels` to true to receive the bounded base64 PNG/JPEG/WebP payload plus `capture_id` and viewport geometry. A following `browser.cdp.coordinate_click` must provide that capture token and is refused with `stale_geometry` if the viewport changed since the capture. The binding proof is the captured viewport, not a pixel comparison: pages with continuously animating pixels (blinking carets, videos, clocks) would otherwise make every coordinate click impossible. This is deterministic coordinate recovery, not a claim that pixels were semantically understood.
+
+Trusted-input routes cover editors that ignore synthetic DOM events, including canvas-style applications: `browser.cdp.type_text` sends real `Input.insertText` text to the element with keyboard focus, and `browser.cdp.press_key` sends real `Input.dispatchKeyEvent` keyDown/keyUp pairs for named keys (Enter, Tab, Escape, Backspace, Delete, arrows, Home, End, PageUp, PageDown) with an optional `modifiers` array (`ctrl`, `alt`, `shift`, `meta`). Place the caret first with `semantic_click` or `coordinate_click`, then type, then press Enter to commit. Both intents report `dispatch_only` verification: the input was sent through the trusted channel, and the resulting page change must be confirmed by an independent check such as `browser.cdp.wait_for` or a readback.
 
 Chrome closed tab groups are not restored through CDP because the protocol exposes neither portable closed-group history nor a cross-platform group identity. `browser.cdp.reopen_closed_group` therefore refuses safely. The native macOS Accessibility route may be used when its exact semantic control is exposed and permission is granted.
 

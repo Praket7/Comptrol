@@ -1,27 +1,69 @@
-# Current support
+# Support matrix
 
-Checked on 24 September 2026. Version 0.1.67 is the release version for this update. The public GitHub release contains runtime archives for all five listed processor and operating system combinations. This checks package availability. It does not prove every adapter works on every computer.
+What is actually verified, per route family. Comptrol separates *implemented*
+from *live-verified*: a route is only marked verified here when a gate has run
+it against the real app and observed the result. Everything else is labeled
+honestly rather than claimed.
 
-| Computer | Runtime package | Computer controls | Evidence in this checkout |
-|---|---|---|---|
-| macOS Apple silicon | Available | App and browser actions work through supported routes. Semantic app control needs Accessibility permission. | Workspace tests and local browser fixture passed on macOS ARM64. |
-| macOS Intel | Available | Same permission boundary as Apple silicon. | Release archive is published. No Intel live run was performed here. |
-| Windows x64 | Available | UI Automation needs an active desktop session plus local permission. | Release archive is published. A Windows junction test is in the test suite. |
-| Linux x64 | Available | Accessibility control needs an active desktop accessibility session. | Release archive is published. No Linux desktop session was tested here. |
-| Linux ARM64 | Available | Same session requirement as Linux x64. | Release archive is published. No Linux desktop session was tested here. |
+Status key:
 
-The npm package requires Node.js 18 or newer. It starts the matching native runtime. App controls depend on installed apps, local permission, each app's own connection settings.
+- **live-verified** — a gate ran the route against the real app and read the
+  result back (artifact, readback, or independent reopen).
+- **compile-verified** — the route is implemented and unit-tested, and builds on
+  its target OS, but the live gate has not yet run on this machine.
+- **gated** — implemented but requires a credential, an installed app, or a
+  human step before the live gate can run.
+- **absent** — not implemented.
 
-## What live means
+## Browser (Chrome)
 
-The doctor report has separate fields for local environment availability, local policy permission, operation attempts, verified successes. An available route is ready to try. It is not proof that an external app is installed. A verified success means the current runtime observed a successful result at least once.
+| Route family | Status | Evidence |
+| --- | --- | --- |
+| CDP session + discovery | live-verified | `chrome_lazy_conformance.py` |
+| Lazy windowless start (`--no-startup-window`) | live-verified | `chrome_lazy_conformance.py` (no `about:blank` window) |
+| CDP navigate / click / fill / read | live-verified | `chrome_conformance.py`, `command_conformance.py` |
+| Extension bridge (native messaging) | live-verified | handshake + challenge round trip, channel `active` |
+| Session reuse via `DevToolsActivePort` | live-verified | `chrome_lazy_conformance.py` |
 
-Comptrol binds browser operations to an exact tab, browser context, revision. It rejects stale references before sending a command. A previous success does not prove that another tab, browser profile, app version, or account will work.
+## Desktop (three OSes)
 
-## ChatGPT in a browser
+| Route family | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| Semantic press / fill / inspect | live-verified (`windows_uia_conformance.py`) | compile-verified (AX, `uia.rs` parity) | compile-verified (AT-SPI, `uia.rs` parity) |
+| `match_index` ordinal targeting | live-verified | compile-verified | compile-verified |
+| Post-action verification readback | live-verified | compile-verified | compile-verified |
+| Keyboard dispatch (`key_sequence`) | live-verified | compile-verified | compile-verified |
+| ms-settings / permission surfaces | live-verified (`settings_conformance.py`) | compile-verified | compile-verified |
+| Terminal (`desktop.terminal`) | live-verified (`terminal_conformance.py`) | gated (needs macOS run) | gated (needs Linux run) |
+| File explorer (`desktop.explorer`) | live-verified (`terminal_conformance.py --reveal`) | gated | gated |
 
-Installing the npm package does not connect ChatGPT on the web to your computer. Hosted ChatGPT needs an HTTPS service reachable from the internet plus its own authentication setup. The local runtime in this release is not a complete public remote control service. The local HTTP preview must stay bound to loopback.
+## Adapters
 
-## Verified package references
+| Adapter | Status | Evidence |
+| --- | --- | --- |
+| Blender | live-verified | `blender_live_conformance.py` — rocket recipe, `.blend` + `.png` artifacts, independent reopen |
+| PowerPoint (COM) | live-verified | `powerpoint_live_conformance.py` — save + reopen-verify, SHA readback, macro/scope refusal |
+| Canva | gated | `canva_conformance.py` — honest contract always; live CRUD needs `COMPTROL_CANVA_ACCESS_TOKEN` |
+| Terminal / Explorer | live-verified | `terminal_conformance.py` |
+| LibreOffice, DaVinci Resolve, OBS, Fusion | gated | need the app installed; doctor reports honest state |
+| Gmail, Google Workspace, Discord, Apple Mail/Messages | gated | need service tokens / macOS |
 
-The release lists macOS ARM64, macOS Intel, Windows x64, Linux ARM64, Linux x64 archives. The [GitHub release](https://github.com/Praket7/Comptrol/releases/tag/v0.1.67) is public. The [npm package](https://www.npmjs.com/package/comptrolling/v/0.1.67) lists the same package version.
+## Setup
+
+| Capability | Status | Evidence |
+| --- | --- | --- |
+| `comptrol setup` one-command install | live-verified | 4-client config generator (6 unit tests), native-host registration |
+| 4-client configs (Freebuff / Claude Code / Codex / OpenCode) | live-verified | `comptrol setup --print`, written configs |
+| Six-task benchmark + baselines | live-verified | `bench/run_suite.mjs --self-check`, `bench/baselines.json` |
+
+## Honest gaps
+
+- macOS AX and Linux AT-SPI reach `uia.rs` parity in code and semantics tests,
+  but their live gates self-skip off-platform. Run `macos_ax_conformance.py` on
+  macOS and `linux_atspi_conformance.py` on Linux to promote them to live.
+- Canva element editing has no Connect API equivalent; it honestly returns
+  `design_editing_app_required` pointing at the companion App bridge (preview)
+  instead of fabricating an edit.
+- Adapters without a live gate report `requires_consent` /
+  `implemented_not_live_verified` in `comptrol doctor` rather than claiming
+  success.

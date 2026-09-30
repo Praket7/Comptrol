@@ -2,7 +2,11 @@ use crate::{BrowserConnection, BrowserError};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::time::timeout;
+
+const BROWSER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Owns the long-lived browser-level connections used by warm operations.
 ///
@@ -31,7 +35,19 @@ impl BrowserManager {
         {
             return Ok(connection);
         }
-        let connection = Arc::new(BrowserConnection::connect(endpoint).await?);
+        let connection = Arc::new(
+            timeout(
+                BROWSER_CONNECT_TIMEOUT,
+                BrowserConnection::connect(endpoint),
+            )
+            .await
+            .map_err(|_| {
+                BrowserError::Connection(
+                    "browser WebSocket handshake timed out; accept Chrome's native Allow prompt if shown"
+                        .to_owned(),
+                )
+            })??,
+        );
         connection.bootstrap().await?;
         attach_existing_targets(&connection).await?;
         connection.bootstrap_attached_targets().await?;

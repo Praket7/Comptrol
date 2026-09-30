@@ -283,6 +283,16 @@ impl AdapterHost {
     pub fn handshake(&mut self) -> Result<RpcResponse, HostError> {
         self.request("handshake", "adapter", Value::Null, None)
     }
+
+    /// Whether this host can still exchange frames with its adapter.
+    ///
+    /// A request that hits its deadline or is cancelled kills the child and
+    /// consumes the stdout pipe. Such a host can never answer again, so it
+    /// must be replaced rather than reused; callers evict it when this is
+    /// false.
+    pub fn connection_is_alive(&self) -> bool {
+        self.stdout.is_some()
+    }
 }
 
 #[cfg(windows)]
@@ -388,6 +398,7 @@ mod tests {
                     background: "supported".to_owned(),
                     verification: "application_state".to_owned(),
                 }],
+                max_operation_ms: comptrol_adapter_sdk::DEFAULT_MAX_OPERATION_MS,
             },
             executable: PathBuf::from("does-not-exist"),
             arguments: Vec::new(),
@@ -396,5 +407,70 @@ mod tests {
             timeout_ms: 1_000,
         };
         assert!(config.manifest.validate().is_ok());
+    }
+
+    // A silent child that never answers: the host must give up on the
+    // deadline AND report that the connection is gone, so the caller can
+    // respawn instead of reusing a consumed pipe forever.
+    #[cfg(windows)]
+    fn silent_child() -> (PathBuf, Vec<String>) {
+        (
+            PathBuf::from("cmd.exe"),
+            vec!["/c".to_owned(), "ping -n 30 127.0.0.1 > NUL".to_owned()],
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn silent_child() -> (PathBuf, Vec<String>) {
+        (
+            PathBuf::from("sh"),
+            vec!["-c".to_owned(), "sleep 30".to_owned()],
+        )
+    }
+
+    #[test]
+    fn a_timed_out_host_reports_a_dead_connection() {
+        let mut manifest = AdapterManifest {
+            manifest_version: 1,
+            id: "comptrol.test".to_owned(),
+            name: "test".to_owned(),
+            version: "0.1".to_owned(),
+            platforms: vec!["linux".to_owned()],
+            applications: vec!["test".to_owned()],
+            isolation: comptrol_adapter_sdk::Isolation {
+                mode: "out_of_process".to_owned(),
+                network: "loopback_only".to_owned(),
+                filesystem: "declared_scopes".to_owned(),
+            },
+            capabilities: vec![comptrol_adapter_sdk::CapabilitySpec {
+                intent: "test.set".to_owned(),
+                risk: "R2".to_owned(),
+                background: "supported".to_owned(),
+                verification: "application_state".to_owned(),
+            }],
+            max_operation_ms: comptrol_adapter_sdk::DEFAULT_MAX_OPERATION_MS,
+        };
+        manifest.max_operation_ms = 200;
+        let (executable, arguments) = silent_child();
+        let config = AdapterHostConfig {
+            manifest,
+            executable,
+            arguments,
+            instance_id: "deadline-test".to_owned(),
+            max_frame_bytes: MAX_FRAME_BYTES,
+            timeout_ms: 200,
+        };
+        let mut host = AdapterHost::spawn(config).expect("silent child should spawn");
+        assert!(host.connection_is_alive());
+        // A read-only probe needs no capability token, so this reaches
+        // the deadline instead of being rejected during preflight.
+        match host.request("probe", "adapter", Value::Null, None) {
+            Err(HostError::Timeout) => {}
+            other => panic!("expected a deadline, got {other:?}"),
+        }
+        assert!(
+            !host.connection_is_alive(),
+            "a host that consumed its reader thread must not be reused"
+        );
     }
 }

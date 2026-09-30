@@ -40,6 +40,65 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local address").port()
 }
 
+fn daemon_answers_its_own_challenge(port: u16, token: &str) -> bool {
+    let nonce = "53544147453252454144494e4553533031";
+    let body = json!({"nonce":nonce}).to_string();
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .is_err()
+    {
+        return false;
+    }
+    let request = format!(
+        "POST /browser-auth/challenge HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    if stream.read_to_end(&mut response).is_err() {
+        return false;
+    }
+    let Ok(response) = String::from_utf8(response) else {
+        return false;
+    };
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let Some(status) = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+    else {
+        return false;
+    };
+    if status != "200" {
+        return false;
+    }
+    let expected = {
+        let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("HMAC key");
+        mac.update(b"comptrol.browser.bridge/0.1.0");
+        mac.update(b"\0");
+        mac.update(nonce.as_bytes());
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|body| body["proof"] == expected)
+}
+
 fn start_daemon(state_dir: &PathBuf) -> Daemon {
     let port = free_port();
     let binary = env!("CARGO_BIN_EXE_comptrol");
@@ -52,8 +111,9 @@ fn start_daemon(state_dir: &PathBuf) -> Daemon {
         .expect("spawn Comptrol HTTP daemon");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && state_dir.join("browser-bridge.token").is_file()
+        if let Ok(token) = fs::read_to_string(state_dir.join("browser-bridge.token"))
+            && daemon_answers_its_own_challenge(port, token.trim())
+            && child.try_wait().expect("check daemon process").is_none()
         {
             return Daemon { child, port };
         }
@@ -121,7 +181,9 @@ fn http_request(
     stream.flush().expect("flush request");
 
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).expect("read response");
+    stream
+        .read_to_end(&mut response)
+        .unwrap_or_else(|error| panic!("read {method} {path} response: {error}"));
     let response = String::from_utf8(response).expect("UTF-8 response");
     let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
     let status = headers
@@ -293,5 +355,71 @@ fn daemon_bridge_queue_poll_result_and_persistence_round_trip() {
         assert_eq!(health["target_count"], 1);
     }
 
+    let _ = fs::remove_dir_all(state_dir);
+}
+
+#[test]
+fn daemon_bridge_long_poll_delivers_new_command_without_poll_sleep() {
+    let state_dir = unique_state_dir();
+    fs::create_dir_all(&state_dir).expect("create state directory");
+    let daemon = start_daemon(&state_dir);
+    let token = fs::read_to_string(state_dir.join("browser-bridge.token"))
+        .expect("read browser bridge auth token")
+        .trim()
+        .to_owned();
+
+    let port = daemon.port;
+    let poll_token = token.clone();
+    let poll = thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let response = http_request(
+            port,
+            "POST",
+            "/browser/command/poll",
+            json!({"wait_ms": 800}),
+            Some(&poll_token),
+        );
+        (response, started.elapsed())
+    });
+
+    thread::sleep(Duration::from_millis(100));
+    let (status, accepted) = http_request(
+        daemon.port,
+        "POST",
+        "/browser/debugger/attach",
+        json!({"target_id": "long-poll-target"}),
+        Some(&token),
+    );
+    assert_eq!(status, 202, "{accepted}");
+    let request_id = accepted["request_id"]
+        .as_str()
+        .expect("queued request id")
+        .to_owned();
+    let enqueued_at = std::time::Instant::now();
+
+    let ((status, polled), poll_elapsed) = poll.join().expect("long poll thread");
+    assert_eq!(status, 200, "{polled}");
+    let command = polled["commands"]
+        .as_array()
+        .and_then(|commands| {
+            commands
+                .iter()
+                .find(|command| command["request_id"] == request_id)
+        })
+        .expect("long poll returned the newly queued command");
+    assert_eq!(command["command_type"], "attach_debugger");
+    assert_eq!(command["payload"]["targetId"], "long-poll-target");
+    let delivery_latency = enqueued_at.elapsed();
+    println!(
+        "authenticated long-poll delivery after enqueue: {} ms",
+        delivery_latency.as_millis()
+    );
+    assert!(
+        delivery_latency < Duration::from_millis(500),
+        "new command waited {delivery_latency:?} after enqueue"
+    );
+    assert!(poll_elapsed < Duration::from_millis(750));
+
+    drop(daemon);
     let _ = fs::remove_dir_all(state_dir);
 }

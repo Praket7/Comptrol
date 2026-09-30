@@ -4,6 +4,16 @@ use std::fmt;
 
 pub const ADAPTER_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
+/// Operation budget used when a manifest does not declare one.
+///
+/// It matches the historical host default, so adapters that say nothing
+/// keep exactly the deadline they had before budgets were declarable.
+pub const DEFAULT_MAX_OPERATION_MS: u64 = 5_000;
+/// Largest operation budget a manifest may declare.
+///
+/// A budget above this is rejected rather than clamped, so an adapter
+/// cannot silently ask for an unbounded hold on a client.
+pub const MAX_OPERATION_MS: u64 = 300_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AdapterManifest {
@@ -15,6 +25,18 @@ pub struct AdapterManifest {
     pub applications: Vec<String>,
     pub isolation: Isolation,
     pub capabilities: Vec<CapabilitySpec>,
+    /// How long one operation may run before the host gives up on it.
+    ///
+    /// Heavy first-party adapters (Blender, PowerPoint COM, Resolve) declare
+    /// their real budget here. Without it the host fell back to a flat five
+    /// seconds and killed legitimate work -- a Blender rocket recipe runs for
+    /// roughly ten -- then reused the dead connection for every later call.
+    #[serde(default = "default_max_operation_ms")]
+    pub max_operation_ms: u64,
+}
+
+pub fn default_max_operation_ms() -> u64 {
+    DEFAULT_MAX_OPERATION_MS
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -151,6 +173,11 @@ impl AdapterManifest {
                     .to_owned(),
             ));
         }
+        if !(100..=MAX_OPERATION_MS).contains(&self.max_operation_ms) {
+            return Err(ValidationError(format!(
+                "max_operation_ms must be between 100 and {MAX_OPERATION_MS}"
+            )));
+        }
         let mut intents = std::collections::HashSet::new();
         for capability in &self.capabilities {
             if capability.intent.trim().is_empty()
@@ -261,6 +288,7 @@ mod tests {
                 background: "supported".to_owned(),
                 verification: "application_state".to_owned(),
             }],
+            max_operation_ms: DEFAULT_MAX_OPERATION_MS,
         }
     }
 

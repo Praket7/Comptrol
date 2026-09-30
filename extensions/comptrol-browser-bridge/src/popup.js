@@ -15,15 +15,15 @@ async function sendMessage(message) {
     chrome.runtime.sendMessage(message, (response) => {
       resolve(response);
     });
-  }
+  });
 }
 
-function setStatus(connected, text) {
+function setStatus(connected, statusText) {
   const dot = $("statusDot");
-  const text = $("statusText");
+  const label = $("statusText");
   state.connected = connected;
   dot.className = "status-dot " + (connected ? "connected" : "disconnected");
-  text.textContent = text || (connected ? "Connected to daemon" : "Disconnected");
+  label.textContent = statusText || (connected ? "Connected to daemon" : "Disconnected");
 }
 
 function renderTargets(targets) {
@@ -74,7 +74,19 @@ function escapeHtml(text) {
 async function loadStatus() {
   const response = await sendMessage({ type: "get_status" });
   if (response.ok) {
-    setStatus(response.connected, response.connected ? "Connected to daemon" : "Disconnected");
+    const labels = {
+      profile_not_selected: "Choose whether to share this Chrome profile",
+      host_registration_required: "Run Comptrol Browser Bridge setup",
+      authorization_required: "Native host authorization needs attention",
+      extension_identity_mismatch: "Reload the unpacked extension from Comptrol setup",
+      profile_in_use: "Another Chrome profile is selected; stop sharing it before selecting this profile",
+      daemon_unavailable: "Comptrol daemon is unavailable",
+      connecting: "Connecting to Comptrol",
+      ready: "Connected and authorized"
+    };
+    setStatus(response.connected, labels[response.status] || response.status || "Disconnected");
+    $("selectProfileBtn").disabled = response.profileSelected;
+    $("deselectProfileBtn").disabled = !response.profileSelected;
     state.attached = new Set(response.targets || []);
     renderTargets(state.targets);
   }
@@ -149,6 +161,30 @@ async function handleDisconnect() {
   }
 }
 
+async function handleProfileSelection(selected) {
+  const response = await sendMessage({ type: selected ? "select_profile" : "deselect_profile" });
+  if (!response.ok) alert("Profile selection failed: " + (response.error || "Unknown error"));
+  await loadStatus();
+  await loadTargets();
+}
+
+async function handleGrantSiteAccess() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  let origin;
+  try {
+    const url = new URL(tab?.url || "");
+    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Choose an ordinary HTTP or HTTPS page first.");
+    origin = `${url.origin}/*`;
+  } catch (error) {
+    alert(error.message || "This page cannot receive site access.");
+    return;
+  }
+  const granted = await chrome.permissions.request({ permissions: ["scripting"], origins: [origin] });
+  alert(granted
+    ? `DOM actions are enabled for ${new URL(tab.url).origin}. You can revoke this site grant in Chrome extension settings.`
+    : "Chrome did not grant site access.");
+}
+
 function init() {
   // Initial load
   loadStatus();
@@ -169,6 +205,9 @@ function init() {
   $("observeGroupsBtn").addEventListener("click", handleObserveGroups);
   $("listSnapshotsBtn").addEventListener("click", handleListSnapshots);
   $("disconnectBtn").addEventListener("click", handleDisconnect);
+  $("selectProfileBtn").addEventListener("click", () => handleProfileSelection(true));
+  $("deselectProfileBtn").addEventListener("click", () => handleProfileSelection(false));
+  $("grantSiteBtn").addEventListener("click", handleGrantSiteAccess);
 }
 
 // Initialize when DOM is ready

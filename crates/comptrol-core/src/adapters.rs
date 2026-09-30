@@ -136,6 +136,8 @@ impl AdapterRegistry {
                         "blender.scene.object.create".to_owned(),
                         "blender.scene.object.transform".to_owned(),
                         "blender.scene.object.delete".to_owned(),
+                        "blender.scene.create_2d_rocket".to_owned(),
+                        "blender.scene.copy_2d_rocket_to_3d".to_owned(),
                         "blender.project.save".to_owned(),
                         "blender.render".to_owned(),
                     ],

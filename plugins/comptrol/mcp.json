@@ -9,8 +9,12 @@
       "env": {
         "COMPTROL_ALLOW_BROWSER_CDP": "1",
         "COMPTROL_ALLOW_WINDOWS_UIA": "1",
+        "COMPTROL_ALLOW_APP_LAUNCH": "1",
+        "COMPTROL_ALLOW_SETTINGS": "1",
+        "COMPTROL_ALLOW_CREATIVE_ADAPTERS": "1",
         "COMPTROL_WINDOWS_UIA": "1",
-        "COMPTROL_AUTO_START_CHROME_CDP": "0"
+        "COMPTROL_AUTO_START_CHROME_CDP": "0",
+        "COMPTROL_CHROME_AUTO_CONNECT": "1"
       }
     }
   }

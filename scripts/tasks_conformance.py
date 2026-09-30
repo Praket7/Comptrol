@@ -3,9 +3,19 @@
 
 import json
 import os
+import pathlib
 import subprocess
 import tempfile
 import time
+
+
+# Honor COMPTROL_BIN so the tested artifact is pinned; Windows needs .exe.
+binary = os.environ.get("COMPTROL_BIN") or str(
+    pathlib.Path(__file__).resolve().parents[1]
+    / "target"
+    / "debug"
+    / ("comptrol.exe" if os.name == "nt" else "comptrol")
+)
 
 
 def send(process, message):
@@ -37,7 +47,7 @@ def initialize(process, identifier):
 with tempfile.TemporaryDirectory(prefix="comptrol-tasks-") as state:
     environment = {**os.environ, "COMPTROL_STATE_DIR": state}
     process = subprocess.Popen(
-        ["target/debug/comptrol", "mcp"],
+        [binary, "mcp"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
@@ -81,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-tasks-") as state:
         process.wait(timeout=3)
 
     process = subprocess.Popen(
-        ["target/debug/comptrol", "mcp"],
+        [binary, "mcp"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,

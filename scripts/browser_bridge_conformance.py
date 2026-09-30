@@ -7,6 +7,7 @@ import http.server
 import json
 import os
 import pathlib
+import runpy
 import shutil
 import struct
 import subprocess
@@ -226,6 +227,19 @@ def main() -> None:
     missing_permissions = required_permissions - permissions
     if missing_permissions:
         raise SystemExit(f"Browser Bridge missing permissions: {sorted(missing_permissions)}")
+    unused_permissions = {"activeTab", "scripting"} & permissions
+    if unused_permissions:
+        raise SystemExit(f"Browser Bridge requests unused permissions: {sorted(unused_permissions)}")
+    if manifest.get("host_permissions"):
+        raise SystemExit("Browser Bridge must not request broad website host permissions")
+    installer = BRIDGE / "install.py"
+    installer_api = runpy.run_path(str(installer), run_name="comptrol_installer_conformance")
+    valid_extension_id = installer_api["is_chrome_extension_id"]
+    if not valid_extension_id("a" * 32) or valid_extension_id("a" * 31) or valid_extension_id("z" * 32):
+        raise SystemExit("Browser Bridge installer must validate exact Chrome extension IDs")
+    installer_source = installer.read_text(encoding="utf-8").lower()
+    if "microsoft-edge/nativemessaginghosts" in installer_source or "microsoft\\\\edge\\\\nativemessaginghosts" in installer_source:
+        raise SystemExit("Chrome setup must not register the host for Edge")
 
     referenced = [
         manifest["background"]["service_worker"],
@@ -236,19 +250,32 @@ def main() -> None:
         require(BRIDGE / relative)
 
     service_worker = BRIDGE / manifest["background"]["service_worker"]
+    popup_script = BRIDGE / "src" / "popup.js"
     node = shutil.which("node")
     if not node:
         raise SystemExit("node is required for Browser Bridge conformance")
     subprocess.run([node, "--check", str(service_worker)], check=True)
-
-    native_host = BRIDGE / "native_host.py"
-    installer = BRIDGE / "install.py"
-    require(native_host)
-    require(installer)
+    subprocess.run([node, "--check", str(popup_script)], check=True)
     subprocess.run(
-        [sys.executable, "-m", "py_compile", str(native_host), str(installer)],
+        [node, str(ROOT / "scripts" / "browser_bridge_connection_test.mjs")],
         check=True,
     )
+
+    native_host = BRIDGE / "native_host.py"
+    require(native_host)
+    require(installer)
+    native_host_source = native_host.read_text(encoding="utf-8")
+    if '"wait_ms": 800' not in native_host_source:
+        raise SystemExit("native host must use the bounded browser-command long poll")
+    if 'time.sleep(poll_interval)' in native_host_source:
+        raise SystemExit("native host must not sleep before every healthy long-poll request")
+    with tempfile.TemporaryDirectory(prefix="comptrol-bridge-pycache-") as pycache_dir:
+        pycache_env = {**os.environ, "PYTHONPYCACHEPREFIX": pycache_dir}
+        subprocess.run(
+            [sys.executable, "-m", "py_compile", str(native_host), str(installer)],
+            check=True,
+            env=pycache_env,
+        )
 
     # Framing remains valid even when no daemon is available.
     env = {**os.environ, "COMPTROL_DAEMON_URL": "http://127.0.0.1:1"}

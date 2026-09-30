@@ -50,11 +50,15 @@ def main():
         "env": {
             "COMPTROL_ALLOW_BROWSER_CDP": "1",
             "COMPTROL_ALLOW_WINDOWS_UIA": "1",
+            "COMPTROL_ALLOW_APP_LAUNCH": "1",
+            "COMPTROL_ALLOW_SETTINGS": "1",
+            "COMPTROL_ALLOW_CREATIVE_ADAPTERS": "1",
             "COMPTROL_WINDOWS_UIA": "1",
             "COMPTROL_AUTO_START_CHROME_CDP": "0",
+            "COMPTROL_CHROME_AUTO_CONNECT": "1",
         },
     }:
-        fail("plugin must declare its stdio runtime and only the intended browser and Windows UIA policies")
+        fail("plugin must declare its stdio runtime and explicit browser, Windows UIA, app-launch, settings, and creative-adapter policies")
     legacy_server = codex_mcp.get("mcpServers", {}).get("comptrol-local")
     portable_launch = {key: value for key, value in server.items() if key != "type"}
     if legacy_server != portable_launch:

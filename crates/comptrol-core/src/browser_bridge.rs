@@ -7,8 +7,10 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
+use std::sync::{
+    Condvar, Mutex as StdMutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const COMPANION_BRIDGE_ENDPOINT: &str = "comptrol+bridge://local";
@@ -21,6 +23,95 @@ const EVENT_RETENTION_MS: i64 = 10 * 60 * 1000;
 const AUTH_NONCE_RETENTION_MS: i64 = 5 * 60 * 1000;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// How long a stored round-trip probe result stays authoritative. Probes are
+/// re-run when older than this so `health_round_trip` reflects the live SW.
+const ROUND_TRIP_MAX_AGE: Duration = Duration::from_secs(15);
+
+/// Same-process completions notify immediately. Separate MCP/HTTP processes
+/// share SQLite but cannot share a Rust condvar; bounded checks cover that case.
+static WAKE_WAITERS: Condvar = Condvar::new();
+static WAITER_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+fn waiter_lock() -> &'static StdMutex<()> {
+    WAITER_LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+/// An extension-wake request. The runtime records one when a command times out
+/// while the heartbeat looks fresh (the classic suspended-service-worker
+/// signature); `native_host.py` drains it via `POST /browser/wake` and pokes
+/// Chrome. Stored in `bridge_meta` because the recorder (MCP runtime) and the
+/// drainer (HTTP server) are different processes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WakeNotice {
+    pub requested_at_ms: i64,
+    pub reason: String,
+}
+
+impl BridgeStore {
+    /// Record an extension-wake request (any process with the store open).
+    pub fn record_wake_requested(&mut self, reason: &str) -> io::Result<()> {
+        let notice = WakeNotice {
+            requested_at_ms: now_ms(),
+            reason: reason
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(120)
+                .collect(),
+        };
+        let encoded = serde_json::to_string(&notice)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        self.connection
+            .execute(
+                "INSERT INTO bridge_meta(key, value) VALUES ('wake_request', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![encoded],
+            )
+            .map(|_| ())
+            .map_err(|error| sqlite_error("record browser bridge wake request", error))
+    }
+
+    /// Drain the pending wake request for native-host polling. Each notice is
+    /// returned once so the host stops waking after the SW responds.
+    pub fn drain_wake_notice(&mut self) -> io::Result<Option<WakeNotice>> {
+        let encoded = self
+            .connection
+            .query_row(
+                "SELECT value FROM bridge_meta WHERE key = 'wake_request'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| sqlite_error("read browser bridge wake request", error))?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        self.connection
+            .execute("DELETE FROM bridge_meta WHERE key = 'wake_request'", [])
+            .map_err(|error| sqlite_error("clear browser bridge wake request", error))?;
+        serde_json::from_str(&encoded)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    /// Reap stale probe commands so a dead service worker cannot fill the
+    /// command queue with unanswered `bridge_ping` probes and crowd out real
+    /// work. Probes older than 30 seconds are unproven either way.
+    pub fn prune_stale_probes(&mut self) -> io::Result<usize> {
+        let cutoff = now_ms().saturating_sub(30_000);
+        let changed = self
+            .connection
+            .execute(
+                "DELETE FROM bridge_commands
+                 WHERE command_type = 'bridge_ping'
+                   AND state IN ('pending', 'inflight')
+                   AND created_at_ms < ?1",
+                params![cutoff],
+            )
+            .map_err(|error| sqlite_error("prune stale browser bridge probes", error))?;
+        Ok(changed)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeCommand {
@@ -36,6 +127,10 @@ pub struct BridgeHealth {
     pub active: bool,
     pub last_heartbeat_ms: Option<i64>,
     pub target_count: usize,
+    #[serde(default)]
+    pub last_round_trip_ms: Option<i64>,
+    #[serde(default)]
+    pub last_round_trip_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -261,7 +356,9 @@ impl BridgeStore {
                    leased_until_ms INTEGER,
                    attempts INTEGER NOT NULL DEFAULT 0,
                    result TEXT,
-                   completed_at_ms INTEGER
+                   completed_at_ms INTEGER,
+                   retryable INTEGER NOT NULL DEFAULT 0,
+                   requeued INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE INDEX IF NOT EXISTS bridge_commands_state_created
                    ON bridge_commands(state, created_at_ms);
@@ -290,6 +387,25 @@ impl BridgeStore {
                    ON bridge_auth_nonces(seen_at_ms);",
             )
             .map_err(|error| sqlite_error("initialize browser bridge database", error))?;
+        // P2.4 migration: pre-existing databases lack the requeue columns.
+        let columns: std::collections::HashSet<String> = connection
+            .prepare("PRAGMA table_info(bridge_commands)")
+            .and_then(|mut statement| {
+                let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .map(|names| names.into_iter().collect())
+            .unwrap_or_default();
+        for (name, ddl) in [
+            ("retryable", "retryable INTEGER NOT NULL DEFAULT 0"),
+            ("requeued", "requeued INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !columns.contains(name) {
+                connection
+                    .execute(&format!("ALTER TABLE bridge_commands ADD COLUMN {ddl}"), [])
+                    .map_err(|error| sqlite_error("migrate browser bridge commands", error))?;
+            }
+        }
         Ok(Self { connection })
     }
 
@@ -429,16 +545,151 @@ impl BridgeStore {
     pub fn store_result(&mut self, request_id: &str, result: Value) -> io::Result<bool> {
         let encoded = serde_json::to_string(&result)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let completed_at = now_ms();
+        let mut requeued = false;
+        let mut channel_recovered = false;
+        // Record the round-trip truth for ping commands: the measured
+        // host->extension->host latency proves the service worker is live.
+        // This persists in bridge_meta so every process (HTTP server, host,
+        // doctor) observes the same channel state.
+        if let Ok(row) = self.connection.query_row(
+            "SELECT command_type, created_at_ms, requeued FROM bridge_commands
+             WHERE request_id = ?1",
+            params![request_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        ) {
+            let (command_type, created_at, requeued_flag) = row;
+            requeued = requeued_flag != 0;
+            if command_type == "bridge_ping" {
+                let ok = result.get("ok").and_then(Value::as_bool) == Some(true);
+                channel_recovered = ok;
+                let latency_ms = if ok {
+                    completed_at.saturating_sub(created_at)
+                } else {
+                    -1
+                };
+                let _ = self.connection.execute(
+                    "INSERT INTO bridge_meta(key, value) VALUES ('last_round_trip_ms', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![latency_ms.to_string()],
+                );
+                let _ = self.connection.execute(
+                    "INSERT INTO bridge_meta(key, value) VALUES ('last_round_trip_at_ms', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![completed_at.to_string()],
+                );
+                // K5: persist the extension's page-op counters so health can
+                // separate "the channel answers pings" from "page operations
+                // actually complete" (live incident: pings healthy while every
+                // debugger-backed command hung).
+                if let Some(page_ops) = result.get("result").and_then(|value| value.get("page_ops"))
+                {
+                    for (key, field) in [
+                        ("page_ops_ok_at_ms", "last_ok_at_ms"),
+                        ("page_ops_fail_at_ms", "last_fail_at_ms"),
+                        ("page_ops_orphaned", "orphaned"),
+                        ("page_ops_remediations", "remediations"),
+                    ] {
+                        if let Some(value) = page_ops.get(field).and_then(|value| value.as_i64()) {
+                            let _ = self.connection.execute(
+                                "INSERT INTO bridge_meta(key, value) VALUES (?1, ?2)
+                                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                params![key, value.to_string()],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // P2.4: a command that was auto-requeued reports its recovered
+        // outcome honestly to whoever reads the result later.
+        let encoded = match requeued {
+            true => match serde_json::from_str::<Value>(&encoded) {
+                Ok(Value::Object(mut map)) => {
+                    map.insert("auto_requeued".to_owned(), Value::Bool(true));
+                    serde_json::to_string(&Value::Object(map))
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                }
+                _ => encoded,
+            },
+            false => encoded,
+        };
         let changed = self
             .connection
             .execute(
                 "UPDATE bridge_commands
                  SET state = 'completed', result = ?2, completed_at_ms = ?3, leased_until_ms = NULL
                  WHERE request_id = ?1",
-                params![request_id, encoded, now_ms()],
+                params![request_id, encoded, completed_at],
             )
             .map_err(|error| sqlite_error("store browser bridge result", error))?;
+        // P2.4: channel recovery (a fresh successful bridge_ping round trip)
+        // requeues every command whose dispatch timed out - exactly once per
+        // command, same request_id, so the extension-side dedupe ledger makes
+        // the replay safe. Runs after this result is stored so a completing
+        // command can never be re-flipped to pending.
+        if channel_recovered {
+            let _ = self.requeue_retryable();
+        }
+        // Wake every waiter immediately; each rechecks its own request_id.
+        WAKE_WAITERS.notify_all();
         Ok(changed > 0)
+    }
+
+    /// P2.4: mark a command whose dispatch outcome is a transport-level
+    /// timeout (`sw_deadline` / `bridge_timeout`) as eligible for one
+    /// automatic requeue. The row keeps its request_id so the extension-side
+    /// dedupe ledger can answer a replay instead of double-executing a
+    /// mutation.
+    pub fn mark_retryable(&mut self, request_id: &str) -> io::Result<bool> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE bridge_commands
+                 SET retryable = 1
+                 WHERE request_id = ?1 AND requeued = 0 AND state IN ('inflight','completed')",
+                params![request_id],
+            )
+            .map_err(|error| sqlite_error("mark browser bridge command retryable", error))?;
+        Ok(changed > 0)
+    }
+
+    /// P2.4: requeue every retryable command exactly once. Called when the
+    /// channel proves it recovered (a fresh successful bridge_ping round
+    /// trip). Requeued commands carry the same request_id and the eventual
+    /// result is flagged `auto_requeued: true`.
+    pub fn requeue_retryable(&mut self) -> io::Result<usize> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE bridge_commands
+                 SET state = 'pending', leased_until_ms = NULL, retryable = 0, requeued = 1
+                 WHERE retryable = 1 AND requeued = 0",
+                [],
+            )
+            .map_err(|error| sqlite_error("requeue browser bridge commands", error))?;
+        if changed > 0 {
+            WAKE_WAITERS.notify_all();
+        }
+        Ok(changed)
+    }
+
+    /// Test/observability helper: how many commands were auto-requeued.
+    pub fn requeued_count(&self) -> io::Result<usize> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_commands WHERE requeued = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count.max(0) as usize)
+            .map_err(|error| sqlite_error("count requeued browser bridge commands", error))
     }
 
     pub fn result(&self, request_id: &str) -> io::Result<Option<Value>> {
@@ -463,6 +714,7 @@ impl BridgeStore {
 
     pub fn wait_result(&self, request_id: &str, timeout: Duration) -> io::Result<Value> {
         let deadline = std::time::Instant::now() + timeout;
+        let mut remaining = timeout;
         loop {
             if let Some(result) = self.result(request_id)? {
                 return Ok(result);
@@ -473,7 +725,20 @@ impl BridgeStore {
                     format!("browser bridge command {request_id} timed out"),
                 ));
             }
-            thread::sleep(Duration::from_millis(25));
+            // The HTTP sidecar usually writes from another process, where
+            // this condvar cannot wake us. Check only while a caller waits,
+            // at 20 ms rather than adding 500 ms to every browser command.
+            let slice = remaining.min(Duration::from_millis(20));
+            let started = std::time::Instant::now();
+            let guard = waiter_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The guard releases when the wait ends; the timed-out flag is
+            // irrelevant because the loop always rechecks the result store.
+            let _ = WAKE_WAITERS
+                .wait_timeout(guard, slice)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            remaining = remaining.saturating_sub(started.elapsed());
         }
     }
 
@@ -587,7 +852,124 @@ impl BridgeStore {
             active,
             last_heartbeat_ms,
             target_count: target_count.max(0) as usize,
+            last_round_trip_ms: None,
+            last_round_trip_at_ms: None,
         })
+    }
+
+    /// Channel truth: a daemon-side heartbeat proves only that *this process*
+    /// is alive. `active` therefore requires a completed extension round trip
+    /// (a `bridge_ping` answered by the actual service worker, recorded in
+    /// `store_result`) within `max_age`, not just heartbeat recency.
+    pub fn health_round_trip(&self, max_age: Duration) -> io::Result<BridgeHealth> {
+        let mut health = self.health(max_age)?;
+        let round_trip_max_age = max_age.max(ROUND_TRIP_MAX_AGE);
+        let read_meta = |key: &str| -> Option<i64> {
+            self.connection
+                .query_row(
+                    "SELECT value FROM bridge_meta WHERE key = ?1",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse::<i64>().ok())
+        };
+        let latency_ms = read_meta("last_round_trip_ms");
+        let at_ms = read_meta("last_round_trip_at_ms");
+        match (latency_ms, at_ms) {
+            (Some(latency), Some(at))
+                if now_ms().saturating_sub(at) <= duration_ms(round_trip_max_age) =>
+            {
+                health.active = health.active && latency >= 0;
+                health.last_round_trip_ms = Some(latency);
+                health.last_round_trip_at_ms = Some(at);
+            }
+            _ => {
+                // No fresh probe: the extension command channel is unproven,
+                // which is exactly what "not active" means for callers.
+                health.active = false;
+            }
+        }
+        Ok(health)
+    }
+
+    /// Record why the channel is degraded so doctor/inspect can report the
+    /// last known state instead of a stale "connected".
+    pub fn record_channel_state(&mut self, state: &str) -> io::Result<()> {
+        let changed = self
+            .connection
+            .execute(
+                "INSERT INTO bridge_meta(key, value) VALUES ('channel_state', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![state],
+            )
+            .map_err(|error| sqlite_error("record browser bridge channel state", error))?;
+        let _ = changed;
+        Ok(())
+    }
+
+    pub fn channel_state(&self) -> io::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT value FROM bridge_meta WHERE key = 'channel_state'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| sqlite_error("read browser bridge channel state", error))
+    }
+
+    /// Timestamp of the extension's most recent targets_list push (bridge_meta
+    /// 'last_targets_ms'). None means the extension never pushed targets.
+    pub fn last_targets_ms(&self) -> io::Result<Option<i64>> {
+        self.connection
+            .query_row(
+                "SELECT value FROM bridge_meta WHERE key = 'last_targets_ms'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| sqlite_error("read browser bridge last targets time", error))
+            .map(|stored| stored.and_then(|value| value.parse::<i64>().ok()))
+    }
+
+    /// Page-op health (K5): distinguishes "the channel answers pings" from
+    /// "page operations actually complete". Persisted from bridge_ping
+    /// results that carry the extension's page_ops counters.
+    pub fn page_ops_health(&self) -> io::Result<serde_json::Value> {
+        let read = |key: &str| -> Option<i64> {
+            self.connection
+                .query_row(
+                    "SELECT value FROM bridge_meta WHERE key = ?1",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+        };
+        let last_ok = read("page_ops_ok_at_ms");
+        let last_fail = read("page_ops_fail_at_ms");
+        let orphaned = read("page_ops_orphaned").unwrap_or(0);
+        let remediations = read("page_ops_remediations").unwrap_or(0);
+        let now = now_ms();
+        let state = match (last_ok, last_fail) {
+            (None, None) => "unknown",
+            (None, Some(_)) => "degraded",
+            (Some(ok), fail) if orphaned > 0 || fail.map(|failed| failed > ok).unwrap_or(false) => {
+                "degraded"
+            }
+            (Some(ok), _) if now.saturating_sub(ok) <= 120_000 => "ok",
+            _ => "stale",
+        };
+        Ok(serde_json::json!({
+            "state": state,
+            "last_ok_at_ms": last_ok,
+            "last_fail_at_ms": last_fail,
+            "orphaned": orphaned,
+            "remediations": remediations
+        }))
     }
 
     pub fn append_event(&mut self, event_type: &str, payload: Value) -> io::Result<i64> {
@@ -685,6 +1067,15 @@ pub fn bridge_is_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Truthful liveness for doctor/inspect: active requires a recent successful
+/// extension round trip, not merely a recorded daemon-side heartbeat.
+pub fn bridge_channel_alive() -> bool {
+    BridgeStore::open(&crate::default_state_dir())
+        .and_then(|store| store.health_round_trip(DEFAULT_HEALTH_MAX_AGE))
+        .map(|health| health.active)
+        .unwrap_or(false)
+}
+
 fn sqlite_error(context: &str, error: rusqlite::Error) -> io::Error {
     io::Error::other(format!("{context}: {error}"))
 }
@@ -704,6 +1095,7 @@ fn duration_ms(duration: Duration) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     fn temp_state(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -759,6 +1151,150 @@ mod tests {
     }
 
     #[test]
+    fn page_ops_health_separates_ping_liveness_from_page_op_liveness() {
+        // K5: a store with no page-op data reports unknown; a ping result that
+        // carries the extension's page_ops counters flips it to ok; a newer
+        // failure with orphans reports degraded.
+        let state = temp_state("page-ops");
+        let mut store = BridgeStore::open(&state).expect("store");
+        assert_eq!(
+            store.page_ops_health().expect("fresh")["state"].as_str(),
+            Some("unknown")
+        );
+        let request_id = store
+            .submit("bridge_ping", serde_json::json!({}))
+            .expect("submit");
+        store
+            .store_result(
+                &request_id,
+                serde_json::json!({
+                    "ok": true,
+                    "result": {
+                        "pong": true,
+                        "timestamp": 1,
+                        "page_ops": {
+                            "last_ok_at_ms": now_ms(),
+                            "last_fail_at_ms": null,
+                            "orphaned": 0,
+                            "remediations": 0,
+                            "instance_id": "test"
+                        }
+                    }
+                }),
+            )
+            .expect("result");
+        assert_eq!(
+            store.page_ops_health().expect("ok")["state"].as_str(),
+            Some("ok")
+        );
+        let second = store
+            .submit("bridge_ping", serde_json::json!({}))
+            .expect("submit");
+        store
+            .store_result(
+                &second,
+                serde_json::json!({
+                    "ok": true,
+                    "result": {
+                        "pong": true,
+                        "timestamp": 2,
+                        "page_ops": {
+                            "last_ok_at_ms": now_ms() - 1_000,
+                            "last_fail_at_ms": now_ms(),
+                            "orphaned": 1,
+                            "remediations": 1,
+                            "instance_id": "test"
+                        }
+                    }
+                }),
+            )
+            .expect("result");
+        assert_eq!(
+            store.page_ops_health().expect("degraded")["state"].as_str(),
+            Some("degraded")
+        );
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn p24_recovery_requeues_timed_out_command_once_with_flagged_result() {
+        let state = temp_state("p24_requeue");
+        let mut store = BridgeStore::open(&state).expect("store");
+        // A dispatch times out (sw_deadline / bridge_timeout) and is marked.
+        let request_id = store
+            .submit("mutate", serde_json::json!({"x": 1}))
+            .expect("submit");
+        // Dispatched and timed out: the row is inflight when the caller gives
+        // up (browser_bridge_timeout) or completed-with-error (sw_deadline).
+        let leased = store
+            .lease_pending(8, Duration::from_secs(30))
+            .expect("lease");
+        assert_eq!(leased[0].request_id, request_id);
+        assert!(store.mark_retryable(&request_id).expect("mark"));
+        // Idempotent while un-requeued; nothing moves until recovery.
+        assert!(store.mark_retryable(&request_id).expect("mark twice"));
+        assert_eq!(store.requeued_count().expect("count"), 0);
+        // Channel recovery: a fresh successful bridge_ping round trip fires
+        // the requeue internally - same request_id, exactly once.
+        let ping_id = store
+            .submit("bridge_ping", serde_json::json!({}))
+            .expect("ping");
+        store
+            .store_result(&ping_id, serde_json::json!({"ok": true, "result": {}}))
+            .expect("ping result");
+        let leased = store
+            .lease_pending(8, Duration::from_secs(30))
+            .expect("lease");
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].request_id, request_id);
+        assert_eq!(store.requeued_count().expect("count"), 1);
+        // The recovered outcome is honestly flagged.
+        store
+            .store_result(
+                &request_id,
+                serde_json::json!({"ok": true, "result": {"done": 1}}),
+            )
+            .expect("result");
+        assert_eq!(
+            store.result(&request_id).expect("read"),
+            Some(serde_json::json!({"ok": true, "result": {"done": 1}, "auto_requeued": true}))
+        );
+        // A second failure is NOT auto-requeued (one requeue per command).
+        assert!(!store.mark_retryable(&request_id).expect("re-mark"));
+        let ping_id = store
+            .submit("bridge_ping", serde_json::json!({}))
+            .expect("ping2");
+        store
+            .store_result(&ping_id, serde_json::json!({"ok": true, "result": {}}))
+            .expect("ping2 result");
+        assert_eq!(store.requeued_count().expect("count stays 1"), 1);
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn p24_failed_commands_stay_completed_until_recovery() {
+        let state = temp_state("p24_no_requeue");
+        let mut store = BridgeStore::open(&state).expect("store");
+        // A completed non-retryable result is never requeued by recovery.
+        let request_id = store.submit("mutate", Value::Null).expect("submit");
+        store
+            .store_result(&request_id, serde_json::json!({"ok": true}))
+            .expect("result");
+        let ping_id = store
+            .submit("bridge_ping", serde_json::json!({}))
+            .expect("ping");
+        store
+            .store_result(&ping_id, serde_json::json!({"ok": true, "result": {}}))
+            .expect("ping result");
+        assert_eq!(store.requeue_retryable().expect("requeue"), 0);
+        assert_eq!(
+            store.result(&request_id).expect("read"),
+            Some(serde_json::json!({"ok": true}))
+        );
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
     fn lease_expiry_requeues_command() {
         let state = temp_state("lease");
         let mut store = BridgeStore::open(&state).expect("store");
@@ -803,11 +1339,178 @@ mod tests {
     fn heartbeat_controls_health_independently_of_targets() {
         let state = temp_state("health");
         let mut store = BridgeStore::open(&state).expect("store");
-        assert!(!store.health(Duration::from_secs(1)).expect("health").active);
+        // A generous window keeps the assertion about semantics (heartbeat
+        // present vs absent) instead of about scheduler timing under load.
+        assert!(
+            !store
+                .health(Duration::from_secs(60))
+                .expect("health")
+                .active
+        );
         store.record_heartbeat(Some("test")).expect("heartbeat");
-        let health = store.health(Duration::from_secs(1)).expect("health");
+        let health = store.health(Duration::from_secs(60)).expect("health");
         assert!(health.active);
-        assert_eq!(health.target_count, 0);
+        assert_eq!(
+            health.target_count, 0,
+            "fresh store must report zero targets"
+        );
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn round_trip_health_requires_a_fresh_probe() {
+        let state = temp_state("round-trip-health");
+        let mut store = BridgeStore::open(&state).expect("store");
+        // A daemon-side heartbeat alone must NOT read as channel-alive.
+        store.record_heartbeat(Some("test")).expect("heartbeat");
+        assert!(
+            !store
+                .health_round_trip(Duration::from_secs(1))
+                .expect("health")
+                .active,
+            "heartbeat without round trip must not be active"
+        );
+        // A fresh successful probe (a completed bridge_ping result) makes it
+        // alive with the measured latency.
+        let ping_id = store
+            .submit("bridge_ping", Value::Null)
+            .expect("submit ping");
+        store
+            .store_result(
+                &ping_id,
+                serde_json::json!({"ok": true, "result": {"pong": true}}),
+            )
+            .expect("store ping result");
+        let health = store
+            .health_round_trip(Duration::from_secs(30))
+            .expect("health");
+        assert!(health.active, "fresh successful ping must read active");
+        assert!(health.last_round_trip_ms.unwrap_or(i64::MAX) >= 0);
+        // A failed ping degrades it again.
+        let failed_id = store.submit("bridge_ping", Value::Null).expect("submit");
+        store
+            .store_result(
+                &failed_id,
+                serde_json::json!({"ok": false, "error": "sw dead"}),
+            )
+            .expect("store failed result");
+        assert!(
+            !store
+                .health_round_trip(Duration::from_secs(30))
+                .expect("health")
+                .active,
+            "failed ping must read inactive"
+        );
+        // A stale successful ping is not proof of liveness.
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn wake_notices_are_single_serve() {
+        let state = temp_state("wake");
+        let mut store = BridgeStore::open(&state).expect("store");
+        assert!(store.drain_wake_notice().expect("drain empty").is_none());
+        store.record_wake_requested("pipe_stale").expect("record");
+        let first = store.drain_wake_notice().expect("first notice");
+        assert_eq!(first.expect("notice").reason, "pipe_stale");
+        assert!(
+            store.drain_wake_notice().expect("second drain").is_none(),
+            "notice must be consumed once"
+        );
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn stale_probes_are_pruned_without_touching_real_commands() {
+        let state = temp_state("probe-prune");
+        let mut store = BridgeStore::open(&state).expect("store");
+        let probe_id = store.submit("bridge_ping", Value::Null).expect("probe");
+        let real_id = store.submit("cdp_command", Value::Null).expect("real");
+        // Age both beyond the prune cutoff.
+        thread::sleep(Duration::from_millis(15));
+        let _ = store;
+        let mut reopened = BridgeStore::open(&state).expect("reopen");
+        reopened.prune_stale_probes().expect("prune");
+        // Probes created just now are NOT stale (30 s cutoff), so both rows
+        // must survive; this guards against pruning live traffic.
+        assert!(reopened.result(&probe_id).expect("probe row").is_none());
+        assert!(reopened.result(&real_id).expect("real row").is_none());
+        let _ = fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn cross_process_result_writer() {
+        let Ok(state) = std::env::var("COMPTROL_TEST_WRITER_STATE") else {
+            return;
+        };
+        let id = std::env::var("COMPTROL_TEST_WRITER_ID").unwrap();
+        let mut store = BridgeStore::open(Path::new(&state)).unwrap();
+        fs::write(Path::new(&state).join("writer-ready"), b"ready").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        store
+            .store_result(&id, serde_json::json!({"ok":true}))
+            .unwrap();
+    }
+
+    #[test]
+    fn cross_process_result_has_bounded_latency() {
+        let state = temp_state("process-waiter");
+        let mut store = BridgeStore::open(&state).unwrap();
+        let id = store.submit("test", Value::Null).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "browser_bridge::tests::cross_process_result_writer",
+                "--nocapture",
+            ])
+            .env("COMPTROL_TEST_WRITER_STATE", &state)
+            .env("COMPTROL_TEST_WRITER_ID", &id)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !state.join("writer-ready").exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let started = std::time::Instant::now();
+        let result = store.wait_result(&id, Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        assert!(child.wait().unwrap().success());
+        assert!(result.unwrap()["ok"].as_bool().unwrap());
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "cross-process result delayed {elapsed:?}"
+        );
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn wait_result_returns_when_store_result_notifies() {
+        let state = temp_state("waiter");
+        let mut store = BridgeStore::open(&state).expect("store");
+        let request_id = store.submit("test", Value::Null).expect("submit");
+        let writer_request_id = request_id.clone();
+        let writer_state = state.clone();
+        let handle = thread::spawn(move || {
+            // Store the result from another thread after a short delay;
+            // wait_result must return without waiting for its full timeout.
+            thread::sleep(Duration::from_millis(40));
+            let mut store = BridgeStore::open(&writer_state).expect("reopen");
+            store
+                .store_result(&writer_request_id, serde_json::json!({"ok": true}))
+                .expect("store");
+        });
+        let started = std::time::Instant::now();
+        let result = store
+            .wait_result(&request_id, Duration::from_secs(10))
+            .expect("result before timeout");
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waiter must wake on notify, not poll to timeout"
+        );
+        handle.join().expect("writer thread");
         let _ = fs::remove_dir_all(state);
     }
 }

@@ -1,67 +1,87 @@
 # Comptrol
 
-Comptrol gives an AI assistant a careful way to use your computer. It runs on your device. You describe one task. It checks permission, acts, then confirms what happened.
+Comptrol lets an assistant use selected apps on your computer. It checks each action and reports what it could verify.
 
-Comptrol opens selected apps. It controls browser sessions supported by your setup. It edits files. It connects to supported services. Each action stays within the permissions you set.
+## Set up Comptrol
 
-Comptrol does not claim success just because an app accepted a command. It reports whether the requested result was actually observed. You can inspect what happened later.
+Use these steps on Windows, macOS, or Linux. Set up Comptrol on the same computer where you use Chrome and your assistant app.
 
-## See how it works
+### 1. Install the tools
+
+You need Git, stable Rust, Python 3, Google Chrome, and an assistant app that can use a local MCP server. MCP lets the assistant call Comptrol on your computer.
+
+### 2. Download and build
+
+Open a terminal and enter these commands.
+
+```sh
+git clone https://github.com/Praket7/Comptrol.git
+cd Comptrol
+cargo build --release -p comptrol
+```
+
+### 3. Register Comptrol
+
+Run the setup command from the Comptrol folder.
+
+On Windows, use PowerShell.
+
+```powershell
+target\release\comptrol.exe setup
+```
+
+On macOS or Linux, use Terminal.
+
+```sh
+./target/release/comptrol setup
+```
+
+Setup adds Comptrol to the settings for Freebuff, Claude Code, Codex, and OpenCode when their settings files do not already exist. It also prepares the local Chrome connection. It leaves existing settings files unchanged. If your assistant already has a settings file, see [Client settings](docs/clients.md) for the entry to add.
+
+### 4. Add the Chrome extension
+
+1. Open Chrome's Extensions page from the browser menu.
+2. Turn on Developer mode.
+3. Choose Load unpacked.
+4. Select `extensions/comptrol-browser-bridge` inside the Comptrol folder.
+5. Check that Chrome shows the Comptrol extension ID `bpnakihocoimajcddkohnpgkepdmdkna`.
+6. Accept Chrome's permission request and keep the extension turned on.
+
+The extension lets Comptrol use the Chrome window that you already opened. Chrome asks you to approve the extension. Comptrol does not approve it for you. Click Reload on the extension page after you change its files.
+
+### 5. Check the connection
+
+Close and reopen your assistant, or reload its local server settings. Ask the assistant to run Comptrol's `inspect` tool with `kind` set to `doctor`. Then ask it to run `system.ping`. A working connection reports `ready` as `true` and `verification` as `verified`.
+
+These checks confirm that the assistant reached Comptrol. They do not prove that every app action works. Use the [support guide](docs/support.md) to see what has been checked on each system.
+
+## Give system access
+
+On macOS, open System Settings, then Privacy and Security, then Accessibility. Allow the Comptrol program that you built. Restart your assistant after changing this setting.
+
+On Linux, sign in to your normal desktop before testing app controls. The desktop must provide its accessibility information to apps.
+
+Windows setup does not need this extra permission step.
+
+## What Comptrol can do
+
+Comptrol can open selected apps, inspect their controls, work with supported browser pages, and change files inside its own safe area. Each action follows the permissions on your computer. Comptrol checks the result before it reports success.
+
+Comptrol keeps its action records and file copies on your computer. Data sharing is off by default. It does not need an online account or an AI service key.
+
+## See the steps
 
 ![An animated view of Comptrol checking permission, acting, then checking the result](media/remotion/out/comptrol.png)
 
-[Watch the short demo](media/remotion/out/comptrol.mp4)
+[Watch the short video](media/remotion/out/comptrol.mp4)
 
-The animation explains the flow. It is not a recording of a live computer session.
+The video explains the flow. It is not a recording of a live computer session.
 
-## What it can do
+## More help
 
-Comptrol can open selected apps. It can inspect computer state. It can write files inside its own sandbox. It can interact with supported services. Your available actions depend on installed apps, permissions, local settings.
-
-The word adapter means a connection to an app. Some connections use an app's own controls. Others use the browser. Some use built in accessibility tools. The setup guide explains which connections need extra steps.
-
-## Try it
-
-Install comptrolling, the Comptrol package. Add its local server command to a compatible assistant app. Then ask it to list available capabilities. MCP is the connection format that lets assistant apps use Comptrol.
-
-This update uses npm version 0.1.67. Install it with npm to get this release.
-
-[Start here](docs/start.md)
-
-The doctor report separates local setup from actions verified on this computer. Untested connections stay marked as untested.
-
-The local server works with compatible desktop assistants. ChatGPT in a browser cannot reach a program running only on your computer. A separate HTTPS connection is required to use Comptrol there.
-
-## What stays on your computer
-
-Comptrol keeps operation records on your computer. File checkpoints stay there too. Telemetry is off by default. It needs no account. It needs no cloud service. It needs no model API.
-
-Local policy controls changes to apps. It also controls changes to settings. Some sensitive actions need a separate approval saved on your computer. A damaged approval record blocks them.
-
-## A small browser check
-
-The current local browser fixture check passed nine of nine task runs. It recorded zero retries, zero incorrect success reports, zero foreground disturbances. The quickest task medians were 2.58 ms, 2.92 ms, 5.58 ms.
-
-These figures come from three repeated checks against a small local browser fixture on macOS ARM64. They do not predict speed in other apps. They do not prove support on every computer. Browser support can vary.
-
-[Read the full results](bench/results/audit_browser_fixture_20260923.json)
-
-The result file notes that this run used uncommitted source changes.
-
-## Support limits
-
-Comptrol runs on macOS, Windows, Linux. Controls differ by platform. Some routes have only been tested with fixtures. Live support varies with your app setup, permissions.
-
-Comptrol refuses a request when it cannot safely identify the target. It also refuses when it cannot verify the result. You can stop local changes with the emergency stop command. Restarting requires a person at the computer.
-
-## Learn more
-
-[Setup guide](docs/start.md)
-
-[Adapter support](docs/adapters.md)
-
-[Platform support](docs/support.md)
-
-[Security policy](SECURITY.md)
-
-[Privacy](PRIVACY.md)
+* [Detailed setup](docs/platform-setup.md)
+* [Client settings](docs/clients.md)
+* [What works today](docs/support.md)
+* [App support](docs/adapters.md)
+* [Security](SECURITY.md)
+* [Privacy](PRIVACY.md)

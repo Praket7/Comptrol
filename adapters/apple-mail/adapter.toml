@@ -4,6 +4,9 @@ name = "Apple Mail"
 version = "0.1.0"
 platforms = ["macos"]
 applications = ["Mail"]
+# Budget for one operation; heavy desktop adapters need more than the default.
+max_operation_ms = 60000
+
 
 [isolation]
 mode = "out_of_process"

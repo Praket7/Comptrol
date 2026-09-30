@@ -2,7 +2,9 @@
   "manifest_version": 3,
   "name": "Comptrol Browser Bridge",
   "version": "0.1.0",
-  "description": "Production-ready bridge between Comptrol runtime and existing signed-in Chrome sessions. Enables exact target identity, CDP attachment to existing tabs, tab group management, and closed session recovery without profile copying.",
+  "description": "Local browser bridge for Comptrol. Debugger access can inspect/control pages. Site DOM access is requested separately per site; review Chrome's warnings before granting.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtCKujexCeCsLXmqWd5u8PPe+NMnnS/pZmvb+IFD6K3lN1OUkGiDFSlcn7VV/B8HPmMb6Ots5azTewPKT5XO09BCRdcOy3Zs25rB1VUUJpUGyeto57MPUi0MZU0pVbtbtCQSk3CwZPeBj+v1P6IDfQmrcKv447uk5T9Lb5fNep4Co9PEIN/ioL3y3FmgHXasjZqZ+TyvS67jjMAOy0gNXGWcmXQZ1+qNleOdGraT3HTkegF72U6uI90AOBUcHQ0tZZU65wCIsLFFWxN/KAwSLKpl08BH8/JZ/jct9NRNA2LCxtWuu1gNhDNhaxEG3zLFyiBu+NkGsugplM866WEVo+wIDAQAB",
+  "minimum_chrome_version": "125",
   "permissions": [
     "debugger",
     "tabs",
@@ -11,14 +13,11 @@
     "storage",
     "alarms",
     "nativeMessaging",
-    "scripting",
-    "activeTab",
-    "downloads"
+    "downloads",
+    "offscreen"
   ],
-  "host_permissions": [
-    "http://*/*",
-    "https://*/*"
-  ],
+  "optional_permissions": ["scripting"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
   "background": {
     "service_worker": "src/service_worker.js",
     "type": "module"

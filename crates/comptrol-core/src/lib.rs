@@ -4,13 +4,17 @@ pub mod adapters;
 pub mod browser;
 pub mod browser_bridge;
 pub mod checkpoints;
+pub mod chrome_autostart;
 pub mod events;
 pub mod geometry;
 pub mod integration;
+pub mod intent_schema;
 pub mod mcp;
 pub mod pairing;
 pub mod restore;
 pub mod restore_native;
+pub mod setup;
+pub mod terminal;
 pub mod trace;
 
 use comptrol_adapter_host::{AdapterHost, AdapterHostConfig};
@@ -20,18 +24,21 @@ pub use comptrol_verification::{
     VerificationCriterion, VerificationEvidence, VerificationLevel, VerificationReport,
     VerificationSource, VerificationState as StructuredVerificationState,
 };
-use comptrol_workflow::{Workflow, WorkflowExecutor, WorkflowNode};
+use comptrol_workflow::{
+    SpeculativeStep, Workflow, WorkflowExecutor, WorkflowNode, run_speculative,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,9 +53,15 @@ pub use trace::{
 
 pub const PROTOCOL_VERSION: &str = "0.1";
 pub const SERVER_VERSION: &str = "0.1.67";
+
+/// P3.3: daemon ownership reporting. Set by `comptrol daemon` while it owns
+/// the runtime; doctor reports `resident` and the live MCP client count so
+/// multi-client sharing is observable instead of assumed.
+pub static DAEMON_RESIDENT: AtomicBool = AtomicBool::new(false);
+pub static DAEMON_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 pub const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
 
-const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
+pub const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "vscode.workspace.list",
     "vscode.setting.get",
     "vscode.setting.set",
@@ -70,6 +83,8 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
     "blender.scene.object.create",
     "blender.scene.object.transform",
     "blender.scene.object.delete",
+    "blender.scene.create_2d_rocket",
+    "blender.scene.copy_2d_rocket_to_3d",
     "blender.project.save",
     "blender.render",
     "video.project.list",
@@ -150,6 +165,143 @@ const FIRST_PARTY_ADAPTER_INTENTS: &[&str] = &[
 
 fn is_first_party_adapter_intent(intent: &str) -> bool {
     FIRST_PARTY_ADAPTER_INTENTS.contains(&intent)
+}
+
+/// Every non-adapter intent that `operate` dispatches. This is the
+/// canonical list of callable core surfaces: the capability catalog
+/// advertises exactly these names (plus the adapter list above), and a
+/// conformance test fails if an intent is dispatched but never
+/// advertised, or advertised but never dispatched. Both halves used to
+/// drift silently, which is how a live route ended up unreachable.
+pub const CORE_INTENTS: &[&str] = &[
+    "system.ping",
+    "workflow.execute",
+    "workflow.speculate",
+    "recipe.run",
+    "desktop.terminal",
+    "desktop.explorer",
+    "desktop.observe",
+    "platform.broker.observe",
+    "filesystem.write",
+    "filesystem.copy",
+    "filesystem.restore_checkpoint",
+    "desktop.notify",
+    "desktop.open_app",
+    "app.launch",
+    "app.resolve",
+    "app.list",
+    "app.open_resource",
+    "app.focus",
+    "app.close",
+    "permission.status",
+    "permission.request",
+    "settings.get",
+    "settings.set",
+    "settings.write",
+    "software.search",
+    "software.describe",
+    "software.install",
+    "software.update",
+    "software.uninstall",
+    "popup.inspect",
+    "popup.dismiss",
+    "browser.session.list",
+    "browser.session.connect",
+    "browser.ensure_session",
+    "browser.chrome.open_tab",
+    "browser.chrome.restore_recent",
+    "browser.chrome.reopen_closed_group",
+    "command.run",
+    "windows.uia.inspect",
+    "windows.uia.press",
+    "windows.uia.set_value",
+    "linux.atspi.press",
+    "linux.atspi.set_value",
+    "macos.ax.press",
+    "macos.ax.set_value",
+    "browser.fixture.submit",
+    "browser.cdp.reopen_closed_group",
+    "browser.cdp.discovery",
+    "browser.cdp.wait_for",
+    "browser.cdp.accessibility_snapshot",
+    "browser.cdp.evaluate",
+    "browser.cdp.frame_evaluate",
+    "browser.cdp.ensure_state",
+    "browser.cdp.navigate",
+    "browser.cdp.upload",
+    "browser.cdp.download",
+    "browser.cdp.fill",
+    "browser.cdp.click",
+    "browser.cdp.focus",
+    "browser.cdp.open_tab",
+    "browser.cdp.close_tab",
+    "browser.cdp.activate_tab",
+    "browser.cdp.history_back",
+    "browser.cdp.history_forward",
+    "browser.cdp.semantic_click",
+    "browser.cdp.semantic_fill",
+    "browser.cdp.compact_snapshot",
+    "browser.cdp.workflow",
+    "browser.cdp.screenshot",
+    "browser.cdp.coordinate_click",
+    "browser.cdp.type_text",
+    "browser.cdp.press_key",
+    "browser.cdp.dialog",
+];
+
+/// Catalog names that describe a route family rather than a callable
+/// intent. They are reported so a client can see the surface exists, but
+/// calling them is a client error, so they live in their own catalog
+/// section instead of being mistaken for dispatchable names.
+pub const CAPABILITY_FAMILIES: &[&str] = &[
+    "browser.cdp",
+    "browser.cdp.history",
+    "daemon.ipc",
+    "desktop.semantic_input",
+    "linux.atspi.semantic",
+    "windows.uia.semantic",
+];
+
+/// Catalog rows that are detected surfaces rather than operations. Note
+/// that `platform.broker.observe` is deliberately absent: it is a callable
+/// intent that happens to share the prefix, so classification uses this
+/// list instead of a name prefix.
+pub const PLATFORM_OBSERVATIONS: &[&str] = &[
+    "platform.macos.ax",
+    "platform.windows.uia",
+    "platform.linux.atspi",
+    "platform.linux.x11",
+    "platform.linux.wayland",
+];
+
+/// The callable surface, as the capability catalog reports it: every core
+/// dispatch intent plus every first party adapter intent. Anything else in
+/// the catalog is an observation or a family label.
+pub fn callable_intent_catalog() -> Vec<Capability> {
+    let mut result = capabilities();
+    for intent in CORE_INTENTS {
+        if !result.iter().any(|capability| capability.name == *intent) {
+            result.push(Capability {
+                name: (*intent).to_owned(),
+                available: policy_reaches(intent),
+                risk: classify(intent),
+                route: "core".to_owned(),
+                note: format!(
+                    "Dispatchable core intent; required gates {:?}",
+                    EnvGates::default().required_gates(intent)
+                ),
+            });
+        }
+    }
+    result.sort_by(|left, right| left.name.cmp(&right.name));
+    result
+}
+
+/// Whether the active policy would authorize this intent. Used for the
+/// catalog rows that have no bespoke availability probe.
+pub fn policy_reaches(intent: &str) -> bool {
+    let policy = Policy::from_environment();
+    policy.authorize(intent, classify(intent)).is_ok()
 }
 
 fn adapter_root() -> PathBuf {
@@ -279,8 +431,8 @@ pub fn privacy_network_endpoints() -> Value {
         "endpoints": [
             {
                 "name": "browser_cdp",
-                "configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
-                "address": std::env::var("COMPTROL_CDP_ENDPOINT").ok(),
+                "configured": browser::active_endpoint().is_some(),
+                "address": browser::active_endpoint(),
                 "reason": "Only used when an explicit browser action is requested"
             },
             {
@@ -624,13 +776,36 @@ pub fn bind_browser_target(
     }
     if browser_context_id
         .is_some_and(|expected| target.browser_context_id.as_deref() != Some(expected))
-        || revision.is_some_and(|expected| target.revision.as_deref() != Some(expected))
     {
         return Err(ComptrolError {
             code: "stale_reference".to_owned(),
-            message: "The browser target context or revision changed".to_owned(),
+            message: "The browser target context changed".to_owned(),
             recovery: Some("Inspect browser targets and bind again".to_owned()),
         });
+    }
+    // K4: generation-tolerant revalidation. Revisions embed the tab URL as
+    // their tail (`bridge:<profile:tab>:<generation>:<url>`); live SPAs bump
+    // the generation constantly (status changes, same-URL reloads,
+    // pushState), so an exact revision match is a losing race on real pages.
+    // When only the generation counter moved — the pinned tail equals the
+    // live URL — the document is the same class and the operation re-resolves
+    // its locator at dispatch anyway, so revalidate instead of refusing. A
+    // URL change or an unparsable revision still refuses.
+    if let Some(expected) = revision {
+        let actual = target.revision.as_deref().unwrap_or("");
+        if actual != expected {
+            let live_url = target.url.as_deref().unwrap_or("");
+            let generation_only_drift = !live_url.is_empty()
+                && expected.starts_with("bridge:")
+                && expected.ends_with(&format!(":{live_url}"));
+            if !generation_only_drift {
+                return Err(ComptrolError {
+                    code: "stale_reference".to_owned(),
+                    message: "The browser target context or revision changed".to_owned(),
+                    recovery: Some("Inspect browser targets and bind again".to_owned()),
+                });
+            }
+        }
     }
     Ok(target.clone())
 }
@@ -712,8 +887,11 @@ impl Default for Policy {
                 "platform.broker.observe".to_owned(),
                 "browser.cdp.wait_for".to_owned(),
                 "browser.cdp.accessibility_snapshot".to_owned(),
+                "browser.cdp.discovery".to_owned(),
                 "browser.cdp.reopen_closed_group".to_owned(),
                 "workflow.execute".to_owned(),
+                "workflow.speculate".to_owned(),
+                "recipe.run".to_owned(),
                 "app.resolve".to_owned(),
                 "app.list".to_owned(),
                 "app.launch".to_owned(),
@@ -726,25 +904,295 @@ impl Default for Policy {
     }
 }
 
+/// Every environment switch that can widen a [`Policy`], captured as data
+/// instead of read inline. Keeping the gate set explicit is what makes it
+/// possible to prove the capability gate and the policy allowlist agree:
+/// they are two independent gates, and the bug that shipped
+/// `policy_denied` on a capability-gated intent came from editing one
+/// without the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnvGates {
+    pub sandbox_writes: bool,
+    pub desktop_notify: bool,
+    pub macos_ax: bool,
+    pub app_launch: bool,
+    pub app_close: bool,
+    pub software: bool,
+    pub software_install: bool,
+    pub settings: bool,
+    pub popup: bool,
+    pub commands: bool,
+    pub desktop_explorer: bool,
+    pub windows_uia: bool,
+    pub linux_atspi: bool,
+    pub browser_fixture: bool,
+    pub all_intents: bool,
+    pub browser_cdp: bool,
+    pub adapters: bool,
+    pub creative_adapters: bool,
+    pub high_consequence_adapters: bool,
+    pub mail_send: bool,
+}
+
+impl EnvGates {
+    /// Every policy gate with the field that carries it, so
+    /// `comptrol setup`, the docs, and the conformance test all walk the
+    /// same list instead of keeping private copies.
+    pub const NAMES: &'static [(&'static str, &'static str)] = &[
+        ("COMPTROL_ALLOW_SANDBOX_WRITES", "sandbox_writes"),
+        ("COMPTROL_ALLOW_DESKTOP_NOTIFY", "desktop_notify"),
+        ("COMPTROL_ALLOW_MACOS_AX", "macos_ax"),
+        ("COMPTROL_ALLOW_APP_LAUNCH", "app_launch"),
+        ("COMPTROL_ALLOW_APP_CLOSE", "app_close"),
+        ("COMPTROL_ALLOW_SOFTWARE", "software"),
+        ("COMPTROL_ALLOW_SOFTWARE_INSTALL", "software_install"),
+        ("COMPTROL_ALLOW_SETTINGS", "settings"),
+        ("COMPTROL_ALLOW_POPUP", "popup"),
+        ("COMPTROL_ALLOW_COMMANDS", "commands"),
+        ("COMPTROL_ALLOW_DESKTOP_EXPLORER", "desktop_explorer"),
+        ("COMPTROL_ALLOW_WINDOWS_UIA", "windows_uia"),
+        ("COMPTROL_ALLOW_LINUX_ATSPI", "linux_atspi"),
+        ("COMPTROL_ALLOW_BROWSER_FIXTURE", "browser_fixture"),
+        ("COMPTROL_ALLOW_ALL_INTENTS", "all_intents"),
+        ("COMPTROL_ALLOW_BROWSER_CDP", "browser_cdp"),
+        ("COMPTROL_ALLOW_ADAPTERS", "adapters"),
+        ("COMPTROL_ALLOW_CREATIVE_ADAPTERS", "creative_adapters"),
+        (
+            "COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS",
+            "high_consequence_adapters",
+        ),
+        ("COMPTROL_ALLOW_MAIL_SEND", "mail_send"),
+    ];
+
+    pub fn from_environment() -> Self {
+        Self {
+            sandbox_writes: env_enabled("COMPTROL_ALLOW_SANDBOX_WRITES"),
+            desktop_notify: env_enabled("COMPTROL_ALLOW_DESKTOP_NOTIFY"),
+            macos_ax: env_enabled("COMPTROL_ALLOW_MACOS_AX"),
+            app_launch: env_enabled("COMPTROL_ALLOW_APP_LAUNCH"),
+            app_close: env_enabled("COMPTROL_ALLOW_APP_CLOSE"),
+            software: env_enabled("COMPTROL_ALLOW_SOFTWARE"),
+            software_install: env_enabled("COMPTROL_ALLOW_SOFTWARE_INSTALL"),
+            settings: env_enabled("COMPTROL_ALLOW_SETTINGS"),
+            popup: env_enabled("COMPTROL_ALLOW_POPUP"),
+            commands: env_enabled("COMPTROL_ALLOW_COMMANDS"),
+            desktop_explorer: env_enabled("COMPTROL_ALLOW_DESKTOP_EXPLORER"),
+            windows_uia: env_enabled("COMPTROL_ALLOW_WINDOWS_UIA"),
+            linux_atspi: env_enabled("COMPTROL_ALLOW_LINUX_ATSPI"),
+            browser_fixture: env_enabled("COMPTROL_ALLOW_BROWSER_FIXTURE"),
+            all_intents: env_enabled("COMPTROL_ALLOW_ALL_INTENTS"),
+            browser_cdp: env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
+            adapters: env_enabled("COMPTROL_ALLOW_ADAPTERS"),
+            creative_adapters: env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS"),
+            high_consequence_adapters: env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS"),
+            mail_send: env_enabled("COMPTROL_ALLOW_MAIL_SEND"),
+        }
+    }
+
+    /// A gate set with exactly one switch on or off. Returns `None` when
+    /// the variable is not a recognized policy gate, which is itself a
+    /// failure signal for callers that enumerate gate names.
+    pub fn with(var: &str, value: bool) -> Option<Self> {
+        let mut gates = Self::default();
+        for (name, field) in Self::NAMES {
+            if *name != var {
+                continue;
+            }
+            match *field {
+                "sandbox_writes" => gates.sandbox_writes = value,
+                "desktop_notify" => gates.desktop_notify = value,
+                "macos_ax" => gates.macos_ax = value,
+                "app_launch" => gates.app_launch = value,
+                "app_close" => gates.app_close = value,
+                "software" => gates.software = value,
+                "software_install" => gates.software_install = value,
+                "settings" => gates.settings = value,
+                "popup" => gates.popup = value,
+                "commands" => gates.commands = value,
+                "desktop_explorer" => gates.desktop_explorer = value,
+                "windows_uia" => gates.windows_uia = value,
+                "linux_atspi" => gates.linux_atspi = value,
+                "browser_fixture" => gates.browser_fixture = value,
+                "all_intents" => gates.all_intents = value,
+                "browser_cdp" => gates.browser_cdp = value,
+                "adapters" => gates.adapters = value,
+                "creative_adapters" => gates.creative_adapters = value,
+                "high_consequence_adapters" => gates.high_consequence_adapters = value,
+                "mail_send" => gates.mail_send = value,
+                _ => return None,
+            }
+            return Some(gates);
+        }
+        None
+    }
+
+    /// Every switch on. The most permissive policy the runtime can build,
+    /// so a test can compare "what the catalog advertises" against
+    /// "what policy can ever authorize" in one shot.
+    pub fn all() -> Self {
+        Self {
+            sandbox_writes: true,
+            desktop_notify: true,
+            macos_ax: true,
+            app_launch: true,
+            app_close: true,
+            software: true,
+            software_install: true,
+            settings: true,
+            popup: true,
+            commands: true,
+            desktop_explorer: true,
+            windows_uia: true,
+            linux_atspi: true,
+            browser_fixture: true,
+            all_intents: true,
+            browser_cdp: true,
+            adapters: true,
+            creative_adapters: true,
+            high_consequence_adapters: true,
+            mail_send: true,
+        }
+    }
+
+    /// The environment switches that must be on before an intent can be
+    /// authorized. `comptrol setup` prints these per intent so an
+    /// operator never has to guess which switch unlocks a route.
+    pub fn required_gates(self, intent: &str) -> &'static [&'static str] {
+        GateRequirement::for_intent(intent, self)
+    }
+}
+
+/// Declares the minimum gate set that makes an intent authorizable.
+/// `comptrol_conformance` asserts that this table and the real
+/// `Policy::from_gates` agree for every advertised intent, so a new
+/// gate-gated intent cannot ship allowlist-less.
+pub struct GateRequirement;
+
+impl GateRequirement {
+    pub fn for_intent(intent: &str, _gates: EnvGates) -> &'static [&'static str] {
+        const NONE: &[&str] = &[];
+        const SANDBOX: &[&str] = &["COMPTROL_ALLOW_SANDBOX_WRITES"];
+        const NOTIFY: &[&str] = &["COMPTROL_ALLOW_DESKTOP_NOTIFY"];
+        const MACOS_AX: &[&str] = &["COMPTROL_ALLOW_MACOS_AX"];
+        const APP_LAUNCH: &[&str] = &["COMPTROL_ALLOW_APP_LAUNCH"];
+        const APP_CLOSE: &[&str] = &["COMPTROL_ALLOW_APP_CLOSE"];
+        const SOFTWARE: &[&str] = &["COMPTROL_ALLOW_SOFTWARE"];
+        const SOFTWARE_INSTALL: &[&str] = &["COMPTROL_ALLOW_SOFTWARE_INSTALL"];
+        const SETTINGS: &[&str] = &["COMPTROL_ALLOW_SETTINGS"];
+        const POPUP: &[&str] = &["COMPTROL_ALLOW_POPUP"];
+        const COMMANDS: &[&str] = &["COMPTROL_ALLOW_COMMANDS"];
+        const DESKTOP_EXPLORER: &[&str] = &["COMPTROL_ALLOW_DESKTOP_EXPLORER"];
+        const WINDOWS_UIA: &[&str] = &["COMPTROL_ALLOW_WINDOWS_UIA"];
+        const LINUX_ATSPI: &[&str] = &["COMPTROL_ALLOW_LINUX_ATSPI"];
+        const BROWSER_FIXTURE: &[&str] = &["COMPTROL_ALLOW_BROWSER_FIXTURE"];
+        const BROWSER_CDP: &[&str] = &["COMPTROL_ALLOW_BROWSER_CDP"];
+        const ADAPTERS: &[&str] = &["COMPTROL_ALLOW_ADAPTERS"];
+        // `COMPTROL_ALLOW_ADAPTERS` is a superset that already unlocks every
+        // creative adapter intent, so the creative switch is the narrow way
+        // in, not the only one. Listing both keeps the declaration honest
+        // about what a minimal configuration needs.
+        const CREATIVE: &[&str] = &[
+            "COMPTROL_ALLOW_CREATIVE_ADAPTERS",
+            "COMPTROL_ALLOW_ADAPTERS",
+        ];
+        const HIGH_CONSEQUENCE: &[&str] = &[
+            "COMPTROL_ALLOW_ADAPTERS",
+            "COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS",
+        ];
+        const MAIL_SEND: &[&str] = &["COMPTROL_ALLOW_ADAPTERS", "COMPTROL_ALLOW_MAIL_SEND"];
+        // Anything the default policy already allows needs no switch, so it
+        // reports NONE. Checking the real default allowlist rather than a
+        // hand-copied list is what keeps this table honest.
+        if Policy::default().allowed_intents.contains(intent) {
+            return NONE;
+        }
+        match intent {
+            "recipe.run" => NONE,
+            "filesystem.write" | "filesystem.copy" | "filesystem.restore_checkpoint" => SANDBOX,
+            "desktop.notify" => NOTIFY,
+            "macos.ax.press" | "macos.ax.set_value" => MACOS_AX,
+            "desktop.open_app" | "app.open_resource" | "app.focus" => APP_LAUNCH,
+            "app.close" => APP_CLOSE,
+            "software.search" | "software.describe" => SOFTWARE,
+            "software.install" | "software.update" | "software.uninstall" => SOFTWARE_INSTALL,
+            "settings.get" | "settings.set" | "settings.write" | "permission.request" => SETTINGS,
+            "popup.dismiss" => POPUP,
+            "command.run" | "desktop.terminal" => COMMANDS,
+            "desktop.explorer" => DESKTOP_EXPLORER,
+            "windows.uia.press" | "windows.uia.set_value" | "windows.uia.inspect" => WINDOWS_UIA,
+            "linux.atspi.press" | "linux.atspi.set_value" => LINUX_ATSPI,
+            "browser.fixture.submit" => BROWSER_FIXTURE,
+            "browser.chrome.restore_recent" | "browser.chrome.reopen_closed_group" => MACOS_AX,
+            "browser.cdp.evaluate"
+            | "browser.cdp.frame_evaluate"
+            | "browser.cdp.ensure_state"
+            | "browser.cdp.navigate"
+            | "browser.cdp.upload"
+            | "browser.cdp.download"
+            | "browser.cdp.fill"
+            | "browser.cdp.click"
+            | "browser.cdp.focus"
+            | "browser.cdp.open_tab"
+            | "browser.cdp.close_tab"
+            | "browser.cdp.activate_tab"
+            | "browser.cdp.history_back"
+            | "browser.cdp.history_forward"
+            | "browser.cdp.semantic_click"
+            | "browser.cdp.semantic_fill"
+            | "browser.cdp.compact_snapshot"
+            | "browser.cdp.workflow"
+            | "browser.cdp.screenshot"
+            | "browser.cdp.coordinate_click"
+            | "browser.cdp.type_text"
+            | "browser.cdp.press_key"
+            | "browser.cdp.dialog"
+            | "browser.ensure_session"
+            | "browser.session.connect" => BROWSER_CDP,
+            "obs.recording.start"
+            | "obs.recording.stop"
+            | "discord.message.delete"
+            | "message.send" => HIGH_CONSEQUENCE,
+            "mail.send" => MAIL_SEND,
+            intent if is_first_party_adapter_intent(intent) => {
+                if classify(intent) > Risk::R2 {
+                    HIGH_CONSEQUENCE
+                } else if is_creative_adapter_intent(intent) {
+                    CREATIVE
+                } else {
+                    ADAPTERS
+                }
+            }
+            _ => NONE,
+        }
+    }
+}
+
 impl Policy {
     pub fn from_environment() -> Self {
+        Self::from_gates(EnvGates::from_environment())
+    }
+
+    /// Pure function of the gate set, so a test can ask "if an operator
+    /// sets exactly this switch, which intents become reachable?" without
+    /// mutating the test process environment.
+    pub fn from_gates(gates: EnvGates) -> Self {
         let mut policy = Self::default();
-        if std::env::var("COMPTROL_ALLOW_SANDBOX_WRITES").as_deref() == Ok("1") {
+        if gates.sandbox_writes {
             policy.allow_sandbox_writes = true;
-            policy.max_risk = Risk::R1;
+            policy.max_risk = policy.max_risk.max(Risk::R1);
             policy.allowed_intents.insert("filesystem.write".to_owned());
             policy.allowed_intents.insert("filesystem.copy".to_owned());
             policy
                 .allowed_intents
                 .insert("filesystem.restore_checkpoint".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_DESKTOP_NOTIFY").as_deref() == Ok("1") {
+        if gates.desktop_notify {
             policy.allow_desktop_notify = true;
-            policy.max_risk = Risk::R1;
+            policy.max_risk = policy.max_risk.max(Risk::R1);
             policy.allowed_intents.insert("desktop.notify".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_MACOS_AX").as_deref() == Ok("1") {
-            policy.max_risk = Risk::R2;
+        if gates.macos_ax {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
             policy.allowed_intents.insert("macos.ax.press".to_owned());
             policy
                 .allowed_intents
@@ -756,9 +1204,9 @@ impl Policy {
                 .allowed_intents
                 .insert("browser.chrome.restore_recent".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_APP_LAUNCH").as_deref() == Ok("1") {
+        if gates.app_launch {
             policy.allow_app_launch = true;
-            policy.max_risk = Risk::R2;
+            policy.max_risk = policy.max_risk.max(Risk::R2);
             policy.allowed_intents.insert("desktop.open_app".to_owned());
             policy.allowed_intents.insert("app.launch".to_owned());
             policy.allowed_intents.insert("app.resolve".to_owned());
@@ -768,18 +1216,18 @@ impl Policy {
                 .insert("app.open_resource".to_owned());
             policy.allowed_intents.insert("app.focus".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_APP_CLOSE").as_deref() == Ok("1") {
+        if gates.app_close {
             policy.max_risk = policy.max_risk.max(Risk::R3);
             policy.allowed_intents.insert("app.close".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_SOFTWARE").as_deref() == Ok("1") {
+        if gates.software {
             policy.max_risk = policy.max_risk.max(Risk::R1);
             policy.allowed_intents.insert("software.search".to_owned());
             policy
                 .allowed_intents
                 .insert("software.describe".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_SOFTWARE_INSTALL").as_deref() == Ok("1") {
+        if gates.software_install {
             policy.max_risk = policy.max_risk.max(Risk::R3);
             policy.allowed_intents.insert("software.install".to_owned());
             policy.allowed_intents.insert("software.update".to_owned());
@@ -787,7 +1235,7 @@ impl Policy {
                 .allowed_intents
                 .insert("software.uninstall".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_SETTINGS").as_deref() == Ok("1") {
+        if gates.settings {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             policy.allowed_intents.insert("settings.get".to_owned());
             policy.allowed_intents.insert("settings.set".to_owned());
@@ -799,16 +1247,23 @@ impl Policy {
                 .allowed_intents
                 .insert("permission.request".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_POPUP").as_deref() == Ok("1") {
+        if gates.popup {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             policy.allowed_intents.insert("popup.inspect".to_owned());
             policy.allowed_intents.insert("popup.dismiss".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_COMMANDS").as_deref() == Ok("1") {
+        if gates.commands {
             policy.max_risk = policy.max_risk.max(Risk::R3);
             policy.allowed_intents.insert("command.run".to_owned());
+            // The terminal route runs the same allowlisted executables, so
+            // it inherits the same gate rather than inventing a looser one.
+            policy.allowed_intents.insert("desktop.terminal".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_WINDOWS_UIA").as_deref() == Ok("1") {
+        if gates.desktop_explorer {
+            policy.max_risk = policy.max_risk.max(Risk::R2);
+            policy.allowed_intents.insert("desktop.explorer".to_owned());
+        }
+        if gates.windows_uia {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             policy
                 .allowed_intents
@@ -816,8 +1271,11 @@ impl Policy {
             policy
                 .allowed_intents
                 .insert("windows.uia.set_value".to_owned());
+            policy
+                .allowed_intents
+                .insert("windows.uia.inspect".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_LINUX_ATSPI").as_deref() == Ok("1") {
+        if gates.linux_atspi {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             policy
                 .allowed_intents
@@ -826,13 +1284,13 @@ impl Policy {
                 .allowed_intents
                 .insert("linux.atspi.set_value".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_BROWSER_FIXTURE").as_deref() == Ok("1") {
+        if gates.browser_fixture {
             policy.max_risk = policy.max_risk.max(Risk::R1);
             policy
                 .allowed_intents
                 .insert("browser.fixture.submit".to_owned());
         }
-        if std::env::var("COMPTROL_ALLOW_ALL_INTENTS").as_deref() == Ok("1") {
+        if gates.all_intents {
             policy.max_risk = Risk::R3;
             for intent in FIRST_PARTY_ADAPTER_INTENTS {
                 policy.allowed_intents.insert((*intent).to_owned());
@@ -845,17 +1303,28 @@ impl Policy {
                 "browser.cdp.accessibility_snapshot".to_owned(),
                 "browser.cdp.reopen_closed_group".to_owned(),
                 "workflow.execute".to_owned(),
+                "workflow.speculate".to_owned(),
+                "recipe.run".to_owned(),
                 "app.resolve".to_owned(),
                 "app.list".to_owned(),
                 "permission.status".to_owned(),
                 "popup.inspect".to_owned(),
                 "browser.session.list".to_owned(),
                 "browser.session.connect".to_owned(),
+                "browser.ensure_session".to_owned(),
             ]);
         }
-        if std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1") {
+        if gates.browser_cdp {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             policy.allowed_intents.extend([
+                // These operations only inspect browser targets or expose
+                // their accessible names. Keep them available with CDP
+                // inspection enabled, without opening the mutation routes.
+                // ensure_session is a read-only readiness probe: route
+                // resolution plus one bounded channel round trip.
+                "browser.ensure_session".to_owned(),
+                "browser.cdp.discovery".to_owned(),
+                "browser.cdp.accessibility_snapshot".to_owned(),
                 "browser.cdp.evaluate".to_owned(),
                 "browser.cdp.frame_evaluate".to_owned(),
                 "browser.cdp.ensure_state".to_owned(),
@@ -867,6 +1336,7 @@ impl Policy {
                 "browser.cdp.focus".to_owned(),
                 "browser.cdp.open_tab".to_owned(),
                 "browser.cdp.close_tab".to_owned(),
+                "browser.cdp.activate_tab".to_owned(),
                 "browser.cdp.history_back".to_owned(),
                 "browser.cdp.history_forward".to_owned(),
                 "browser.cdp.semantic_click".to_owned(),
@@ -875,19 +1345,21 @@ impl Policy {
                 "browser.cdp.workflow".to_owned(),
                 "browser.cdp.screenshot".to_owned(),
                 "browser.cdp.coordinate_click".to_owned(),
+                "browser.cdp.type_text".to_owned(),
+                "browser.cdp.press_key".to_owned(),
                 "browser.cdp.dialog".to_owned(),
                 "browser.session.connect".to_owned(),
             ]);
         }
-        if env_enabled("COMPTROL_ALLOW_ADAPTERS") {
+        if gates.adapters {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             for intent in FIRST_PARTY_ADAPTER_INTENTS {
                 if classify(intent) <= Risk::R2 {
                     policy.allowed_intents.insert((*intent).to_owned());
                 }
             }
-            if env_enabled("COMPTROL_ALLOW_HIGH_CONSEQUENCE_ADAPTERS") {
-                policy.max_risk = policy.max_risk.max(Risk::R3);
+            if gates.high_consequence_adapters {
+                policy.max_risk = Risk::R3;
                 policy
                     .allowed_intents
                     .insert("obs.recording.start".to_owned());
@@ -901,11 +1373,11 @@ impl Policy {
                 policy.allowed_intents.insert("message.send".to_owned());
             }
         }
-        if env_enabled("COMPTROL_ALLOW_MAIL_SEND") && env_enabled("COMPTROL_ALLOW_ADAPTERS") {
+        if gates.mail_send && gates.adapters {
             policy.max_risk = Risk::R3;
             policy.allowed_intents.insert("mail.send".to_owned());
         }
-        if env_enabled("COMPTROL_ALLOW_CREATIVE_ADAPTERS") {
+        if gates.creative_adapters {
             policy.max_risk = policy.max_risk.max(Risk::R2);
             for intent in FIRST_PARTY_ADAPTER_INTENTS {
                 if is_creative_adapter_intent(intent) && classify(intent) <= Risk::R2 {
@@ -1195,6 +1667,7 @@ impl StopLatch {
 
 #[derive(Debug)]
 pub struct Runtime {
+    state_dir: PathBuf,
     pub policy: Policy,
     pub leases: LeaseManager,
     pub journal: AuditJournal,
@@ -1380,6 +1853,7 @@ impl Runtime {
                 Err(error) => (None, Some(error.to_string())),
             };
         Ok(Self {
+            state_dir: state_dir.clone(),
             policy: Policy::from_environment(),
             leases: LeaseManager::new(),
             journal: AuditJournal::open(&state_dir)?,
@@ -1443,6 +1917,16 @@ impl Runtime {
             return idempotency_conflict(&request, operation_id);
         }
         let risk = effective_risk(&request);
+        // Asking for a browser operation is what starts the local browser;
+        // starting one also turns on the CDP policy gate that exists to
+        // serve it, so the cached policy snapshot is refreshed before route
+        // selection and authorization see the request.
+        if chrome_autostart::intent_needs_browser(&request.intent) {
+            let gate_was_open = env_enabled("COMPTROL_ALLOW_BROWSER_CDP");
+            if chrome_autostart::ensure() && !gate_was_open {
+                self.policy = Policy::from_environment();
+            }
+        }
         if let Some(background) = request.background.as_deref()
             && !matches!(
                 background,
@@ -1492,6 +1976,24 @@ impl Runtime {
         }
         if let Err(error) = self.policy.authorize(&request.intent, risk) {
             let result = ActionResult::refused(&request, operation_id, error);
+            self.remember(&request, result.clone());
+            return result;
+        }
+        // Schema validation runs after the policy gate on purpose: an
+        // intent the local policy forbids is refused as `policy_denied`
+        // without first describing what parameters it would have accepted.
+        if let Err(message) = intent_schema::validate_params(&request.intent, &request.params) {
+            let result = ActionResult::refused(
+                &request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message,
+                    recovery: intent_schema::schema_for(&request.intent).map(|schema| {
+                        format!("Use the intent_schema tool for {}", schema["intent"])
+                    }),
+                },
+            );
             self.remember(&request, result.clone());
             return result;
         }
@@ -1614,16 +2116,24 @@ impl Runtime {
             return result;
         }
         let route_started = Instant::now();
-        let result = match request.intent.as_str() {
+        let mut result = match request.intent.as_str() {
             "system.ping" => success(
                 &request,
                 operation_id,
                 "native",
                 EffectState::None,
                 VerificationState::Verified,
-                json!({ "ready": true, "protocol": PROTOCOL_VERSION }),
+                json!({
+                    "ready": true,
+                    "protocol": PROTOCOL_VERSION,
+                    "runtime_fingerprint": runtime_fingerprint()
+                }),
             ),
             "workflow.execute" => execute_workflow_request(self, &request, operation_id),
+            "workflow.speculate" => execute_speculate_request(self, &request, operation_id),
+            "recipe.run" => execute_recipe_request(self, &request, operation_id),
+            "desktop.terminal" => terminal::terminal_run(&request, operation_id),
+            "desktop.explorer" => terminal::explorer_open(&request, operation_id),
             "desktop.observe" => desktop_observe(&request, operation_id),
             "platform.broker.observe" => platform_broker_observe(&request, operation_id),
             "filesystem.write" => sandbox_write(&request, operation_id, &self.checkpoints),
@@ -1651,13 +2161,18 @@ impl Runtime {
             "popup.inspect" => popup_inspect(&request, operation_id),
             "popup.dismiss" => popup_dismiss(&request, operation_id),
             "browser.session.list" => browser_session_list(&request, operation_id),
-            "browser.session.connect" => browser_session_connect(&request, operation_id),
+            "browser.session.connect" => {
+                browser_session_connect(&request, operation_id, &self.state_dir)
+            }
+            "browser.ensure_session" => {
+                browser_ensure_session(&request, operation_id, &self.state_dir)
+            }
             "browser.chrome.open_tab" => browser_chrome_open_tab(&request, operation_id),
             "browser.chrome.restore_recent" | "browser.chrome.reopen_closed_group" => {
                 browser_chrome_restore_recent(&request, operation_id)
             }
             "command.run" => command_run(&request, operation_id),
-            "windows.uia.press" | "windows.uia.set_value" => {
+            "windows.uia.inspect" | "windows.uia.press" | "windows.uia.set_value" => {
                 windows_uia_action(&request, operation_id)
             }
             "linux.atspi.press" | "linux.atspi.set_value" => {
@@ -1680,15 +2195,19 @@ impl Runtime {
             | "browser.cdp.focus"
             | "browser.cdp.open_tab"
             | "browser.cdp.close_tab"
+            | "browser.cdp.activate_tab"
             | "browser.cdp.history_back"
             | "browser.cdp.history_forward"
             | "browser.cdp.semantic_click"
             | "browser.cdp.semantic_fill"
+            | "browser.cdp.type_text"
+            | "browser.cdp.press_key"
             | "browser.cdp.compact_snapshot"
             | "browser.cdp.workflow"
             | "browser.cdp.screenshot"
             | "browser.cdp.coordinate_click"
             | "browser.cdp.dialog"
+            | "browser.cdp.discovery"
             | "browser.cdp.accessibility_snapshot"
             | "browser.cdp.wait_for" => browser_cdp_action(&request, operation_id),
             intent if is_first_party_adapter_intent(intent) => {
@@ -1704,7 +2223,14 @@ impl Runtime {
                 },
             ),
         };
-        self.record_route_outcome(&result, route_started.elapsed().as_secs_f64() * 1_000.0);
+        let route_execution_ms = route_started.elapsed().as_secs_f64() * 1_000.0;
+        if let Some(data) = result.data.as_object_mut() {
+            data.insert(
+                "_comptrol_timing".to_owned(),
+                json!({"action_and_verification_ms":route_execution_ms}),
+            );
+        }
+        self.record_route_outcome(&result, route_execution_ms);
         self.remember(&request, result.clone());
         result
     }
@@ -1808,7 +2334,7 @@ impl Runtime {
                     "requests": self.human_actions.all(),
                 },
             }),
-            "capabilities" => json!(capabilities()),
+            "capabilities" => capability_catalog(),
             "routes" => json!(route_catalog()),
             "route_stats" => json!({
                 "routes": self
@@ -1830,7 +2356,7 @@ impl Runtime {
             }),
             "platform" => platform_diagnostics(),
             "browser" => {
-                if let Ok(endpoint) = std::env::var("COMPTROL_CDP_ENDPOINT") {
+                if let Some(endpoint) = browser::active_endpoint() {
                     match browser::discover(&endpoint) {
                         Ok(targets) => {
                             json!({ "endpoint": endpoint, "targets": targets, "transport": "direct_cdp" })
@@ -1968,11 +2494,11 @@ impl Runtime {
         }
         if record.intent == "browser.fixture.submit"
             && let (Some(endpoint), Some(key)) = (
-                std::env::var_os("COMPTROL_CDP_ENDPOINT"),
+                browser::active_endpoint(),
                 record.idempotency_key.as_deref(),
             )
         {
-            match browser::fixture_state(&endpoint.to_string_lossy()) {
+            match browser::fixture_state(&endpoint) {
                 Ok(state)
                     if state
                         .get("submissions")
@@ -2011,6 +2537,116 @@ impl Runtime {
                     return json!({ "state": "unknown", "operation_id": operation_id, "error": error });
                 }
             }
+        }
+        // F03 closure: a dispatched/unknown browser workflow reconciles by
+        // RE-OBSERVING the goal postcondition on the live page. The original
+        // actor readback died with the caller, so the reconciled envelope is
+        // a fresh independent observation (delivery/effect reflect the
+        // observed page, never the vanished execution's self-report).
+        if record.intent == "browser.cdp.workflow"
+            && let (Some(goal), Some(target_id), Some(context_id)) = (
+                record.metadata.get("reconcile_goal"),
+                record
+                    .metadata
+                    .get("reconcile_target_id")
+                    .and_then(Value::as_str),
+                record
+                    .metadata
+                    .get("reconcile_browser_context_id")
+                    .and_then(Value::as_str),
+            )
+        {
+            let endpoint = browser::active_endpoint()
+                .unwrap_or_else(|| browser_bridge::COMPANION_BRIDGE_ENDPOINT.to_owned());
+            let expression = match goal.get("kind").and_then(Value::as_str) {
+                Some("text") => goal
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(|text| serde_json::to_string(text).ok())
+                    .map(|needle| {
+                        // Same hidden-tab rule as wait_for_text: innerText is
+                        // layout-dependent and empty for background tabs.
+                        format!(
+                            "(() => {{ const body = document.hidden ? (document.body?.textContent || '') : (document.body?.innerText || document.body?.textContent || ''); return body.includes({needle}); }})()"
+                        )
+                    }),
+                Some("url") => goal
+                    .get("contains")
+                    .and_then(Value::as_str)
+                    .map(|needle| {
+                        format!(
+                            "location.href.includes({})",
+                            serde_json::to_string(needle).unwrap_or_else(|_| "''".to_owned())
+                        )
+                    }),
+                _ => None,
+            };
+            let observation = match expression {
+                Some(expression) => browser::cdp_call(
+                    &endpoint,
+                    target_id,
+                    Some(context_id),
+                    None,
+                    "Runtime.evaluate",
+                    json!({ "expression": expression, "returnByValue": true }),
+                ),
+                None => Err(ComptrolError {
+                    code: "reconcile_unsupported".to_owned(),
+                    message: "Workflow record has no observable final goal".to_owned(),
+                    recovery: Some(
+                        "Observe the page directly and resolve the operation manually".to_owned(),
+                    ),
+                }),
+            };
+            let met = observation
+                .as_ref()
+                .ok()
+                .and_then(|data| {
+                    data.get("result")
+                        .and_then(|result| result.get("value"))
+                        .cloned()
+                })
+                .map(|value| value == Value::Bool(true))
+                .unwrap_or(false);
+            if met {
+                let result = ActionResult {
+                    operation_id: record.operation_id.clone(),
+                    intent: record.intent.clone(),
+                    route: "recovery_observation".to_owned(),
+                    target: record.target.clone(),
+                    preflight: "reconciled".to_owned(),
+                    delivery: DeliveryState::Delivered,
+                    effect: EffectState::Changed,
+                    verification: VerificationState::Verified,
+                    disturbance: json!({ "foreground_changed": false, "mouse": "untouched", "clipboard": "untouched" }),
+                    recovery: RecoveryState::None,
+                    data: json!({
+                        "reconciled": true,
+                        "goal": goal,
+                        "observed_on": target_id,
+                        "basis": "independent_readback_after_recovery",
+                    }),
+                    error: None,
+                };
+                let idempotency_key = record.idempotency_key.clone();
+                let fingerprint = record.request_fingerprint.clone();
+                if let Err(error) = self.operations.reconciled(record, result.clone()) {
+                    return json!({ "state": "unknown", "operation_id": operation_id, "error": { "code": "recovery_write_failed", "message": error.to_string() } });
+                }
+                self.cache_idempotency(idempotency_key, fingerprint, result.clone());
+                return json!({ "state": "reconciled", "result": result });
+            }
+            // Goal not yet met (or target gone): stay honestly unknown. The
+            // late command may still land; repeated reconcile is safe because
+            // this branch is read-only.
+            let error = observation.err();
+            return json!({
+                "state": "unknown",
+                "operation_id": operation_id,
+                "reconcile_required": true,
+                "error": error.map(|err| json!({ "code": err.code, "message": err.message })),
+                "note": "goal not observed yet; operation remains pending reconciliation",
+            });
         }
         if (record.intent == "desktop.open_app"
             || record.intent == "macos.ax.press"
@@ -2119,6 +2755,21 @@ impl Runtime {
             "operation.completed",
             json!({ "operation_id": result.operation_id, "intent": result.intent, "verification": result.verification }),
         );
+        // P4.6: trace spans via MCP. The operation_id doubles as the trace_id;
+        // `inspect kind:events` (kind: "trace.span") shows per-step spans and
+        // the benchmark harness can attribute latency per step from them.
+        self.events.emit(
+            "trace.span",
+            json!({
+                "trace_id": result.operation_id,
+                "span": "operate",
+                "intent": result.intent,
+                "route": result.route,
+                "verification": result.verification,
+                "delivery": result.delivery,
+                "effect": result.effect,
+            }),
+        );
         if let Err(error) = self.durable_events.emit(
             "operation.completed",
             json!({ "operation_id": result.operation_id, "intent": result.intent, "verification": result.verification }),
@@ -2133,11 +2784,37 @@ impl Runtime {
     }
 }
 
-fn classify(intent: &str) -> Risk {
+/// Whether an executable is in the local command allowlist.
+///
+/// Both command routes (`command.run` and `desktop.terminal`) go through
+/// this one check. When they each had their own copy, the terminal route
+/// shipped without one, which would have made it a way to run any
+/// executable the policy switch had been opened for.
+pub fn command_program_allowed(program: &str) -> bool {
+    match std::env::var("COMPTROL_COMMAND_ALLOWLIST") {
+        Ok(allowlist) => program_in_allowlist(program, &allowlist),
+        Err(_) => false,
+    }
+}
+
+/// The allowlist rule itself, separated from the environment so it can be
+/// exercised without mutating process state.
+pub fn program_in_allowlist(program: &str, allowlist: &str) -> bool {
+    allowlist
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|allowed| allowed == program)
+}
+
+pub fn classify(intent: &str) -> Risk {
     match intent {
         "system.ping" | "desktop.observe" | "platform.broker.observe" | "workflow.execute" => {
             Risk::R0
         }
+        // The batch wrapper only orchestrates; every step re-enters operate()
+        // and is classified, consent-gated, and policy-checked on its own.
+        "workflow.speculate" | "recipe.run" => Risk::R1,
         "app.launch" => Risk::R1,
         "app.resolve" | "app.list" | "permission.status" | "popup.inspect" => Risk::R0,
         "permission.request" | "software.search" | "software.describe" | "settings.get" => Risk::R1,
@@ -2160,6 +2837,8 @@ fn classify(intent: &str) -> Risk {
         | "browser.chrome.restore_recent"
         | "browser.chrome.reopen_closed_group" => Risk::R2,
         "command.run" => Risk::R3,
+        "desktop.terminal" | "desktop.explorer" => Risk::R2,
+        "windows.uia.inspect" => Risk::R0,
         "windows.uia.press" | "windows.uia.set_value" => Risk::R2,
         "linux.atspi.press" | "linux.atspi.set_value" => Risk::R2,
         "browser.fixture.submit" => Risk::R1,
@@ -2178,7 +2857,9 @@ fn classify(intent: &str) -> Risk {
         | "browser.cdp.history_forward"
         | "browser.cdp.semantic_click"
         | "browser.cdp.semantic_fill"
-        | "browser.cdp.coordinate_click" => Risk::R2,
+        | "browser.cdp.coordinate_click"
+        | "browser.cdp.type_text"
+        | "browser.cdp.press_key" => Risk::R2,
         "browser.cdp.screenshot" | "browser.cdp.compact_snapshot" => Risk::R0,
         "browser.cdp.workflow" => Risk::R2,
         "obs.recording.start" | "obs.recording.stop" => Risk::R3,
@@ -2207,7 +2888,8 @@ fn classify(intent: &str) -> Risk {
         | "video.render.preset.list"
         | "video.render.status" => Risk::R0,
         intent if is_first_party_adapter_intent(intent) => Risk::R2,
-        "browser.cdp.wait_for"
+        "browser.cdp.discovery"
+        | "browser.cdp.wait_for"
         | "browser.cdp.accessibility_snapshot"
         | "browser.cdp.reopen_closed_group" => Risk::R0,
         _ => Risk::R2,
@@ -2325,7 +3007,29 @@ fn execute_adapter_request(
         }
     };
     let isolation_dimensions = manifest.isolation.dimensions();
-    if !runtime.adapter_hosts.contains_key(adapter_name) {
+    // The adapter's manifest declares how long one operation may run, and the
+    // host deadline must never be shorter than that. The old flat five-second
+    // default killed work the adapter was built to finish -- a Blender rocket
+    // recipe legitimately runs for about ten seconds -- and then left the
+    // adapter route dead. A caller may still ask for a tighter bound.
+    let declared_budget = manifest.max_operation_ms;
+    let host_timeout_ms = request
+        .params
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(declared_budget)
+        .min(declared_budget)
+        .max(100);
+    // A host whose connection died is replaced rather than reused: its reader
+    // thread already consumed the pipe, so every later request would fail
+    // against it while the route stayed broken until a restart.
+    let reusable = runtime
+        .adapter_hosts
+        .get(adapter_name)
+        .is_some_and(AdapterHost::connection_is_alive);
+    let adapter_host_startup_ms = if !reusable {
+        runtime.adapter_hosts.remove(adapter_name);
+        let adapter_startup = Instant::now();
         let python = adapter_python();
         let script = root.join(adapter_name).join("src").join("adapter.py");
         let config = AdapterHostConfig {
@@ -2334,12 +3038,7 @@ fn execute_adapter_request(
             arguments: vec![script.to_string_lossy().into_owned()],
             instance_id: format!("{adapter_name}-{operation_id}"),
             max_frame_bytes: comptrol_adapter_sdk::MAX_FRAME_BYTES,
-            timeout_ms: request
-                .params
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(5_000)
-                .clamp(100, 120_000),
+            timeout_ms: host_timeout_ms,
         };
         let mut host = match AdapterHost::spawn(config) {
             Ok(host) => host,
@@ -2371,7 +3070,10 @@ fn execute_adapter_request(
             );
         }
         runtime.adapter_hosts.insert(adapter_name.to_owned(), host);
-    }
+        adapter_startup.elapsed().as_secs_f64() * 1000.0
+    } else {
+        0.0
+    };
     let Some(host) = runtime.adapter_hosts.get_mut(adapter_name) else {
         return ActionResult::refused(
             request,
@@ -2408,6 +3110,7 @@ fn execute_adapter_request(
         payload = json!({});
     }
     payload["intent"] = json!(request.intent);
+    let adapter_execution_started = Instant::now();
     let response = if let Some(cancellation) = runtime.operation_cancel.as_ref() {
         host.request_with_cancel("execute", &resource, payload, Some(token), || {
             cancellation.load(Ordering::Acquire)
@@ -2415,6 +3118,18 @@ fn execute_adapter_request(
     } else {
         host.request("execute", &resource, payload, Some(token))
     };
+    let adapter_execution_ms = adapter_execution_started.elapsed().as_secs_f64() * 1000.0;
+    // Any error, or a connection that did not survive the exchange, means the
+    // adapter process is no longer trustworthy: drop it so the next operation
+    // starts a fresh one. Retrying against a half-read pipe is what made one
+    // timeout disable an adapter until the daemon restarted.
+    let connection_survived = runtime
+        .adapter_hosts
+        .get(adapter_name)
+        .is_some_and(AdapterHost::connection_is_alive);
+    if response.is_err() || !connection_survived {
+        runtime.adapter_hosts.remove(adapter_name);
+    }
     match response {
         Ok(response) if response.ok && response.health == HealthState::Available => {
             let verified = response
@@ -2433,7 +3148,7 @@ fn execute_adapter_request(
                 } else {
                     VerificationState::Unverified
                 },
-                json!({"adapter": adapter_name, "health": response.health, "payload": response.payload, "verified": verified, "isolation": isolation_dimensions.clone()}),
+                json!({"adapter": adapter_name, "health": response.health, "payload": response.payload, "verified": verified, "isolation": isolation_dimensions.clone(), "timings_ms":{"adapter_host_startup_ms":adapter_host_startup_ms,"adapter_execution_and_verification_ms":adapter_execution_ms}}),
             )
         }
         Ok(response) => ActionResult {
@@ -2447,7 +3162,7 @@ fn execute_adapter_request(
             verification: VerificationState::NotAttempted,
             disturbance: json!({ "foreground_changed": false, "mouse": "untouched", "clipboard": "untouched" }),
             recovery: RecoveryState::None,
-            data: json!({"adapter": adapter_name, "health": response.health, "payload": response.payload, "isolation": isolation_dimensions}),
+            data: json!({"adapter": adapter_name, "health": response.health, "payload": response.payload, "isolation": isolation_dimensions, "timings_ms":{"adapter_host_startup_ms":adapter_host_startup_ms,"adapter_execution_and_verification_ms":adapter_execution_ms}}),
             error: Some(ComptrolError {
                 code: "adapter_execution_failed".to_owned(),
                 message: response
@@ -2507,6 +3222,49 @@ fn operation_metadata(request: &OperationRequest) -> Value {
     });
     if let Some(background) = request.background.as_deref() {
         metadata["background"] = json!(background);
+    }
+    if request.intent == "browser.cdp.workflow" {
+        // Recovery evidence: enough to re-observe the goal postcondition on
+        // the live page after a crash, without replaying any step.
+        if let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) {
+            metadata["reconcile_target_id"] = json!(target_id);
+        }
+        if let Some(context) = request
+            .params
+            .get("browser_context_id")
+            .and_then(Value::as_str)
+        {
+            metadata["reconcile_browser_context_id"] = json!(context);
+        }
+        if let Some(steps) = request.params.get("steps").and_then(Value::as_array) {
+            let final_goal = steps.iter().rev().find_map(|step| {
+                let action = step.get("action").and_then(Value::as_str)?;
+                match action {
+                    "wait_text" => Some(json!({
+                        "kind": "text",
+                        "text": step.get("text").cloned()?,
+                    })),
+                    "wait_url" => Some(json!({
+                        "kind": "url",
+                        "contains": step.get("contains").cloned()?,
+                    })),
+                    "navigate" => Some(json!({
+                        "kind": "url",
+                        "contains": step
+                            .get("url_contains")
+                            .cloned()
+                            .or_else(|| step.get("url").cloned())?,
+                    })),
+                    _ => None,
+                }
+            });
+            if let Some(goal) = final_goal {
+                metadata["reconcile_goal"] = goal;
+            }
+        }
+        if let Some(goal) = request.postcondition.as_ref() {
+            metadata["reconcile_postcondition"] = goal.clone();
+        }
     }
     if request.intent == "filesystem.write" {
         if let Some(path) = request.params.get("path").and_then(Value::as_str) {
@@ -2688,6 +3446,7 @@ fn route_plan(request: &OperationRequest, policy: Option<&Policy>) -> RoutePlan 
         "software.uninstall",
         "popup.dismiss",
         "browser.session.connect",
+        "browser.ensure_session",
     ];
     if POLICY_DIRECT_INTENTS.contains(&request.intent.as_str())
         && let Some(policy) = policy
@@ -2770,6 +3529,16 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
             "Read-only broker diagnostics do not require actuation",
         )),
         "workflow.execute" => Some(("workflow", true, "Bounded workflow VM route")),
+        "recipe.run" => Some((
+            "recipe",
+            true,
+            "Promoted, replay-gated recipes re-enter the normal dispatch path per step; each step keeps its own policy and consent gate",
+        )),
+        "workflow.speculate" => Some((
+            "workflow",
+            true,
+            "Bounded speculative batch route with per-step postconditions",
+        )),
         "filesystem.write" | "filesystem.copy" => Some((
             "sandbox_filesystem",
             env_enabled("COMPTROL_ALLOW_SANDBOX_WRITES"),
@@ -2872,6 +3641,11 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
             env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
             "Session connection needs the browser protocol policy",
         )),
+        "browser.ensure_session" => Some((
+            "browser_session_broker",
+            true,
+            "Read-only readiness probe with a bounded channel round trip",
+        )),
         "browser.chrome.open_tab" => Some((
             "browser_launcher",
             cfg!(any(
@@ -2886,13 +3660,29 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
             true,
             "Chrome restore uses the native recently-closed surface when reachable and otherwise reconstructs only when explicitly allowed",
         )),
+        "desktop.terminal" => Some((
+            "terminal",
+            env_enabled("COMPTROL_ALLOW_COMMANDS")
+                && std::env::var_os("COMPTROL_COMMAND_ROOT").is_some()
+                && std::env::var_os("COMPTROL_COMMAND_ALLOWLIST").is_some(),
+            "Terminal commands require the same allowlist policy and command root as command.run; no shell is involved",
+        )),
+        "desktop.explorer" => Some((
+            "file_explorer",
+            cfg!(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "linux"
+            )),
+            "Revealing a path uses the platform file manager and never mutates the file",
+        )),
         "command.run" => Some((
             "process_argv",
             env_enabled("COMPTROL_ALLOW_COMMANDS")
                 && std::env::var_os("COMPTROL_COMMAND_ROOT").is_some(),
             "Command execution requires an allowlist policy and command root",
         )),
-        "windows.uia.press" | "windows.uia.set_value" => Some((
+        "windows.uia.inspect" | "windows.uia.press" | "windows.uia.set_value" => Some((
             "windows_uia",
             cfg!(target_os = "windows") && env_enabled("COMPTROL_ALLOW_WINDOWS_UIA"),
             "Windows UI Automation requires Windows and explicit policy",
@@ -2924,14 +3714,12 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
         )),
         "browser.cdp.frame_evaluate" => Some((
             "browser_protocol",
-            std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
+            browser::active_endpoint().is_some() && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
             "Frame-scoped CDP requires the direct event-maintained frame graph; the companion bridge intentionally refuses this route until it can prove a stable frame binding",
         )),
         value if value.starts_with("browser.cdp.") => Some((
             "browser_protocol",
-            (std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                || browser_bridge::bridge_is_active())
+            (browser::active_endpoint().is_some() || browser_bridge::bridge_is_active())
                 && env_enabled("COMPTROL_ALLOW_BROWSER_CDP"),
             "Browser protocol control requires a direct CDP endpoint or a live companion bridge heartbeat and explicit policy",
         )),
@@ -2998,12 +3786,16 @@ fn route_plan_for_intent(intent: &str, params: Value, background: Option<&str>) 
     }
 }
 
-fn route_catalog() -> Vec<RoutePlan> {
+pub fn route_catalog() -> Vec<RoutePlan> {
     [
         "system.ping",
         "desktop.observe",
         "platform.broker.observe",
         "workflow.execute",
+        "workflow.speculate",
+        "recipe.run",
+        "desktop.terminal",
+        "desktop.explorer",
         "filesystem.write",
         "filesystem.copy",
         "filesystem.restore_checkpoint",
@@ -3028,10 +3820,12 @@ fn route_catalog() -> Vec<RoutePlan> {
         "popup.dismiss",
         "browser.session.list",
         "browser.session.connect",
+        "browser.ensure_session",
         "browser.chrome.open_tab",
         "browser.chrome.restore_recent",
         "browser.chrome.reopen_closed_group",
         "command.run",
+        "windows.uia.inspect",
         "windows.uia.press",
         "linux.atspi.press",
         "macos.ax.press",
@@ -3047,6 +3841,8 @@ fn route_catalog() -> Vec<RoutePlan> {
         "browser.cdp.compact_snapshot",
         "browser.cdp.screenshot",
         "browser.cdp.coordinate_click",
+        "browser.cdp.type_text",
+        "browser.cdp.press_key",
         "browser.cdp.dialog",
     ]
     .into_iter()
@@ -3260,6 +4056,321 @@ fn execute_workflow_request(
     }
 }
 
+/// P4.4: run one promoted recipe as a single operation.
+///
+/// A recipe is a stored, parameter-lifted workflow. Running it here means
+/// the caller makes one `operate` call instead of reconstructing the task
+/// step by step. Every step still re-enters `operate`, so each one is
+/// classified, policy-checked, and consent-gated on its own: a recipe is
+/// a shorter conversation, not a wider door.
+fn execute_recipe_request(
+    runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    let Some(recipe_id) = request.params.get("recipe").and_then(Value::as_str) else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "recipe.run needs params.recipe with an exact recipe id".to_owned(),
+                recovery: Some("List recipes with the recipe_list tool".to_owned()),
+            },
+        );
+    };
+    let Some(recipe) = comptrol_workflow::recipes::catalog()
+        .into_iter()
+        .find(|recipe| recipe.workflow.id == recipe_id)
+    else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "unknown_recipe".to_owned(),
+                message: format!("No recipe named {recipe_id}"),
+                recovery: Some("List recipes with the recipe_list tool".to_owned()),
+            },
+        );
+    };
+    // Promotion is earned by recorded, independently verified replays. An
+    // unpromoted recipe is refused with its own state rather than being
+    // silently run as if it were proven. The bar is one verified replay
+    // in a clean fixture with independent verification.
+    if !recipe.is_promoted(1) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "recipe_not_promoted".to_owned(),
+                message: format!(
+                    "Recipe {recipe_id} has {} verified replays and is not promoted",
+                    recipe.evidence.verified_runs
+                ),
+                recovery: Some(
+                    "Record the task with recipe_record, then promote it after independent verification"
+                        .to_owned(),
+                ),
+            },
+        );
+    }
+    let supplied = request
+        .params
+        .get("parameters")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let workflow = match recipe.bind(&supplied) {
+        Ok(workflow) => workflow,
+        Err(message) => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message,
+                    recovery: Some("Inspect the recipe's declared parameters".to_owned()),
+                },
+            );
+        }
+    };
+    let target = request.target.clone();
+    let background = request.background.clone();
+    let mut executor = WorkflowExecutor {
+        action: |intent: &str, params: &Value| {
+            let result = runtime.operate(OperationRequest {
+                intent: intent.to_owned(),
+                target: target.clone(),
+                params: params.clone(),
+                postcondition: None,
+                risk: None,
+                idempotency_key: None,
+                dry_run: false,
+                background: background.clone(),
+            });
+            serde_json::to_value(result).map_err(|error| error.to_string())
+        },
+        verify: |criterion: &Value, observed: &Value| {
+            criterion
+                .get("equals")
+                .is_some_and(|expected| observed.get("data") == Some(expected))
+                || criterion == observed
+        },
+        wait: |_event: &str, timeout_ms: u64| {
+            std::thread::sleep(Duration::from_millis(timeout_ms.min(60_000)));
+            Ok(())
+        },
+        max_steps: workflow.nodes.len().saturating_mul(4).saturating_add(4),
+    };
+    match executor.run(&workflow) {
+        Ok(value) => success(
+            request,
+            operation_id,
+            "recipe",
+            EffectState::Changed,
+            VerificationState::Verified,
+            json!({
+                "recipe": recipe_id,
+                "recipe_fingerprint": workflow.fingerprint,
+                "steps": workflow.nodes.len(),
+                "result": value
+            }),
+        ),
+        Err(error) => ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "recipe_execution_failed".to_owned(),
+                message: error.to_string(),
+                recovery: Some("Observe the current state and run the recipe cold".to_owned()),
+            },
+        ),
+    }
+}
+
+/// P4.2: `workflow.speculate` - run N steps optimistically with per-step
+/// postconditions and rollback hints. Every step re-enters `operate()`, so
+/// intent-level classification, consent, and policy apply unchanged. On
+/// failure the result carries the durable state of executed steps plus a
+/// reconcile plan instead of an opaque error (Gate 3: Classroom in 1 call).
+fn execute_speculate_request(
+    runtime: &mut Runtime,
+    request: &OperationRequest,
+    operation_id: String,
+) -> ActionResult {
+    let steps_value = match request.params.get("steps") {
+        Some(Value::Array(steps)) if !steps.is_empty() => steps.clone(),
+        _ => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "workflow.speculate needs a non-empty steps array".to_owned(),
+                    recovery: Some(
+                        "Each step is {intent, params, postcondition?, rollback_hint?}".to_owned(),
+                    ),
+                },
+            );
+        }
+    };
+    let Ok(steps) = serde_json::from_value::<Vec<SpeculativeStep>>(Value::Array(steps_value))
+    else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message: "Speculative steps did not match the closed schema".to_owned(),
+                recovery: Some(
+                    "Each step is {intent, params, postcondition?, rollback_hint?}".to_owned(),
+                ),
+            },
+        );
+    };
+    let deadline_ms = request
+        .params
+        .get("deadline_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000)
+        .clamp(1_000, 300_000);
+    let target = request.target.clone();
+    let background = request.background.clone();
+    let mut step_results = Vec::new();
+    let mut intents = Vec::new();
+    let outcome = {
+        let step_results = &mut step_results;
+        let intents = &mut intents;
+        run_speculative(
+            &steps,
+            deadline_ms,
+            |_index, intent: &str, params: &Value| {
+                let step_outcome = runtime.operate(OperationRequest {
+                    intent: intent.to_owned(),
+                    target: target.clone(),
+                    params: params.clone(),
+                    postcondition: None,
+                    risk: None,
+                    idempotency_key: None,
+                    dry_run: false,
+                    background: background.clone(),
+                });
+                let failed = step_outcome.error.is_some()
+                    || step_outcome.verification == VerificationState::Failed;
+                let value = serde_json::to_value(&step_outcome).unwrap_or(Value::Null);
+                step_results.push(value.clone());
+                intents.push(intent.to_owned());
+                if failed {
+                    let message = step_outcome
+                        .error
+                        .map(|error| error.message)
+                        .unwrap_or_else(|| "step verification failed".to_owned());
+                    Err(message)
+                } else {
+                    Ok(value)
+                }
+            },
+            |criterion: &Value, observed: &Value| match criterion.get("equals") {
+                Some(expected) => {
+                    observed.get("data") == Some(expected)
+                        || observed.get("verification") == Some(expected)
+                }
+                None => criterion == observed,
+            },
+            || false,
+        )
+    };
+    let data = json!({
+        "batch_state": outcome.state,
+        "failed_at": outcome.failed_at,
+        "steps": outcome.steps,
+        "executed_results": step_results,
+        "reconcile_plan": outcome.reconcile_plan,
+        "verified_by": if outcome.completed() && steps.iter().all(|step| step.postcondition.is_some()) {
+            "postcondition_readback"
+        } else {
+            "actor_dispatch"
+        },
+    });
+    if outcome.completed() {
+        // P4.3: comptrol-verification owns postcondition evaluation and is the
+        // only code that may conclude `verified`. Each declared postcondition
+        // becomes a required criterion evaluated against its step outcome;
+        // dispatch-only evidence can never upgrade the state.
+        let mut report = VerificationReport::new(VerificationLevel::ApplicationState);
+        for (step, step_outcome) in steps.iter().zip(outcome.steps.iter()) {
+            if let Some(criterion) = step.postcondition.as_ref() {
+                let passed = step_outcome.postcondition_passed == Some(true);
+                report.criteria.push(VerificationCriterion {
+                    id: format!("step_{}_{}", step_outcome.index, step_outcome.intent),
+                    required: true,
+                    expected: criterion.clone(),
+                    observed: step_outcome.result.clone(),
+                    passed,
+                    source: VerificationSource::IndependentFixture,
+                });
+            }
+        }
+        if !report.criteria.is_empty() {
+            report.evidence.push(VerificationEvidence {
+                source: VerificationSource::IndependentFixture,
+                kind: "speculative_batch_postconditions".to_owned(),
+                reference: Some(operation_id.clone()),
+                details: json!({ "steps": outcome.steps.len() }),
+            });
+        }
+        let report = report.finalize();
+        let verified = report.is_verified();
+        let mut data = data;
+        if let Some(object) = data.as_object_mut() {
+            object.insert(
+                "verification_report".to_owned(),
+                serde_json::to_value(&report).unwrap_or(Value::Null),
+            );
+        }
+        return success(
+            request,
+            operation_id,
+            "workflow",
+            EffectState::Changed,
+            if verified {
+                VerificationState::Verified
+            } else {
+                VerificationState::Unverified
+            },
+            data,
+        );
+    }
+    ActionResult {
+        operation_id,
+        intent: request.intent.clone(),
+        route: "workflow".to_owned(),
+        target: request.target.clone(),
+        preflight: "passed".to_owned(),
+        delivery: DeliveryState::Delivered,
+        effect: EffectState::Unknown,
+        verification: VerificationState::Failed,
+        disturbance: json!({ "foreground_changed": false }),
+        recovery: RecoveryState::RequiresReconciliation,
+        data,
+        error: Some(ComptrolError {
+            code: "speculative_batch_failed".to_owned(),
+            message: format!(
+                "Speculative batch failed at step {:?}; executed state and reconcile plan are in data",
+                outcome.failed_at
+            ),
+            recovery: Some(
+                "Apply data.reconcile_plan newest-first or re-observe and retry the remaining steps"
+                    .to_owned(),
+            ),
+        }),
+    }
+}
+
 fn resolve_workflow_parameters(template: &Value, parameters: &Value) -> Value {
     match template {
         Value::Object(object) => {
@@ -3286,7 +4397,7 @@ fn resolve_workflow_parameters(template: &Value, parameters: &Value) -> Value {
 }
 
 fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> ActionResult {
-    let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") else {
+    let Some(endpoint) = browser::active_endpoint() else {
         return ActionResult::refused(
             request,
             operation_id,
@@ -3338,7 +4449,7 @@ fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> A
         );
     };
     match browser::fixture_submit(
-        &endpoint.to_string_lossy(),
+        &endpoint,
         target_id,
         browser_context_id,
         revision,
@@ -3361,12 +4472,31 @@ fn browser_fixture_submit(request: &OperationRequest, operation_id: String) -> A
     }
 }
 
+/// The endpoint one browser operation should use.
+///
+/// A local Chrome is started here, on first use, rather than when the
+/// process starts: a session that only touches the desktop, the terminal,
+/// or an adapter must never make a browser window appear.
+fn browser_cdp_endpoint() -> Option<std::ffi::OsString> {
+    if let Some(endpoint) = browser::active_endpoint() {
+        return Some(std::ffi::OsString::from(endpoint));
+    }
+    if browser_bridge::bridge_is_active() {
+        return Some(std::ffi::OsString::from(
+            browser_bridge::COMPANION_BRIDGE_ENDPOINT,
+        ));
+    }
+    if chrome_autostart::ensure()
+        && let Some(endpoint) = browser::active_endpoint()
+    {
+        return Some(std::ffi::OsString::from(endpoint));
+    }
+    browser_bridge::bridge_is_active()
+        .then(|| std::ffi::OsString::from(browser_bridge::COMPANION_BRIDGE_ENDPOINT))
+}
+
 fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> ActionResult {
-    let endpoint = if let Some(endpoint) = std::env::var_os("COMPTROL_CDP_ENDPOINT") {
-        endpoint
-    } else if browser_bridge::bridge_is_active() {
-        std::ffi::OsString::from(browser_bridge::COMPANION_BRIDGE_ENDPOINT)
-    } else {
+    let Some(endpoint) = browser_cdp_endpoint() else {
         return ActionResult::refused(
             request,
             operation_id,
@@ -3377,6 +4507,35 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    if request.intent == "browser.cdp.discovery" {
+        return match browser::discover(&endpoint.to_string_lossy()) {
+            Ok(targets) => {
+                let pages = targets
+                    .into_iter()
+                    .filter(|target| target.target_type.as_deref() == Some("page"))
+                    .map(|target| {
+                        json!({
+                            "id": target.id,
+                            "type": target.target_type,
+                            "browser_context_id": target.browser_context_id,
+                            "url": target.url,
+                            "title": target.title,
+                            "revision": target.revision,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                success(
+                    request,
+                    operation_id,
+                    "browser_protocol",
+                    EffectState::None,
+                    VerificationState::Verified,
+                    json!({ "targets": pages, "verified": true }),
+                )
+            }
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
     if request.intent == "browser.cdp.frame_evaluate" {
         let Some(frame_id) = request.params.get("frame_id").and_then(Value::as_str) else {
             return ActionResult::refused(
@@ -3544,7 +4703,12 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
-    let Some(revision) = request.params.get("revision").and_then(Value::as_str) else {
+    let Some(revision) = request
+        .params
+        .get("revision")
+        .and_then(Value::as_str)
+        .or_else(|| (request.intent == "browser.cdp.wait_for").then_some(""))
+    else {
         return ActionResult::refused(
             request,
             operation_id,
@@ -3555,6 +4719,35 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
+    // Read-only observation re-binds to the live revision before dispatch.
+    // An SPA that changes URL between discovery and read (a redirect that
+    // lands mid-load, a pushState) otherwise turns every read during the
+    // load into stale_reference, which made hands-off flows impossible.
+    // Mutations keep the caller-pinned revision so they can never act on a
+    // page state other than the one the caller observed.
+    let revision: String = if matches!(
+        request.intent.as_str(),
+        "browser.cdp.compact_snapshot"
+            | "browser.cdp.accessibility_snapshot"
+            | "browser.cdp.wait_for"
+            | "browser.cdp.screenshot"
+    ) {
+        browser::discover(&endpoint.to_string_lossy())
+            .ok()
+            .and_then(|targets| {
+                targets
+                    .iter()
+                    .find(|target| {
+                        target.id == target_id
+                            && target.browser_context_id.as_deref() == Some(browser_context_id)
+                    })
+                    .and_then(|target| target.revision.clone())
+            })
+            .unwrap_or_else(|| revision.to_owned())
+    } else {
+        revision.to_owned()
+    };
+    let revision: &str = &revision;
     if request.intent == "browser.cdp.close_tab" {
         return match browser::close_tab(
             &endpoint.to_string_lossy(),
@@ -3569,6 +4762,53 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
                 EffectState::Changed,
                 VerificationState::Verified,
                 data,
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
+    if request.intent == "browser.cdp.activate_tab" {
+        // Foreground disclosure: activating a tab may bring its window forward,
+        // so the result states the disturbance explicitly instead of hiding it.
+        let deactivate = request
+            .params
+            .get("deactivate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !deactivate && request.background.as_deref() == Some("strict_background") {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "background_unavailable".to_owned(),
+                    message: "Activating a tab can change which page is visible on screen".to_owned(),
+                    recovery: Some(
+                        "Use background-safe read and semantic actions, or drop strict_background knowingly".to_owned(),
+                    ),
+                },
+            );
+        }
+        return match browser::activate_tab(
+            &endpoint.to_string_lossy(),
+            target_id,
+            browser_context_id,
+            revision,
+            deactivate,
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                VerificationState::Verified,
+                json!({
+                    "activation": data,
+                    "disturbance": {
+                        "foreground_changed": !deactivate,
+                        "disclosed": true,
+                        "mouse": "untouched",
+                        "clipboard": "untouched"
+                    }
+                }),
             ),
             Err(error) => browser_failure(request, operation_id, error),
         };
@@ -3756,6 +4996,71 @@ fn browser_cdp_action(request: &OperationRequest, operation_id: String) -> Actio
             x,
             y,
             button,
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                VerificationState::Unverified,
+                data,
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
+    // Real trusted-input routes: type into the focused element (canvas
+    // editors included) and press named keys. The caller places the caret
+    // first via semantic_click or coordinate_click.
+    if request.intent == "browser.cdp.type_text" {
+        let Some(text) = request.params.get("text").and_then(Value::as_str) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "type_text needs a text parameter".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        return match browser::type_text(
+            &endpoint.to_string_lossy(),
+            target_id,
+            browser_context_id,
+            Some(revision),
+            text,
+        ) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "browser_protocol",
+                EffectState::Changed,
+                VerificationState::Unverified,
+                data,
+            ),
+            Err(error) => browser_failure(request, operation_id, error),
+        };
+    }
+    if request.intent == "browser.cdp.press_key" {
+        let Some(key) = request.params.get("key").and_then(Value::as_str) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "press_key needs a key parameter".to_owned(),
+                    recovery: Some("Named keys: Enter, Tab, Escape, Backspace, Delete, arrows, Home, End, PageUp, PageDown, or a single character; optional modifiers array (ctrl/alt/shift/meta)".to_owned()),
+                },
+            );
+        };
+        let modifiers = request.params.get("modifiers").and_then(Value::as_array);
+        return match browser::press_key(
+            &endpoint.to_string_lossy(),
+            target_id,
+            browser_context_id,
+            Some(revision),
+            key,
+            modifiers,
         ) {
             Ok(data) => success(
                 request,
@@ -4073,31 +5378,117 @@ fn browser_cdp_semantic_click(
         timeout,
     ) {
         Ok(data) => {
-            // The dispatch carries an independent in-page readback: a unique
-            // locator match plus full actionability plus a clicked
-            // confirmation from the DOM itself. When that readback reports
-            // verified, the outcome is application-state verified, not merely
-            // delivered.
+            // Honesty contract: the in-page readback (unique match +
+            // actionability + clicked confirmation) proves the DISPATCH
+            // happened on the right element, but it is produced by the same
+            // evaluate that performed the action. It attests delivery, not the
+            // user-visible outcome.
+            //
+            // C5: when the caller supplies a postcondition ({"text_contains":
+            // ...} or {"url_contains": ...}), we verify through a SECOND,
+            // independent channel — a fresh target observation (discover) for
+            // url_contains, or a separate Runtime.evaluate for text_contains —
+            // and only then mark Verified.
             let verified = data.get("verified").and_then(Value::as_bool) == Some(true);
+            let postcondition = request.postcondition.as_ref();
+            let url_contains = postcondition
+                .and_then(|value| value.get("url_contains"))
+                .and_then(Value::as_str);
+            let text_contains = postcondition
+                .and_then(|value| value.get("text_contains"))
+                .and_then(Value::as_str);
+            let mut independent = json!({
+                "requested": postcondition.is_some(),
+                "checked": false,
+            });
+            let mut independently_verified = false;
+            if verified && (url_contains.is_some() || text_contains.is_some()) {
+                let endpoint_string = endpoint.to_string_lossy().into_owned();
+                let deadline = Instant::now()
+                    + Duration::from_millis(
+                        request
+                            .params
+                            .get("timeout_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(8_000)
+                            .clamp(100, 30_000),
+                    );
+                loop {
+                    let mut ok = true;
+                    if let Some(contains) = url_contains {
+                        // Second channel: fresh discovery snapshot, not the
+                        // actor's evaluate result.
+                        ok = browser::discover(&endpoint_string)
+                            .ok()
+                            .is_some_and(|targets| {
+                                targets.iter().any(|target| {
+                                    target.id == *target_id
+                                        && target
+                                            .url
+                                            .as_deref()
+                                            .is_some_and(|url| browser::url_matches(url, contains))
+                                })
+                            });
+                    }
+                    if text_contains.is_some() {
+                        // Second channel: a separate evaluate that only reads.
+                        let expression = format!(
+                            "document.body && document.body.innerText.includes({})",
+                            serde_json::to_string(text_contains.unwrap_or_default())
+                                .unwrap_or_else(|_| "''".to_owned())
+                        );
+                        ok &= browser::cdp_call(
+                            &endpoint_string,
+                            target_id,
+                            Some(browser_context_id),
+                            None,
+                            "Runtime.evaluate",
+                            json!({ "expression": expression, "returnByValue": true }),
+                        )
+                        .ok()
+                        .and_then(|data| {
+                            data.get("result")
+                                .and_then(|result| result.get("value"))
+                                .cloned()
+                        })
+                        .map(|value| value == Value::Bool(true))
+                        .unwrap_or(false);
+                    }
+                    independently_verified = ok;
+                    if ok || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                independent["checked"] = json!(true);
+                independent["met"] = json!(independently_verified);
+            }
             success(
                 request,
                 operation_id,
                 "browser_protocol",
                 EffectState::Changed,
-                if verified {
+                if independently_verified {
                     VerificationState::Verified
+                } else if postcondition.is_some() {
+                    VerificationState::Failed
                 } else {
                     VerificationState::Unverified
                 },
                 json!({
                     "dispatch": data,
-                    "postcondition": if request.postcondition.is_some() {
-                        "requested_but_not_checked"
+                    "postcondition": if independently_verified {
+                        "verified"
+                    } else if postcondition.is_some() {
+                        "failed"
                     } else {
                         "none"
                     },
-                    "verification": if verified {
-                        "in_page_actionability_readback"
+                    "independent_verification": independent,
+                    "verification": if independently_verified {
+                        "independent_second_channel_readback"
+                    } else if verified {
+                        "actor_attested_in_page_readback"
                     } else {
                         "unverified"
                     }
@@ -4170,22 +5561,21 @@ fn browser_cdp_semantic_fill(
         timeout,
     ) {
         Ok(data) => {
+            // Same honesty contract as semantic_click: the in-page value
+            // readback is actor-attested proof of dispatch, not independent
+            // outcome verification.
             let verified = data.get("verified").and_then(Value::as_bool) == Some(true);
             success(
                 request,
                 operation_id,
                 "browser_protocol",
                 EffectState::Changed,
-                if verified {
-                    VerificationState::Verified
-                } else {
-                    VerificationState::Unverified
-                },
+                VerificationState::Unverified,
                 json!({
                     "dispatch": data,
                     "value_length": value.chars().count(),
                     "verification": if verified {
-                        "semantic_value_readback"
+                        "actor_attested_in_page_readback"
                     } else {
                         "unverified"
                     }
@@ -4306,6 +5696,11 @@ enum BrowserWorkflowStep {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    WaitText {
+        text: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 fn browser_cdp_workflow(
@@ -4313,34 +5708,6 @@ fn browser_cdp_workflow(
     operation_id: String,
     endpoint: &std::ffi::OsStr,
 ) -> ActionResult {
-    let Some(target_id) = request.params.get("target_id").and_then(Value::as_str) else {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "invalid_input".to_owned(),
-                message: "Browser workflows need a target id".to_owned(),
-                recovery: Some(
-                    "Inspect browser targets and include the exact target identity".to_owned(),
-                ),
-            },
-        );
-    };
-    let Some(browser_context_id) = request
-        .params
-        .get("browser_context_id")
-        .and_then(Value::as_str)
-    else {
-        return ActionResult::refused(
-            request,
-            operation_id,
-            ComptrolError {
-                code: "invalid_input".to_owned(),
-                message: "Browser workflows need a browser context id".to_owned(),
-                recovery: Some("Inspect targets and include the exact browser context".to_owned()),
-            },
-        );
-    };
     let Some(steps_value) = request.params.get("steps") else {
         return ActionResult::refused(
             request,
@@ -4348,7 +5715,9 @@ fn browser_cdp_workflow(
             ComptrolError {
                 code: "invalid_input".to_owned(),
                 message: "Browser workflows need a steps array".to_owned(),
-                recovery: Some("Use navigate, click, fill, and wait_url steps".to_owned()),
+                recovery: Some(
+                    "Use data-only navigate, click, fill, wait_url, and wait_text steps".to_owned(),
+                ),
             },
         );
     };
@@ -4359,7 +5728,9 @@ fn browser_cdp_workflow(
             ComptrolError {
                 code: "invalid_input".to_owned(),
                 message: "Browser workflow steps did not match the closed schema".to_owned(),
-                recovery: Some("Use data-only navigate, click, and wait_url steps".to_owned()),
+                recovery: Some(
+                    "Use data-only navigate, click, fill, wait_url, and wait_text steps".to_owned(),
+                ),
             },
         );
     };
@@ -4375,23 +5746,78 @@ fn browser_cdp_workflow(
         );
     }
     let endpoint = endpoint.to_string_lossy();
-    let initial_revision = request.params.get("revision").and_then(Value::as_str);
+    let target_resolution = Instant::now();
     let targets = match browser::discover_cached_targets(&endpoint) {
         Ok(targets) => targets,
         Err(error) => return browser_failure(request, operation_id, error),
     };
-    let target = match crate::bind_browser_target(
-        &targets,
-        target_id,
-        Some(browser_context_id),
-        initial_revision,
-    ) {
-        Ok(target) => target,
-        Err(error) => return browser_failure(request, operation_id, error),
+    let (target, target_was_resolved) = if let Some(target_id) =
+        request.params.get("target_id").and_then(Value::as_str)
+    {
+        let browser_context_id = request
+            .params
+            .get("browser_context_id")
+            .and_then(Value::as_str);
+        match crate::bind_browser_target(
+            &targets,
+            target_id,
+            browser_context_id,
+            request.params.get("revision").and_then(Value::as_str),
+        ) {
+            Ok(target) => (target, false),
+            Err(error) => return browser_failure(request, operation_id, error),
+        }
+    } else {
+        let Some(url_match) = request
+            .params
+            .get("target_url_contains")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "Browser workflows need target_id or target_url_contains".to_owned(),
+                    recovery: Some("Provide an exact id or a unique URL/title matcher".to_owned()),
+                },
+            );
+        };
+        let title_match = request
+            .params
+            .get("target_title_contains")
+            .and_then(Value::as_str);
+        let context_match = request
+            .params
+            .get("browser_context_id")
+            .and_then(Value::as_str);
+        match unique_workflow_target(&targets, url_match, title_match, context_match) {
+            Ok(target) => (target, true),
+            Err(error) => return browser_failure(request, operation_id, error),
+        }
     };
+    let target_id = target.id.as_str();
+    let Some(browser_context_id) = target.browser_context_id.as_deref() else {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "target_context_missing".to_owned(),
+                message: "Selected browser target has no browser context identity".to_owned(),
+                recovery: Some("Inspect the live browser target inventory".to_owned()),
+            },
+        );
+    };
+    // F07: per-span timings so latency attribution is measured, not guessed.
+    let target_resolution_ms = target_resolution.elapsed().as_secs_f64() * 1000.0;
     let mut revision = target.revision;
     let mut completed = Vec::with_capacity(steps.len());
+    let mut step_timings = Vec::with_capacity(steps.len());
+    let mut postcondition_verified = false;
+    let mut observed_change = false;
     for (index, step) in steps.iter().enumerate() {
+        let step_started = Instant::now();
         let result = match step {
             BrowserWorkflowStep::Navigate {
                 url,
@@ -4413,6 +5839,7 @@ fn browser_cdp_workflow(
                 if let Ok(state) = live
                     && state.get("satisfied").and_then(Value::as_bool) == Some(true)
                 {
+                    postcondition_verified = true;
                     Ok(json!({
                         "action": "navigate",
                         "url": url,
@@ -4430,22 +5857,30 @@ fn browser_cdp_workflow(
                         json!({"url": url}),
                     ) {
                         Ok(data) => {
-                            if let Some(expected) = url_contains
-                                && let Err(error) = browser_wait_for_url(
-                                    &endpoint,
-                                    target_id,
-                                    browser_context_id,
-                                    expected,
-                                    timeout_ms.unwrap_or(2_000),
-                                )
-                            {
-                                return browser_failure(request, operation_id, error);
-                            }
+                            observed_change = true;
+                            let expected = url_contains.clone().unwrap_or_else(|| {
+                                url.split_once("://")
+                                    .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+                                    .unwrap_or(url)
+                                    .to_owned()
+                            });
+                            let observed = match browser_wait_for_url(
+                                &endpoint,
+                                target_id,
+                                browser_context_id,
+                                &expected,
+                                timeout_ms.unwrap_or(2_000),
+                            ) {
+                                Ok(observed) => observed,
+                                Err(error) => return browser_failure(request, operation_id, error),
+                            };
+                            postcondition_verified = true;
                             Ok(json!({
                                 "action":"navigate",
                                 "url": url,
                                 "navigated": true,
-                                "protocol": data
+                                "protocol": data,
+                                "postcondition": observed
                             }))
                         }
                         Err(error) => Err(error),
@@ -4462,7 +5897,8 @@ fn browser_cdp_workflow(
                 revision.as_deref(),
                 locator,
                 timeout_ms.unwrap_or(1_500).clamp(100, 10_000),
-            ),
+            )
+            .inspect(|_| observed_change = true),
             BrowserWorkflowStep::Fill {
                 locator,
                 value,
@@ -4475,7 +5911,8 @@ fn browser_cdp_workflow(
                 locator,
                 value,
                 timeout_ms.unwrap_or(1_500).clamp(100, 10_000),
-            ),
+            )
+            .inspect(|_| observed_change = true),
             BrowserWorkflowStep::WaitUrl {
                 contains,
                 timeout_ms,
@@ -4486,28 +5923,145 @@ fn browser_cdp_workflow(
                 contains,
                 timeout_ms.unwrap_or(2_000),
             )
-            .map(|_| json!({"action":"wait_url", "contains": contains})),
+            .map(|observed| {
+                postcondition_verified = true;
+                json!({"action":"wait_url", "contains": contains, "observed": observed})
+            }),
+            BrowserWorkflowStep::WaitText { text, timeout_ms } => browser::wait_for_text(
+                &endpoint,
+                target_id,
+                browser_context_id,
+                text,
+                Duration::from_millis(timeout_ms.unwrap_or(2_000).clamp(100, 30_000)),
+            )
+            .map(|observed| {
+                postcondition_verified = true;
+                json!({"action":"wait_text", "observed": observed})
+            }),
         };
+        let step_elapsed_ms = step_started.elapsed().as_secs_f64() * 1000.0;
         let data = match result {
             Ok(data) => data,
             Err(error) => return browser_failure(request, operation_id, error),
         };
-        completed.push(json!({"index": index, "result": data}));
-        if let Ok(current) = browser::discover_cached_targets(&endpoint)
-            && let Ok(bound) =
-                crate::bind_browser_target(&current, target_id, Some(browser_context_id), None)
-        {
-            revision = bound.revision;
+        // Actor acknowledgement cannot prove the goal, even in a one-step
+        // workflow. Require a final independent observation after mutations.
+        if !matches!(
+            step,
+            BrowserWorkflowStep::Navigate { .. }
+                | BrowserWorkflowStep::WaitUrl { .. }
+                | BrowserWorkflowStep::WaitText { .. }
+        ) {
+            postcondition_verified = false;
         }
+        // Per-step revision refresh through a full bridge discovery; timed
+        // separately so its cost is visible in the result envelope.
+        let refresh_started = Instant::now();
+        let refreshed_revision =
+            browser::discover_cached_targets(&endpoint)
+                .ok()
+                .and_then(|current| {
+                    crate::bind_browser_target(&current, target_id, Some(browser_context_id), None)
+                        .ok()
+                        .map(|bound| bound.revision)
+                });
+        let revision_refresh_ms = refresh_started.elapsed().as_secs_f64() * 1000.0;
+        if let Some(bound) = refreshed_revision {
+            revision = bound;
+        }
+        step_timings.push(json!({
+            "index": index,
+            "step_ms": step_elapsed_ms,
+            "revision_refresh_ms": revision_refresh_ms,
+        }));
+        completed.push(json!({"index": index, "result": data}));
     }
     success(
         request,
         operation_id,
         "browser_protocol",
-        EffectState::Changed,
-        VerificationState::Verified,
-        json!({"steps": completed, "step_count": completed.len(), "verified": true}),
+        if observed_change {
+            EffectState::Changed
+        } else {
+            EffectState::None
+        },
+        if postcondition_verified {
+            VerificationState::Verified
+        } else {
+            VerificationState::Unverified
+        },
+        json!({
+            "steps": completed,
+            "step_count": completed.len(),
+            "step_timings_ms": step_timings,
+            "target_resolution_ms": target_resolution_ms,
+            "verified": postcondition_verified,
+            "target_revision": revision,
+            "verification_basis": if !postcondition_verified {
+                "no_goal_postcondition"
+            } else {
+                "observed_workflow_postcondition"
+            },
+            "target_resolved_internally": target_was_resolved,
+            "target_match": if target_was_resolved {
+                json!({
+                    "url_contains": request.params.get("target_url_contains"),
+                    "title_contains": request.params.get("target_title_contains")
+                })
+            } else {
+                Value::Null
+            }
+        }),
     )
+}
+
+fn unique_workflow_target(
+    targets: &[BrowserTarget],
+    url_match: &str,
+    title_match: Option<&str>,
+    context_match: Option<&str>,
+) -> Result<BrowserTarget, ComptrolError> {
+    let candidates = targets
+        .iter()
+        .filter(|candidate| candidate.target_type.as_deref() == Some("page"))
+        .filter(|candidate| {
+            candidate
+                .url
+                .as_deref()
+                .is_some_and(|url| browser::url_matches(url, url_match))
+        })
+        .filter(|candidate| {
+            title_match.is_none_or(|title_match| {
+                candidate
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.contains(title_match))
+            })
+        })
+        .filter(|candidate| {
+            context_match
+                .is_none_or(|context| candidate.browser_context_id.as_deref() == Some(context))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return Ok(candidates.into_iter().next().expect("one target"));
+    }
+    let code = if candidates.is_empty() {
+        "target_missing"
+    } else {
+        "ambiguous_target"
+    };
+    Err(ComptrolError {
+        code: code.to_owned(),
+        message: format!(
+            "Browser target matcher resolved to {} page targets",
+            candidates.len()
+        ),
+        recovery: Some(
+            "Narrow target_url_contains, target_title_contains, or browser_context_id".to_owned(),
+        ),
+    })
 }
 
 fn browser_wait_for_url(
@@ -4748,21 +6302,62 @@ fn browser_cdp_dom_action(
             );
         }
         if request.intent != "browser.cdp.wait_for" || Instant::now() >= deadline {
-            return ActionResult::refused(
+            // The read/action was dispatched. A false postcondition cannot
+            // be represented as a failed preflight or "not attempted".
+            let mut result = success(
                 request,
                 operation_id,
-                ComptrolError {
-                    code: "verification_failed".to_owned(),
-                    message: "The browser did not confirm the requested DOM condition".to_owned(),
-                    recovery: Some("Inspect the exact page state and retry once".to_owned()),
+                "browser_protocol",
+                if request.intent == "browser.cdp.wait_for" {
+                    EffectState::None
+                } else {
+                    EffectState::Unknown
                 },
+                VerificationState::Failed,
+                json!({"result": data, "postcondition": "failed"}),
             );
+            result.error = Some(ComptrolError {
+                code: "verification_failed".to_owned(),
+                message: "The browser did not confirm the requested DOM condition".to_owned(),
+                recovery: Some("Inspect the exact page state before retrying".to_owned()),
+            });
+            if request.intent != "browser.cdp.wait_for" {
+                result.recovery = RecoveryState::RequiresReconciliation;
+            }
+            return result;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
 fn browser_wait_expression(params: &Value) -> Result<String, &'static str> {
+    let mut conditions = Vec::new();
+    for (key, expression) in [
+        ("url_contains", "location.href"),
+        ("text_contains", "(document.body?.innerText ?? '')"),
+    ] {
+        if let Some(value) = params.get(key).and_then(Value::as_str) {
+            let value = serde_json::to_string(value).map_err(|_| "Invalid wait string")?;
+            conditions.push(format!("{expression}.includes({value})"));
+        }
+    }
+    if let Some(expression) = params.get("ready_expression").and_then(Value::as_str) {
+        conditions.push(format!("Boolean({expression})"));
+    }
+    if !conditions.is_empty() {
+        if params.get("selector").is_some() {
+            let mut dom = params.clone();
+            for key in ["url_contains", "text_contains", "ready_expression"] {
+                dom.as_object_mut().unwrap().remove(key);
+            }
+            conditions.push(browser_wait_expression(&dom)?);
+        }
+        return Ok(conditions
+            .into_iter()
+            .map(|value| format!("({value})"))
+            .collect::<Vec<_>>()
+            .join(" && "));
+    }
     let selector = params
         .get("selector")
         .and_then(Value::as_str)
@@ -4982,7 +6577,10 @@ fn browser_failure(
 ) -> ActionResult {
     if matches!(
         error.code.as_str(),
-        "browser_dispatch_failed" | "browser_response_failed" | "browser_unavailable"
+        "browser_dispatch_failed"
+            | "browser_response_failed"
+            | "browser_unavailable"
+            | "browser_bridge_timeout"
     ) {
         return ActionResult {
             operation_id,
@@ -5141,6 +6739,48 @@ fn desktop_observe(request: &OperationRequest, operation_id: String) -> ActionRe
                 data["diagnostic"] = json!(error.to_string());
             }
         }
+    } else if cfg!(target_os = "windows") {
+        // C4 compact output: callers can bound the inventory (default 256);
+        // min_windows=true drops invisible windows to shrink tool responses.
+        let max_windows = request
+            .params
+            .get("max_windows")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(256);
+        let min_windows_only = request
+            .params
+            .get("visible_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut inventory =
+            match comptrol_platform_windows::enumerate_top_level_windows_bounded(max_windows) {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    data["process_observation"] = json!("unavailable");
+                    data["diagnostic"] = json!(error);
+                    return success(
+                        request,
+                        operation_id,
+                        "platform_observe",
+                        EffectState::None,
+                        VerificationState::Unverified,
+                        data,
+                    );
+                }
+            };
+        if min_windows_only
+            && let Some(windows) = inventory.get_mut("windows").and_then(Value::as_array_mut)
+        {
+            windows.retain(|window| window.get("visible").and_then(Value::as_bool) == Some(true));
+            inventory["window_count"] = json!(windows.len());
+            inventory["visible_only"] = json!(true);
+        }
+        data["windows"] = inventory["windows"].clone();
+        data["window_count"] = inventory["window_count"].clone();
+        data["truncated"] = inventory["truncated"].clone();
+        data["window_enumeration"] = inventory["enumeration"].clone();
+        data["process_observation"] = json!("verified");
     } else if let Ok(output) = Command::new("ps").args(["-A", "-o", "comm="]).output()
         && output.status.success()
     {
@@ -5381,9 +7021,296 @@ fn desktop_notify(request: &OperationRequest, operation_id: String) -> ActionRes
 }
 
 /// Registry-backed launch: resolve the exact installed app, launch
-/// through the native mechanism, and verify the process identity is
-/// alive afterwards. The registry refuses ambiguous or missing apps
-/// instead of guessing.
+/// through the native mechanism, correlate a top-level window, and wait
+/// for a non-empty UIA observation before reporting content-ready.
+#[cfg(windows)]
+fn windows_app_matches_window(
+    app: &comptrol_app_registry::AppEntry,
+    window: &Value,
+    _process_id: Option<u32>,
+    exact_window_handle: Option<u64>,
+) -> bool {
+    if window["visible"].as_bool() != Some(true) {
+        return false;
+    }
+    if exact_window_handle.is_some_and(|handle| window["window_handle"].as_u64() != Some(handle)) {
+        return false;
+    }
+    if exact_window_handle.is_some() && windows_packaged_host_matches_app(app, window) {
+        return true;
+    }
+    let aumid_matches = window["app_user_model_id"]
+        .as_str()
+        .is_some_and(|aumid| aumid.eq_ignore_ascii_case(&app.id));
+    let executable_matches = app.executable.as_deref().is_some_and(|expected| {
+        window["executable"]
+            .as_str()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected.to_string_lossy()))
+    });
+    aumid_matches || executable_matches
+}
+
+#[cfg(windows)]
+fn windows_packaged_host_matches_app(
+    app: &comptrol_app_registry::AppEntry,
+    window: &Value,
+) -> bool {
+    app.id.contains('!')
+        && window["visible"].as_bool() == Some(true)
+        && window["class_name"].as_str() == Some("ApplicationFrameWindow")
+        && window["executable"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("\\ApplicationFrameHost.exe"))
+        && window["title"]
+            .as_str()
+            .is_some_and(|title| title.eq_ignore_ascii_case(&app.display_name))
+}
+
+#[cfg(windows)]
+fn windows_app_windows(
+    app: &comptrol_app_registry::AppEntry,
+    process_id: Option<u32>,
+    exact_window_handle: Option<u64>,
+) -> Result<Vec<Value>, String> {
+    let inventory = comptrol_platform_windows::enumerate_top_level_windows()?;
+    let inventory_windows = inventory["windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    if exact_window_handle.is_some() {
+        return Ok(inventory_windows
+            .iter()
+            .filter(|window| {
+                windows_app_matches_window(app, window, process_id, exact_window_handle)
+            })
+            .cloned()
+            .collect());
+    }
+    if let Some(process_id) = process_id {
+        let exact_process = inventory_windows
+            .iter()
+            .filter(|window| {
+                window["visible"].as_bool() == Some(true)
+                    && window["process_id"].as_u64() == Some(process_id as u64)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exact_process.is_empty() {
+            return Ok(exact_process);
+        }
+    }
+    Ok(inventory_windows
+        .iter()
+        .filter(|window| windows_app_matches_window(app, window, None, None))
+        .cloned()
+        .collect())
+}
+
+#[cfg(windows)]
+fn windows_foreground_packaged_host(app: &comptrol_app_registry::AppEntry) -> Option<Value> {
+    if !app.id.contains('!') {
+        return None;
+    }
+    let foreground = comptrol_platform_windows::foreground_window_handle()?;
+    let inventory = comptrol_platform_windows::enumerate_top_level_windows().ok()?;
+    inventory["windows"]
+        .as_array()?
+        .iter()
+        .find(|candidate| {
+            candidate["window_handle"].as_u64() == Some(foreground)
+                && windows_packaged_host_matches_app(app, candidate)
+        })
+        .cloned()
+}
+
+#[cfg(windows)]
+fn windows_app_readiness(
+    app: &comptrol_app_registry::AppEntry,
+    process_id: Option<u32>,
+    exact_window_handle: Option<u64>,
+    timeout_ms: u64,
+    wait_for_content: bool,
+) -> (Value, bool) {
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(timeout_ms.clamp(100, 30_000));
+    let mut first_window_ms = None;
+    let mut last_observation = Value::Null;
+    let mut event_wakeups = 0usize;
+    let mut fallback_waits = 0usize;
+    loop {
+        // The packaged-app activation API returns the app PID, while UIA's
+        // usable root may be the foreground ApplicationFrameHost window. This
+        // correlation is permitted only during an explicit AUMID launch and
+        // only for the exact foreground host with the expected title/class.
+        if let (Some(activation_pid), Some(host)) =
+            (process_id, windows_foreground_packaged_host(app))
+            && let (Some(host_pid), Some(host_handle)) =
+                (host["process_id"].as_u64(), host["window_handle"].as_u64())
+            && let Ok(data) =
+                comptrol_platform_windows::execute(comptrol_platform_windows::Request {
+                    process_id: host_pid as u32,
+                    window_handle: Some(host_handle),
+                    name: None,
+                    automation_id: None,
+                    role: None,
+                    action: comptrol_platform_windows::Action::Inspect,
+                    value: None,
+                    expected_attribute: None,
+                    expected_value: None,
+                    match_index: None,
+                    expected_match_count: None,
+                    max_nodes: 96,
+                    allow_physical_click: false,
+                })
+            && data["control_count"].as_u64().unwrap_or(0) > 0
+        {
+            return (
+                json!({
+                                "ready":true,
+                                "stage":"content_ready",
+                                "readiness_source":"foreground_application_frame_host_uia",
+                                "window":host,
+                                "activation_process_id":activation_pid,
+                                "controls_matched":data["matched_count"],
+                                "controls_actionable":data["actionable_count"],
+                                "window_poll_ms":first_window_ms,
+                                "content_observed_ms":started.elapsed().as_secs_f64()*1000.0,
+                                "ui_observation_ms":data["elapsed_ms"],
+                                "event_wakeups":event_wakeups,
+                                "fallback_waits":fallback_waits
+                }),
+                true,
+            );
+        }
+        let windows = match windows_app_windows(app, process_id, exact_window_handle) {
+            Ok(windows) => windows,
+            Err(error) => {
+                return (
+                    json!({"ready":false,"stage":"window_inventory_failed","error":error}),
+                    false,
+                );
+            }
+        };
+        if windows.len() > 1 {
+            return (
+                json!({
+                    "ready":false,
+                    "stage":"ambiguous_windows",
+                    "candidate_window_handles":windows.iter().filter_map(|window| window["window_handle"].as_u64()).collect::<Vec<_>>(),
+                    "window_poll_ms":started.elapsed().as_secs_f64()*1000.0
+                }),
+                false,
+            );
+        }
+        if let Some(window) = windows.first() {
+            first_window_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1000.0);
+            let Some(window_handle) = window["window_handle"].as_u64() else {
+                return (
+                    json!({"ready":false,"stage":"window_handle_missing"}),
+                    false,
+                );
+            };
+            let Some(owner_pid) = window["process_id"].as_u64() else {
+                return (
+                    json!({"ready":false,"stage":"window_process_identity_missing"}),
+                    false,
+                );
+            };
+            let observation =
+                comptrol_platform_windows::execute(comptrol_platform_windows::Request {
+                    process_id: owner_pid as u32,
+                    window_handle: Some(window_handle),
+                    name: None,
+                    automation_id: None,
+                    role: None,
+                    action: comptrol_platform_windows::Action::Inspect,
+                    value: None,
+                    expected_attribute: None,
+                    expected_value: None,
+                    match_index: None,
+                    expected_match_count: None,
+                    max_nodes: 96,
+                    allow_physical_click: false,
+                });
+            match observation {
+                Ok(data) if data["control_count"].as_u64().unwrap_or(0) > 0 => {
+                    return (
+                        json!({
+                            "ready":true,
+                            "stage":"content_ready",
+                            "readiness_source":"win_event_wake_with_bounded_inventory_fallback_and_uia_observation",
+                            "window":window,
+                            "controls_matched":data["matched_count"],
+                            "controls_actionable":data["actionable_count"],
+                            "window_poll_ms":first_window_ms,
+                            "content_observed_ms":started.elapsed().as_secs_f64()*1000.0,
+                            "ui_observation_ms":data["elapsed_ms"]
+                            ,"event_wakeups":event_wakeups
+                            ,"fallback_waits":fallback_waits
+                        }),
+                        true,
+                    );
+                }
+                Ok(data) => {
+                    last_observation = data;
+                    // Packaged Windows apps can expose their usable UIA tree
+                    // under the foreground ApplicationFrameHost HWND instead
+                    // of their AUMID-bearing CoreWindow. Correlate only the
+                    // exact current foreground host, and only after this app's
+                    // unique AUMID window was found above. Never infer a host
+                    // from title alone or choose among stale host HWNDs.
+                }
+                Err(error) if error.starts_with("uia_worker_timeout:") => {
+                    last_observation = json!({"error":"provider_timeout"});
+                }
+                Err(error) => last_observation = json!({"error":error}),
+            }
+            if !wait_for_content {
+                return (
+                    json!({
+                        "ready":false,
+                        "stage":"window_created_content_unready",
+                        "readiness_source":"one_fresh_uia_observation_for_reused_window",
+                        "window":window,
+                        "last_observation":last_observation,
+                        "window_poll_ms":first_window_ms,
+                        "elapsed_ms":started.elapsed().as_secs_f64()*1000.0
+                    }),
+                    false,
+                );
+            }
+        }
+        if Instant::now() >= deadline {
+            return (
+                json!({
+                    "ready":false,
+                    "stage":if first_window_ms.is_some() { "window_created_content_unready" } else { "window_not_found" },
+                    "readiness_source":"win_event_wake_with_bounded_inventory_fallback",
+                    "window":windows.first(),
+                    "last_observation":last_observation,
+                    "window_poll_ms":first_window_ms,
+                    "event_wakeups":event_wakeups,
+                    "fallback_waits":fallback_waits,
+                    "elapsed_ms":started.elapsed().as_secs_f64()*1000.0
+                }),
+                false,
+            );
+        }
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(250) as u32;
+        if comptrol_platform_windows::wait_for_window_event(remaining_ms.max(1)) {
+            event_wakeups += 1;
+        } else {
+            fallback_waits += 1;
+        }
+    }
+}
+
+/// The registry refuses ambiguous or missing apps instead of guessing.
 fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult {
     if request.background.as_deref() == Some("strict_background") {
         return ActionResult::refused(
@@ -5414,6 +7341,23 @@ fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult 
             },
         );
     };
+    let instance_policy = request
+        .params
+        .get("instance_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("reuse_unique");
+    let exact_window_handle = request.params.get("window_handle").and_then(Value::as_u64);
+    if let Err(message) = validate_app_instance_policy(instance_policy, exact_window_handle) {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "invalid_input".to_owned(),
+                message,
+                recovery: Some("Use reuse_unique for exact-window targeting; otherwise choose reuse_unique, launch_new, or error_if_running".to_owned()),
+            },
+        );
+    }
     let resource = match request.params.get("resource") {
         Some(value) => {
             match serde_json::from_value::<comptrol_app_registry::Resource>(value.clone()) {
@@ -5433,6 +7377,7 @@ fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult 
         }
         None => comptrol_app_registry::Resource::None,
     };
+    let resolution_started = Instant::now();
     let resolved = match comptrol_app_registry::resolve(&app) {
         Ok(entry) => entry,
         Err(error @ comptrol_app_registry::RegistryError::NotFound(_))
@@ -5461,27 +7406,153 @@ fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult 
             );
         }
     };
-    let mut launch_request = comptrol_app_registry::LaunchRequest::new(resolved);
-    launch_request.resource = resource;
-    launch_request.settle_ms = request
+    let app_resolution_ms = resolution_started.elapsed().as_millis() as u64;
+    let readiness_timeout_ms = request
         .params
-        .get("settle_ms")
+        .get("readiness_timeout_ms")
         .and_then(Value::as_u64)
-        .unwrap_or(300)
-        .clamp(200, 2_000);
+        .unwrap_or(10_000)
+        .clamp(100, 30_000);
+    #[cfg(windows)]
+    if resource == comptrol_app_registry::Resource::None && instance_policy != "launch_new" {
+        let running = match windows_app_windows(&resolved, None, exact_window_handle) {
+            Ok(windows) => windows,
+            Err(error) => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "window_inventory_failed".to_owned(),
+                        message: error,
+                        recovery: Some("Refresh the Windows window inventory and retry".to_owned()),
+                    },
+                );
+            }
+        };
+        if instance_policy == "error_if_running" && !running.is_empty() {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "app_already_running".to_owned(),
+                    message: "The requested application already has a matching window".to_owned(),
+                    recovery: Some(
+                        "Use instance_policy=reuse_unique or select a distinct app instance"
+                            .to_owned(),
+                    ),
+                },
+            );
+        }
+        if instance_policy == "reuse_unique" && !running.is_empty() {
+            if running.len() != 1 {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "target_ambiguous".to_owned(),
+                        message: format!(
+                            "{} matching application windows are running; refusing to guess",
+                            running.len()
+                        ),
+                        recovery: Some(
+                            "Inspect the window inventory and pass the exact window_handle"
+                                .to_owned(),
+                        ),
+                    },
+                );
+            }
+            let window = &running[0];
+            let hwnd = window["window_handle"].as_u64().unwrap_or_default();
+            let pid = window["process_id"].as_u64().unwrap_or_default() as u32;
+            let created = window["process_created_at_100ns"].as_u64();
+            let focused = if request.background.as_deref() == Some("prefer_background") {
+                Value::Null
+            } else {
+                match comptrol_platform_windows::focus_window_handle(hwnd, pid, created) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return ActionResult::refused(
+                            request,
+                            operation_id,
+                            ComptrolError {
+                                code: "app_focus_failed".to_owned(),
+                                message: error,
+                                recovery: Some("Confirm that the exact existing window is still active and retry".to_owned()),
+                            },
+                        );
+                    }
+                }
+            };
+            let (readiness, ready) = windows_app_readiness(
+                &resolved,
+                Some(pid),
+                Some(hwnd),
+                readiness_timeout_ms,
+                false,
+            );
+            return success(
+                request,
+                operation_id,
+                "app_window_reuse",
+                EffectState::None,
+                if ready {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                json!({
+                    "app": resolved.id,
+                    "instance_policy": instance_policy,
+                    "existing_window": window,
+                    "focused": focused,
+                    "readiness": readiness,
+                    "timings_ms": {"app_resolution_ms": app_resolution_ms},
+                    "mouse": "untouched",
+                    "clipboard": "untouched"
+                }),
+            );
+        }
+    }
+    #[cfg(windows)]
+    if exact_window_handle.is_some()
+        && instance_policy == "reuse_unique"
+        && resource == comptrol_app_registry::Resource::None
+    {
+        return ActionResult::refused(
+            request,
+            operation_id,
+            ComptrolError {
+                code: "target_gone".to_owned(),
+                message: "The requested exact window is not a visible window for this app"
+                    .to_owned(),
+                recovery: Some("Refresh the exact window inventory and retry".to_owned()),
+            },
+        );
+    }
+    let mut launch_request = comptrol_app_registry::LaunchRequest::new(resolved.clone());
+    launch_request.resource = resource;
     launch_request.background = request.background.as_deref() == Some("prefer_background");
     match comptrol_app_registry::launch_verified(&launch_request) {
         Ok((outcome, verification)) => {
-            let verified = matches!(
-                verification,
-                comptrol_app_registry::LaunchVerification::Verified
+            #[cfg(windows)]
+            let (readiness, ready) = windows_app_readiness(
+                &resolved,
+                outcome.pid,
+                exact_window_handle,
+                readiness_timeout_ms,
+                true,
+            );
+            #[cfg(not(windows))]
+            let (readiness, ready) = (
+                json!({"ready":false,"stage":"platform_readiness_unavailable"}),
+                false,
             );
             success(
                 request,
                 operation_id,
                 "app_registry_launch",
                 EffectState::Changed,
-                if verified {
+                if ready {
                     VerificationState::Verified
                 } else {
                     VerificationState::Unverified
@@ -5490,7 +7561,10 @@ fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult 
                     "app": outcome.app_id,
                     "route": outcome.route,
                     "pid": outcome.pid,
-                    "verification": verification,
+                    "process_verification": verification,
+                    "instance_policy": instance_policy,
+                    "readiness": readiness,
+                    "timings_ms": {"app_resolution_ms":app_resolution_ms, "launch":outcome.timings_ms},
                     "mouse": "untouched",
                     "clipboard": "untouched",
                 }),
@@ -5506,6 +7580,27 @@ fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult 
             },
         ),
     }
+}
+
+fn validate_app_instance_policy(
+    instance_policy: &str,
+    exact_window_handle: Option<u64>,
+) -> Result<(), String> {
+    if !matches!(
+        instance_policy,
+        "reuse_unique" | "launch_new" | "error_if_running"
+    ) {
+        return Err(format!(
+            "unsupported app instance policy: {instance_policy}"
+        ));
+    }
+    if exact_window_handle.is_some() && instance_policy != "reuse_unique" {
+        return Err(
+            "window_handle selects an existing window and requires instance_policy=reuse_unique"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn app_resolve(request: &OperationRequest, operation_id: String) -> ActionResult {
@@ -5694,12 +7789,71 @@ fn app_launch_with_resource(
         .unwrap_or(300)
         .clamp(200, 2_000);
     launch_request.background = request.background.as_deref() == Some("prefer_background");
+    // P5.4: `window_state` chooses how the launched window is left. Hidden
+    // keeps a desktop app out of the user's way while its controls remain
+    // reachable through UIA.
+    let window_state = match request
+        .params
+        .get("window_state")
+        .and_then(Value::as_str)
+        .unwrap_or("normal")
+    {
+        "hidden" => comptrol_app_registry::WindowState::Hidden,
+        "minimized" => comptrol_app_registry::WindowState::Minimized,
+        "off_desktop" => comptrol_app_registry::WindowState::OffDesktop,
+        "normal" => comptrol_app_registry::WindowState::Normal,
+        other => {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: format!(
+                        "unknown window_state {other}; use normal, hidden, minimized, or off_desktop"
+                    ),
+                    recovery: None,
+                },
+            );
+        }
+    };
     match comptrol_app_registry::launch_verified(&launch_request) {
         Ok((outcome, verification)) => {
+            // P5.3: a PID is not a surface. Correlate the launch with the
+            // window that actually appeared, and report the real outcome
+            // rather than upgrading delivery into verification.
+            let correlate_options = comptrol_app_registry::CorrelateOptions {
+                deadline_ms: request
+                    .params
+                    .get("surface_timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(5_000)
+                    .clamp(200, 30_000),
+                state: window_state,
+                virtual_desktop: None,
+            };
+            let correlation = outcome
+                .pid
+                .map(|pid| comptrol_app_registry::correlate(pid, correlate_options));
+            let surface = correlation.as_ref().and_then(|result| result.as_ref().ok());
             let verified = matches!(
                 verification,
                 comptrol_app_registry::LaunchVerification::Verified
-            );
+            ) && surface.is_some();
+            let surface_report = match surface {
+                Some(surface) => {
+                    comptrol_app_registry::surface::surface_payload(surface, window_state)
+                }
+                None => json!({
+                    "window_handle": Value::Null,
+                    "window_state": window_state,
+                    "correlation": match correlation {
+                        Some(Err(error)) => error.as_str(),
+                        Some(Ok(_)) => "correlated",
+                        None => "no_pid",
+                    },
+                    "note": "No window was correlated to this launch; a tray-only or service launch reports this rather than claiming a surface",
+                }),
+            };
             success(
                 request,
                 operation_id,
@@ -5715,6 +7869,7 @@ fn app_launch_with_resource(
                     "route": outcome.route,
                     "pid": outcome.pid,
                     "verification": verification,
+                    "surface": surface_report,
                     "mouse": "untouched",
                     "clipboard": "untouched",
                 }),
@@ -5737,7 +7892,195 @@ fn app_open_resource(request: &OperationRequest, operation_id: String) -> Action
 }
 
 fn app_focus(request: &OperationRequest, operation_id: String) -> ActionResult {
-    app_launch_with_resource(request, operation_id, false, "app_registry_activate")
+    #[cfg(not(windows))]
+    {
+        return app_launch_with_resource(request, operation_id, false, "app_registry_activate");
+    }
+    #[cfg(windows)]
+    {
+        if request.background.as_deref() == Some("strict_background") {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "background_unavailable".to_owned(),
+                    message: "Focusing an application requires foreground posture".to_owned(),
+                    recovery: Some("Use foreground_allowed or foreground_required".to_owned()),
+                },
+            );
+        }
+        if request.params.get("resource").is_some() {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message:
+                        "app.focus does not accept a resource; use app.open_resource to open one"
+                            .to_owned(),
+                    recovery: None,
+                },
+            );
+        }
+        let Some(query) = request.params.get("app").and_then(Value::as_str) else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "app.focus needs an exact app identity or display name".to_owned(),
+                    recovery: Some(
+                        "Inspect the app registry and use one exact identity".to_owned(),
+                    ),
+                },
+            );
+        };
+        let app = match comptrol_app_registry::registry::resolve(query) {
+            Ok(app) => app,
+            Err(error) => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "app_not_resolved".to_owned(),
+                        message: error.to_string(),
+                        recovery: Some("List installed apps and use one exact identity".to_owned()),
+                    },
+                );
+            }
+        };
+        let window_handle = request.params.get("window_handle").and_then(Value::as_u64);
+        if let Some(hwnd) = window_handle {
+            let host = comptrol_platform_windows::enumerate_top_level_windows()
+                .ok()
+                .and_then(|inventory| {
+                    inventory["windows"]
+                        .as_array()?
+                        .iter()
+                        .find(|window| {
+                            window["window_handle"].as_u64() == Some(hwnd)
+                                && windows_packaged_host_matches_app(&app, window)
+                        })
+                        .cloned()
+                });
+            if let Some(window) = host {
+                let pid = window["process_id"].as_u64().unwrap_or_default() as u32;
+                let created = window["process_created_at_100ns"].as_u64();
+                return match comptrol_platform_windows::focus_window_handle(hwnd, pid, created) {
+                    Ok(result) => success(
+                        request,
+                        operation_id,
+                        "windows_exact_packaged_host_focus",
+                        EffectState::Changed,
+                        VerificationState::Verified,
+                        json!({"app":app.id,"window":result,"mouse":"untouched","clipboard":"untouched"}),
+                    ),
+                    Err(error) => ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "app_focus_failed".to_owned(),
+                            message: error,
+                            recovery: Some("Windows may deny foreground activation; use the app or retry after a user action".to_owned()),
+                        },
+                    ),
+                };
+            }
+        }
+        let windows = match windows_app_windows(&app, None, window_handle) {
+            Ok(windows) => windows,
+            Err(error) => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "window_inventory_failed".to_owned(),
+                        message: error,
+                        recovery: Some("Refresh the Windows window inventory and retry".to_owned()),
+                    },
+                );
+            }
+        };
+        let window = match windows.as_slice() {
+            [] => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "target_missing".to_owned(),
+                        message: "No visible window matches the exact registered app identity"
+                            .to_owned(),
+                        recovery: Some(
+                            "Refresh the window inventory and retry with an exact window handle"
+                                .to_owned(),
+                        ),
+                    },
+                );
+            }
+            [window] => window,
+            candidates => {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "target_ambiguous".to_owned(),
+                        message: format!(
+                            "{} visible windows match this app; refusing to guess",
+                            candidates.len()
+                        ),
+                        recovery: Some(
+                            "Inspect the exact app windows and pass window_handle".to_owned(),
+                        ),
+                    },
+                );
+            }
+        };
+        let Some(hwnd) = window["window_handle"].as_u64() else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "window_identity_incomplete".to_owned(),
+                    message: "The matching app window has no native HWND".to_owned(),
+                    recovery: Some("Refresh the Windows window inventory and retry".to_owned()),
+                },
+            );
+        };
+        let Some(pid) = window["process_id"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "window_identity_incomplete".to_owned(),
+                    message: "The matching app window has no valid process identity".to_owned(),
+                    recovery: Some("Refresh the Windows window inventory and retry".to_owned()),
+                },
+            );
+        };
+        let created = window["process_created_at_100ns"].as_u64();
+        match comptrol_platform_windows::focus_window_handle(hwnd, pid, created) {
+            Ok(result) => success(
+                request,
+                operation_id,
+                "windows_exact_app_window_focus",
+                EffectState::Changed,
+                VerificationState::Verified,
+                json!({"app":app.id,"window":result,"mouse":"untouched","clipboard":"untouched"}),
+            ),
+            Err(error) => ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "app_focus_failed".to_owned(),
+                    message: error,
+                    recovery: Some("Windows may deny foreground activation; use the app or retry after a user action".to_owned()),
+                },
+            ),
+        }
+    }
 }
 
 fn app_close(request: &OperationRequest, operation_id: String) -> ActionResult {
@@ -5771,7 +8114,8 @@ fn permission_status(request: &OperationRequest, operation_id: String) -> Action
             "windows_uia_policy": std::env::var("COMPTROL_ALLOW_WINDOWS_UIA").as_deref() == Ok("1"),
             "linux_atspi_bus": std::env::var_os("AT_SPI_BUS_ADDRESS").is_some(),
             "linux_session": std::env::var("XDG_SESSION_TYPE").ok().or_else(|| std::env::var("WAYLAND_DISPLAY").ok().map(|_| "wayland".to_owned())),
-            "browser_cdp_configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            "browser_cdp_configured": browser::active_endpoint().is_some(),
+            "browser_bridge_active": browser_bridge::bridge_is_active(),
             "software_policy": std::env::var("COMPTROL_ALLOW_SOFTWARE").as_deref() == Ok("1"),
             "software_install_policy": std::env::var("COMPTROL_ALLOW_SOFTWARE_INSTALL").as_deref() == Ok("1"),
             "settings_policy": std::env::var("COMPTROL_ALLOW_SETTINGS").as_deref() == Ok("1"),
@@ -5803,19 +8147,65 @@ fn permission_surface_for(permission: &str) -> Option<String> {
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
                     .to_owned()
             }
+            "notification" | "notifications" => {
+                "x-apple.systempreferences:com.apple.preference.notifications".to_owned()
+            }
             _ => return None,
         }),
         "windows" => Some(match permission {
             "accessibility" => "ms-settings:privacy-accessibility".to_owned(),
             "microphone" => "ms-settings:privacy-microphone".to_owned(),
-            "notifications" => "ms-settings:privacy-notifications".to_owned(),
+            "notification" | "notifications" => "ms-settings:privacy-notifications".to_owned(),
+            "screen_recording" => "ms-settings:privacy-screencapture".to_owned(),
             _ => return None,
         }),
         "linux" => Some(match permission {
-            "notifications" => "gnome-control-center notifications".to_owned(),
+            "notification" | "notifications" => "gnome-control-center notifications".to_owned(),
             _ => return None,
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod permission_surface_tests {
+    use super::permission_surface_for;
+
+    /// The `permission.request` schema advertises exactly these values; each
+    /// platform must map them to its documented surface or refuse honestly
+    /// with None. This is the drift class that once left the schema's own
+    /// `notification` value unmapped on every platform.
+    #[test]
+    fn permission_surfaces_cover_the_documented_enum() {
+        let expected: &[(&str, bool)] = if cfg!(target_os = "macos") {
+            &[
+                ("accessibility", true),
+                ("screen_recording", true),
+                ("automation", true),
+                ("notification", true),
+            ]
+        } else if cfg!(windows) {
+            &[
+                ("accessibility", true),
+                ("screen_recording", true),
+                ("automation", false),
+                ("notification", true),
+            ]
+        } else {
+            &[
+                ("accessibility", false),
+                ("screen_recording", false),
+                ("automation", false),
+                ("notification", true),
+            ]
+        };
+        for (permission, mapped) in expected {
+            assert_eq!(
+                permission_surface_for(permission).is_some(),
+                *mapped,
+                "permission {permission} surface mapping drifted from the documented enum"
+            );
+        }
     }
 }
 
@@ -6549,12 +8939,17 @@ fn native_popup_dismiss(
         if let Ok(pid) = target_name.parse::<u64>() {
             let result = comptrol_platform_macos::execute(comptrol_platform_macos::Request {
                 process_id: pid as u32,
-                name: &action_label,
+                name: Some(action_label.as_str()),
+                automation_id: None,
                 role: Some("AXButton"),
                 action: comptrol_platform_macos::Action::Press,
                 value: None,
                 expected_attribute: None,
                 expected_value: None,
+                match_index: None,
+                expected_match_count: None,
+                max_nodes: 128,
+                allow_physical_click: false,
                 timeout: std::time::Duration::from_millis(1000),
             });
             return match result {
@@ -6734,7 +9129,7 @@ fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResu
                 && let Some(target_id) = target_spec.id.as_ref().or(target_spec.name.as_ref())
             {
                 // First, try CDP if this looks like a browser target or CDP is available.
-                if std::env::var("COMPTROL_CDP_ENDPOINT").is_ok() {
+                if let Some(endpoint) = browser::active_endpoint() {
                     let mut dialog_request = request.clone();
                     dialog_request.intent = "browser.cdp.dialog".to_owned();
                     dialog_request.params = json!({
@@ -6745,9 +9140,7 @@ fn popup_dismiss(request: &OperationRequest, operation_id: String) -> ActionResu
                     let cdp_result = browser_cdp_dialog(
                         &dialog_request,
                         operation_id.clone(),
-                        std::ffi::OsStr::new(
-                            &std::env::var("COMPTROL_CDP_ENDPOINT").unwrap_or_default(),
-                        ),
+                        std::ffi::OsStr::new(&endpoint),
                     );
                     if cdp_result.error.is_none() {
                         return cdp_result;
@@ -6834,7 +9227,7 @@ fn browser_session_list(request: &OperationRequest, operation_id: String) -> Act
                 "signed_in_capable": session.signed_in_capable,
                 "preferred_for": match session.provider {
                     comptrol_browser::SessionProvider::PermissionedAutoConnect => "signed-in tabs and tab groups",
-                    comptrol_browser::SessionProvider::CompanionExtension => "closed-group restore without full CDP",
+                    comptrol_browser::SessionProvider::CompanionExtension => "ordinary signed-in tabs and tab groups through the authenticated extension bridge",
                     comptrol_browser::SessionProvider::ExplicitCdp => "dedicated automation profiles and custom endpoints",
                     comptrol_browser::SessionProvider::DedicatedProfile => "isolated automation",
                     comptrol_browser::SessionProvider::NativeLauncher => "foreground fallback with launcher-acceptance reporting only",
@@ -6847,7 +9240,11 @@ fn browser_session_list(request: &OperationRequest, operation_id: String) -> Act
 }
 
 #[allow(unsafe_code)]
-fn browser_session_connect(request: &OperationRequest, operation_id: String) -> ActionResult {
+fn browser_session_connect(
+    request: &OperationRequest,
+    operation_id: String,
+    state_dir: &Path,
+) -> ActionResult {
     let Some(provider) = request.params.get("provider").and_then(Value::as_str) else {
         return ActionResult::refused(
             request,
@@ -6862,7 +9259,7 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
     };
     match provider {
         "explicit_cdp_endpoint" => {
-            if std::env::var_os("COMPTROL_CDP_ENDPOINT").is_none() {
+            if browser::active_endpoint().is_none() {
                 return ActionResult::refused(
                     request,
                     operation_id,
@@ -6883,10 +9280,7 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
             )
         }
         "chrome_permissioned_auto_connect" => {
-            let timeout = Duration::from_secs(30);
-            let ws_url = match tokio::runtime::Runtime::new().unwrap().block_on(
-                comptrol_browser::connect_permissioned_auto_connect(9222, timeout),
-            ) {
+            let ws_url = match comptrol_browser::connect_permissioned_auto_connect() {
                 Ok(url) => url,
                 Err(e) => {
                     return ActionResult::refused(
@@ -6900,10 +9294,44 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                     );
                 }
             };
-            // Set the endpoint for subsequent browser operations
-            unsafe {
-                std::env::set_var("COMPTROL_CDP_ENDPOINT", &ws_url);
-            }
+            let version = browser::bridge().command(&ws_url, "Browser.getVersion", json!({}));
+            let product = match version {
+                Ok(value) => value
+                    .get("product")
+                    .and_then(Value::as_str)
+                    .filter(|product| product.starts_with("Chrome/"))
+                    .map(str::to_owned),
+                Err(error) => {
+                    return ActionResult::refused(
+                        request,
+                        operation_id,
+                        ComptrolError {
+                            code: "route_unavailable".to_owned(),
+                            message: format!(
+                                "Chrome's permissioned WebSocket did not complete a live CDP handshake: {error}"
+                            ),
+                            recovery: Some(
+                                "Keep Chrome running with Remote Debugging enabled and accept its native Allow prompt when shown".to_owned(),
+                            ),
+                        },
+                    );
+                }
+            };
+            let Some(product) = product else {
+                return ActionResult::refused(
+                    request,
+                    operation_id,
+                    ComptrolError {
+                        code: "browser_protocol_invalid".to_owned(),
+                        message: "The permissioned WebSocket did not identify a Chrome browser"
+                            .to_owned(),
+                        recovery: Some(
+                            "Inspect the active Chrome remote debugging session".to_owned(),
+                        ),
+                    },
+                );
+            };
+            browser::set_active_endpoint(ws_url);
             success(
                 request,
                 operation_id,
@@ -6913,7 +9341,7 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                 json!({
                     "provider": "chrome_permissioned_auto_connect",
                     "status": "connected_via_permissioned_auto_connect",
-                    "websocket_url": ws_url,
+                    "browser_product": product,
                     "note": "Chrome shows its native Allow prompt per connection; Comptrol never bypasses it"
                 }),
             )
@@ -6938,7 +9366,7 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                     },
                 );
             }
-            let mut store = match browser_bridge::BridgeStore::open(&default_state_dir()) {
+            let mut store = match browser_bridge::BridgeStore::open(state_dir) {
                 Ok(store) => store,
                 Err(error) => {
                     return ActionResult::refused(
@@ -6958,6 +9386,8 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
                     active: false,
                     last_heartbeat_ms: None,
                     target_count: 0,
+                    last_round_trip_ms: None,
+                    last_round_trip_at_ms: None,
                 });
             if !health.active {
                 return success(
@@ -7030,6 +9460,91 @@ fn browser_session_connect(request: &OperationRequest, operation_id: String) -> 
             },
         ),
     }
+}
+
+/// C6: the low-command contract. One call resolves the best available browser
+/// route, proves the command channel with a live round trip, and returns the
+/// current surface (targets) so the next call can act immediately. Replaces
+/// the list → connect → discover → act dance with a single idempotent read.
+fn browser_ensure_session(
+    request: &OperationRequest,
+    operation_id: String,
+    state_dir: &Path,
+) -> ActionResult {
+    let mut route_report = Vec::new();
+    // Route 1: explicit CDP endpoint (policy-gated, consent is per-connection).
+    if let Some(endpoint) = browser::active_endpoint() {
+        route_report.push(json!({ "route": "explicit_cdp_endpoint", "endpoint": endpoint, "state": "configured" }));
+    }
+    // Route 2: companion extension — prove it with a live round trip.
+    let store_result = browser_bridge::BridgeStore::open(state_dir);
+    if let Ok(store) = store_result {
+        let health = store
+            .health(browser_bridge::DEFAULT_HEALTH_MAX_AGE)
+            .unwrap_or(browser_bridge::BridgeHealth {
+                active: false,
+                last_heartbeat_ms: None,
+                target_count: 0,
+                last_round_trip_ms: None,
+                last_round_trip_at_ms: None,
+            });
+        let channel = store
+            .health_round_trip(browser_bridge::DEFAULT_HEALTH_MAX_AGE)
+            .ok();
+        if channel.as_ref().is_some_and(|health| health.active) {
+            // Channel proven; return the live surface in the same call.
+            let targets = store
+                .targets()
+                .unwrap_or_default()
+                .into_iter()
+                .take(16)
+                .collect::<Vec<_>>();
+            return success(
+                request,
+                operation_id,
+                "companion_extension",
+                EffectState::None,
+                VerificationState::Verified,
+                json!({
+                    "route": "companion_extension",
+                    "ready": true,
+                    "channel": channel,
+                    "surface": {
+                        "endpoint": "comptrol+bridge://local",
+                        "targets": targets,
+                        "target_count": targets.len()
+                    },
+                    "next": "Use browser.cdp.* intents against comptrol+bridge://local"
+                }),
+            );
+        }
+        route_report.push(json!({
+            "route": "companion_extension",
+            "state": if health.active { "host_alive_channel_unproven" } else { "inactive" },
+            "channel": channel,
+            "recovery": if health.active {
+                "The extension service worker is not answering. Reload the extension at chrome://extensions, then retry; the wake bus may also recover it automatically."
+            } else {
+                "Open Chrome with the Comptrol Browser Bridge extension enabled and selected"
+            }
+        }));
+    }
+    // Nothing proved ready: report the strongest route state honestly with
+    // its recovery path. (ComptrolError carries code/message/recovery; richer
+    // per-route detail is visible in inspect kind:doctor → browser.channel.)
+    let _ = route_report;
+    ActionResult::refused(
+        request,
+        operation_id,
+        ComptrolError {
+            code: "browser_not_ready".to_owned(),
+            message: "No browser route could be verified ready in one ensure_session call"
+                .to_owned(),
+            recovery: Some(
+                "Reload the Browser Bridge extension at chrome://extensions if Chrome is running; once the channel round trip succeeds this call returns the live surface".to_owned(),
+            ),
+        },
+    )
 }
 
 fn desktop_open_app(request: &OperationRequest, operation_id: String) -> ActionResult {
@@ -7196,7 +9711,7 @@ fn browser_chrome_restore_recent(request: &OperationRequest, operation_id: Strin
             },
         );
     }
-    let endpoint = std::env::var("COMPTROL_CDP_ENDPOINT").ok();
+    let endpoint = browser::active_endpoint();
     // Compatibility alias: a legacy caller that passes only a group name gets
     // tab_group semantics with native restore then explicit reconstruction
     // permission preserved from its params.
@@ -7329,18 +9844,7 @@ fn command_run(request: &OperationRequest, operation_id: String) -> ActionResult
         }
         argv.push(value);
     }
-    let allowed = std::env::var("COMPTROL_COMMAND_ALLOWLIST")
-        .ok()
-        .into_iter()
-        .flat_map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .any(|allowed| allowed == program);
-    if !allowed {
+    if !command_program_allowed(program) {
         return ActionResult::refused(
             request,
             operation_id,
@@ -7789,6 +10293,57 @@ fn semantic_provider_result(
     }
 }
 
+fn uia_worker_unknown(
+    request: &OperationRequest,
+    operation_id: String,
+    inspecting: bool,
+    message: String,
+) -> ActionResult {
+    let timed_out = message.starts_with("uia_worker_timeout:");
+    ActionResult {
+        operation_id,
+        intent: request.intent.clone(),
+        route: "windows_uia_supervised_worker".to_owned(),
+        target: request.target.clone(),
+        preflight: "worker_result_unknown".to_owned(),
+        delivery: DeliveryState::Unknown,
+        effect: if inspecting {
+            EffectState::None
+        } else {
+            EffectState::Unknown
+        },
+        verification: VerificationState::Unverified,
+        disturbance: json!({
+            "foreground_changed": "unknown",
+            "mouse": "unknown",
+            "clipboard": "untouched",
+            "posture": request.background.as_deref().unwrap_or("foreground_allowed")
+        }),
+        recovery: if inspecting {
+            RecoveryState::None
+        } else {
+            RecoveryState::RequiresReconciliation
+        },
+        data: json!({"worker_terminated": timed_out}),
+        error: Some(ComptrolError {
+            code: if timed_out {
+                "uia_provider_timeout"
+            } else {
+                "uia_worker_stopped"
+            }
+            .to_owned(),
+            message,
+            recovery: Some(if inspecting {
+                "The blocked UIA worker was stopped. Refresh the exact surface and inspect again."
+                    .to_owned()
+            } else {
+                "Do not repeat this mutation yet. Inspect or reconcile the exact target state before retrying."
+                    .to_owned()
+            }),
+        }),
+    }
+}
+
 fn windows_uia_action(request: &OperationRequest, operation_id: String) -> ActionResult {
     if !cfg!(target_os = "windows") {
         return ActionResult::refused(
@@ -7814,7 +10369,9 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
     };
     let name = request.params.get("name").and_then(Value::as_str);
     let automation_id = request.params.get("automation_id").and_then(Value::as_str);
-    if name.is_none() && automation_id.is_none() {
+    let key_sequence = request.params.get("key_sequence").and_then(Value::as_array);
+    let inspecting = request.intent == "windows.uia.inspect";
+    if !inspecting && key_sequence.is_none() && name.is_none() && automation_id.is_none() {
         return ActionResult::refused(
             request,
             operation_id,
@@ -7826,8 +10383,78 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
         );
     }
     #[cfg(windows)]
-    if std::env::var("COMPTROL_WINDOWS_UIA_LEGACY").as_deref() != Ok("1") {
-        let action = if request.intent.ends_with("press") {
+    if let Some(sequence) = key_sequence {
+        if !matches!(
+            request.background.as_deref(),
+            Some("foreground_allowed" | "foreground_required")
+        ) {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "foreground_required".to_owned(),
+                    message: "key_sequence requires foreground_allowed or foreground_required"
+                        .to_owned(),
+                    recovery: Some(
+                        "Focus the exact target window and retry with foreground_allowed"
+                            .to_owned(),
+                    ),
+                },
+            );
+        }
+        let Some(window_handle) = request.params.get("window_handle").and_then(Value::as_u64)
+        else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "key_sequence requires an exact window_handle".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        let keys: Option<Vec<String>> = sequence
+            .iter()
+            .map(Value::as_str)
+            .map(|v| v.map(str::to_owned))
+            .collect();
+        let Some(keys) = keys else {
+            return ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "invalid_input".to_owned(),
+                    message: "key_sequence must contain only string key tokens".to_owned(),
+                    recovery: None,
+                },
+            );
+        };
+        return match comptrol_platform_windows::send_key_sequence(process_id as u32, window_handle, &keys) {
+            Ok(data) => success(
+                request,
+                operation_id,
+                "windows_uia_key_sequence",
+                EffectState::Changed,
+                VerificationState::Unverified,
+                data,
+            ),
+            Err(message) => ActionResult::refused(
+                request,
+                operation_id,
+                ComptrolError {
+                    code: "keyboard_input_refused".to_owned(),
+                    message,
+                    recovery: Some("Confirm the exact target window is foreground and use an allowed key token".to_owned()),
+                },
+            ),
+        };
+    }
+    #[cfg(windows)]
+    if inspecting || std::env::var("COMPTROL_WINDOWS_UIA_LEGACY").as_deref() != Ok("1") {
+        let action = if inspecting {
+            comptrol_platform_windows::Action::Inspect
+        } else if request.intent.ends_with("press") {
             comptrol_platform_windows::Action::Press
         } else {
             comptrol_platform_windows::Action::SetValue
@@ -7844,6 +10471,7 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
             .unzip();
         let result = comptrol_platform_windows::execute(comptrol_platform_windows::Request {
             process_id: process_id as u32,
+            window_handle: request.params.get("window_handle").and_then(Value::as_u64),
             name,
             automation_id,
             role: request.params.get("role").and_then(Value::as_str),
@@ -7851,8 +10479,39 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
             value: request.params.get("value").and_then(Value::as_str),
             expected_attribute,
             expected_value,
+            match_index: request
+                .params
+                .get("match_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            expected_match_count: request
+                .params
+                .get("expected_match_count")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            max_nodes: request
+                .params
+                .get("max_nodes")
+                .and_then(Value::as_u64)
+                .unwrap_or(128) as usize,
+            allow_physical_click: matches!(
+                request.background.as_deref(),
+                Some("foreground_allowed" | "foreground_required")
+            ),
         });
         return match result {
+            Ok(data) if inspecting => success(
+                request,
+                operation_id,
+                "windows_uia_inspect",
+                EffectState::None,
+                if data.get("verified").and_then(Value::as_bool) == Some(true) {
+                    VerificationState::Verified
+                } else {
+                    VerificationState::Unverified
+                },
+                data,
+            ),
             Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
                 request,
                 operation_id,
@@ -7869,6 +10528,12 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
                 VerificationState::Unverified,
                 data,
             ),
+            Err(message)
+                if message.starts_with("uia_worker_timeout:")
+                    || message.starts_with("uia_worker_stopped:") =>
+            {
+                uia_worker_unknown(request, operation_id, inspecting, message)
+            }
             Err(message) => ActionResult::refused(
                 request,
                 operation_id,
@@ -7877,7 +10542,7 @@ fn windows_uia_action(request: &OperationRequest, operation_id: String) -> Actio
                         "target_ambiguous"
                     } else if message.contains("missing") {
                         "target_gone"
-                    } else if message.contains("disabled") {
+                    } else if message.contains("not_actionable") || message.contains("disabled") {
                         "not_actionable"
                     } else {
                         "adapter_unavailable"
@@ -7967,17 +10632,19 @@ fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> Actio
             },
         );
     };
-    let Some(name) = request.params.get("name").and_then(Value::as_str) else {
+    let name = request.params.get("name").and_then(Value::as_str);
+    let automation_id = request.params.get("automation_id").and_then(Value::as_str);
+    if name.is_none() && automation_id.is_none() {
         return ActionResult::refused(
             request,
             operation_id,
             ComptrolError {
                 code: "invalid_input".to_owned(),
-                message: "Linux AT SPI needs an exact accessible name".to_owned(),
+                message: "Linux AT SPI needs a name or automation_id".to_owned(),
                 recovery: None,
             },
         );
-    };
+    }
     #[cfg(target_os = "linux")]
     {
         let action = if request.intent.ends_with("press") {
@@ -7998,11 +10665,31 @@ fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> Actio
         let result = comptrol_platform_linux::execute(comptrol_platform_linux::Request {
             process_id: process_id as u32,
             name,
+            automation_id,
             role: request.params.get("role").and_then(Value::as_str),
             action,
             value: request.params.get("value").and_then(Value::as_str),
             expected_attribute,
             expected_value,
+            match_index: request
+                .params
+                .get("match_index")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            expected_match_count: request
+                .params
+                .get("expected_match_count")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            max_nodes: request
+                .params
+                .get("max_nodes")
+                .and_then(Value::as_u64)
+                .unwrap_or(128) as usize,
+            allow_physical_click: matches!(
+                request.background.as_deref(),
+                Some("foreground_allowed" | "foreground_required")
+            ),
             timeout: Duration::from_millis(1500),
         });
         match result {
@@ -8049,7 +10736,10 @@ fn linux_atspi_action(request: &OperationRequest, operation_id: String) -> Actio
     command
         .args(["-c", LINUX_ATSPI_SCRIPT])
         .env("COMPTROL_ATSPI_PROCESS_ID", process_id.to_string())
-        .env("COMPTROL_ATSPI_NAME", name)
+        .env(
+            "COMPTROL_ATSPI_NAME",
+            name.or(automation_id).unwrap_or_default(),
+        )
         .env(
             "COMPTROL_ATSPI_OPERATION",
             if request.intent.ends_with("press") {
@@ -8248,12 +10938,32 @@ fn macos_ax_direct_result(
         .unzip();
     match comptrol_platform_macos::execute(comptrol_platform_macos::Request {
         process_id: process_id as u32,
-        name: control,
+        name: Some(control),
+        automation_id: request.params.get("automation_id").and_then(Value::as_str),
         role: request.params.get("role").and_then(Value::as_str),
         action,
         value,
         expected_attribute,
         expected_value,
+        match_index: request
+            .params
+            .get("match_index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        expected_match_count: request
+            .params
+            .get("expected_match_count")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        max_nodes: request
+            .params
+            .get("max_nodes")
+            .and_then(Value::as_u64)
+            .unwrap_or(128) as usize,
+        allow_physical_click: matches!(
+            request.background.as_deref(),
+            Some("foreground_allowed" | "foreground_required")
+        ),
         timeout: Duration::from_millis(1500),
     }) {
         Ok(data) if data.get("verified").and_then(Value::as_bool) == Some(true) => success(
@@ -8518,6 +11228,21 @@ pub(crate) fn run_osascript(script: &str) -> io::Result<Output> {
 }
 
 pub fn capabilities() -> Vec<Capability> {
+    // Browser actions can run through either the explicitly configured direct
+    // CDP endpoint or the authenticated companion bridge. Keep capability
+    // discovery aligned with route planning and dispatch; otherwise a healthy
+    // extension session is invisible to clients even though dispatch supports
+    // it.
+    let direct_browser_available = browser::active_endpoint().is_some();
+    let companion_bridge_available = browser_bridge::bridge_is_active();
+    let browser_session_available = direct_browser_available || companion_bridge_available;
+    let browser_cdp_allowed = env_enabled("COMPTROL_ALLOW_BROWSER_CDP");
+    let browser_cdp_available = browser_protocol_available(
+        direct_browser_available,
+        companion_bridge_available,
+        browser_cdp_allowed,
+        chrome_autostart::available(),
+    );
     let mut result = vec![
         Capability {
             name: "system.ping".to_owned(),
@@ -8700,9 +11425,16 @@ pub fn capabilities() -> Vec<Capability> {
             note: "Connects through the selected browser surface; permissioned routes keep the browser consent UI".to_owned(),
         },
         Capability {
+            name: "browser.ensure_session".to_owned(),
+            available: true,
+            risk: Risk::R0,
+            route: "browser_session_broker".to_owned(),
+            note: "One-call readiness: resolves the best browser route, proves the command channel with a live round trip, and returns the current surface".to_owned(),
+        },
+        Capability {
             name: "browser.cdp.dialog".to_owned(),
-            available: std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1")
-                && std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            available: browser_cdp_allowed
+                && browser::active_endpoint().is_some(),
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Handles a JavaScript dialog on one exact target; protected dialogs go through popup.dismiss".to_owned(),
@@ -8731,6 +11463,25 @@ pub fn capabilities() -> Vec<Capability> {
             risk: Risk::R2,
             route: "chrome_restore".to_owned(),
             note: "Compatibility alias for browser.chrome.restore_recent with kind tab_group".to_owned(),
+        },
+        Capability {
+            name: "desktop.terminal".to_owned(),
+            available: env_enabled("COMPTROL_ALLOW_COMMANDS")
+                && std::env::var_os("COMPTROL_COMMAND_ROOT").is_some()
+                && std::env::var_os("COMPTROL_COMMAND_ALLOWLIST").is_some(),
+            risk: Risk::R2,
+            route: "terminal".to_owned(),
+            note: "Runs allowlisted executables with structured argv and reads output back; no shell is involved and the window can be hidden"
+                .to_owned(),
+        },
+        Capability {
+            name: "desktop.explorer".to_owned(),
+            available: cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"))
+                && env_enabled("COMPTROL_ALLOW_DESKTOP_EXPLORER"),
+            risk: Risk::R2,
+            route: "file_explorer".to_owned(),
+            note: "Reveals one exact path in the platform file manager without mutating the file"
+                .to_owned(),
         },
         Capability {
             name: "command.run".to_owned(),
@@ -8770,81 +11521,84 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
-            note: "Local CDP evaluation navigation uploads and downloads require explicit policy"
-                .to_owned(),
+            note: "Direct CDP or an active authenticated companion bridge can serve browser actions; explicit browser policy is required".to_owned(),
         },
         Capability {
             name: "browser.cdp.open_tab".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Opens a visible or background tab in the existing local browser profile without mouse or clipboard input".to_owned(),
         },
         Capability {
             name: "browser.cdp.close_tab".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Closes one exact live page target after context and revision validation".to_owned(),
         },
         Capability {
+            name: "browser.cdp.activate_tab".to_owned(),
+            available: browser_cdp_available,
+            risk: Risk::R2,
+            route: "browser_protocol".to_owned(),
+            note: "Activates or deactivates one exact live page target; activation is a disclosed foreground change for rendering-dependent steps".to_owned(),
+        },
+        Capability {
             name: "browser.cdp.history".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Moves one exact live page target through bounded browser history without foreground input".to_owned(),
         },
         Capability {
             name: "browser.cdp.accessibility_snapshot".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
             note: "Reads a bounded accessibility tree from one exact live page target".to_owned(),
         },
         Capability {
+            name: "browser.cdp.compact_snapshot".to_owned(),
+            available: browser_cdp_available,
+            risk: Risk::R0,
+            route: "browser_protocol".to_owned(),
+            note: "Reads a bounded list of visible actionable controls from one exact live page target".to_owned(),
+        },
+        Capability {
             name: "browser.cdp.screenshot".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
             note: "Captures a bounded target-scoped visual digest without returning pixels through MCP".to_owned(),
         },
         Capability {
             name: "browser.cdp.coordinate_click".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Dispatches one coordinate click only when a fresh screenshot capture_id proves the viewport geometry is current".to_owned(),
         },
         Capability {
             name: "browser.cdp.focus".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R1,
             route: "browser_protocol".to_owned(),
             note: "Focuses one exact live page element without mouse or clipboard input".to_owned(),
         },
         Capability {
             name: "browser.cdp.semantic_click".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Resolves a fresh semantic locator, checks visibility and overlay coverage, then retries once after a stale target revision".to_owned(),
         },
         Capability {
             name: "browser.cdp.workflow".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-                && std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1"),
+            available: browser_cdp_available,
             risk: Risk::R2,
             route: "browser_protocol".to_owned(),
             note: "Executes a bounded data-only browser navigation and semantic-click workflow in one MCP operation with URL postconditions".to_owned(),
@@ -8858,14 +11612,14 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "browser.cdp.discovery".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            available: browser_session_available,
             risk: Risk::R0,
             route: "browser_protocol".to_owned(),
             note: "Discovers exact local browser targets without mutation".to_owned(),
         },
         Capability {
             name: "browser.fixture.submit".to_owned(),
-            available: std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
+            available: direct_browser_available
                 && std::env::var("COMPTROL_ALLOW_BROWSER_FIXTURE").as_deref() == Ok("1"),
             risk: Risk::R1,
             route: "browser_fixture".to_owned(),
@@ -8903,6 +11657,33 @@ pub fn capabilities() -> Vec<Capability> {
     }
     result.extend(platform_capabilities());
     result
+}
+
+/// Machine-readable catalog that keeps callable intent names separate from
+/// platform readiness labels, which are observations rather than operations.
+pub fn capability_catalog() -> Value {
+    let all = callable_intent_catalog();
+    let intents = all
+        .iter()
+        .filter(|capability| {
+            !PLATFORM_OBSERVATIONS.contains(&capability.name.as_str())
+                && !CAPABILITY_FAMILIES.contains(&capability.name.as_str())
+        })
+        .collect::<Vec<_>>();
+    let families = all
+        .iter()
+        .filter(|capability| CAPABILITY_FAMILIES.contains(&capability.name.as_str()))
+        .collect::<Vec<_>>();
+    let platforms = all
+        .iter()
+        .filter(|capability| PLATFORM_OBSERVATIONS.contains(&capability.name.as_str()))
+        .collect::<Vec<_>>();
+    json!({
+        "intents": intents,
+        "capability_families": families,
+        "platform_observations": platforms,
+        "note": "Only entries in intents are callable operate intent names; capability_families describe a route family without a dispatchable name, and platform_observations describe detected surfaces."
+    })
 }
 
 pub fn platform_capabilities() -> Vec<Capability> {
@@ -9006,13 +11787,98 @@ fn macos_accessibility_reachable() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Whether a local browser route can be reached right now.
+///
+/// `auto_start` means this runtime can start the local browser on demand,
+/// which both produces an endpoint and opens the CDP policy gate the
+/// browser exists to serve. Reporting that honestly is what lets a client
+/// try the browser route at all; the eager start used to fake it by
+/// writing the gate at process start for every session.
+fn browser_protocol_available(
+    direct_endpoint: bool,
+    companion_bridge: bool,
+    policy: bool,
+    auto_start: bool,
+) -> bool {
+    (direct_endpoint || companion_bridge || auto_start) && (policy || auto_start)
+}
+
 fn doctor(runtime: &Runtime) -> Value {
+    let direct_browser_configured = browser::active_endpoint().is_some();
+    let extension_registered = comptrol_browser::list_sessions().iter().any(|session| {
+        session.provider == comptrol_browser::SessionProvider::CompanionExtension
+            && session.available
+    });
+    // Channel truth: a heartbeat alone lied during live failure analysis (the
+    // daemon recorded its own heartbeat posts while the extension service
+    // worker was dead). "Alive" now means a completed extension round trip
+    // (a bridge_ping answered by the actual service worker) within the health
+    // window; host-heartbeat-only state is reported as degraded, not ready.
+    let channel =
+        browser_bridge::BridgeStore::open(&crate::default_state_dir()).and_then(|store| {
+            store
+                .health_round_trip(browser_bridge::DEFAULT_HEALTH_MAX_AGE)
+                .map(|health| {
+                    (
+                        store.health(browser_bridge::DEFAULT_HEALTH_MAX_AGE).ok(),
+                        Some(health),
+                    )
+                })
+        });
+    let (host_health, channel_health) = match channel {
+        Ok((host, channel)) => (host, channel),
+        Err(_) => (None, None),
+    };
+    let channel_alive = channel_health.as_ref().is_some_and(|health| health.active);
+    let host_heartbeat_active = host_health.as_ref().is_some_and(|health| health.active);
+    // K5: the page-op tier. A channel can answer pings while every in-page
+    // command hangs (observed live), so health reports both tiers.
+    let page_ops_report = browser_bridge::BridgeStore::open(&default_state_dir())
+        .and_then(|store| store.page_ops_health())
+        .unwrap_or_else(|_| json!({ "state": "unknown" }));
+    let extension_active = channel_alive;
+    let browser_ready = extension_active;
+    let browser_status = if channel_alive {
+        "connected"
+    } else if host_heartbeat_active {
+        // Exactly the zombie state observed live: something posts host
+        // heartbeats, but the extension has not proven liveness. Never
+        // report this as ready.
+        "degraded_extension_unreachable"
+    } else if direct_browser_configured {
+        "configured_unverified"
+    } else if extension_registered {
+        "registered_channel_unverified"
+    } else {
+        "not_configured"
+    };
+    let channel_report = json!({
+        "state": if channel_alive {
+            "alive"
+        } else if host_heartbeat_active {
+            "degraded_extension_unreachable"
+        } else {
+            "down"
+        },
+        "host_heartbeat_active": host_heartbeat_active,
+        "last_host_heartbeat_ms": host_health.and_then(|health| health.last_heartbeat_ms),
+        "round_trip_active": channel_alive,
+        "last_round_trip_ms": channel_health.as_ref().and_then(|health| health.last_round_trip_ms),
+        "last_round_trip_at_ms": channel_health.as_ref().and_then(|health| health.last_round_trip_at_ms),
+        "page_ops": page_ops_report,
+        "meaning": "alive requires a service-worker-answered bridge_ping within the health window; host_heartbeat alone is daemon liveness only, and page_ops separates page-operation health from ping health"
+    });
     json!({
         "server": SERVER_VERSION,
         "protocol": PROTOCOL_VERSION,
         "platform": std::env::consts::OS,
         "architecture": std::env::consts::ARCH,
-        "daemon": { "state": "in_process", "available": true },
+        "daemon": {
+            "state": if DAEMON_RESIDENT.load(Ordering::Relaxed) { "resident" } else { "in_process" },
+            "available": true,
+            "resident": DAEMON_RESIDENT.load(Ordering::Relaxed),
+            "clients": DAEMON_CLIENTS.load(Ordering::Relaxed),
+        },
         "mcp_adapter": { "available": true, "transport": "stdio", "command": "comptrol mcp" },
         "mcp_protocols": {
             "current": { "version": mcp::CURRENT_VERSION, "mode": "stateless", "status": "implemented_not_live_verified" },
@@ -9042,13 +11908,15 @@ fn doctor(runtime: &Runtime) -> Value {
         "desktop_observation": { "available": true, "semantic_mutation": platform_capabilities().iter().any(|capability| capability.name == "platform.macos.ax" && capability.available) },
         "platform": platform_diagnostics(),
         "browser": {
-            "configured": std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some(),
+            "configured": direct_browser_configured || extension_registered,
+            "ready": browser_ready,
+            "status": browser_status,
+            "channel": channel_report,
             "fixture_mutation": runtime.policy.allowed_intents.contains("browser.fixture.submit"),
-            "status": if std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some() { "configured" } else { "not_configured" },
+            "extension": if extension_active { "ready" } else if extension_registered { "registered_channel_unverified" } else { "not_registered" },
             "persistent_multiplexer": "implemented_not_live_verified",
             "event_target_frame_graph": "implemented_not_live_verified",
             "chrome_native_restore": "implemented_not_live_verified",
-            "extension": "experimental_only"
         },
         "adapters": {
             "vscode_bridge": if std::env::var_os("COMPTROL_VSCODE_BRIDGE_TOKEN").is_some() { "configured" } else { "requires_consent" },
@@ -9139,6 +12007,50 @@ fn state_dir() -> PathBuf {
     PathBuf::from(".comptrol")
 }
 
+fn runtime_fingerprint() -> Value {
+    static FINGERPRINT: OnceLock<Value> = OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            const POLICY_FLAGS: &[&str] = &[
+                "COMPTROL_ALLOW_APP_LAUNCH",
+                "COMPTROL_ALLOW_BROWSER_CDP",
+                "COMPTROL_ALLOW_CREATIVE_ADAPTERS",
+                "COMPTROL_ALLOW_SETTINGS",
+                "COMPTROL_ALLOW_WINDOWS_UIA",
+                "COMPTROL_AUTO_START_CHROME_CDP",
+                "COMPTROL_CHROME_AUTO_CONNECT",
+                "COMPTROL_WINDOWS_UIA",
+            ];
+            let effective_policy = POLICY_FLAGS
+                .iter()
+                .map(|name| ((*name).to_owned(), env_enabled(name)))
+                .collect::<Vec<_>>();
+            let policy_bytes = serde_json::to_vec(&effective_policy).unwrap_or_default();
+            let policy_fingerprint = format!("{:x}", Sha256::digest(policy_bytes));
+            let executable_path = std::env::current_exe().ok();
+            let executable_sha256 = executable_path
+                .as_ref()
+                .and_then(|path| fs::read(path).ok())
+                .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+            let effective_policy = effective_policy
+                .into_iter()
+                .map(|(name, value)| (name, Value::Bool(value)))
+                .collect::<serde_json::Map<_, _>>();
+            json!({
+                "server_version": SERVER_VERSION,
+                "protocol_version": PROTOCOL_VERSION,
+                "process_id": std::process::id(),
+                "executable_path": executable_path,
+                "executable_sha256": executable_sha256,
+                "state_directory": state_dir(),
+                "adapter_root": adapter_root(),
+                "effective_policy": effective_policy,
+                "policy_fingerprint": policy_fingerprint
+            })
+        })
+        .clone()
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9157,39 +12069,26 @@ fn restrict_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum WorkflowOp {
-    Sense { key: String, value: Value },
-    Assert { key: String, equals: Value },
-    Set { key: String, value: Value },
-    Wait { milliseconds: u64 },
-    Return { value: Value },
-}
+// P4.1: the op interpreter itself lives in `comptrol-workflow` beside the
+// node graph executor, so the two workflow dialects cannot drift. This is
+// the runtime's error mapping on top of that single executor.
+pub use comptrol_workflow::WorkflowOp;
 
 pub fn execute_workflow(ops: &[WorkflowOp]) -> Result<Value, ComptrolError> {
-    let mut memory = HashMap::<String, Value>::new();
-    for op in ops {
-        match op {
-            WorkflowOp::Sense { key, value } | WorkflowOp::Set { key, value } => {
-                memory.insert(key.clone(), value.clone());
-            }
-            WorkflowOp::Assert { key, equals } => {
-                if memory.get(key) != Some(equals) {
-                    return Err(ComptrolError {
-                        code: "verification_failed".to_owned(),
-                        message: format!("Workflow assertion failed for {key}"),
-                        recovery: Some("Reobserve and compile a repaired branch".to_owned()),
-                    });
-                }
-            }
-            WorkflowOp::Wait { milliseconds } => {
-                std::thread::sleep(Duration::from_millis((*milliseconds).min(60_000)))
-            }
-            WorkflowOp::Return { value } => return Ok(value.clone()),
+    let outcome = comptrol_workflow::execute_ops(ops, |milliseconds| {
+        std::thread::sleep(Duration::from_millis(milliseconds));
+        Ok(())
+    });
+    outcome.map_err(|error| ComptrolError {
+        code: match error {
+            comptrol_workflow::OpError::AssertionFailed(_) => "verification_failed",
+            comptrol_workflow::OpError::WaitTooLong(_) => "invalid_input",
+            comptrol_workflow::OpError::Cancelled => "cancelled",
         }
-    }
-    Ok(Value::Null)
+        .to_owned(),
+        message: error.to_string(),
+        recovery: Some("Reobserve and compile a repaired branch".to_owned()),
+    })
 }
 
 pub fn default_state_dir() -> PathBuf {
@@ -9199,6 +12098,100 @@ pub fn default_state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn packaged_app_focus_matches_exact_aumid_without_registered_executable() {
+        let app = comptrol_app_registry::AppEntry {
+            id: "sample.package_abcd!App".to_owned(),
+            display_name: "Sample".to_owned(),
+            platform: "windows".to_owned(),
+            executable: None,
+            launch_args: Vec::new(),
+            version: None,
+            metadata: Default::default(),
+        };
+        let window = json!({
+            "visible": true,
+            "window_handle": 42,
+            "app_user_model_id": "sample.package_abcd!App",
+            "process_id": 10
+        });
+        assert!(windows_app_matches_window(&app, &window, None, Some(42)));
+        assert!(!windows_app_matches_window(&app, &window, None, Some(43)));
+
+        let wrong_package = json!({
+            "visible": true,
+            "window_handle": 42,
+            "app_user_model_id": "other.package_abcd!App",
+            "process_id": 10
+        });
+        assert!(!windows_app_matches_window(
+            &app,
+            &wrong_package,
+            None,
+            Some(42)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packaged_host_requires_exact_host_identity_and_app_title() {
+        let app = comptrol_app_registry::AppEntry {
+            id: "sample.package_abcd!App".to_owned(),
+            display_name: "Sample".to_owned(),
+            platform: "windows".to_owned(),
+            executable: None,
+            launch_args: Vec::new(),
+            version: None,
+            metadata: Default::default(),
+        };
+        let host = json!({
+            "visible": true,
+            "class_name": "ApplicationFrameWindow",
+            "executable": "C:\\Windows\\System32\\ApplicationFrameHost.exe",
+            "title": "Sample"
+        });
+        assert!(windows_packaged_host_matches_app(&app, &host));
+
+        let wrong_title = json!({"visible":true,"class_name":"ApplicationFrameWindow","executable":"C:\\Windows\\System32\\ApplicationFrameHost.exe","title":"Other"});
+        assert!(!windows_packaged_host_matches_app(&app, &wrong_title));
+        let wrong_host = json!({"visible":true,"class_name":"OtherWindow","executable":"C:\\Windows\\System32\\other.exe","title":"Sample"});
+        assert!(!windows_packaged_host_matches_app(&app, &wrong_host));
+    }
+
+    #[test]
+    fn app_instance_policy_requires_exact_window_to_reuse_existing_instance() {
+        assert!(validate_app_instance_policy("reuse_unique", Some(42)).is_ok());
+        assert!(validate_app_instance_policy("launch_new", Some(42)).is_err());
+        assert!(validate_app_instance_policy("error_if_running", Some(42)).is_err());
+        assert!(validate_app_instance_policy("guess", None).is_err());
+        assert!(validate_app_instance_policy("launch_new", None).is_ok());
+    }
+
+    #[test]
+    fn uia_provider_timeout_marks_mutation_unknown_for_reconciliation() {
+        let request = OperationRequest {
+            intent: "windows.uia.press".to_owned(),
+            target: None,
+            params: json!({"process_id": 1234, "name":"Save"}),
+            postcondition: None,
+            risk: None,
+            idempotency_key: Some("uia-timeout-case".to_owned()),
+            dry_run: false,
+            background: Some("foreground_allowed".to_owned()),
+        };
+        let result = uia_worker_unknown(
+            &request,
+            "uia-timeout-op".to_owned(),
+            false,
+            "uia_worker_timeout: provider exceeded deadline".to_owned(),
+        );
+        assert_eq!(result.delivery, DeliveryState::Unknown);
+        assert_eq!(result.effect, EffectState::Unknown);
+        assert_eq!(result.recovery, RecoveryState::RequiresReconciliation);
+        assert_eq!(result.error.unwrap().code, "uia_provider_timeout");
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
@@ -9256,6 +12249,26 @@ mod tests {
     }
 
     #[test]
+    fn runtime_fingerprint_hashes_the_running_executable_and_policy() {
+        let fingerprint = runtime_fingerprint();
+        let executable = std::env::current_exe().expect("test executable path");
+        let executable_hash = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        assert_eq!(fingerprint["server_version"], SERVER_VERSION);
+        assert_eq!(fingerprint["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(
+            fingerprint["executable_path"],
+            executable.to_string_lossy().as_ref()
+        );
+        assert_eq!(fingerprint["executable_sha256"], executable_hash);
+        assert_eq!(fingerprint["process_id"], std::process::id());
+        assert_eq!(
+            fingerprint["policy_fingerprint"].as_str().unwrap().len(),
+            64
+        );
+        assert!(fingerprint["effective_policy"].is_object());
+    }
+
+    #[test]
     fn policy_denies_mutation_by_default() {
         let mut runtime = runtime();
         let result = runtime.operate(OperationRequest {
@@ -9273,6 +12286,19 @@ mod tests {
             Some("policy_denied")
         );
         assert!(matches!(result.delivery, DeliveryState::Refused));
+    }
+
+    #[test]
+    fn browser_protocol_capability_requires_policy_and_a_live_transport() {
+        assert!(!browser_protocol_available(false, false, false, false));
+        assert!(!browser_protocol_available(false, false, true, false));
+        assert!(!browser_protocol_available(true, false, false, false));
+        assert!(browser_protocol_available(true, false, true, false));
+        assert!(!browser_protocol_available(false, true, false, false));
+        assert!(browser_protocol_available(false, true, true, false));
+        // Auto-start alone is enough: it produces the endpoint and the gate.
+        assert!(browser_protocol_available(false, false, false, true));
+        assert!(browser_protocol_available(false, false, true, true));
     }
 
     #[test]
@@ -9343,6 +12369,96 @@ mod tests {
         assert_eq!(
             result.error.as_ref().map(|error| error.code.as_str()),
             Some("invalid_input")
+        );
+    }
+
+    #[test]
+    fn recipe_run_refuses_an_unpromoted_recipe_and_an_unknown_one() {
+        let mut runtime = runtime();
+        // The closed schema rejects an unknown recipe name before dispatch,
+        // so the caller learns it from a validated enum rather than from a
+        // runtime lookup failure.
+        let unknown = operate(
+            &mut runtime,
+            "recipe.run",
+            json!({"recipe":"recipe.does_not_exist"}),
+            Risk::R1,
+        );
+        assert_eq!(
+            unknown.error.as_ref().map(|e| e.code.as_str()),
+            Some("invalid_input")
+        );
+        // Every checked-in recipe ships with zero verified replays, so it
+        // must refuse rather than pretend to be proven.
+        let unpromoted = operate(
+            &mut runtime,
+            "recipe.run",
+            json!({
+                "recipe":"recipe.classroom_open_class",
+                "parameters":{"account":"a@example.test","class_name":"Investment Club"}
+            }),
+            Risk::R1,
+        );
+        assert_eq!(
+            unpromoted.error.as_ref().map(|e| e.code.as_str()),
+            Some("recipe_not_promoted")
+        );
+        assert!(
+            unpromoted
+                .error
+                .as_ref()
+                .is_some_and(|e| e.message.contains("0 verified replays")),
+            "the refusal must report the recipe's real promotion state"
+        );
+        // Promotion is checked before binding, so an unpromoted recipe
+        // reports its promotion state even when its parameters are also
+        // missing. That ordering is deliberate: telling a caller their
+        // parameters are wrong when the real problem is "this recipe has
+        // never been proven" would send them down the wrong path.
+        let missing_params = operate(
+            &mut runtime,
+            "recipe.run",
+            json!({"recipe":"recipe.classroom_open_class"}),
+            Risk::R1,
+        );
+        assert_eq!(
+            missing_params.error.as_ref().map(|e| e.code.as_str()),
+            Some("recipe_not_promoted")
+        );
+    }
+
+    #[test]
+    fn recipes_are_discoverable_and_their_steps_reuse_dispatchable_intents() {
+        // A recipe must never reach a route the caller could not reach
+        // directly, so every step it names has to be a real intent.
+        for recipe in comptrol_workflow::recipes::catalog() {
+            assert!(intent_schema::schema_for("recipe.run").is_some());
+            for node in recipe.workflow.nodes.values() {
+                if let comptrol_workflow::WorkflowNode::Act { intent, .. } = node {
+                    assert!(
+                        CORE_INTENTS.contains(&intent.as_str()),
+                        "recipe {} steps through {intent}, which is not a core intent",
+                        recipe.workflow.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn app_launch_rejects_an_unknown_window_state_before_launching_anything() {
+        let mut runtime = runtime();
+        allow(&mut runtime, "app.launch", Risk::R1);
+        let result = operate(
+            &mut runtime,
+            "app.launch",
+            json!({"app":"this-application-does-not-exist","window_state":"invisible"}),
+            Risk::R1,
+        );
+        assert_eq!(
+            result.error.as_ref().map(|e| e.code.as_str()),
+            Some("invalid_input"),
+            "an unknown window_state must be refused by the closed schema, not by a failed launch"
         );
     }
 
@@ -9794,16 +12910,45 @@ mod tests {
         let steps: Vec<BrowserWorkflowStep> = serde_json::from_value(json!([
             {"action":"navigate","url":"https://example.com","url_contains":"example.com"},
             {"action":"click","locator":{"role":"link","name":"Example"},"timeout_ms":900},
-            {"action":"wait_url","contains":"/done","timeout_ms":1200}
+            {"action":"wait_url","contains":"/done","timeout_ms":1200},
+            {"action":"wait_text","text":"Task completed","timeout_ms":1200}
         ]))
         .expect("browser workflow schema");
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 4);
         assert!(
             serde_json::from_value::<Vec<BrowserWorkflowStep>>(json!([
                 {"action":"evaluate","expression":"alert(1)"}
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn browser_bridge_timeout_is_unknown_and_requires_reconciliation() {
+        let request = OperationRequest {
+            intent: "browser.cdp.workflow".to_owned(),
+            target: None,
+            params: json!({"steps":[{"action":"click","locator":{"text":"Continue"}}]}),
+            postcondition: None,
+            risk: Some(Risk::R2),
+            idempotency_key: Some("bridge-timeout-reconcile".to_owned()),
+            dry_run: false,
+            background: None,
+        };
+        let result = browser_failure(
+            &request,
+            "bridge-timeout-reconcile".to_owned(),
+            ComptrolError {
+                code: "browser_bridge_timeout".to_owned(),
+                message: "command result timed out".to_owned(),
+                recovery: Some("Inspect the live target before retrying".to_owned()),
+            },
+        );
+        assert_eq!(result.preflight, "passed");
+        assert_eq!(result.delivery, DeliveryState::Unknown);
+        assert_eq!(result.effect, EffectState::Unknown);
+        assert_eq!(result.verification, VerificationState::Unverified);
+        assert_eq!(result.recovery, RecoveryState::RequiresReconciliation);
     }
 
     #[test]
@@ -9998,6 +13143,136 @@ mod tests {
                 .expect_err("browser UI target")
                 .code,
             "wrong_target_type"
+        );
+    }
+
+    #[test]
+    fn browser_binding_revalidates_generation_only_drift() {
+        // K4: live SPAs bump the generation constantly; a pinned revision
+        // whose URL tail matches the live URL is generation-only drift and
+        // must revalidate, while a URL change must still refuse.
+        let targets = vec![BrowserTarget {
+            id: "profile-1:42".to_owned(),
+            browser_context_id: Some("profile-1".to_owned()),
+            target_type: Some("page".to_owned()),
+            url: Some("https://classroom.google.com/u/2/h/st".to_owned()),
+            title: Some("Home - Classroom".to_owned()),
+            revision: Some(
+                "bridge:profile-1:42:3:https://classroom.google.com/u/2/h/st".to_owned(),
+            ),
+            web_socket_url: None,
+        }];
+        assert_eq!(
+            bind_browser_target(
+                &targets,
+                "profile-1:42",
+                Some("profile-1"),
+                Some("bridge:profile-1:42:3:https://classroom.google.com/u/2/h/st")
+            )
+            .expect("exact revision")
+            .id,
+            "profile-1:42"
+        );
+        assert_eq!(
+            bind_browser_target(
+                &targets,
+                "profile-1:42",
+                Some("profile-1"),
+                Some("bridge:profile-1:42:9:https://classroom.google.com/u/2/h/st")
+            )
+            .expect("generation-only drift revalidates")
+            .id,
+            "profile-1:42"
+        );
+        assert_eq!(
+            bind_browser_target(
+                &targets,
+                "profile-1:42",
+                Some("profile-1"),
+                Some("bridge:profile-1:42:9:https://classroom.google.com/u/2/c/abc")
+            )
+            .expect_err("url change")
+            .code,
+            "stale_reference"
+        );
+        assert_eq!(
+            bind_browser_target(&targets, "profile-1:42", None, Some("revision-1"))
+                .expect_err("strict non-bridge revision")
+                .code,
+            "stale_reference"
+        );
+    }
+
+    #[test]
+    fn browser_workflow_target_match_requires_one_exact_page_candidate() {
+        let target = BrowserTarget {
+            id: "tab-classroom".to_owned(),
+            browser_context_id: Some("profile-school".to_owned()),
+            target_type: Some("page".to_owned()),
+            url: Some("https://classroom.google.com/u/2/h/st".to_owned()),
+            title: Some("Home - Classroom".to_owned()),
+            revision: Some("url:https://classroom.google.com/u/2/h/st".to_owned()),
+            web_socket_url: None,
+        };
+        assert_eq!(
+            unique_workflow_target(
+                std::slice::from_ref(&target),
+                "classroom.google.com",
+                Some("Classroom"),
+                Some("profile-school")
+            )
+            .expect("one exact page")
+            .id,
+            "tab-classroom"
+        );
+        assert_eq!(
+            unique_workflow_target(
+                std::slice::from_ref(&target),
+                "classroom.google.com",
+                None,
+                Some("other-profile")
+            )
+            .expect_err("wrong context")
+            .code,
+            "target_missing"
+        );
+        let mut duplicate = target.clone();
+        duplicate.id = "tab-classroom-2".to_owned();
+        assert_eq!(
+            unique_workflow_target(
+                &[target.clone(), duplicate],
+                "classroom.google.com",
+                None,
+                None
+            )
+            .expect_err("ambiguous classroom pages")
+            .code,
+            "ambiguous_target"
+        );
+        let mut chrome_internal = target;
+        chrome_internal.id = "chrome-internal".to_owned();
+        chrome_internal.target_type = Some("other".to_owned());
+        assert_eq!(
+            unique_workflow_target(&[chrome_internal], "classroom.google.com", None, None)
+                .expect_err("non-page target")
+                .code,
+            "target_missing"
+        );
+
+        let account_chooser = BrowserTarget {
+            id: "tab-account-chooser".to_owned(),
+            browser_context_id: Some("profile-school".to_owned()),
+            target_type: Some("page".to_owned()),
+            url: Some("https://accounts.google.com/v3/signin?continue=https%3A%2F%2Fclassroom.google.com%2Fu%2F2%2Fh%2Fst".to_owned()),
+            title: Some("Choose an account".to_owned()),
+            revision: Some("url:account-chooser".to_owned()),
+            web_socket_url: None,
+        };
+        assert_eq!(
+            unique_workflow_target(&[account_chooser], "classroom.google.com", None, None)
+                .expect_err("account chooser must not match Classroom destination query")
+                .code,
+            "target_missing"
         );
     }
 
@@ -10413,7 +13688,15 @@ mod tests {
             "software.install",
             "popup.dismiss",
         ] {
-            let result = operate(&mut runtime, intent, json!({}), Risk::R3);
+            let params = if intent == "app.open_resource" {
+                json!({
+                    "app":"example-app-id",
+                    "resource":{"kind":"url","url":"https://example.com/"}
+                })
+            } else {
+                json!({})
+            };
+            let result = operate(&mut runtime, intent, params, Risk::R3);
             assert_eq!(
                 result.error.as_ref().map(|e| e.code.as_str()),
                 Some("policy_denied"),
@@ -10664,17 +13947,18 @@ mod tests {
             unknown.error.as_ref().map(|e| e.code.as_str()),
             Some("invalid_input")
         );
-        let unavailable = operate(
+        let disconnected = operate(
             &mut runtime,
             "browser.session.connect",
             json!({"provider": "companion_extension"}),
             Risk::R2,
         );
-        // CompanionExtension no longer requires COMPTROL_CDP_ENDPOINT;
-        // it routes through the daemon's native bridge instead.
-        assert_eq!(
-            unavailable.error.as_ref().map(|e| e.code.as_str()),
-            Some("route_unavailable")
-        );
+        // The extension is registered on this machine, but this isolated
+        // runtime must not borrow the user's default bridge state or connect
+        // to their live browser session.
+        assert_eq!(disconnected.error, None);
+        assert_eq!(disconnected.verification, VerificationState::Unverified);
+        assert_eq!(disconnected.data["status"], "registered_but_inactive");
+        assert_eq!(disconnected.data["bridge_health"]["active"], false);
     }
 }

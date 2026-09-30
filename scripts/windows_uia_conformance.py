@@ -59,10 +59,22 @@ try:
         },
     )
     call(runtime, 1, "initialize", {})
-    result = call(runtime, 2, "tools/call", {"name": "operate", "arguments": {
+    observed = call(runtime, 2, "tools/call", {"name": "operate", "arguments": {
+        "intent": "windows.uia.inspect",
+        "params": {"process_id": fixture.pid, "max_nodes": 128},
+    }})
+    observed_state = observed["result"]["structuredContent"]
+    if observed_state.get("error"):
+        raise RuntimeError(observed_state)
+    controls = observed_state.get("data", {}).get("controls", [])
+    handles = {control.get("window_handle") for control in controls if control.get("window_handle")}
+    if len(handles) != 1:
+        raise AssertionError({"fixture_window_handles": sorted(handles), "controls": controls})
+    fixture_window_handle = handles.pop()
+    result = call(runtime, 3, "tools/call", {"name": "operate", "arguments": {
         "intent": "windows.uia.press",
         "idempotency_key": f"windows-uia-press-{fixture.pid}",
-        "params": {"process_id": fixture.pid, "name": "Submit", "automation_id": "SubmitButton", "role": "button"},
+        "params": {"process_id": fixture.pid, "window_handle": fixture_window_handle, "name": "Submit", "automation_id": "SubmitButton", "role": "button"},
         "postcondition": {"attribute": "name", "equals": "Submitted"},
     }})
     structured = result["result"]["structuredContent"]

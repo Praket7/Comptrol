@@ -169,11 +169,16 @@ function connectSocket(attempt = 0) {
 function startDaemon() {
   if (stopping) return;
   daemon = spawn(binary, ["daemon"], {
-    stdio: ["ignore", "ignore", "inherit"],
+    // The daemon owns the persistent runtime; MCP clients are disposable
+    // connections. Keep it outside this launcher's process tree so closing one
+    // client cannot take the shared broker away from other clients.
+    detached: true,
+    stdio: "ignore",
     env: process.env,
     shell: process.platform === "win32" && binary.toLowerCase().endsWith(".cmd"),
   });
   daemon.on("error", (error) => scheduleRestart(`because daemon launch failed ${error.message}`));
+  daemon.unref();
   connectSocket();
 }
 
@@ -202,7 +207,6 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     clearTimeout(restartTimer);
     process.stdin.destroy();
     socket?.destroy();
-    daemon?.kill(signal);
   });
 }
 

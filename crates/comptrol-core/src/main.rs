@@ -1,8 +1,10 @@
 use comptrol::{
     CompiledWorkflow, MAX_PROTOCOL_BYTES, OperationRequest, PROTOCOL_VERSION, Runtime,
     SERVER_VERSION, TraceMode,
-    browser_bridge::{BridgeStore, COMPANION_BRIDGE_ENDPOINT, DEFAULT_HEALTH_MAX_AGE},
-    capabilities, compile_verified_trace, default_state_dir, integration, mcp,
+    browser_bridge::{
+        BridgeCommand, BridgeStore, COMPANION_BRIDGE_ENDPOINT, DEFAULT_HEALTH_MAX_AGE,
+    },
+    capability_catalog, compile_verified_trace, default_state_dir, integration, intent_schema, mcp,
     pairing::PairingStore,
     privacy_network_endpoints, privacy_status, read_trace, validate_compiled_workflow,
 };
@@ -23,12 +25,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -36,7 +36,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::windows::io::{FromRawHandle, RawHandle};
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE,
+};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -46,6 +48,8 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::CreateMutexW;
 
 const DEFAULT_TASK_TTL_MS: u64 = 300_000;
 const TASK_POLL_INTERVAL_MS: u64 = 50;
@@ -53,6 +57,11 @@ const HTTP_SESSION_TTL_MS: u128 = 86_400_000;
 const HTTP_EVENT_CAPACITY: usize = 256;
 const HTTP_STREAM_IDLE_MS: u64 = 300_000;
 const HTTP_MAX_CONNECTIONS: usize = 32;
+const BROWSER_BRIDGE_POLL_MAX_WAIT_MS: u64 = 800;
+const BROWSER_BRIDGE_POLL_INTERVAL_MS: u64 = 20;
+static PROCESS_STARTED: OnceLock<Instant> = OnceLock::new();
+static STDIO_READY_MS: AtomicUsize = AtomicUsize::new(0);
+static MCP_OPERATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredTask {
@@ -635,6 +644,7 @@ impl TaskManager {
     }
 
     fn spawn(&self, params: Value, ttl_ms: u64) -> io::Result<Value> {
+        let queued_at = Instant::now();
         let task = self
             .store
             .lock()
@@ -664,10 +674,11 @@ impl TaskManager {
                     return;
                 }
                 let _ = update_task(&store, &task_id, "running", Value::Null);
+                let queue_wait_ms = queued_at.elapsed().as_secs_f64() * 1000.0;
                 let started_at_ms = now_ms();
                 let result = {
                     let mut runtime = runtime.lock().expect("runtime lock poisoned");
-                    call_tool_with_cancel(&mut runtime, params, Some(Arc::clone(&cancelled)))
+                    call_tool_with_cancel(&mut runtime, params, Some(Arc::clone(&cancelled)), queue_wait_ms)
                 };
                 let requested = cancelled.load(Ordering::Acquire)
                     || store
@@ -865,6 +876,9 @@ fn run_open(args: Vec<String>) -> i32 {
         return print_open_result(result);
     }
 
+    // `comptrol open <url>` is an explicit request for a browser, so this is the
+    // one place that may start the local Chrome before deciding how to reach it.
+    comptrol::chrome_autostart::ensure();
     let can_verify = std::env::var("COMPTROL_ALLOW_BROWSER_CDP").as_deref() == Ok("1")
         && (std::env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
             || comptrol::browser_bridge::bridge_is_active());
@@ -928,29 +942,23 @@ fn print_open_result(result: comptrol::ActionResult) -> i32 {
 }
 
 fn main() {
+    let _ = PROCESS_STARTED.set(Instant::now());
     let result = match env::args().nth(1).as_deref() {
+        #[cfg(windows)]
+        Some("__windows-uia-worker") => comptrol_platform_windows::run_worker_stdio(),
         None | Some("mcp") => {
-            let auto_started_chrome = auto_start_chrome_cdp();
+            // Chrome is not started here. A browser operation starts it on
+            // first use, windowless, so a desktop-only session never shows a
+            // browser window at all. See `comptrol::chrome_autostart`.
             let result = run_stdio();
-            if let Some(mut chrome) = auto_started_chrome {
-                #[cfg(windows)]
-                {
-                    let pid = chrome.id().to_string();
-                    let _ = Command::new("taskkill")
-                        .args(["/PID", &pid, "/T", "/F"])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                }
-                let _ = chrome.kill();
-                let _ = chrome.wait();
-            }
+            comptrol::chrome_autostart::shutdown();
             result
         }
+        Some("setup") => comptrol::setup::run_setup(&env::args().skip(2).collect::<Vec<String>>()),
         Some("doctor") => run_doctor(env::args().skip(2).collect()),
         Some("open") => run_open(env::args().skip(2).collect()),
         Some("status") => print_json(run_inspect("status")),
-        Some("capabilities") => print_json(json!(capabilities())),
+        Some("capabilities") => print_json(capability_catalog()),
         Some("stop") => change_stop(true),
         Some("resume") => change_stop(false),
         Some("resolve-action") => resolve_human_action_cli(env::args().skip(2).collect()),
@@ -982,7 +990,7 @@ fn main() {
         Some(other) => {
             eprintln!("unknown command {other}");
             eprintln!(
-                "commands are mcp doctor open status capabilities stop resume serve-http serve-mtls daemon daemon-health record replay workflow adapter integrate pair privacy version"
+                "commands are mcp doctor setup open status capabilities stop resume serve-http serve-mtls daemon daemon-health record replay workflow adapter integrate pair privacy version"
             );
             2
         }
@@ -990,118 +998,6 @@ fn main() {
     if result != 0 {
         std::process::exit(result);
     }
-}
-
-fn auto_start_chrome_cdp() -> Option<std::process::Child> {
-    if env::var_os("COMPTROL_CDP_ENDPOINT").is_some()
-        || env::var("COMPTROL_AUTO_START_CHROME_CDP").as_deref() == Ok("0")
-    {
-        return None;
-    }
-
-    #[cfg(not(windows))]
-    return None;
-
-    #[cfg(windows)]
-    {
-        let Some(chrome) = windows_chrome_path() else {
-            eprintln!("Comptrol Chrome CDP auto-start skipped because Chrome was not found");
-            return None;
-        };
-        let port = match TcpListener::bind(("127.0.0.1", 0))
-            .and_then(|listener| listener.local_addr())
-            .map(|address| address.port())
-        {
-            Ok(port) => port,
-            Err(error) => {
-                eprintln!(
-                    "Comptrol Chrome CDP auto-start skipped because a local port was unavailable: {error}"
-                );
-                return None;
-            }
-        };
-        let profile = env::var_os("COMPTROL_CHROME_PROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| default_state_dir().join("chrome-cdp-profile"));
-        if let Err(error) = std::fs::create_dir_all(&profile) {
-            eprintln!(
-                "Comptrol Chrome CDP auto-start skipped because the profile could not be created: {error}"
-            );
-            return None;
-        }
-        let url =
-            env::var("COMPTROL_CHROME_START_URL").unwrap_or_else(|_| "about:blank".to_owned());
-        let endpoint = format!("http://127.0.0.1:{port}");
-        let mut child = match Command::new(&chrome)
-            .args([
-                "--remote-debugging-address=127.0.0.1".to_owned(),
-                format!("--remote-debugging-port={port}"),
-                format!("--user-data-dir={}", profile.display()),
-                "--no-first-run".to_owned(),
-                "--no-default-browser-check".to_owned(),
-                url,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                eprintln!(
-                    "Comptrol Chrome CDP auto-start skipped because Chrome could not launch: {error}"
-                );
-                return None;
-            }
-        };
-        let ready = (0..100).any(|_| {
-            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-                let _ = stream.write_all(
-                    b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-                );
-                let mut response = String::new();
-                let _ = stream.read_to_string(&mut response);
-                if response.contains("200 OK") && response.contains("Browser") {
-                    return true;
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-            false
-        });
-        if !ready {
-            eprintln!(
-                "Comptrol Chrome CDP auto-start skipped because Chrome did not expose /json/version"
-            );
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        unsafe {
-            env::set_var("COMPTROL_CDP_ENDPOINT", endpoint);
-            env::set_var("COMPTROL_ALLOW_BROWSER_CDP", "1");
-        }
-        eprintln!(
-            "Comptrol Chrome CDP auto-started with profile {}",
-            profile.display()
-        );
-        Some(child)
-    }
-}
-
-#[cfg(windows)]
-fn windows_chrome_path() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(program_files) = env::var_os("PROGRAMFILES") {
-        candidates.push(PathBuf::from(program_files).join("Google/Chrome/Application/chrome.exe"));
-    }
-    if let Some(program_files_x86) = env::var_os("PROGRAMFILES(X86)") {
-        candidates
-            .push(PathBuf::from(program_files_x86).join("Google/Chrome/Application/chrome.exe"));
-    }
-    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(local_app_data).join("Google/Chrome/Application/chrome.exe"));
-    }
-    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn run_privacy(args: Vec<String>) -> i32 {
@@ -1339,6 +1235,7 @@ fn run_integrate(args: Vec<String>) -> i32 {
 }
 
 fn run_stdio() -> i32 {
+    let startup_started = Instant::now();
     let runtime = match Runtime::new(default_state_dir()) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -1355,6 +1252,13 @@ fn run_stdio() -> i32 {
     };
     let runtime = Arc::new(Mutex::new(runtime));
     let tasks = TaskManager::new(Arc::clone(&runtime), tasks);
+    STDIO_READY_MS.store(
+        startup_started
+            .elapsed()
+            .as_millis()
+            .min(usize::MAX as u128) as usize,
+        Ordering::Release,
+    );
     let mut tasks_enabled = false;
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -1504,7 +1408,7 @@ where
             } else {
                 json!({})
             };
-            json!({ "protocolVersion": protocol_version, "capabilities": { "tools": { "listChanged": false }, "tasks": task_capabilities, "extensions": extensions }, "serverInfo": { "name": "comptrol", "version": SERVER_VERSION }, "instructions": "Use operate for one bounded intent. Use inspect for current state. Results distinguish delivery, effect, and verification. Unsupported capabilities refuse safely.", "comptrol": { "protocol_mode": if protocol_mode == mcp::ProtocolMode::Current { "stateless" } else { "legacy_compatibility" } } })
+            json!({ "protocolVersion": protocol_version, "capabilities": { "tools": { "listChanged": false }, "tasks": task_capabilities, "extensions": extensions }, "serverInfo": { "name": "comptrol", "version": SERVER_VERSION }, "instructions": "Use capabilities.intents for callable intent names; platform_observations are not callable. intent_schema returns the enforced parameter schema and example for supported intents. Use operate for one bounded intent and inspect for current state. Results distinguish delivery, effect, and verification.", "comptrol": { "protocol_mode": if protocol_mode == mcp::ProtocolMode::Current { "stateless" } else { "legacy_compatibility" } } })
         }
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tools() }),
@@ -1528,6 +1432,7 @@ where
                         &mut runtime.lock().expect("runtime lock poisoned"),
                         request.get("params").cloned().unwrap_or(Value::Null),
                         None,
+                        0.0,
                     ),
                 }
             } else {
@@ -1535,6 +1440,7 @@ where
                     &mut runtime.lock().expect("runtime lock poisoned"),
                     params,
                     None,
+                    0.0,
                 )
             }
         }
@@ -1616,6 +1522,7 @@ fn task_error(message: &str) -> Value {
 fn tools() -> Value {
     json!([
         { "name": "operate", "description": "Execute one bounded local intent with policy, idempotency, background posture, and verification state", "annotations": {"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true,"idempotentHint":false}, "inputSchema": { "type": "object", "required": ["intent"], "properties": { "intent": {"type":"string"}, "target": {"type":"object"}, "params": {"type":"object"}, "postcondition": {"type":"object"}, "risk": {"type":"string"}, "idempotency_key": {"type":"string"}, "dry_run": {"type":"boolean"}, "background": {"type":"string", "enum":["strict_background","prefer_background","foreground_allowed","foreground_required"]} } } },
+        { "name": "intent_schema", "description": "Return the exact parameter schema, constraints, and example for a supported intent when discovery is needed; operate validates against the same schema before dispatch", "annotations": {"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false,"idempotentHint":true}, "inputSchema": {"type":"object","required":["intent"],"properties":{"intent":{"type":"string"}}} },
         { "name": "inspect", "description": "Inspect doctor, status, capabilities, deterministic route plans, platform state, events, checkpoints, adapters, or current desktop observation", "annotations": {"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false,"idempotentHint":true}, "inputSchema": { "type": "object", "properties": { "kind": {"type":"string", "enum":["doctor","status","capabilities","routes","platform","desktop","events","checkpoints","adapters"]} } } },
         { "name": "watch", "description": "Return the known state of an operation without repeating its mutation", "annotations": {"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false,"idempotentHint":true}, "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
         { "name": "reconcile", "description": "Reconcile a durable unknown operation from observed local state without repeating its mutation", "annotations": {"readOnlyHint":false,"destructiveHint":false,"openWorldHint":true,"idempotentHint":true}, "inputSchema": { "type": "object", "required":["operation_id"], "properties": { "operation_id": {"type":"string"} } } },
@@ -1629,27 +1536,82 @@ fn call_tool_with_cancel(
     runtime: &mut Runtime,
     params: Value,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    queue_wait_ms: f64,
 ) -> Value {
+    let call_started = Instant::now();
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let call_number = if name == "operate" {
+        MCP_OPERATION_COUNT.fetch_add(1, Ordering::AcqRel)
+    } else {
+        MCP_OPERATION_COUNT.load(Ordering::Acquire)
+    };
     let arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let value = match name {
-        "operate" => serde_json::from_value::<OperationRequest>(arguments).map(|request| {
-            json!(match cancellation {
-                Some(cancellation) => runtime.operate_with_cancel(request, cancellation),
-                None => runtime.operate(request),
-            })
-        }).unwrap_or_else(|error| json!({ "error": { "code": "invalid_input", "message": error.to_string() } })),
+    let client_timing = params
+        .get("_meta")
+        .and_then(|meta| meta.get("comptrolTiming"));
+    let workflow_id = client_timing
+        .and_then(|value| value.get("workflow_id"))
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+        })
+        .map(str::to_owned);
+    let client_model_ms =
+        external_duration_ms(client_timing.and_then(|value| value.get("client_model_ms")));
+    let human_prompt_ms =
+        external_duration_ms(client_timing.and_then(|value| value.get("human_prompt_ms")));
+    let perceived_elapsed_ms =
+        external_duration_ms(client_timing.and_then(|value| value.get("perceived_elapsed_ms")));
+    let mut value = match name {
+        "operate" => {
+            let started = Instant::now();
+            let mut runtime_operate_ms = None;
+            let mut value = serde_json::from_value::<OperationRequest>(arguments)
+                .map(|request| {
+                    let operation_started = Instant::now();
+                    let result = match cancellation {
+                        Some(cancellation) => runtime.operate_with_cancel(request, cancellation),
+                        None => runtime.operate(request),
+                    };
+                    runtime_operate_ms = Some(operation_started.elapsed().as_secs_f64() * 1000.0);
+                    json!(result)
+                })
+                .unwrap_or_else(|error| json!({ "error": { "code": "invalid_input", "message": error.to_string() } }));
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "timings".to_owned(),
+                    json!({
+                        "runtime_total_ms": started.elapsed().as_secs_f64() * 1000.0,
+                        "runtime_operate_ms": runtime_operate_ms
+                    }),
+                );
+            }
+            value
+        }
+        "intent_schema" => match arguments.get("intent").and_then(Value::as_str) {
+            Some(intent) => intent_schema::schema_for(intent).unwrap_or_else(|| {
+                json!({
+                    "error": {"code":"schema_unavailable","message":format!("No intent-specific schema is published for {intent}")},
+                    "available_schemas": intent_schema::available_schemas()
+                })
+            }),
+            None => json!({"error":{"code":"invalid_input","message":"intent_schema requires a string intent"}}),
+        },
         "inspect" => json!(runtime.inspect(arguments.get("kind").and_then(Value::as_str).unwrap_or("status"))),
         "watch" => json!(runtime.watch(arguments.get("operation_id").and_then(Value::as_str).unwrap_or_default())),
         "reconcile" => json!(runtime.reconcile(arguments.get("operation_id").and_then(Value::as_str).unwrap_or_default())),
         "restore_checkpoint" => serde_json::from_value::<OperationRequest>(json!({ "intent": "filesystem.restore_checkpoint", "params": arguments.clone(), "idempotency_key": arguments.get("idempotency_key"), "risk": "R1" })).map(|request| json!(runtime.operate(request))).unwrap_or_else(|error| json!({ "error": { "code": "invalid_input", "message": error.to_string() } })),
-        "capabilities" => json!(capabilities()),
+        "capabilities" => capability_catalog(),
         "human_action.resolve" => {
             let action_id = arguments.get("action_id").and_then(Value::as_str).unwrap_or_default();
             let resolution_str = arguments.get("resolution").and_then(Value::as_str).unwrap_or_default();
@@ -1678,7 +1640,397 @@ fn call_tool_with_cancel(
         }
         _ => json!({ "error": { "code": "tool_not_found", "message": format!("Unknown tool {name}") } }),
     };
-    json!({ "content": [{ "type": "text", "text": serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned()) }], "structuredContent": value })
+    if name == "operate" {
+        let server_call_ms = call_started.elapsed().as_secs_f64() * 1000.0;
+        let process_uptime_ms = PROCESS_STARTED
+            .get()
+            .map(|start| start.elapsed().as_millis());
+        let action_and_verification_ms = value
+            .pointer("/data/_comptrol_timing/action_and_verification_ms")
+            .cloned();
+        let intent = value["intent"].as_str().unwrap_or_default().to_owned();
+        let app_launch_timings = value.pointer("/data/timings_ms").cloned();
+        let focus_timings = value.pointer("/data/window/timings_ms").cloned();
+        let retry_count = value
+            .pointer("/data/retry_count")
+            .cloned()
+            .unwrap_or(json!(0));
+        let user_intervention = value
+            .pointer("/data/awaiting_human_action")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let queue_wait = value
+            .pointer("/timings/queue_wait_ms")
+            .cloned()
+            .unwrap_or(json!(0));
+        if let Some(data) = value.get_mut("data").and_then(Value::as_object_mut) {
+            data.remove("_comptrol_timing");
+        }
+        let action_ms = action_and_verification_ms.as_ref().and_then(Value::as_f64);
+        if let Some(timings) = value.get_mut("timings").and_then(Value::as_object_mut) {
+            let engine_ms = timings
+                .get("runtime_operate_ms")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let engine_total = engine_ms.as_f64();
+            timings.insert("server_call_ms".to_owned(), json!(server_call_ms));
+            timings.insert("engine_total_ms".to_owned(), engine_ms.clone());
+            timings.insert(
+                "action_and_verification_ms".to_owned(),
+                action_and_verification_ms.clone().unwrap_or(Value::Null),
+            );
+            timings.insert(
+                "engine_overhead_ms".to_owned(),
+                json!(
+                    engine_total
+                        .zip(action_ms)
+                        .map(|(total, action)| (total - action).max(0.0))
+                ),
+            );
+            timings.insert("queue_wait_ms".to_owned(), json!(queue_wait_ms));
+            timings.insert(
+                "daemon_startup_ms".to_owned(),
+                json!(STDIO_READY_MS.load(Ordering::Acquire)),
+            );
+            timings.insert("process_uptime_ms".to_owned(), json!(process_uptime_ms));
+            timings.insert(
+                "process_state".to_owned(),
+                json!(if call_number == 0 {
+                    "first_operation_after_start"
+                } else {
+                    "warm"
+                }),
+            );
+            timings.insert("retry_count".to_owned(), retry_count);
+            timings.insert("user_intervention".to_owned(), user_intervention);
+            timings.insert("app_network_ms".to_owned(), Value::Null);
+            timings.insert("client_model_ms".to_owned(), client_model_ms);
+            timings.insert("human_prompt_ms".to_owned(), human_prompt_ms);
+            timings.insert("perceived_elapsed_ms".to_owned(), perceived_elapsed_ms);
+            let route_ms = action_and_verification_ms.clone().unwrap_or(Value::Null);
+            let browser_route = intent.starts_with("browser.");
+            let application_route = intent.starts_with("app.") || intent.starts_with("blender.");
+            timings.insert("phase_spans_ms".to_owned(), json!({
+                "queue": queue_wait,
+                "startup": STDIO_READY_MS.load(Ordering::Acquire),
+                "app_resolution": app_launch_timings.as_ref().and_then(|v| v.get("app_resolution_ms")).cloned(),
+                "launch_and_settle": app_launch_timings.as_ref().and_then(|v| v.pointer("/launch/launch_and_settle_ms")).cloned(),
+                "window_resolution": focus_timings.as_ref().and_then(|v| v.get("window_resolution_ms")).cloned(),
+                "foreground_activation_and_verification": focus_timings.as_ref().and_then(|v| v.get("foreground_activation_and_verification_ms")).cloned(),
+                "adapter_host_startup": app_launch_timings.as_ref().and_then(|v| v.get("adapter_host_startup_ms")).cloned(),
+                "adapter_execution_and_verification": app_launch_timings.as_ref().and_then(|v| v.get("adapter_execution_and_verification_ms")).cloned(),
+                "content_readiness": null,
+                "observation": if matches!(intent.as_str(), "desktop.observe" | "browser.session.list") { action_and_verification_ms.clone().unwrap_or(Value::Null) } else { Value::Null },
+                "network_route_inclusive": if browser_route { route_ms.clone() } else { Value::Null },
+                "application_route_inclusive": if application_route { route_ms.clone() } else { Value::Null },
+                "action_and_verification": action_and_verification_ms.clone().unwrap_or(Value::Null),
+                "process_identity_verification": app_launch_timings.as_ref().and_then(|v| v.pointer("/launch/process_identity_verification_ms")).cloned(),
+                "recovery": if matches!(intent.as_str(), "reconcile" | "restore_checkpoint" | "browser.chrome.restore_recent") { route_ms.clone() } else { Value::Null }
+            }));
+        }
+        let mut detailed_timings = value.get("timings").cloned().unwrap_or_else(|| json!({}));
+        let mut compact_timings = json!({
+            "runtime_total_ms": detailed_timings["runtime_total_ms"],
+            "runtime_operate_ms": detailed_timings["runtime_operate_ms"],
+            "server_call_ms": detailed_timings["server_call_ms"],
+            "action_and_verification_ms": detailed_timings["action_and_verification_ms"],
+            "queue_wait_ms": detailed_timings["queue_wait_ms"],
+            "process_state": detailed_timings["process_state"]
+        });
+        for field in ["client_model_ms", "human_prompt_ms", "perceived_elapsed_ms"] {
+            if !detailed_timings[field].is_null() {
+                compact_timings[field] = detailed_timings[field].clone();
+            }
+        }
+        let trace_id = value.get("operation_id").cloned();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("timings".to_owned(), compact_timings);
+            // P4.6: trace_id for MCP trace spans (inspect kind:events with
+            // kind "trace.span" returns the per-step spans for this trace).
+            if let Some(trace_id) = trace_id {
+                object.insert("trace_id".to_owned(), trace_id);
+            }
+        }
+        let measured_bytes = serde_json::to_vec(&value).map_or(0, |bytes| bytes.len());
+        if let Some(timings) = value.get_mut("timings").and_then(Value::as_object_mut) {
+            timings.insert("output_bytes".to_owned(), json!(measured_bytes));
+            timings.insert(
+                "output_tokens_estimate".to_owned(),
+                json!(measured_bytes.div_ceil(4)),
+            );
+        }
+        let final_bytes = serde_json::to_vec(&value).map_or(measured_bytes, |bytes| bytes.len());
+        if let Some(timings) = value.get_mut("timings").and_then(Value::as_object_mut) {
+            timings.insert("output_bytes".to_owned(), json!(final_bytes));
+            timings.insert(
+                "output_tokens_estimate".to_owned(),
+                json!(final_bytes.div_ceil(4)),
+            );
+        }
+        if let Some(full) = detailed_timings.as_object_mut() {
+            full.insert("output_bytes".to_owned(), json!(final_bytes));
+            full.insert(
+                "output_tokens_estimate".to_owned(),
+                json!(final_bytes.div_ceil(4)),
+            );
+        }
+        append_timing_trace(&value, &detailed_timings, workflow_id.as_deref());
+    }
+    // MCP structuredContent must be a JSON object. Capabilities and route
+    // inspection are naturally lists, so preserve their shape under a named
+    // field while keeping the text content backward compatible.
+    let structured_content = structured_content_value(&value);
+    json!({ "content": [{ "type": "text", "text": serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned()) }], "structuredContent": structured_content })
+}
+
+fn external_duration_ms(value: Option<&Value>) -> Value {
+    value
+        .and_then(Value::as_f64)
+        .filter(|milliseconds| {
+            milliseconds.is_finite() && (0.0..=86_400_000.0).contains(milliseconds)
+        })
+        .map_or(Value::Null, |milliseconds| json!(milliseconds))
+}
+
+fn append_timing_trace(value: &Value, timings: &Value, workflow_id: Option<&str>) {
+    let Some(path) = env::var_os("COMPTROL_TIMING_TRACE_PATH") else {
+        return;
+    };
+    append_timing_trace_to(Path::new(&path), value, timings, workflow_id);
+}
+
+fn append_timing_trace_to(path: &Path, value: &Value, timings: &Value, workflow_id: Option<&str>) {
+    let record = json!({
+        "kind":"comptrol_timing",
+        "monotonic_offset_ms": PROCESS_STARTED.get().map(|start| start.elapsed().as_secs_f64() * 1000.0),
+        "intent":value["intent"],
+        "route":value["route"],
+        "verification":value["verification"],
+        "workflow_id":workflow_id,
+        "timings":timings
+    });
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{record}"));
+    if let Err(error) = result {
+        eprintln!("comptrol timing trace append failed: {error}");
+    }
+}
+
+fn structured_content_value(value: &Value) -> Value {
+    if value.is_object() {
+        value.clone()
+    } else {
+        json!({ "result": value })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod mcp_result_tests {
+    use super::{
+        append_timing_trace_to, browser_bridge_poll_wait_ms, call_tool_with_cancel,
+        structured_content_value,
+    };
+    use comptrol::{Runtime, capability_catalog};
+    use serde_json::json;
+
+    #[test]
+    fn structured_content_is_always_an_object_without_changing_list_shape() {
+        let list = json!([{"name":"one"},{"name":"two"}]);
+        assert_eq!(structured_content_value(&list), json!({"result":list}));
+
+        let object = json!({"status":"ready"});
+        assert_eq!(structured_content_value(&object), object);
+    }
+
+    #[test]
+    fn browser_bridge_poll_wait_is_bounded() {
+        assert_eq!(browser_bridge_poll_wait_ms(&json!({"wait_ms": 500})), 500);
+        assert_eq!(
+            browser_bridge_poll_wait_ms(&json!({"wait_ms": 50_000})),
+            800
+        );
+        assert_eq!(browser_bridge_poll_wait_ms(&json!({"wait_ms": -1})), 0);
+        assert_eq!(browser_bridge_poll_wait_ms(&json!({})), 0);
+    }
+
+    #[test]
+    fn operate_response_has_compact_measured_timing_and_no_private_fields() {
+        let state = std::env::temp_dir().join(format!(
+            "comptrol-stage1-timing-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let mut runtime = Runtime::new(state.clone()).expect("runtime");
+        let result = call_tool_with_cancel(
+            &mut runtime,
+            json!({"name":"operate","arguments":{"intent":"system.ping","params":{}},"_meta":{"comptrolTiming":{"client_model_ms":12.5,"human_prompt_ms":3.0,"perceived_elapsed_ms":40.0}}}),
+            None,
+            12.5,
+        );
+        let structured = &result["structuredContent"];
+        for field in [
+            "runtime_total_ms",
+            "runtime_operate_ms",
+            "server_call_ms",
+            "action_and_verification_ms",
+            "queue_wait_ms",
+            "process_state",
+            "output_bytes",
+            "output_tokens_estimate",
+        ] {
+            assert!(
+                !structured["timings"][field].is_null(),
+                "missing timing {field}"
+            );
+        }
+        assert!(structured["data"].get("_comptrol_timing").is_none());
+        assert!(structured["timings"].get("phase_spans_ms").is_none());
+        assert!(structured["timings"].get("engine_overhead_ms").is_none());
+        assert_eq!(structured["timings"]["client_model_ms"], json!(12.5));
+        assert_eq!(structured["timings"]["human_prompt_ms"], json!(3.0));
+        assert_eq!(structured["timings"]["perceived_elapsed_ms"], json!(40.0));
+        assert_eq!(structured["timings"]["queue_wait_ms"], json!(12.5));
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn capability_catalog_separates_callable_intents_from_platform_observations() {
+        let catalog = capability_catalog();
+        assert!(catalog["intents"].as_array().is_some());
+        assert!(catalog["platform_observations"].as_array().is_some());
+        // `platform.broker.observe` is a callable intent that happens to
+        // share the prefix, so classification uses the explicit observation
+        // list rather than a name prefix.
+        assert!(
+            catalog["intents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["name"].as_str() == Some("platform.broker.observe") })
+        );
+        assert!(catalog["intents"].as_array().unwrap().iter().all(|item| {
+            !comptrol::PLATFORM_OBSERVATIONS.contains(&item["name"].as_str().unwrap_or_default())
+        }));
+        assert!(catalog["capability_families"].as_array().is_some());
+        assert!(
+            catalog["capability_families"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| {
+                    comptrol::CAPABILITY_FAMILIES
+                        .contains(&item["name"].as_str().unwrap_or_default())
+                })
+        );
+        assert!(catalog["intents"].as_array().unwrap().iter().all(|item| {
+            !comptrol::CAPABILITY_FAMILIES.contains(&item["name"].as_str().unwrap_or_default())
+        }));
+        assert!(
+            catalog["platform_observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| {
+                    item["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .starts_with("platform.")
+                })
+        );
+    }
+
+    #[test]
+    fn opt_in_timing_trace_contains_no_request_or_result_content() {
+        let path = std::env::temp_dir().join(format!(
+            "comptrol-stage1-trace-{}-{}.jsonl",
+            std::process::id(),
+            super::now_ms()
+        ));
+        append_timing_trace_to(
+            &path,
+            &json!({
+                "intent":"system.ping","route":"native","verification":"verified",
+                "data":{"secret":"must not be recorded"},"timings":{"server_call_ms":1.5}
+            }),
+            &json!({"server_call_ms":1.5,"phase_spans_ms":{"queue":0,"recovery":null}}),
+            Some("wf-123"),
+        );
+        let contents = std::fs::read_to_string(&path).expect("trace was written");
+        let record: serde_json::Value = serde_json::from_str(contents.trim()).expect("valid JSONL");
+        assert_eq!(record["kind"], "comptrol_timing");
+        assert_eq!(record["timings"]["server_call_ms"], 1.5);
+        assert!(record["timings"]["phase_spans_ms"].is_object());
+        assert_eq!(record["workflow_id"], "wf-123");
+        assert!(!contents.contains("must not be recorded"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mcp_schema_tool_and_pre_dispatch_error_share_the_same_definition() {
+        // desktop.notify is deliberately used here: it is a non-default
+        // intent with NO browser-autostart linkage. A browser intent (the
+        // historical choice) made this test depend on ambient Chrome state:
+        // `operate` auto-starts Chrome for browser intents and then refreshes
+        // the policy from the environment, which re-granted the intent behind
+        // the test's back and could even spawn a real browser window.
+        let intent = "desktop.notify";
+        let state = std::env::temp_dir().join(format!(
+            "comptrol-stage1-schema-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let mut runtime = Runtime::new(state.clone()).expect("runtime");
+        let schema = call_tool_with_cancel(
+            &mut runtime,
+            json!({"name":"intent_schema","arguments":{"intent":intent}}),
+            None,
+            0.0,
+        );
+        assert_eq!(
+            schema["structuredContent"]["params"]["required"][0],
+            "title"
+        );
+        // The policy gate runs before schema validation, so a forbidden
+        // intent is refused as policy_denied without describing the
+        // parameters it would have accepted. Grant the intent first to
+        // reach the shared schema definition.
+        let denied = call_tool_with_cancel(
+            &mut runtime,
+            json!({"name":"operate","arguments":{"intent":intent,"params":{}}}),
+            None,
+            0.0,
+        );
+        assert_eq!(
+            denied["structuredContent"]["error"]["code"],
+            "policy_denied"
+        );
+        // Grant only the intent: desktop.notify is R1, within the default
+        // risk ceiling, and needs no consent or extra gates.
+        runtime.policy.allowed_intents.insert(intent.to_owned());
+        let invalid = call_tool_with_cancel(
+            &mut runtime,
+            json!({"name":"operate","arguments":{"intent":intent,"params":{}}}),
+            None,
+            0.0,
+        );
+        assert_eq!(
+            invalid["structuredContent"]["error"]["code"],
+            "invalid_input"
+        );
+        assert!(
+            invalid["structuredContent"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("minimal example")
+        );
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(state);
+    }
 }
 
 fn run_inspect(kind: &str) -> Value {
@@ -2165,14 +2517,24 @@ fn run_daemon() -> i32 {
         }
     };
     let runtime = Arc::new(Mutex::new(runtime));
-    let tasks = TaskManager::new(Arc::clone(&runtime), tasks);
+    let tasks = Arc::new(TaskManager::new(Arc::clone(&runtime), tasks));
+    // P3.3: doctor sees this daemon as the resident runtime owner.
+    comptrol::DAEMON_RESIDENT.store(true, Ordering::Relaxed);
     eprintln!("comptrol daemon listening on {}", path.display());
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(error) = handle_ipc_connection(&mut stream, &runtime, &tasks) {
-                    eprintln!("daemon connection failed: {error}");
-                }
+                // P3.2: one thread per MCP client; the Runtime/TaskStore stay
+                // single-owner behind their mutexes. A slow or idle client
+                // must never block the others.
+                let runtime = Arc::clone(&runtime);
+                let tasks = Arc::clone(&tasks);
+                thread::spawn(move || {
+                    let _clients = DaemonClientGuard::new();
+                    if let Err(error) = handle_ipc_connection(&mut stream, &runtime, &tasks) {
+                        eprintln!("daemon connection failed: {error}");
+                    }
+                });
             }
             Err(error) => eprintln!("daemon accept failed: {error}"),
         }
@@ -2180,10 +2542,47 @@ fn run_daemon() -> i32 {
     0
 }
 
+/// P3.3: tracks live MCP client connections for doctor's `clients` count.
+struct DaemonClientGuard;
+
+impl DaemonClientGuard {
+    fn new() -> Self {
+        comptrol::DAEMON_CLIENTS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for DaemonClientGuard {
+    fn drop(&mut self) {
+        comptrol::DAEMON_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[cfg(not(unix))]
 fn run_daemon() -> i32 {
     #[cfg(windows)]
     {
+        // A per-pipe mutex ensures racing MCP launchers converge on one broker
+        // and one Runtime/SQLite owner. Keep its handle alive until shutdown.
+        let identity = Sha256::digest(daemon_pipe_name().as_bytes());
+        let mutex_name = format!("Local\\ComptrolDaemon-{}", hex_digest(&identity));
+        let mutex_name_wide: Vec<u16> = mutex_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, mutex_name_wide.as_ptr()) };
+        if mutex.is_null() {
+            eprintln!(
+                "daemon singleton mutex creation failed: {}",
+                io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            eprintln!("daemon is already running");
+            unsafe { CloseHandle(mutex) };
+            return 1;
+        }
         let pipe_name = wide_pipe_name(&daemon_pipe_name());
         let runtime = match Runtime::new(default_state_dir()) {
             Ok(runtime) => runtime,
@@ -2200,7 +2599,9 @@ fn run_daemon() -> i32 {
             }
         };
         let runtime = Arc::new(Mutex::new(runtime));
-        let tasks = TaskManager::new(Arc::clone(&runtime), tasks);
+        let tasks = Arc::new(TaskManager::new(Arc::clone(&runtime), tasks));
+        // P3.3: doctor sees this daemon as the resident runtime owner.
+        comptrol::DAEMON_RESIDENT.store(true, Ordering::Relaxed);
         eprintln!("comptrol daemon listening on {}", daemon_pipe_name());
         loop {
             let handle = unsafe {
@@ -2227,8 +2628,18 @@ fn run_daemon() -> i32 {
                     || GetLastError() == ERROR_PIPE_CONNECTED
             };
             let mut stream = unsafe { File::from_raw_handle(handle as RawHandle) };
-            if connected && let Err(error) = handle_ipc_connection(&mut stream, &runtime, &tasks) {
-                eprintln!("daemon connection failed: {error}");
+            if connected {
+                // P3.2: serve each pipe client on its own thread so multiple
+                // MCP clients share the daemon concurrently. The next pipe
+                // instance is created immediately in the accept loop.
+                let runtime = Arc::clone(&runtime);
+                let tasks = Arc::clone(&tasks);
+                thread::spawn(move || {
+                    let _clients = DaemonClientGuard::new();
+                    if let Err(error) = handle_ipc_connection(&mut stream, &runtime, &tasks) {
+                        eprintln!("daemon connection failed: {error}");
+                    }
+                });
             }
         }
     }
@@ -2237,6 +2648,17 @@ fn run_daemon() -> i32 {
         eprintln!("daemon named pipe transport is not implemented on this platform");
         2
     }
+}
+
+#[cfg(windows)]
+fn hex_digest(digest: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[cfg(unix)]
@@ -2329,7 +2751,7 @@ fn run_daemon_health() -> i32 {
 fn handle_ipc_connection<S: Read + Write>(
     stream: &mut S,
     runtime: &Arc<Mutex<Runtime>>,
-    tasks: &TaskManager,
+    tasks: &Arc<TaskManager>,
 ) -> io::Result<()> {
     let mut tasks_enabled = false;
     while let Some(frame) = read_ipc_frame(stream)? {
@@ -2354,7 +2776,18 @@ fn handle_ipc_connection<S: Read + Write>(
         match request.get("method").and_then(Value::as_str) {
             Some("health") => write_ipc_frame(
                 stream,
-                &json!({ "version": 1, "id": id, "result": { "ready": true, "server": SERVER_VERSION, "protocol": PROTOCOL_VERSION } }),
+                &json!({
+                    "version": 1,
+                    "id": id,
+                    "result": {
+                        "ready": true,
+                        "server": SERVER_VERSION,
+                        "protocol": PROTOCOL_VERSION,
+                        // P3.3: daemon ownership + live client count.
+                        "resident": comptrol::DAEMON_RESIDENT.load(Ordering::Relaxed),
+                        "clients": comptrol::DAEMON_CLIENTS.load(Ordering::Relaxed),
+                    }
+                }),
             )?,
             Some("mcp") => {
                 let raw_message = request.get("raw_message").and_then(Value::as_str);
@@ -2467,6 +2900,53 @@ impl HttpStream for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
 
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.get_ref().set_write_timeout(timeout)
+    }
+}
+
+fn drain_wake_notice_locked(
+    command_queue: &Arc<Mutex<BridgeStore>>,
+) -> Option<comptrol::browser_bridge::WakeNotice> {
+    let mut queue = command_queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    queue.drain_wake_notice().unwrap_or(None)
+}
+
+/// P2.1: how long a push stream stays open before the client reconnects.
+const BROWSER_BRIDGE_STREAM_MAX_S: u64 = 300;
+
+fn browser_bridge_poll_wait_ms(request_body: &Value) -> u64 {
+    request_body
+        .get("wait_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .min(BROWSER_BRIDGE_POLL_MAX_WAIT_MS)
+}
+
+fn lease_browser_bridge_commands(
+    command_queue: &Arc<Mutex<BridgeStore>>,
+    wait: Duration,
+) -> io::Result<Vec<BridgeCommand>> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        // NOTE: deliberately no heartbeat recording here. A lease that happens
+        // to be polled is not proof the extension service worker is alive;
+        // recording one made health read green while the command channel was
+        // dead. Host liveness comes from native-host heartbeat posts, and
+        // channel truth comes from completed bridge_ping round trips.
+        let commands = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            queue.lease_pending(64, Duration::from_secs(60))?
+        };
+        if !commands.is_empty() {
+            return Ok(commands);
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(commands);
+        }
+        thread::sleep(Duration::from_millis(BROWSER_BRIDGE_POLL_INTERVAL_MS).min(deadline - now));
     }
 }
 
@@ -2753,6 +3233,46 @@ fn handle_http<S: HttpStream>(
                 None,
             ),
         };
+    }
+
+    // Unauthenticated channel-truth summary. Intentionally before the signed
+    // /browser/* section: doctor and tooling need liveness without holding the
+    // bridge token, and the payload contains no user data (counts and states
+    // only). Everything that submits work still requires a valid signature.
+    if request_line.starts_with("GET /browser/healthz ") {
+        let state_dir = default_state_dir();
+        let report = BridgeStore::open(&state_dir).map(|store| {
+            let host_health = store
+                .health(comptrol::browser_bridge::DEFAULT_HEALTH_MAX_AGE)
+                .ok();
+            let channel = store
+                .health_round_trip(comptrol::browser_bridge::DEFAULT_HEALTH_MAX_AGE)
+                .ok();
+            json!({
+                "ok": channel.as_ref().map(|health| health.active).unwrap_or(false),
+                "channel": channel,
+                "host_heartbeat": host_health,
+                // K5: page-op tier — a channel can answer pings while every
+                // in-page command hangs; health reports both tiers.
+                "page_ops": store.page_ops_health().ok(),
+                "state": match (&host_health, &channel) {
+                    (_, Some(health)) if health.active => "alive",
+                    (Some(host), _) if host.active => "degraded_extension_unreachable",
+                    _ => "down",
+                }
+            })
+        });
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(
+                &report.unwrap_or_else(|error| json!({ "ok": false, "error": error.to_string() })),
+            )
+            .unwrap_or_default(),
+            None,
+        );
     }
 
     let mut request_parts = request_line.split_whitespace();
@@ -3163,6 +3683,118 @@ fn handle_http<S: HttpStream>(
         );
     }
 
+    // Signed discovery over the extension bridge: returns the service
+    // worker's pushed target list (real tabs in the user's real profile). If
+    // the push is stale, submits a bounded get_targets request through the
+    // command queue and waits for the extension's next targets_list push.
+    // The wait releases the queue mutex so the host keeps polling; a timeout
+    // returns degraded with whatever the last push held.
+    if request_line.starts_with("POST /browser/discovery ") {
+        const DISCOVERY_FRESH_MS: i64 = 15_000;
+        const DISCOVERY_WAIT_MS: u64 = 5_000;
+        const DISCOVERY_POLL_MS: u64 = 250;
+        let submitted_at_ms = now_ms();
+        let submit = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            queue.submit("get_targets", json!({ "discovery": true }))
+        };
+        if let Err(error) = submit {
+            return write_http_response(
+                stream,
+                503,
+                "Service Unavailable",
+                "application/json",
+                serde_json::to_vec(&json!({"ok":false,"error":error.to_string()}))
+                    .unwrap_or_default(),
+                None,
+            );
+        }
+        // Wait (without holding the queue mutex) for a targets push newer than
+        // the submit; the extension answers get_targets by pushing its list.
+        let deadline = Instant::now() + Duration::from_millis(DISCOVERY_WAIT_MS);
+        loop {
+            let push_ms = BridgeStore::open(&default_state_dir())
+                .ok()
+                .and_then(|store| store.last_targets_ms().ok().flatten());
+            if push_ms
+                .map(|ms| ms as u128 > submitted_at_ms)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(DISCOVERY_POLL_MS));
+        }
+        let (targets, push_age_ms) = match BridgeStore::open(&default_state_dir()) {
+            Ok(store) => {
+                let push_ms = store.last_targets_ms().ok().flatten();
+                let age = push_ms.map(|ms| now_ms().saturating_sub(ms as u128));
+                (store.targets().unwrap_or_default(), age)
+            }
+            Err(error) => {
+                return write_http_response(
+                    stream,
+                    502,
+                    "Bad Gateway",
+                    "application/json",
+                    serde_json::to_vec(&json!({"ok":false,"error":error.to_string()}))
+                        .unwrap_or_default(),
+                    None,
+                );
+            }
+        };
+        let fresh = matches!(push_age_ms, Some(age) if age <= DISCOVERY_FRESH_MS as u128);
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(&json!({
+                "ok": fresh,
+                "fresh": fresh,
+                "push_age_ms": push_age_ms,
+                "count": targets.len(),
+                "targets": targets
+            }))
+            .unwrap_or_default(),
+            None,
+        );
+    }
+
+    // Native-host liveness probe: the host submits a bridge_ping through the
+    // real command channel; the extension answers over its native port and the
+    // result flows back through /browser/command/result, which records the
+    // measured round trip as channel truth. A completed probe therefore
+    // proves the whole host -> Chrome -> service worker -> host path.
+    if request_line.starts_with("POST /browser/probe ") {
+        let request_id = {
+            let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            queue.submit("bridge_ping", json!({ "probe": true }))
+        };
+        return match request_id {
+            Ok(request_id) => write_http_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                serde_json::to_vec(&json!({ "ok": true, "request_id": request_id }))
+                    .unwrap_or_default(),
+                None,
+            ),
+            Err(error) => write_http_response(
+                stream,
+                503,
+                "Service Unavailable",
+                "application/json",
+                serde_json::to_vec(&json!({ "ok": false, "error": error.to_string() }))
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
+    }
+
     if request_line.starts_with("POST /browser/extension/heartbeat ") {
         let request_body: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
         let protocol = request_body.get("protocol").and_then(Value::as_str);
@@ -3292,11 +3924,9 @@ fn handle_http<S: HttpStream>(
 
     // ── Browser Bridge command queue endpoints ──────────────────────────────
     if request_line.starts_with("POST /browser/command/poll ") {
-        let commands = {
-            let mut queue = command_queue.lock().expect("command queue lock poisoned");
-            let _ = queue.record_heartbeat(Some("comptrol.browser.bridge/0.1.0"));
-            queue.lease_pending(64, Duration::from_secs(60))
-        };
+        let request_body: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+        let wait = Duration::from_millis(browser_bridge_poll_wait_ms(&request_body));
+        let commands = lease_browser_bridge_commands(command_queue, wait);
         return match commands {
             Ok(commands) => write_http_response(
                 stream,
@@ -3321,6 +3951,64 @@ fn handle_http<S: HttpStream>(
                 None,
             ),
         };
+    }
+    // P2.1 push transport: one persistent chunked connection over which the
+    // sidecar pushes commands the moment they are submitted (no poll gap),
+    // with wake notices multiplexed on the same stream. The stream self-caps
+    // at BROWSER_BRIDGE_STREAM_MAX_S and the client reconnects immediately;
+    // POST /browser/command/poll remains the fallback for older hosts.
+    if request_line.starts_with("POST /browser/command/stream ") {
+        write_sse_headers(stream)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(BROWSER_BRIDGE_STREAM_MAX_S);
+        let mut last_beat = std::time::Instant::now();
+        loop {
+            let commands =
+                lease_browser_bridge_commands(command_queue, Duration::from_millis(250))?;
+            for command in commands {
+                write_sse_event(
+                    stream,
+                    None,
+                    "command",
+                    &json!({
+                        "request_id": command.request_id,
+                        "command_type": command.command_type,
+                        "payload": command.payload,
+                        "attempts": command.attempts,
+                    }),
+                )?;
+            }
+            if let Some(notice) = drain_wake_notice_locked(command_queue) {
+                write_sse_event(stream, None, "wake", &json!({ "reason": notice.reason }))?;
+            }
+            if last_beat.elapsed() >= Duration::from_secs(15) {
+                write_sse_event(stream, None, "heartbeat", &json!({ "ok": true }))?;
+                last_beat = std::time::Instant::now();
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        write_sse_end(stream)?;
+        return Ok(());
+    }
+    // Wake-notice drain: native_host.py polls this when its Chrome pipe looks
+    // stale (or proactively); if the daemon has requested a wake, the host
+    // forwards it to Chrome over the native messaging pipe and the service
+    // worker's onMessage listener resuscitates the suspended worker.
+    if request_line.starts_with("POST /browser/wake ") {
+        let notice = drain_wake_notice_locked(command_queue);
+        return write_http_response(
+            stream,
+            200,
+            "OK",
+            "application/json",
+            serde_json::to_vec(&json!({
+                "ok": true,
+                "wake": notice,
+            }))
+            .unwrap_or_default(),
+            None,
+        );
     }
     if request_line.starts_with("POST /browser/command/result ") {
         // native_host.py posts command results back here
@@ -3363,6 +4051,9 @@ fn handle_http<S: HttpStream>(
         };
         let stored = {
             let mut queue = command_queue.lock().expect("command queue lock poisoned");
+            // Command results arrive over the live native messaging pipe, so
+            // they double as host liveness; but only a bridge_ping result
+            // proves the extension round trip (recorded inside store_result).
             let _ = queue.record_heartbeat(Some("comptrol.browser.bridge/0.1.0"));
             queue.store_result(request_id, result)
         };

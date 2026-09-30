@@ -86,8 +86,14 @@ try:
             "COMPTROL_CDP_ENDPOINT": f"http://127.0.0.1:{fixture_port}",
             "COMPTROL_ALLOW_BROWSER_FIXTURE": "1",
         }
+        # Honor COMPTROL_BIN so the tested artifact is exercised; Windows
+        # needs the .exe suffix when falling back to the debug build.
+        binary = os.environ.get(
+            "COMPTROL_BIN",
+            "target/debug/comptrol" + (".exe" if os.name == "nt" else ""),
+        )
         process = subprocess.Popen(
-            ["target/debug/comptrol", "mcp"],
+            [binary, "mcp"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
@@ -102,12 +108,14 @@ try:
             }
             unknown = call(process, 2, "tools/call", {"name": "operate", "arguments": arguments})
             unknown_data = unknown["result"]["structuredContent"]
-            assert unknown_data["error"]["code"] == "operation_unknown", unknown_data
+            assert unknown_data["error"]["code"] == "idempotency_conflict", unknown_data
             reconciled = call(process, 3, "tools/call", {"name": "reconcile", "arguments": {"operation_id": "op-restart-fixture"}})
             reconciled_data = reconciled["result"]["structuredContent"]
             assert reconciled_data.get("state") == "reconciled", reconciled
             replay = call(process, 4, "tools/call", {"name": "operate", "arguments": arguments})
-            assert replay["result"]["structuredContent"]["recovery"] == "idempotent_replay"
+            assert replay["result"]["structuredContent"]["error"]["code"] == "idempotency_conflict", replay
+            # Legacy records lack a request fingerprint: reconcile their outcome,
+            # but never authorize a replay of a potentially different request.
             final = wait_for(f"http://127.0.0.1:{fixture_port}/state")
             assert len(final["submissions"]) == 1, final
             print("restart reconciliation conformance passed")

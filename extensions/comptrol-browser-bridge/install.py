@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import secrets
 import sys
@@ -26,33 +27,25 @@ def get_manifest_dir():
     """Get the platform-specific native messaging hosts directory."""
     system = platform.system()
     if system == "Darwin":
-        chrome = os.path.expanduser(
+        return [os.path.expanduser(
             "~/Library/Application Support/Google/Chrome/NativeMessagingHosts"
-        )
-        edge = os.path.expanduser(
-            "~/Library/Application Support/Microsoft Edge/NativeMessagingHosts"
-        )
-        return [chrome, edge]
+        )]
     elif system == "Linux":
-        chrome = os.path.expanduser(
+        return [os.path.expanduser(
             "~/.config/google-chrome/NativeMessagingHosts"
-        )
-        edge = os.path.expanduser(
-            "~/.config/microsoft-edge/NativeMessagingHosts"
-        )
-        return [chrome, edge]
+        )]
     elif system == "Windows":
-        # Windows uses registry for Native Messaging Hosts
-        # We still provide files in LOCALAPPDATA as a backup/reference
+        # Windows uses a per-user registry entry pointing to the Chrome host manifest.
         local_app_data = os.environ.get("LOCALAPPDATA", "")
         chrome = os.path.join(
             local_app_data, "Google", "Chrome", "NativeMessagingHosts"
         )
-        edge = os.path.join(
-            local_app_data, "Microsoft", "Edge", "NativeMessagingHosts"
-        )
-        return [chrome, edge]
+        return [chrome] if local_app_data else []
     return []
+
+
+def is_chrome_extension_id(value):
+    return isinstance(value, str) and re.fullmatch(r"[a-p]{32}", value) is not None
 
 
 def main():
@@ -69,6 +62,9 @@ def main():
         help="Exact Chrome extension ID authorized to connect to the native host",
     )
     args = parser.parse_args()
+    if not is_chrome_extension_id(args.extension_id):
+        print("Error: --extension-id must be Chrome's exact 32-character extension ID", file=sys.stderr)
+        sys.exit(2)
 
     # Determine host path
     if args.host_path:
@@ -101,6 +97,7 @@ def main():
         json.dump(
             {
                 "state_dir": os.path.abspath(state_dir),
+                "extension_id": args.extension_id,
                 "daemon_url": os.environ.get(
                     "COMPTROL_DAEMON_URL",
                     "http://127.0.0.1:7317",
@@ -110,6 +107,36 @@ def main():
             indent=2,
         )
         config_file.write("\n")
+
+    # The host reads the state-directory config (or COMPTROL_BRIDGE_CONFIG).
+    # Keep that authoritative file aligned with registration; the adjacent
+    # file above is retained for older packaged hosts.
+    runtime_config_path = os.path.abspath(
+        os.environ.get(
+            "COMPTROL_BRIDGE_CONFIG", os.path.join(state_dir, "browser-bridge-config.json")
+        )
+    )
+    try:
+        with open(runtime_config_path, encoding="utf-8") as config_file:
+            runtime_config = json.load(config_file)
+        if not isinstance(runtime_config, dict):
+            raise ValueError("Browser Bridge configuration must be an object")
+    except FileNotFoundError:
+        runtime_config = {}
+    runtime_config.update({
+        "state_dir": os.path.abspath(state_dir),
+        "extension_id": args.extension_id,
+        "daemon_url": os.environ.get("COMPTROL_DAEMON_URL", "http://127.0.0.1:7317"),
+        "native_host_script": host_path,
+    })
+    runtime_config_parent = os.path.dirname(runtime_config_path)
+    if runtime_config_parent:
+        os.makedirs(runtime_config_parent, exist_ok=True)
+    temporary_config = runtime_config_path + ".tmp"
+    with open(temporary_config, "w", encoding="utf-8") as config_file:
+        json.dump(runtime_config, config_file, indent=2)
+        config_file.write("\n")
+    os.replace(temporary_config, runtime_config_path)
 
     manifest_host_path = host_path
     if platform.system() == "Windows":
@@ -158,15 +185,11 @@ def main():
             # Windows expects the registry value to be the path to the manifest JSON file
             # We use the Chrome one as the primary path if available
             primary_manifest = manifest_files[0]
-            registry_paths = [
-                r"Software\Google\Chrome\NativeMessagingHosts\comptrol_browser_bridge",
-                r"Software\Microsoft\Edge\NativeMessagingHosts\comptrol_browser_bridge",
-            ]
-            for reg_path in registry_paths:
-                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_path)
-                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, primary_manifest)
-                winreg.CloseKey(key)
-            print("Installed Windows registry keys for Browser Bridge")
+            reg_path = r"Software\Google\Chrome\NativeMessagingHosts\comptrol_browser_bridge"
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_path)
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, primary_manifest)
+            winreg.CloseKey(key)
+            print("Installed the current-user Chrome native messaging registration")
         except Exception as e:
             print(f"Warning: Failed to install Windows registry keys: {e}", file=sys.stderr)
 

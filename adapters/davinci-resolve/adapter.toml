@@ -4,6 +4,9 @@ name = "DaVinci Resolve"
 version = "0.1.0"
 platforms = ["windows", "macos", "linux"]
 applications = ["Resolve.exe", "Resolve", "DaVinci Resolve"]
+# Budget for one operation; heavy desktop adapters need more than the default.
+max_operation_ms = 120000
+
 
 [isolation]
 mode = "out_of_process"

@@ -10,8 +10,11 @@ import queue
 import socket
 import threading
 import math
+import hashlib
+from pathlib import Path
 
 import bpy
+from mathutils import Vector
 
 _requests = queue.Queue()
 _server = None
@@ -33,11 +36,117 @@ def _reply(connection, request, ok, payload=None, error=None, authenticated=True
     connection.sendall((json.dumps(result) + "\n").encode("utf-8"))
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source_file:
+        for block in iter(lambda: source_file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _projected_range(obj, axis, evaluated=False):
+    target = obj.evaluated_get(bpy.context.evaluated_depsgraph_get()) if evaluated else obj
+    points = [target.matrix_world @ vertex.co for vertex in target.data.vertices]
+    values = [point.dot(axis) for point in points]
+    if not values:
+        raise ValueError("rocket part has no mesh vertices: " + obj.name)
+    return min(values), max(values)
+
+
+def _interval_overlap(first, second):
+    return min(first[1], second[1]) - max(first[0], second[0])
+
+
 def _execute(request):
     payload = request.get("payload", {})
     intent = payload.get("intent")
     if intent == "blender.scene.object.list":
-        return {"objects": [{"name": obj.name, "type": obj.type, "location": list(obj.location), "rotation": list(obj.rotation_euler), "scale": list(obj.scale)} for obj in bpy.context.scene.objects], "mode": "live", "verified": True}
+        return {"file_path": bpy.data.filepath, "file_saved": bool(bpy.data.filepath), "is_dirty": bool(bpy.data.is_dirty), "scene": bpy.context.scene.name, "frame": bpy.context.scene.frame_current, "objects": [{"name": obj.name, "type": obj.type, "location": list(obj.location), "rotation": list(obj.rotation_euler), "scale": list(obj.scale)} for obj in bpy.context.scene.objects], "mode": "live", "verified": bool(bpy.context.scene)}
+    if intent == "blender.scene.copy_2d_rocket_to_3d":
+        source = bpy.data.filepath
+        if not source or Path(source).suffix.lower() != ".blend" or not os.path.isfile(source):
+            raise ValueError("the active Blender document must be a saved .blend file")
+        if bpy.data.is_dirty:
+            raise ValueError("the active Blender document has unsaved changes; save it before making a separate 3D copy")
+        output = str(Path(str(payload.get("output_path", ""))).expanduser().resolve())
+        if Path(output).suffix.lower() != ".blend" or os.path.normcase(output) == os.path.normcase(os.path.abspath(source)):
+            raise ValueError("3D conversion requires a separate .blend output_path")
+        if os.path.exists(output):
+            raise ValueError("output_path already exists; choose a new copy to preserve saved Blender work")
+        if not os.path.isdir(os.path.dirname(output)):
+            raise ValueError("output_path parent directory must already exist")
+        depth = payload.get("depth", 0.35)
+        if isinstance(depth, bool) or not isinstance(depth, (int, float)) or not math.isfinite(depth) or not 0.02 <= depth <= 10:
+            raise ValueError("depth must be a finite number from 0.02 to 10")
+        source_hash = _file_sha256(source)
+        body = bpy.data.objects.get("Rocket Body")
+        flames = [bpy.data.objects.get(name) for name in ("Flame Outer", "Flame Inner")]
+        if body is None or any(flame is None for flame in flames):
+            raise ValueError("source must contain Rocket Body, Flame Outer, and Flame Inner")
+        rotation = body.matrix_world.to_3x3()
+        axis_y = (rotation @ Vector((0.0, 1.0, 0.0))).normalized()
+        axis_x = (rotation @ Vector((1.0, 0.0, 0.0))).normalized()
+        axis_z = (rotation @ Vector((0.0, 0.0, 1.0))).normalized()
+        epsilon = max(float(depth) * 0.025, 0.005)
+        body_base = _projected_range(body, axis_y)[0]
+        body_x = _projected_range(body, axis_x)
+        body_z = _projected_range(body, axis_z)
+        before, after = [], []
+        for flame in flames:
+            flame_normal = (flame.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
+            if abs(flame_normal.dot(axis_z)) < 0.99:
+                raise ValueError("flame plane is not aligned with the rocket body")
+            flame_y = _projected_range(flame, axis_y)
+            flame_x = _projected_range(flame, axis_x)
+            flame_z = _projected_range(flame, axis_z)
+            gap = max(0.0, body_base - flame_y[1])
+            x_overlap = _interval_overlap(body_x, flame_x)
+            if x_overlap <= 0:
+                raise ValueError("flame does not overlap the rocket body width: " + flame.name)
+            shift = gap + epsilon
+            world = flame.matrix_world.copy()
+            world.translation = world.translation + axis_y * shift
+            flame.matrix_world = world
+            penetration = _projected_range(flame, axis_y)[1] - body_base
+            depth_overlap = _interval_overlap((body_z[0] - depth / 2, body_z[1] + depth / 2), (flame_z[0] - depth / 2, flame_z[1] + depth / 2))
+            before.append({"part": flame.name, "gap": round(gap, 6)})
+            after.append({"part": flame.name, "penetration": round(penetration, 6), "x_overlap": round(x_overlap, 6), "depth_overlap": round(depth_overlap, 6), "verified": penetration >= epsilon - 1e-6 and x_overlap > 0 and depth_overlap > 0})
+        if not all(item["verified"] for item in after):
+            raise ValueError("flame/body contact verification failed")
+        converted = []
+        for obj in bpy.context.scene.objects:
+            if obj.type != "MESH" or obj.name == "Background":
+                continue
+            modifier = obj.modifiers.new(name="3D Depth", type="SOLIDIFY")
+            modifier.thickness = float(depth)
+            modifier.offset = 0.0
+            modifier.use_rim = True
+            converted.append(obj.name)
+        if len(converted) < 3:
+            raise ValueError("source project contains too few rocket meshes to convert")
+        for flame in flames:
+            flame["rocket_body_contact_verified"] = True
+        bpy.ops.wm.save_as_mainfile(filepath=output)
+        bpy.ops.wm.open_mainfile(filepath=output)
+        body = bpy.data.objects.get("Rocket Body")
+        flames = [bpy.data.objects.get(name) for name in ("Flame Outer", "Flame Inner")]
+        if body is None or any(flame is None for flame in flames) or os.path.normcase(bpy.data.filepath) != os.path.normcase(output):
+            raise ValueError("saved 3D copy did not reopen as the active Blender document")
+        rotation = body.matrix_world.to_3x3()
+        axis_y = (rotation @ Vector((0.0, 1.0, 0.0))).normalized()
+        axis_x = (rotation @ Vector((1.0, 0.0, 0.0))).normalized()
+        axis_z = (rotation @ Vector((0.0, 0.0, 1.0))).normalized()
+        reopened = []
+        for flame in flames:
+            y_overlap = _projected_range(flame, axis_y, True)[1] - _projected_range(body, axis_y, True)[0]
+            x_overlap = _interval_overlap(_projected_range(body, axis_x, True), _projected_range(flame, axis_x, True))
+            z_overlap = _interval_overlap(_projected_range(body, axis_z, True), _projected_range(flame, axis_z, True))
+            verified = y_overlap >= epsilon - 1e-6 and x_overlap > 0 and z_overlap >= -1e-6 and flame.get("rocket_body_contact_verified") is True
+            reopened.append({"part": flame.name, "axial_overlap": round(y_overlap, 6), "x_overlap": round(x_overlap, 6), "depth_overlap": round(z_overlap, 6), "verified": verified})
+        output_size = os.path.getsize(output) if os.path.isfile(output) else 0
+        source_unchanged = os.path.isfile(source) and _file_sha256(source) == source_hash
+        verified = output_size > 0 and source_unchanged and all(item["verified"] for item in reopened) and len(converted) >= 3
+        return {"source_path": source, "source_sha256": source_hash, "source_unchanged": source_unchanged, "file_path": bpy.data.filepath, "output_path": output, "output_size": output_size, "depth": float(depth), "extruded_objects": converted, "contacts_before": before, "contacts_after": after, "reopened_contacts": reopened, "saved_copy_reopened": True, "verified": verified, "verification": "live_blender_reopen_geometry_readback", "mode": "live"}
     if intent == "blender.scene.object.create":
         name = str(payload.get("name", ""))
         if not name or len(name) > 120 or any(c in name for c in "\r\n\x00"):
@@ -221,7 +330,8 @@ def start():
 def _write_descriptor(endpoint):
     try:
         home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or "."
-        directory = os.path.join(home, ".comptrol", "bridges")
+        state_dir = os.environ.get("COMPTROL_STATE_DIR") or os.path.join(home, ".comptrol")
+        directory = os.path.join(state_dir, "bridges")
         os.makedirs(directory, exist_ok=True)
         descriptor = os.path.join(directory, "blender.json")
         with open(descriptor, "w", encoding="utf-8") as handle:

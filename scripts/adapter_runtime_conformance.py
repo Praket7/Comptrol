@@ -9,12 +9,35 @@ import tempfile
 
 
 root = pathlib.Path(__file__).resolve().parents[1]
-binary = os.environ.get("COMPTROL_BIN", str(root / "target" / "debug" / "comptrol"))
-if os.name == "nt" and not binary.lower().endswith(".exe"):
-    if os.environ.get("COMPTROL_REQUIRE_NATIVE_ADAPTER_RUNTIME") == "1":
-        raise SystemExit("COMPTROL_BIN points to a WSL/Linux binary. Run this conformance test from WSL or set COMPTROL_BIN to a Windows .exe")
-    print("adapter runtime conformance skipped because Windows Python was given a WSL/Linux binary; run it from WSL")
-    raise SystemExit(0)
+
+
+def resolve_binary():
+    """Prefer COMPTROL_BIN, then the local build.
+
+    The historical default had no `.exe` suffix on Windows and the resulting
+    suffix check skipped this entire test, so it never ran on the one platform
+    whose adapters matter most here.
+    """
+    override = os.environ.get("COMPTROL_BIN")
+    if override:
+        if os.name == "nt" and not override.lower().endswith(".exe"):
+            if os.environ.get("COMPTROL_REQUIRE_NATIVE_ADAPTER_RUNTIME") == "1":
+                raise SystemExit("COMPTROL_BIN points to a WSL/Linux binary. Run this conformance test from WSL or set COMPTROL_BIN to a Windows .exe")
+            print("adapter runtime conformance skipped because Windows Python was given a WSL/Linux binary; run it from WSL")
+            raise SystemExit(0)
+        if not pathlib.Path(override).exists():
+            raise SystemExit(f"COMPTROL_BIN points at a missing file: {override}")
+        return override
+    for relative in ("target/release", "target/debug"):
+        candidate = root / relative / "comptrol"
+        if os.name == "nt":
+            candidate = candidate.with_suffix(".exe")
+        if candidate.exists():
+            return str(candidate)
+    raise SystemExit("no built comptrol binary found; run `cargo build -p comptrol` first")
+
+
+binary = resolve_binary()
 with tempfile.TemporaryDirectory(prefix="comptrol-adapter-runtime-") as state:
     process = subprocess.Popen(
         [binary, "mcp"],
@@ -24,6 +47,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-adapter-runtime-") as state:
         env={
             **os.environ,
             "COMPTROL_ALLOW_ADAPTERS": "1",
+            "COMPTROL_AUTO_START_CHROME_CDP": "0",
             "COMPTROL_ADAPTER_ROOT": str(root / "adapters"),
             "COMPTROL_STATE_DIR": state,
         },

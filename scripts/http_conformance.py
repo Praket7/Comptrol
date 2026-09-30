@@ -4,10 +4,20 @@
 import http.client
 import json
 import os
+import pathlib
 import socket
 import subprocess
 import tempfile
 import time
+
+
+# Honor COMPTROL_BIN so the tested artifact is pinned; Windows needs .exe.
+binary = os.environ.get("COMPTROL_BIN") or str(
+    pathlib.Path(__file__).resolve().parents[1]
+    / "target"
+    / "debug"
+    / ("comptrol.exe" if os.name == "nt" else "comptrol")
+)
 
 
 def free_port():
@@ -96,7 +106,7 @@ def read_until(connection, body, marker):
 port = free_port()
 with tempfile.TemporaryDirectory(prefix="comptrol-http-") as state:
     process = subprocess.Popen(
-        ["target/debug/comptrol", "serve-http", str(port)],
+        [binary, "serve-http", str(port)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env={**os.environ, "COMPTROL_STATE_DIR": state},
@@ -177,7 +187,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-http-") as state:
         process.terminate()
         process.wait(timeout=5)
         process = subprocess.Popen(
-            ["target/debug/comptrol", "serve-http", str(port)],
+            [binary, "serve-http", str(port)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env={**os.environ, "COMPTROL_STATE_DIR": state},

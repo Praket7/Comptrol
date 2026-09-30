@@ -4,6 +4,9 @@ Comptrol runs on your computer. It connects an assistant to a small set of compu
 
 ## Install the local runtime
 
+For source-build prerequisites and complete Windows, macOS, Linux, MCP, and
+Chrome Browser Bridge instructions, see [platform setup](platform-setup.md).
+
 Install Node.js with npm, then install the `comptrolling` package.
 
 The npm release for these changes is version 0.1.67. For local Codex setup, follow [the local Codex guide](../plugins/comptrol/CHATGPT_SETUP.md).

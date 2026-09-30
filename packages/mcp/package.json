@@ -8,6 +8,9 @@
     "comptrol-http": "bin/comptrol-http.js",
     "comptrol-browser-setup": "bin/comptrol-browser-setup.js"
   },
+  "scripts": {
+    "prepack": "node ../../scripts/sync-browser-bridge-package.js"
+  },
   "files": [
     "bin",
     "native",

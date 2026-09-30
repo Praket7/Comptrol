@@ -33,6 +33,9 @@ pub struct AppEntry {
     pub platform: String,
     /// Executable or bundle path when the platform exposes one.
     pub executable: Option<PathBuf>,
+    /// Arguments from the registered shortcut, preserved as argv entries.
+    #[serde(default)]
+    pub launch_args: Vec<String>,
     /// Version string when available.
     pub version: Option<String>,
     /// Platform-specific metadata.
@@ -170,6 +173,7 @@ fn macos_entries() -> Result<Vec<AppEntry>, RegistryError> {
                 display_name: stem,
                 platform: "macos".to_owned(),
                 executable: Some(path),
+                launch_args: Vec::new(),
                 version,
                 metadata,
             });
@@ -235,7 +239,8 @@ fn windows_entries() -> Result<Vec<AppEntry>, RegistryError> {
                         id: id.to_owned(),
                         display_name: name.to_owned(),
                         platform: "windows".to_owned(),
-                        executable: None,
+                        executable: program_files_registration_path(id),
+                        launch_args: Vec::new(),
                         version: None,
                         metadata: BTreeMap::new(),
                     });
@@ -261,6 +266,43 @@ fn windows_entries() -> Result<Vec<AppEntry>, RegistryError> {
     }
 
     Ok(entries)
+}
+
+/// Some Windows Start Apps records expose an executable as a known-folder
+/// relative identity (for example `{FOLDERID_ProgramFiles}\\Vendor\\app.exe`).
+/// Resolve only that exact, documented root, canonicalize both sides, and
+/// require an existing executable so arbitrary shell identities are not run.
+#[cfg(any(target_os = "windows", test))]
+pub(super) fn program_files_registration_path(id: &str) -> Option<PathBuf> {
+    const PROGRAM_FILES: &str = "{6D809377-6AF0-444B-8957-A3773F02200E}\\";
+    let relative = id.strip_prefix(PROGRAM_FILES)?;
+    if relative.is_empty() {
+        return None;
+    }
+    let relative_path = PathBuf::from(relative);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+        || !relative_path
+            .extension()?
+            .to_string_lossy()
+            .eq_ignore_ascii_case("exe")
+    {
+        return None;
+    }
+    let root = PathBuf::from(std::env::var_os("ProgramFiles")?);
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let candidate = std::fs::canonicalize(canonical_root.join(relative_path)).ok()?;
+    if !candidate.starts_with(&canonical_root) || !candidate.is_file() {
+        return None;
+    }
+    Some(candidate)
 }
 
 #[cfg(target_os = "windows")]
@@ -291,6 +333,7 @@ fn scan_windows_shortcuts(
                             .to_owned(),
                         platform: "windows".to_owned(),
                         executable: Some(target),
+                        launch_args: read_lnk_arguments(&path).unwrap_or_default(),
                         version: None,
                         metadata: BTreeMap::new(),
                     });
@@ -370,6 +413,113 @@ fn read_lnk_target(lnk_path: &std::path::Path) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(target_os = "windows")]
+fn read_lnk_arguments(lnk_path: &std::path::Path) -> Option<Vec<String>> {
+    let data = std::fs::read(lnk_path).ok()?;
+    if data.len() < 76 || data[0..4] != [0x4c, 0, 0, 0] {
+        return None;
+    }
+    let flags = u32::from_le_bytes(data[0x10..0x14].try_into().ok()?);
+    let unicode = flags & 0x80 != 0;
+    let mut offset = 76usize;
+    if flags & 0x01 != 0 {
+        offset = offset.checked_add(2 + read_lnk_u16(&data, offset)? as usize)?;
+    }
+    if flags & 0x02 != 0 {
+        let size = read_lnk_u32(&data, offset)? as usize;
+        if size < 28 || offset.checked_add(size)? > data.len() {
+            return None;
+        }
+        offset += size;
+    }
+    for (flag, is_arguments) in [
+        (0x04, false),
+        (0x08, false),
+        (0x10, false),
+        (0x20, true),
+        (0x40, false),
+    ] {
+        if flags & flag == 0 {
+            continue;
+        }
+        let character_count = read_lnk_u16(&data, offset)? as usize;
+        offset = offset.checked_add(2)?;
+        let length = character_count.checked_mul(if unicode { 2 } else { 1 })?;
+        let end = offset.checked_add(length)?;
+        let content = data.get(offset..end)?;
+        if is_arguments {
+            let text = if unicode {
+                let (pairs, remainder) = content.as_chunks::<2>();
+                if !remainder.is_empty() {
+                    return None;
+                }
+                let words = pairs
+                    .iter()
+                    .map(|pair| u16::from_le_bytes(*pair))
+                    .collect::<Vec<_>>();
+                String::from_utf16(&words).ok()?
+            } else {
+                content.iter().map(|byte| char::from(*byte)).collect()
+            };
+            return Some(split_windows_arguments(&text));
+        }
+        offset = end;
+    }
+    Some(Vec::new())
+}
+
+#[cfg(target_os = "windows")]
+fn read_lnk_u16(data: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        data.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn read_lnk_u32(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        data.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn split_windows_arguments(value: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut backslashes = 0usize;
+    let mut started = false;
+    for character in value.chars().chain(std::iter::once(' ')) {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            current.extend(std::iter::repeat_n('\\', backslashes / 2));
+            if backslashes % 2 == 1 {
+                current.push('"');
+            } else {
+                quoted = !quoted;
+            }
+            backslashes = 0;
+            started = true;
+            continue;
+        }
+        current.extend(std::iter::repeat_n('\\', backslashes));
+        backslashes = 0;
+        if character.is_whitespace() && !quoted {
+            if started {
+                arguments.push(std::mem::take(&mut current));
+                started = false;
+            }
+        } else {
+            current.push(character);
+            started = true;
+        }
+    }
+    arguments
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -489,6 +639,7 @@ fn parse_desktop_file_inline(content: &str, path: &std::path::Path) -> Option<Ap
         display_name: name.unwrap(),
         platform: "linux".to_owned(),
         executable,
+        launch_args: Vec::new(),
         version,
         metadata,
     })
@@ -596,6 +747,7 @@ pub fn path_entries() -> Result<Vec<AppEntry>, RegistryError> {
                 display_name: stem.to_owned(),
                 platform: std::env::consts::OS.to_owned(),
                 executable: Some(path),
+                launch_args: Vec::new(),
                 version: None,
                 metadata: BTreeMap::new(),
             });
@@ -641,5 +793,13 @@ mod tests {
         stems.sort();
         stems.dedup();
         assert_eq!(stems.len(), entries.len());
+    }
+
+    #[test]
+    fn windows_shortcut_arguments_preserve_quoted_paths_and_escaped_quotes() {
+        assert_eq!(
+            split_windows_arguments(r#"--profile "C:\Program Files\App" --label "a\"b""#),
+            vec!["--profile", r"C:\Program Files\App", "--label", "a\"b"]
+        );
     }
 }

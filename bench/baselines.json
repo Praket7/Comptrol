@@ -1,0 +1,30 @@
+{
+  "bridge_channel_alive": {
+    "not_comparable": true,
+    "note": "infrastructure readiness probe - no native computer-use equivalent"
+  },
+  "ensure_session_one_call": {
+    "not_comparable": true,
+    "note": "infrastructure readiness probe - no native computer-use equivalent"
+  },
+  "classroom_background_click": {
+    "native_cu_ms": 8000,
+    "measured": false,
+    "native_cu_source": "manual operator estimate 2026-09-28 (keyboard+mouse on this machine): find the Classroom tab and click the control on a real SPA; replace with a timed native-CU run when one is recorded"
+  },
+  "terminal_echo_readback": {
+    "native_cu_ms": 5000,
+    "measured": false,
+    "native_cu_source": "manual operator estimate 2026-09-28: open a terminal, type the command, read the output back; replace with a timed native-CU run when one is recorded"
+  },
+  "app_list_indexed": {
+    "native_cu_ms": 6000,
+    "measured": false,
+    "native_cu_source": "manual operator estimate 2026-09-28: open the app launcher and scan installed applications; replace with a timed native-CU run when one is recorded"
+  },
+  "workflow_execute_verified": {
+    "native_cu_ms": 15000,
+    "measured": false,
+    "native_cu_source": "manual operator estimate 2026-09-28: perform the analogous three-step routine manually with checks between steps; replace with a timed native-CU run when one is recorded"
+  }
+}

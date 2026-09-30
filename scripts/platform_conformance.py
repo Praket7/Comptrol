@@ -13,9 +13,16 @@ binary = os.environ.get("COMPTROL_BIN", str(root / "target" / "debug" / ("comptr
 
 
 with tempfile.TemporaryDirectory(prefix="comptrol-platform-") as state:
+    # The child must not inherit browser availability from the invoking
+    # shell (hotload configs set COMPTROL_AUTO_START_CHROME_CDP=1 and
+    # COMPTROL_ALLOW_BROWSER_CDP=1); this gate observes platform routing
+    # with browser routes deterministically closed.
     environment = dict(os.environ, COMPTROL_STATE_DIR=state)
+    environment["COMPTROL_AUTO_START_CHROME_CDP"] = "0"
+    environment.pop("COMPTROL_ALLOW_BROWSER_CDP", None)
+    environment.pop("COMPTROL_CDP_ENDPOINT", None)
     capabilities = json.loads(subprocess.check_output([binary, "capabilities"], env=environment))
-    names = {item["name"]: item for item in capabilities}
+    names = {item["name"]: item for group in ("intents", "capability_families", "platform_observations") for item in capabilities[group]}
     assert names["platform.broker.observe"]["available"] is True
     diagnostics = json.loads(subprocess.check_output([binary, "doctor"], env=environment))
     assert set((diagnostics["platform"]["brokers"] or {})) >= {"windows_uia", "linux_atspi", "linux_x11", "linux_wayland"}

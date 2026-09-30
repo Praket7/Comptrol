@@ -20,6 +20,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -27,6 +30,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release
+      - run: python scripts/browser_bridge_install_conformance.py
       - run: npm run test:daemon-launcher
       - name: Native daemon IPC conformance
         run: python scripts/ipc_conformance.py
@@ -77,6 +81,7 @@ jobs:
       - run: python3 scripts/lint_readme.py
       - run: python3 scripts/test_release_verification.py
       - run: python3 scripts/adapter_conformance.py
+      - run: python3 scripts/blender_rocket_fixture.py
       - run: python3 scripts/adapter_runtime_conformance.py
         env:
           COMPTROL_BIN: target/release/comptrol

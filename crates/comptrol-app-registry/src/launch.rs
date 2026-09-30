@@ -3,7 +3,7 @@
 //! The launcher never shells out through an intermediate shell. It
 //! spawns the resolved executable directly (or the platform open
 //! surface for URLs/deep links). Direct executable routes may verify the
-//! destination process identity after a bounded settle window. Platform
+//! destination process identity after direct dispatch. Platform
 //! helper routes such as open, xdg-open, or explorer only prove dispatch
 //! and deliberately remain unverified until the destination identity is
 //! observed independently.
@@ -12,6 +12,7 @@ use crate::registry::AppEntry;
 use crate::{Resource, Resource as OpenResource};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 #[derive(Debug, thiserror::Error)]
@@ -32,15 +33,18 @@ pub struct LaunchOutcome {
     pub pid: Option<u32>,
     pub resource: OpenResource,
     pub metadata: BTreeMap<String, String>,
+    /// Monotonic phase durations populated by `launch_verified`.
+    #[serde(default)]
+    pub timings_ms: BTreeMap<String, u64>,
 }
 
 /// Verification result carried on the outcome.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchVerification {
-    /// Process identity observed alive after the settle window.
+    /// Process identity observed alive after dispatch.
     Verified,
-    /// Process exited before the settle window closed.
+    /// Process exited before post-dispatch verification.
     ExitedEarly,
     /// Verification could not run on this platform.
     Unavailable,
@@ -50,7 +54,8 @@ pub enum LaunchVerification {
 pub struct LaunchRequest {
     pub app: AppEntry,
     pub resource: Resource,
-    /// Milliseconds to wait before the liveness check (default 750ms).
+    /// Deprecated compatibility field. Readiness is event/poll driven and
+    /// never waits this fixed duration.
     pub settle_ms: u64,
     /// Open without foregrounding where the platform supports it.
     pub background: bool,
@@ -133,9 +138,36 @@ unsafe fn probe_liveness(pid: i32) -> i32 {
 /// cannot preserve the resolved app identity refuse rather than silently
 /// delegating the resource to the OS default handler.
 pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
-    let settle = std::time::Duration::from_millis(request.settle_ms.max(50));
     let mut metadata = BTreeMap::new();
     metadata.insert("background".to_owned(), request.background.to_string());
+
+    // Windows Settings is a packaged AUMID app with no executable path. Its
+    // documented ms-settings protocol is the exact app-owned route for
+    // opening a named Settings page (for example, ms-settings:colors).
+    #[cfg(windows)]
+    if request.app.id
+        == "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+        && let Resource::DeepLink { uri } = &request.resource
+        && uri.starts_with("ms-settings:")
+        && !uri.chars().any(char::is_whitespace)
+    {
+        let mut command = std::process::Command::new("explorer.exe");
+        command
+            .arg(uri)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.spawn()?;
+        let pid = child.id();
+        return Ok(LaunchOutcome {
+            app_id: request.app.id.clone(),
+            route: "windows_settings_protocol".to_owned(),
+            pid: Some(pid),
+            resource: request.resource.clone(),
+            metadata,
+            timings_ms: BTreeMap::new(),
+        });
+    }
 
     #[cfg(target_os = "macos")]
     if request.app.platform == "macos"
@@ -153,48 +185,39 @@ pub fn launch(request: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
         };
         let child = open_macos_bundle(bundle, resource, request.background, &request.args)?;
         let pid = child.id();
-        std::thread::sleep(settle);
         return Ok(LaunchOutcome {
             app_id: request.app.id.clone(),
             route: "macos_launchservices".to_owned(),
             pid: Some(pid),
             resource: request.resource.clone(),
             metadata,
+            timings_ms: BTreeMap::new(),
         });
     }
 
     match &request.resource {
-        Resource::File { path } => {
-            launch_executable(request, Some(path.as_str()), metadata, settle)
-        }
-        Resource::Url { url } => launch_executable(request, Some(url.as_str()), metadata, settle),
-        Resource::DeepLink { uri } => {
-            launch_executable(request, Some(uri.as_str()), metadata, settle)
-        }
+        Resource::File { path } => launch_executable(request, Some(path.as_str()), metadata),
+        Resource::Url { url } => launch_executable(request, Some(url.as_str()), metadata),
+        Resource::DeepLink { uri } => launch_executable(request, Some(uri.as_str()), metadata),
         Resource::None => {
             #[cfg(windows)]
             {
-                let app_id = &request.app.id;
-                let is_aumid = app_id.contains('_')
-                    && (app_id.ends_with("!App") || app_id.ends_with("!Application"));
-                if is_aumid {
-                    let shell_path = format!("shell:AppsFolder\\{app_id}");
-                    let mut command = std::process::Command::new("explorer.exe");
-                    command.arg(&shell_path);
-                    command.stdin(Stdio::null()).stdout(Stdio::null());
-                    let child = command.spawn()?;
-                    let pid = child.id();
-                    std::thread::sleep(settle);
+                // Activate packaged apps through Windows' application
+                // activation API, which returns the destination PID. The PID
+                // is still not treated as window/content readiness.
+                if is_aumid(&request.app.id) {
+                    let pid = activate_packaged_app(&request.app.id)?;
                     return Ok(LaunchOutcome {
                         app_id: request.app.id.clone(),
-                        route: "aumid_shell".to_owned(),
+                        route: "windows_app_activation".to_owned(),
                         pid: Some(pid),
                         resource: request.resource.clone(),
                         metadata,
+                        timings_ms: BTreeMap::new(),
                     });
                 }
             }
-            launch_executable(request, None, metadata, settle)
+            launch_executable(request, None, metadata)
         }
     }
 }
@@ -203,23 +226,24 @@ fn launch_executable(
     request: &LaunchRequest,
     resource: Option<&str>,
     metadata: BTreeMap<String, String>,
-    settle: std::time::Duration,
 ) -> Result<LaunchOutcome, LaunchError> {
-    let Some(executable) = request.app.executable.clone() else {
+    let Some(registered_executable) = request.app.executable.clone() else {
         return Err(LaunchError::ExactResourceRouteUnavailable(
             request.app.id.clone(),
         ));
     };
+    let executable = resolve_known_launcher(&registered_executable);
     if executable.is_dir() {
         return Err(LaunchError::ExactResourceRouteUnavailable(
             request.app.id.clone(),
         ));
     }
-    let mut command = std::process::Command::new(executable);
+    let mut command = std::process::Command::new(&executable);
     if let Some(resource) = resource {
         command.arg(resource);
     }
     command
+        .args(&request.app.launch_args)
         .args(&request.args)
         .stdin(Stdio::null())
         .stdout(Stdio::null());
@@ -232,14 +256,42 @@ fn launch_executable(
     }
     let child = command.spawn()?;
     let pid = child.id();
-    std::thread::sleep(settle);
     Ok(LaunchOutcome {
         app_id: request.app.id.clone(),
         route: "executable_argv".to_owned(),
         pid: Some(pid),
         resource: request.resource.clone(),
-        metadata,
+        metadata: if executable != registered_executable {
+            let mut metadata = metadata;
+            metadata.insert(
+                "launcher_resolved_from".to_owned(),
+                registered_executable.to_string_lossy().into_owned(),
+            );
+            metadata.insert(
+                "launched_executable".to_owned(),
+                executable.to_string_lossy().into_owned(),
+            );
+            metadata
+        } else {
+            metadata
+        },
+        timings_ms: BTreeMap::new(),
     })
+}
+
+fn resolve_known_launcher(registered: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if registered
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("blender-launcher.exe"))
+        && let Some(parent) = registered.parent()
+    {
+        let blender = parent.join("blender.exe");
+        if blender.is_file() {
+            return blender;
+        }
+    }
+    registered.to_path_buf()
 }
 
 #[cfg(target_os = "macos")]
@@ -267,6 +319,53 @@ fn route_pid_is_destination(route: &str) -> bool {
     matches!(route, "executable_argv")
 }
 
+#[cfg(windows)]
+fn activate_packaged_app(aumid: &str) -> Result<u32, LaunchError> {
+    use windows::Win32::System::Com::{
+        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::{
+        ACTIVATEOPTIONS, ApplicationActivationManager, IApplicationActivationManager,
+    };
+    use windows::core::PCWSTR;
+
+    struct ComApartment;
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+        .ok()
+        .map_err(|error| LaunchError::Io(std::io::Error::other(error.to_string())))?;
+    let _apartment = ComApartment;
+    let manager: IApplicationActivationManager =
+        unsafe { CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER) }
+            .map_err(|error| LaunchError::Io(std::io::Error::other(error.to_string())))?;
+    let app_id = aumid
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let arguments = [0u16];
+    unsafe {
+        manager.ActivateApplication(
+            PCWSTR(app_id.as_ptr()),
+            PCWSTR(arguments.as_ptr()),
+            ACTIVATEOPTIONS(0),
+        )
+    }
+    .map_err(|error| LaunchError::Io(std::io::Error::other(error.to_string())))
+}
+
+#[cfg(any(windows, test))]
+fn is_aumid(app_id: &str) -> bool {
+    app_id
+        .split_once('!')
+        .is_some_and(|(package_family, app)| !package_family.is_empty() && !app.is_empty())
+}
+
 /// Launch and then verify, per the V5 rule that delivery is not verification.
 ///
 /// Only direct executable routes bind the returned PID to the destination app.
@@ -275,18 +374,34 @@ fn route_pid_is_destination(route: &str) -> bool {
 pub fn launch_verified(
     request: &LaunchRequest,
 ) -> Result<(LaunchOutcome, LaunchVerification), LaunchError> {
-    let outcome = launch(request)?;
-    if !route_pid_is_destination(&outcome.route) {
-        return Ok((outcome, LaunchVerification::Unavailable));
-    }
-    let Some(pid) = outcome.pid else {
-        return Ok((outcome, LaunchVerification::Unavailable));
+    let total_started = std::time::Instant::now();
+    let launch_started = std::time::Instant::now();
+    let mut outcome = launch(request)?;
+    let launch_dispatch_ms = launch_started.elapsed().as_millis() as u64;
+    let verification_started = std::time::Instant::now();
+    let verification = if !route_pid_is_destination(&outcome.route) {
+        LaunchVerification::Unavailable
+    } else if let Some(pid) = outcome.pid {
+        match process_alive(pid) {
+            Ok(true) => LaunchVerification::Verified,
+            Ok(false) => LaunchVerification::ExitedEarly,
+            Err(_) => LaunchVerification::Unavailable,
+        }
+    } else {
+        LaunchVerification::Unavailable
     };
-    match process_alive(pid) {
-        Ok(true) => Ok((outcome, LaunchVerification::Verified)),
-        Ok(false) => Ok((outcome, LaunchVerification::ExitedEarly)),
-        Err(_) => Ok((outcome, LaunchVerification::Unavailable)),
-    }
+    outcome
+        .timings_ms
+        .insert("launch_dispatch_ms".to_owned(), launch_dispatch_ms);
+    outcome.timings_ms.insert(
+        "process_identity_verification_ms".to_owned(),
+        verification_started.elapsed().as_millis() as u64,
+    );
+    outcome.timings_ms.insert(
+        "total_ms".to_owned(),
+        total_started.elapsed().as_millis() as u64,
+    );
+    Ok((outcome, verification))
 }
 
 /// Test probe exposing the verification decision for a given pid so
@@ -317,5 +432,29 @@ mod tests {
         // Unavailable is only returned on non-Unix platforms where liveness probing is not implemented
         let result = launcher_probe(0x7FFFFFFF);
         assert_eq!(result, LaunchVerification::ExitedEarly);
+    }
+
+    #[test]
+    fn aumid_accepts_packaged_apps_with_specific_application_ids() {
+        assert!(is_aumid(
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+        ));
+        assert!(is_aumid("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"));
+        assert!(!is_aumid("windows.immersivecontrolpanel_cw5n1h2txyewy!"));
+        assert!(!is_aumid("Microsoft.WindowsCalculator"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blender_launcher_resolves_to_the_actual_application_executable() {
+        let root =
+            std::env::temp_dir().join(format!("comptrol-blender-launch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let launcher = root.join("blender-launcher.exe");
+        let blender = root.join("blender.exe");
+        std::fs::write(&launcher, b"launcher fixture").unwrap();
+        std::fs::write(&blender, b"application fixture").unwrap();
+        assert_eq!(resolve_known_launcher(&launcher), blender);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

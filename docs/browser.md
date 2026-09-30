@@ -1,5 +1,26 @@
 # Browser control
 
+## Fast Google Classroom account and class navigation
+
+For a known Classroom class, keep the account change and class selection in the same Chrome tab. Open the Classroom account chooser in the current browser profile, then use one `browser.cdp.workflow` request to wait for and select the exact school email, wait for the exact class name, click that class, and finish with a class URL postcondition. This is two Comptrol operations total (open tab plus workflow); do not split the account click, class-list wait, and class click into separate model calls. If the chooser does not contain the requested email, stop with an unverified result rather than selecting a similar account.
+
+Example workflow after opening the chooser:
+
+```json
+{
+  "target_url_contains": "accounts.google.com",
+  "steps": [
+    {"action":"wait_text","text":"prgauri@williamsvillek12.org"},
+    {"action":"click","locator":{"text":"prgauri@williamsvillek12.org"}},
+    {"action":"wait_text","text":"Investment Club"},
+    {"action":"click","locator":{"role":"link","name":"Investment Club"}},
+    {"action":"wait_url","contains":"/c/"}
+  ]
+}
+```
+
+The last step establishes the requested class navigation. A successful intermediate account click is not end-to-end verification. Keep the target bound to the exact new tab or a unique account-chooser URL matcher.
+
 The repository now includes a local browser fixture with Chromium style discovery endpoints, exact target identity, browser context identity, a revision, and idempotent form submission. The Rust runtime can also discover targets from a configured local DevTools HTTP endpoint through `COMPTROL_CDP_ENDPOINT`.
 
 The fixture now includes a minimal websocket protocol route for `Runtime.evaluate` and `Page.navigate`. It is the deterministic contract test for exact target rebinding and verified protocol responses. A stale target returns a refusal. A repeated idempotency key returns the first result without a second submission. Discovery does not grant browser mutation authority.
@@ -28,7 +49,7 @@ Inactive and grouped live tabs remain addressable through exact target identity 
 
 The fixture page includes a nested frame, download, dialog, dynamic node, shadow root, canvas, and intentionally untrusted instruction text. The text is fixture data only and is never treated as runtime instruction.
 
-The runtime can use the same narrow routes against a local Chromium DevTools endpoint when `COMPTROL_ALLOW_BROWSER_CDP=1` is set outside the agent channel. Every CDP mutation requires the exact page target, browser context, and target revision returned by discovery.
+The runtime can use the same narrow routes against a local Chromium DevTools endpoint when `COMPTROL_ALLOW_BROWSER_CDP=1` is set outside the agent channel. For a permissioned Chrome 144+ session, `COMPTROL_CHROME_AUTO_CONNECT=1` arms the session broker, which reads Chrome's loopback WebSocket URL from `DevToolsActivePort`; Chrome's native **Allow** prompt remains in control. Every CDP mutation requires the exact page target, browser context, and target revision returned by discovery.
 
 Uploads are restricted to the Comptrol sandbox and verify only the selected filename. Generic CDP reports the upload stage as `selected` and remains unverified until a site or application adapter proves transfer or acceptance. Downloads require a stable idempotency key, use a key scoped sandbox directory, wait for the expected file, and verify the resulting file. A repeated key returns an existing verified download without clicking the page again.
 
@@ -40,7 +61,9 @@ The `comptrol open <app-or-url>` CLI command is the one-command launch path. App
 
 Locator resolution traverses the document, open shadow roots, and same-origin iframe documents on every retry. Cross-origin iframe documents remain inaccessible to the page security model and are not guessed through pixels. A locator that matches more than one semantic element is refused as `ambiguous_locator`; the engine does not silently choose the first result. Actionability still requires visibility, enabled state, event reception, and two stable animation frames.
 
-`browser.cdp.workflow` is the low-round-trip fast path for bounded browser tasks. It accepts the exact target identity plus a closed `steps` array containing `navigate`, `click`, and `wait_url` steps. Each click still uses a fresh data-only semantic locator, target context and revision are revalidated between steps, navigation URLs are restricted to `http`, `https`, or `about`, and URL postconditions are bounded. This keeps the safety properties of individual operations while avoiding a separate MCP request, target inspection, and model turn for every click.
+`browser.cdp.workflow` is the low-round-trip fast path for bounded browser tasks. It accepts an exact target identity (or a unique URL/title matcher) plus a closed `steps` array containing `navigate`, `click`, `fill`, `wait_url`, and `wait_text` steps. Each click uses a fresh data-only semantic locator; target context and revision are refreshed between steps; navigation URLs are restricted to `http`, `https`, or `about`; and waits are bounded. URL matchers compare the URL's origin and path and ignore query strings and fragments, so an identity-provider `continue=` parameter cannot masquerade as the destination page. Multi-step workflows are verified only when a navigation or wait step confirms the requested state; successful intermediate clicks alone do not prove the task completed. This avoids a separate MCP request and model turn for every click without treating dispatch as outcome evidence.
+
+`browser.cdp.compact_snapshot` is the preferred first observation for a known page. It returns a bounded list of visible actionable controls and is advertised in both the capability catalog and `intent_schema`. Use the full accessibility snapshot only when the compact result cannot ground the requested control.
 
 Normal target-bound CDP calls now reuse one local websocket per exact DevTools target URL, and a two-second event-invalidated target-list cache avoids repeating `/json/list` for adjacent read-only calls. The cache is invalidated after navigation, stale rebinding, and target lifecycle changes; failures on commands that can change target identity trigger a fresh discovery before retry. Command ids are monotonic within the session, unmatched protocol events are retained in a bounded queue, and any dispatch, read, protocol, or size failure evicts the session before the caller receives the error. Target creation, destruction, and navigation history verification wait for `Target.targetCreated`, `Target.targetDestroyed`, and page navigation events before the final identity check, removing fixed interval lifecycle polling from those waits. The next call reconnects once through the normal target identity binding path. Reuse is a transport optimization only and never bypasses target, context, revision, policy, or verification checks. Upload and download transactions retain their own bounded command scopes until they are migrated to the shared session without weakening their filesystem verification.
 

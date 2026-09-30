@@ -17,6 +17,8 @@ let protocolEvents = 0
 let fixtureHistoryIndex = 1
 let fixtureUrl = `http://127.0.0.1:${port}/`
 let fixtureDialogOpen = false
+let classroomFixtureStage = 0
+let classroomFixtureClassOpened = false
 const fixtureHistory = [
   { id: 1, url: "http://127.0.0.1:17417/previous" },
   { id: 2, url: "http://127.0.0.1:17417/" },
@@ -72,7 +74,7 @@ const server = createServer(async (request, response) => {
     return
   }
   if (request.method === "GET" && request.url === "/state") {
-    json(response, 200, { targetId, browserContextId, revision, submissions: [...submissions.values()] })
+    json(response, 200, { targetId, browserContextId, revision, submissions: [...submissions.values()], classroomFixtureStage, classroomFixtureClassOpened, classroomFixtureUrl: fixtureUrl })
     return
   }
   if (request.method === "GET" && request.url === "/metrics") {
@@ -245,6 +247,30 @@ server.on("upgrade", (request, socket) => {
           ? { result: { type: "string", value: fixtureUrl } }
           : message.params.expression === "document.title"
           ? { result: { type: "string", value: "Comptrol browser fixture" } }
+          : message.params.expression.includes("Switch account")
+            ? (() => {
+                if (classroomFixtureStage !== 0) return { result: { type: "object", value: { clicked: false, reason: "unexpected_fixture_state", matches: 1 } } }
+                classroomFixtureStage = 1
+                return { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Switch account", actionability: { attached: true, visible: true, stable: true, enabled: true, receives_events: true, unobscured: true } } } }
+              })()
+          : message.params.expression.includes("Williamsville profile")
+            ? (() => {
+                if (classroomFixtureStage !== 1) return { result: { type: "object", value: { clicked: false, reason: "account_chooser_not_open", matches: 1 } } }
+                classroomFixtureStage = 2
+                return { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Williamsville profile", actionability: { attached: true, visible: true, stable: true, enabled: true, receives_events: true, unobscured: true } } } }
+              })()
+          : message.params.expression.includes("Investment Club")
+            ? (() => {
+                if (classroomFixtureStage !== 2) return { result: { type: "object", value: { clicked: false, reason: "school_profile_not_selected", matches: 1 } } }
+                classroomFixtureStage = 3
+                classroomFixtureClassOpened = true
+                fixtureUrl = `http://127.0.0.1:${port}/c/investment-club`
+                const info = targetInfo(pageTarget || targetId, fixtureUrl)
+                protocolEvents += 1
+                socket.write(websocketFrame(JSON.stringify({ method: "Target.targetInfoChanged", params: { targetInfo: info } })))
+                socket.write(websocketFrame(JSON.stringify({ method: "Page.frameNavigated", params: { frame: { id: "fixture-frame", url: fixtureUrl } } })))
+                return { result: { type: "object", value: { clicked: true, matches: 1, role: "link", name: "Investment Club", actionability: { attached: true, visible: true, stable: true, enabled: true, receives_events: true, unobscured: true } } } }
+              })()
           : message.params.expression.includes("Add dynamic node")
             ? { result: { type: "object", value: { clicked: true, matches: 1, role: "button", name: "Add dynamic node" } } }
           : message.params.expression.includes("Shadow action")

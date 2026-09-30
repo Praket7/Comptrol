@@ -2,6 +2,7 @@
 """Verify checksums, SBOM output, and detached release signatures."""
 
 import os
+import sys
 import pathlib
 import subprocess
 import tempfile
@@ -22,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-release-") as temporary:
     output = directory / "release"
     subprocess.run(
         [
-            "python3",
+            sys.executable,
             str(root / "scripts" / "package_release.py"),
             "--binary",
             binary,
@@ -40,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix="comptrol-release-") as temporary:
         stdout=subprocess.DEVNULL,
     )
     subprocess.run(
-        ["python3", str(root / "scripts" / "verify_release.py"), "--directory", str(output)],
+        [sys.executable, str(root / "scripts" / "verify_release.py"), "--directory", str(output)],
         check=True,
     )
 print("signed release conformance passed")

@@ -94,8 +94,11 @@ def main():
         raise SystemExit(f"inspect adapters failed: {response}")
     result = response.get("result", {})
     catalog = result.get("structuredContent")
+    if isinstance(catalog, dict):
+        # `inspect` wraps its payload: {"result": [...]}.
+        catalog = catalog.get("result", catalog)
     if not isinstance(catalog, list):
-        raise SystemExit(f"adapter catalog is not an array: {response}")
+        raise SystemExit(f"adapter catalog is not an array: {json.dumps(catalog)[:400]}")
 
     names = [item.get("name") for item in catalog if isinstance(item, dict)]
     if len(names) != len(set(names)):
