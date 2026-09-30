@@ -60,9 +60,6 @@
             "name": "operate",
             "arguments": {
               "intent": "permission.status",
-              "params": {
-                "permission": "accessibility"
-              },
               "idempotency_key": "bench-desktop-perm-001"
             }
           }
