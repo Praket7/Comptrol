@@ -1125,13 +1125,21 @@ fn core_schema(intent: &str) -> Option<Value> {
         | "browser.cdp.focus"
         | "browser.cdp.fill"
         | "browser.cdp.click" => {
-            let extra = json!({
-                "locator": {"type":"object"},
-                "selector": s(0),
-                "value": s(0),
-                "text_contains": s(0),
-                "timeout_ms": {"type":"integer","minimum":100,"maximum":120000}
-            });
+            let is_focus = intent == "browser.cdp.focus";
+            let extra = if is_focus {
+                json!({
+                    "selector": s(1),
+                    "timeout_ms": {"type":"integer","minimum":100,"maximum":120000}
+                })
+            } else {
+                json!({
+                    "locator": {"type":"object"},
+                    "selector": s(0),
+                    "value": s(0),
+                    "text_contains": s(0),
+                    "timeout_ms": {"type":"integer","minimum":100,"maximum":120000}
+                })
+            };
             let needs_value = intent.ends_with("fill");
             (
                 match intent {
@@ -1144,19 +1152,23 @@ fn core_schema(intent: &str) -> Option<Value> {
                     "browser.cdp.fill" => {
                         "Fill one exact target-bound element and verify the resulting value."
                     }
-                    "browser.cdp.focus" => "Focus one exact element by semantic locator.",
+                    "browser.cdp.focus" => "Focus one exact element by CSS selector.",
                     _ => {
                         "Click one exact target-bound element, reporting unverified unless the caller supplies a postcondition."
                     }
                 },
-                if needs_value {
+                if is_focus {
+                    json!({"target_id":"t","browser_context_id":"c","revision":"r","selector":"#message"})
+                } else if needs_value {
                     json!({"target_id":"t","browser_context_id":"c","revision":"r","locator":{"role":"link","name":"Investment Club"},"value":"text"})
                 } else {
                     json!({"target_id":"t","browser_context_id":"c","revision":"r","locator":{"role":"link","name":"Investment Club"}})
                 },
                 target_bound(
                     extra,
-                    if needs_value {
+                    if is_focus {
+                        vec!["target_id", "browser_context_id", "selector"]
+                    } else if needs_value {
                         vec!["target_id", "browser_context_id", "locator", "value"]
                     } else {
                         vec!["target_id", "browser_context_id", "locator"]
@@ -1468,6 +1480,34 @@ mod tests {
                 })
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn browser_focus_schema_matches_selector_input() {
+        assert!(
+            validate_params(
+                "browser.cdp.focus",
+                &json!({
+                    "target_id":"t",
+                    "browser_context_id":"c",
+                    "revision":"r",
+                    "selector":"#message"
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_params(
+                "browser.cdp.focus",
+                &json!({
+                    "target_id":"t",
+                    "browser_context_id":"c",
+                    "revision":"r",
+                    "locator":{"selector":"#message"}
+                })
+            )
+            .is_err()
         );
     }
 
