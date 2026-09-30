@@ -120,7 +120,7 @@ try:
     opened_target = opened_data["data"]["target"]
     opened_identity = {"target_id": opened_target["id"], "browser_context_id": opened_target.get("browser_context_id", "default"), "revision": opened_target.get("revision", f"url:{opened_target['url']}")}
     opened_wait = call(runtime, 13, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.wait_for", "idempotency_key": "chrome-background-ready", "params": {**opened_identity, "selector": "#message", "property": "value", "equals": ""}}})
-    assert opened_wait["result"]["structuredContent"]["verification"] == "verified"
+    assert opened_wait["result"]["structuredContent"]["verification"] == "verified", opened_wait
     identity = {"target_id": target["id"], "browser_context_id": target.get("browserContextId", "default"), "revision": target.get("revision", f"url:{target['url']}")}
     profile_marker = call(runtime, 14, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.evaluate", "idempotency_key": "chrome-profile-marker", "params": {**identity, "expression": "document.cookie = 'comptrol_profile_marker=retained; path=/'; true"}}})
     assert profile_marker["result"]["structuredContent"]["verification"] == "verified"
