@@ -159,7 +159,7 @@ try:
     assert rebound is not None, rebound
     identity = {"target_id": rebound["id"], "browser_context_id": rebound.get("browserContextId", "default"), "revision": rebound.get("revision", f"url:{rebound['url']}")}
     if focus_available:
-        focus = call(runtime, 21, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.focus", "idempotency_key": "chrome-focus", "params": {**identity, "selector": "#message"}}})
+        focus = call(runtime, 21, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.focus", "idempotency_key": "chrome-focus", "params": {**identity, "locator": {"selector": "#message"}}}})
         focus_data = focus["result"]["structuredContent"]
         assert focus_data["verification"] == "verified", focus
         assert focus_data["data"]["postcondition"] == "verified"
