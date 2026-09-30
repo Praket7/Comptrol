@@ -54,3 +54,6 @@ pub mod unsupported {
         Err("Focusing an exact window is only available on Windows".to_owned())
     }
 }
+
+#[cfg(not(windows))]
+pub use unsupported::enumerate_top_level_windows_bounded;

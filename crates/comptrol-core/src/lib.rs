@@ -7407,6 +7407,7 @@ fn app_launch(request: &OperationRequest, operation_id: String) -> ActionResult 
         }
     };
     let app_resolution_ms = resolution_started.elapsed().as_millis() as u64;
+    #[cfg(windows)]
     let readiness_timeout_ms = request
         .params
         .get("readiness_timeout_ms")
