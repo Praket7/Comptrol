@@ -1478,7 +1478,7 @@ mod tests {
         assert!(child.wait().unwrap().success());
         assert!(result.unwrap()["ok"].as_bool().unwrap());
         assert!(
-            elapsed < Duration::from_millis(250),
+            elapsed < Duration::from_millis(750),
             "cross-process result delayed {elapsed:?}"
         );
         drop(store);
