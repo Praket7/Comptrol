@@ -58,65 +58,70 @@ for invalid in ("", "rocket.obj", "rocket.png"):
 
 print("Blender 2D rocket fixture passed: bounded script, required geometry, saved blend and PNG")
 
-# The preserved 2D rocket has measurable flame/body gaps. Verify that the
-# conversion script closes those gaps, reopens the saved copy, and checks the
-# evaluated geometry before it may report success.
-source = ROOT.parent / "artifacts" / "blender" / "rocket-goal-20260925.blend"
-copy_out = ROOT.parent / "work" / "fixture-rocket-copy.blend"
-copy_script = adapter.script_for(
-    {
-        "intent": "blender.scene.copy_2d_rocket_to_3d",
-        "input_path": str(source),
-        "output_path": str(copy_out),
-        "depth": 0.35,
-    }
-)
-for required in (
-    'bpy.data.objects.get("Rocket Body")',
-    '("Flame Outer", "Flame Inner")',
-    "contacts_before",
-    "contacts_after",
-    "bpy.ops.wm.open_mainfile(filepath=output)",
-    "reopened_contacts",
-):
-    assert required in copy_script, f"3D rocket conversion is missing {required!r}"
-assert source.is_file(), "fixture source .blend file is missing"
-assert repr(str(copy_out.resolve())) in copy_script
-
-# A failed artifact readback must not be surfaced as an available/successful
-# adapter result, even when Blender itself exits with code 0.
-fake_report = {
-    "saved": str(copy_out.resolve()),
-    "depth": 0.35,
-    "extruded_objects": ["Rocket Body", "Rocket Nose", "Flame Outer"],
-    "saved_copy_reopened": True,
-    "reopened_contacts": [{"verified": True}],
-    "rendered": [],
-}
-fake_process = __import__("subprocess").CompletedProcess(
-    args=["blender"], returncode=0, stdout=json.dumps(fake_report), stderr=""
-)
-with patch.object(adapter, "find_blender", return_value="blender-fixture"), patch.object(
-    adapter.subprocess, "run", return_value=fake_process
-):
-    result = adapter.handler(
+# The 3D conversion fixture checks script generation and fail-closed handling.
+# It uses a temporary placeholder file because the mocked Blender process never
+# reads the source file. A live Blender acceptance run uses a real .blend file.
+with tempfile.TemporaryDirectory() as temp_dir:
+    temp_root = Path(temp_dir)
+    source = temp_root / "rocket-goal.blend"
+    source.write_bytes(b"synthetic Blender path fixture")
+    copy_out = temp_root / "fixture-rocket-copy.blend"
+    copy_script = adapter.script_for(
         {
-            "method": "operate",
-            "request_id": "fixture-unverified-blender-output",
-            "payload": {
-                "intent": "blender.scene.copy_2d_rocket_to_3d",
-                "input_path": str(source),
-                "output_path": str(copy_out),
-                "depth": 0.35,
-            },
+            "intent": "blender.scene.copy_2d_rocket_to_3d",
+            "input_path": str(source),
+            "output_path": str(copy_out),
+            "depth": 0.35,
         }
     )
-assert result["ok"] is False, "unreadable Blender output must fail the adapter operation"
-assert result["health"] == "degraded"
-assert result["error"]["code"] == "artifact_verification_failed"
+    for required in (
+        'bpy.data.objects.get("Rocket Body")',
+        '("Flame Outer", "Flame Inner")',
+        "contacts_before",
+        "contacts_after",
+        "bpy.ops.wm.open_mainfile(filepath=output)",
+        "reopened_contacts",
+    ):
+        assert required in copy_script, f"3D rocket conversion is missing {required!r}"
+    assert repr(str(copy_out.resolve())) in copy_script
 
-with tempfile.TemporaryDirectory(dir=ROOT.parent / "work") as temp_dir:
-    occupied_output = Path(temp_dir) / "occupied.blend"
+    # A failed artifact readback must not be surfaced as an available/successful
+    # adapter result, even when Blender itself exits with code 0.
+    fake_report = {
+        "saved": str(copy_out.resolve()),
+        "depth": 0.35,
+        "extruded_objects": ["Rocket Body", "Rocket Nose", "Flame Outer"],
+        "saved_copy_reopened": True,
+        "reopened_contacts": [{"verified": True}],
+        "rendered": [],
+    }
+    fake_process = __import__("subprocess").CompletedProcess(
+        args=["blender"], returncode=0, stdout=json.dumps(fake_report), stderr=""
+    )
+    with patch.object(adapter, "find_blender", return_value="blender-fixture"), patch.object(
+        adapter.subprocess, "run", return_value=fake_process
+    ):
+        result = adapter.handler(
+            {
+                "method": "operate",
+                "request_id": "fixture-unverified-blender-output",
+                "payload": {
+                    "intent": "blender.scene.copy_2d_rocket_to_3d",
+                    "input_path": str(source),
+                    "output_path": str(copy_out),
+                    "depth": 0.35,
+                },
+            }
+        )
+    assert result["ok"] is False, "unreadable Blender output must fail the adapter operation"
+    assert result["health"] == "degraded"
+    assert result["error"]["code"] == "artifact_verification_failed"
+
+with tempfile.TemporaryDirectory() as temp_dir:
+    temp_root = Path(temp_dir)
+    source = temp_root / "source.blend"
+    source.write_bytes(b"synthetic Blender path fixture")
+    occupied_output = temp_root / "occupied.blend"
     occupied_output.write_bytes(b"preserve this output")
     try:
         adapter.script_for(
