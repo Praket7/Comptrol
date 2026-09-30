@@ -69,7 +69,9 @@ fixture = subprocess.Popen(
     text=True,
     env={**os.environ, "COMPTROL_FIXTURE_PORT": str(fixture_port)},
 )
-profile = tempfile.TemporaryDirectory(prefix="comptrol-chrome-profile-")
+profile = tempfile.TemporaryDirectory(
+    prefix="comptrol-chrome-profile-", ignore_cleanup_errors=True
+)
 chrome_args = [
     chrome,
     "--headless=new",

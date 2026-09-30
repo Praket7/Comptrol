@@ -1176,13 +1176,25 @@ fn core_schema(intent: &str) -> Option<Value> {
                 ),
             )
         }
-        "browser.cdp.upload" | "browser.cdp.download" => (
-            "Attach one local file to an exact target, or observe one exact target's downloads.",
-            json!({"target_id":"t","browser_context_id":"c","revision":"r","path":"C:/work/file.txt"}),
+        "browser.cdp.upload" => (
+            "Select one local file from the Comptrol sandbox in a file input on an exact target.",
+            json!({"target_id":"t","browser_context_id":"c","revision":"r","path":"C:/work/file.txt","selector":"#upload"}),
             target_bound(
                 json!({
                     "path": path,
-                    "locator": {"type":"object"},
+                    "selector": s(1),
+                    "timeout_ms": {"type":"integer","minimum":100,"maximum":120000}
+                }),
+                vec!["target_id", "browser_context_id", "path"],
+            ),
+        ),
+        "browser.cdp.download" => (
+            "Download one file from an exact target and verify it in the Comptrol sandbox.",
+            json!({"target_id":"t","browser_context_id":"c","revision":"r","selector":"#download","file_name":"fixture.txt"}),
+            target_bound(
+                json!({
+                    "selector": s(1),
+                    "file_name": s(1),
                     "timeout_ms": {"type":"integer","minimum":100,"maximum":120000}
                 }),
                 vec!["target_id", "browser_context_id"],
@@ -1508,6 +1520,36 @@ mod tests {
                 })
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_file_transfer_schemas_match_handler_inputs() {
+        assert!(
+            validate_params(
+                "browser.cdp.upload",
+                &json!({
+                    "target_id":"t",
+                    "browser_context_id":"c",
+                    "revision":"r",
+                    "path":"C:/work/file.txt",
+                    "selector":"#upload"
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_params(
+                "browser.cdp.download",
+                &json!({
+                    "target_id":"t",
+                    "browser_context_id":"c",
+                    "revision":"r",
+                    "selector":"#download",
+                    "file_name":"fixture.txt"
+                })
+            )
+            .is_ok()
         );
     }
 
