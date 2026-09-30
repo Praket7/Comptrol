@@ -83,7 +83,7 @@ with tempfile.TemporaryDirectory(
             "revision": target["revision"],
             "url": "https://example.com",
             "url_contains": "example.com",
-            "timeout_ms": 15000,
+            "skip_if_current": False,
         }
         result = call(3, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.navigate", "idempotency_key": "windows-live-chrome-navigation", "params": params}})
         structured = result["result"]["structuredContent"]
