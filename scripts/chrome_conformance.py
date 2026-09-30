@@ -70,25 +70,38 @@ fixture = subprocess.Popen(
     env={**os.environ, "COMPTROL_FIXTURE_PORT": str(fixture_port)},
 )
 profile = tempfile.TemporaryDirectory(prefix="comptrol-chrome-profile-")
+chrome_args = [
+    chrome,
+    "--headless=new",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-gpu",
+    "--remote-debugging-address=127.0.0.1",
+    f"--remote-debugging-port={debug_port}",
+    f"--user-data-dir={profile.name}",
+    f"http://127.0.0.1:{fixture_port}/",
+]
+if sys.platform.startswith("linux") and os.environ.get("CI") == "true":
+    # Hosted runners need these flags for Chrome's sandbox and shared memory.
+    chrome_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
 chrome_process = subprocess.Popen(
-    [
-        chrome,
-        "--headless=new",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-gpu",
-        "--remote-debugging-address=127.0.0.1",
-        f"--remote-debugging-port={debug_port}",
-        f"--user-data-dir={profile.name}",
-        f"http://127.0.0.1:{fixture_port}/",
-    ],
+    chrome_args,
     stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
+    text=True,
 )
 runtime = None
 try:
     wait_for(f"http://127.0.0.1:{fixture_port}/json/list")
-    targets = wait_for(f"http://127.0.0.1:{debug_port}/json/list")
+    try:
+        targets = wait_for(f"http://127.0.0.1:{debug_port}/json/list", timeout=20)
+    except RuntimeError as error:
+        if chrome_process.poll() is None:
+            raise RuntimeError(f"{error}; Chrome remained running without a CDP endpoint") from error
+        chrome_error = chrome_process.stderr.read().strip()
+        raise RuntimeError(
+            f"{error}; Chrome exited with {chrome_process.returncode}: {chrome_error}"
+        ) from error
     target = next(item for item in targets if item.get("type") == "page" and item.get("url") == f"http://127.0.0.1:{fixture_port}/")
     state = tempfile.TemporaryDirectory(prefix="comptrol-chrome-state-")
     upload_path = pathlib.Path(state.name) / "sandbox" / "verified.txt"

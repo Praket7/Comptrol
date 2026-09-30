@@ -1218,8 +1218,14 @@ fn core_schema(intent: &str) -> Option<Value> {
         ),
         "browser.cdp.dialog" => (
             "Report or hold one JavaScript dialog on an exact target. Comptrol never silently auto-answers a prompt.",
-            json!({"target_id":"t","browser_context_id":"c","revision":"r"}),
-            target_bound(json!({}), vec!["target_id", "browser_context_id"]),
+            json!({"target_id":"t","browser_context_id":"c","revision":"r","action":"dismiss"}),
+            target_bound(
+                json!({
+                    "action": {"type":"string","enum":["accept","dismiss"]},
+                    "prompt_text": {"type":"string"}
+                }),
+                vec!["target_id", "browser_context_id", "action"],
+            ),
         ),
         "browser.cdp.open_tab" | "browser.cdp.activate_tab" => (
             "Open or activate one exact tab. `background: true` keeps it unfocused, which is the default for open_tab.",
@@ -1409,6 +1415,47 @@ mod tests {
             validate_params(
                 "app.focus",
                 &json!({"app":"exact-id","resource":{"kind":"file","path":"C:/work/file.txt"}})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_dialog_schema_accepts_supported_actions() {
+        assert!(
+            validate_params(
+                "browser.cdp.dialog",
+                &json!({
+                    "target_id":"t",
+                    "browser_context_id":"c",
+                    "revision":"r",
+                    "action":"dismiss"
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_params(
+                "browser.cdp.dialog",
+                &json!({
+                    "target_id":"t",
+                    "browser_context_id":"c",
+                    "revision":"r",
+                    "action":"dismiss",
+                    "prompt_text":"answer"
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_params(
+                "browser.cdp.dialog",
+                &json!({
+                    "target_id":"t",
+                    "browser_context_id":"c",
+                    "revision":"r",
+                    "action":"ignore"
+                })
             )
             .is_err()
         );
