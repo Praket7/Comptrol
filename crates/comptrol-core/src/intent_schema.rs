@@ -385,7 +385,7 @@ fn validate_params_inner(intent: &str, params: &Value) -> Result<(), String> {
                 fields.iter().all(|field| {
                     field
                         .as_str()
-                        .is_some_and(|field| object.get(field).is_some_and(property_is_present))
+                        .is_some_and(|field| object.contains_key(field))
                 })
             })
         })
@@ -571,14 +571,6 @@ fn validate_value(field: &str, value: &Value, schema: &Value) -> Result<(), Stri
         }
     }
     Ok(())
-}
-
-fn property_is_present(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::String(text) => !text.trim().is_empty(),
-        _ => true,
-    }
 }
 
 /// Schemas for the core (non-adapter) intent surface. Every intent in
@@ -1458,6 +1450,24 @@ mod tests {
                 })
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_wait_schema_accepts_an_empty_expected_value() {
+        assert!(
+            validate_params(
+                "browser.cdp.wait_for",
+                &json!({
+                    "target_id":"t",
+                    "browser_context_id":"c",
+                    "revision":"r",
+                    "selector":"#message",
+                    "property":"value",
+                    "equals":""
+                })
+            )
+            .is_ok()
         );
     }
 
