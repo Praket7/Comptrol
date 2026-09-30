@@ -176,15 +176,15 @@ try:
     assert snapshot_data["verification"] == "verified"
     assert snapshot_data["data"]["snapshot"]["nodes"]
     upload = call(runtime, 5, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.upload", "idempotency_key": "chrome-upload", "params": {**identity, "selector": "#upload", "path": str(upload_path)}}})
-    assert upload["result"]["structuredContent"]["verification"] == "unverified"
+    assert upload["result"]["structuredContent"]["verification"] == "unverified", upload
     assert upload["result"]["structuredContent"]["data"]["stage"] == "selected"
     assert upload["result"]["structuredContent"]["data"]["verified"] is True
     fill = call(runtime, 6, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.fill", "idempotency_key": "chrome-fill", "params": {**identity, "selector": "#message", "value": "verified form"}}})
-    assert fill["result"]["structuredContent"]["verification"] == "verified"
+    assert fill["result"]["structuredContent"]["verification"] == "verified", fill
     click = call(runtime, 7, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.click", "idempotency_key": "chrome-click", "params": {**identity, "selector": "#submit"}}})
-    assert click["result"]["structuredContent"]["verification"] == "unverified"
+    assert click["result"]["structuredContent"]["verification"] == "unverified", click
     wait = call(runtime, 8, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.wait_for", "idempotency_key": "chrome-wait", "params": {**identity, "selector": "#state", "property": "textContent", "contains": "submitted"}}})
-    assert wait["result"]["structuredContent"]["verification"] == "verified"
+    assert wait["result"]["structuredContent"]["verification"] == "verified", wait
     dialog = call(runtime, 9, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.click", "idempotency_key": "chrome-dialog-open", "params": {**identity, "selector": "#open-dialog", "verify_expression": "document.querySelector('#fixture-dialog').open"}}})
     assert dialog["result"]["structuredContent"]["verification"] == "verified"
     close_dialog = call(runtime, 10, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.click", "idempotency_key": "chrome-dialog-close", "params": {**identity, "selector": "#close-dialog"}}})
