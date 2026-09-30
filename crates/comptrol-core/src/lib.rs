@@ -7895,7 +7895,7 @@ fn app_open_resource(request: &OperationRequest, operation_id: String) -> Action
 fn app_focus(request: &OperationRequest, operation_id: String) -> ActionResult {
     #[cfg(not(windows))]
     {
-        return app_launch_with_resource(request, operation_id, false, "app_registry_activate");
+        app_launch_with_resource(request, operation_id, false, "app_registry_activate")
     }
     #[cfg(windows)]
     {
@@ -10294,6 +10294,7 @@ fn semantic_provider_result(
     }
 }
 
+#[cfg(any(windows, test))]
 fn uia_worker_unknown(
     request: &OperationRequest,
     operation_id: String,
