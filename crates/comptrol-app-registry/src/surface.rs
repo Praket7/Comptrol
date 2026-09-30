@@ -365,6 +365,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn a_dead_process_reports_exited_rather_than_no_window() {
         // The distinction matters to a caller: `ProcessExited` means the
         // launch failed, `NoWindow` means it may have succeeded into a

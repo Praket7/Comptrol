@@ -28,6 +28,7 @@ fn url_resources_require_native_open() {
 }
 
 #[test]
+#[cfg(windows)]
 fn program_files_start_app_identity_resolves_only_inside_program_files() {
     let root = std::env::temp_dir().join(format!("comptrol-app-registry-{}", std::process::id()));
     let executable = root.join("Blender Foundation/Blender 5.2/blender-launcher.exe");

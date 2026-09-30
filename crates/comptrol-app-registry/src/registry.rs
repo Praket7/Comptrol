@@ -272,7 +272,7 @@ fn windows_entries() -> Result<Vec<AppEntry>, RegistryError> {
 /// relative identity (for example `{FOLDERID_ProgramFiles}\\Vendor\\app.exe`).
 /// Resolve only that exact, documented root, canonicalize both sides, and
 /// require an existing executable so arbitrary shell identities are not run.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 pub(super) fn program_files_registration_path(id: &str) -> Option<PathBuf> {
     const PROGRAM_FILES: &str = "{6D809377-6AF0-444B-8957-A3773F02200E}\\";
     let relative = id.strip_prefix(PROGRAM_FILES)?;
