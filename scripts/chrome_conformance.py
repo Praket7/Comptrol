@@ -103,7 +103,10 @@ try:
     )
     call(runtime, 1, "initialize", {})
     capabilities = call(runtime, 20, "tools/call", {"name": "inspect", "arguments": {"kind": "capabilities"}})
-    focus_available = any(item["name"] == "browser.cdp.focus" for item in capabilities["result"]["structuredContent"])
+    focus_available = any(
+        item["name"] == "browser.cdp.focus"
+        for item in capabilities["result"]["structuredContent"]["intents"]
+    )
     inspection = call(runtime, 2, "tools/call", {"name": "inspect", "arguments": {"kind": "browser"}})
     assert any(item["id"] == target["id"] for item in inspection["result"]["structuredContent"]["targets"])
     opened = call(runtime, 12, "tools/call", {"name": "operate", "arguments": {"intent": "browser.cdp.open_tab", "idempotency_key": "chrome-background-tab", "params": {"url": f"http://127.0.0.1:{fixture_port}/", "background": True}}})
